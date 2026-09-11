@@ -265,6 +265,54 @@ pub enum RenderedPrompt {
     },
 }
 
+/// The SHA-256 of the weights a side serves, where its engine publishes one.
+///
+/// Only a digest of the weights themselves counts. Ollama's `/api/tags`
+/// carries a digest too, of a *manifest*, which changes with a template or a
+/// parameter while the weights stay put; reading it here would verify two
+/// different things as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WeightsDigest {
+    /// Lowercase hex, and where it was read.
+    Published {
+        digest: String,
+        source: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// A SHA-256 as 64 lowercase hex characters, or `None` for anything else.
+pub(crate) fn normalized_sha256(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+impl WeightsDigest {
+    pub fn digest(&self) -> Option<&str> {
+        match self {
+            Self::Published { digest, .. } => Some(digest),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// What happened when a side's engine was asked to check its own weights
+/// against the other side's published digest before answering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WeightsCheck {
+    /// Every run carried `expected` and was served: the engine compared its
+    /// own loaded bytes against it and they matched.
+    Enforced { expected: String },
+    /// The engine refused a run bound to `expected` because its loaded bytes
+    /// are something else. That is the answer to the question, not a failure.
+    Refused { expected: String, detail: String },
+}
+
 /// Everything measured about one node in one comparison.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Side {
@@ -292,6 +340,11 @@ pub struct Side {
     /// for the prompt the engine built.
     pub advertised_template: TemplateEvidence,
     pub rendered_prompt: RenderedPrompt,
+    pub weights_digest: WeightsDigest,
+    /// `None` when the engine was not asked to check, which is every engine
+    /// without a way to be asked and every side whose partner published no
+    /// digest to check against.
+    pub weights_check: Option<WeightsCheck>,
 }
 
 impl Side {
@@ -355,13 +408,13 @@ impl Verdict {
     }
 }
 
-/// The whole comparison, in the shape it is reported and exported.
 /// How the two sides came to be treated as the same model.
 ///
 /// Engines do not agree on how to name weights: Ollama suffixes `:latest`, LM
-/// Studio does not, and neither publishes a digest this fabric can compare. So
-/// an exactly-equal id is the only thing this build will *conclude* on its own,
-/// and anything else has to be a human saying so out loud.
+/// Studio does not. Where both engines publish a digest of the weights they
+/// serve, the digests decide. Otherwise an exactly-equal id is the only thing
+/// this build will *conclude* on its own, and anything else has to be a human
+/// saying so out loud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelIdentity {
@@ -371,8 +424,79 @@ pub enum ModelIdentity {
     /// verified, and never inferred — it travels with the receipt so a reader
     /// knows the comparison rests on someone's word.
     AssertedByOperator,
+    /// Both sides are shown to serve weights with one SHA-256: each published
+    /// it, or its engine checked its own loaded bytes against it and served.
+    /// Whatever the ids were, and whatever an operator said, this is the one
+    /// basis that is not a name.
+    VerifiedByDigest,
 }
 
+/// The one weights digest both sides are shown to serve, if there is one.
+///
+/// A side vouches for a digest by publishing it or by having its engine
+/// enforce it. A refusal anywhere, or two different published digests, means
+/// there is no such digest; so does a side that vouched for nothing.
+pub fn shared_weights_digest<'a>(left: &'a Side, right: &'a Side) -> Option<&'a str> {
+    if weights_disagree(left, right) {
+        return None;
+    }
+    let vouched = |side: &'a Side| -> Option<&'a str> {
+        side.weights_digest.digest().or(match &side.weights_check {
+            Some(WeightsCheck::Enforced { expected }) => Some(expected.as_str()),
+            _ => None,
+        })
+    };
+    match (vouched(left), vouched(right)) {
+        (Some(l), Some(r)) if same_digest(l, r) => Some(l),
+        _ => None,
+    }
+}
+
+/// Whether two weights digests name the same bytes. The one place that
+/// decides it, so agreeing and disagreeing can never use different rules.
+fn same_digest(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Whether the weights evidence shows the two sides serve different bytes.
+fn weights_disagree(left: &Side, right: &Side) -> bool {
+    let refused = |side: &Side| matches!(side.weights_check, Some(WeightsCheck::Refused { .. }));
+    if refused(left) || refused(right) {
+        return true;
+    }
+    matches!(
+        (left.weights_digest.digest(), right.weights_digest.digest()),
+        (Some(l), Some(r)) if !same_digest(l, r)
+    )
+}
+
+/// A side's name for a different-files verdict, carrying the digest that
+/// made it one, so two equal ids do not read as the same model.
+///
+/// Named as a file, not as weights: a digest covers the whole GGUF, and an
+/// engine that re-serializes a file on import (measured: Ollama 0.33.2 on
+/// `ollama create` from a local GGUF) publishes a different digest for what
+/// may be the same tensors. Different files are shown; different weights are
+/// not.
+fn named_by_weights(side: &Side) -> String {
+    let name = served(side);
+    match (&side.weights_digest, &side.weights_check) {
+        (WeightsDigest::Published { digest, .. }, _) => {
+            format!("{name} (GGUF file sha256 {})", short_digest(digest))
+        }
+        (_, Some(WeightsCheck::Refused { expected, .. })) => format!(
+            "{name} (its loaded GGUF file is not sha256 {})",
+            short_digest(expected)
+        ),
+        _ => name,
+    }
+}
+
+fn short_digest(digest: &str) -> String {
+    digest.chars().take(12).collect::<String>() + "…"
+}
+
+/// The whole comparison, in the shape it is reported and exported.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Comparison {
     pub prompt: String,
@@ -472,6 +596,13 @@ pub fn conclude(
     right: Side,
     model_identity: ModelIdentity,
 ) -> Comparison {
+    // A shared weights digest settles identity whatever the names were;
+    // anything short of one leaves it resting on the names.
+    let model_identity = if shared_weights_digest(&left, &right).is_some() {
+        ModelIdentity::VerifiedByDigest
+    } else {
+        model_identity
+    };
     let verdict = verdict_for(&left, &right, model_identity);
     let diff = match (&verdict, left.settled_text(), right.settled_text()) {
         (Verdict::Divergent, Some(l), Some(r)) => diff_lines(l, r),
@@ -505,22 +636,24 @@ pub fn conclude(
     // Not added beside a verdict that already says the models differ.
     let identity_reason = match model_identity {
         ModelIdentity::AssertedByOperator => Some(format!(
-            "the operator declared `{}` and `{}` to be the same weights, and nothing here checked it",
+            "the operator declared `{}` and `{}` to be the same weights, and nothing here checked it{}",
             left.model.as_deref().unwrap_or("-"),
             right.model.as_deref().unwrap_or("-"),
+            unpublished_digests(&left, &right),
         )),
         ModelIdentity::SameId
             if left.engine != right.engine
                 && !matches!(verdict, Verdict::DifferentModels { .. }) =>
         {
             Some(format!(
-                "both sides were asked for `{}`, but {} and {} each resolve a name by their own rules, so an equal name is not shown to be the same weights",
+                "both sides were asked for `{}`, but {} and {} each resolve a name by their own rules, so an equal name is not shown to be the same weights{}",
                 left.model.as_deref().unwrap_or("-"),
                 left.engine,
                 right.engine,
+                unpublished_digests(&left, &right),
             ))
         }
-        ModelIdentity::SameId => None,
+        ModelIdentity::SameId | ModelIdentity::VerifiedByDigest => None,
     };
     if let Some(reason) = identity_reason {
         uncontrolled_detail.push(Uncontrolled {
@@ -544,6 +677,26 @@ pub fn conclude(
         model_identity,
         uncontrolled,
         uncontrolled_detail,
+    }
+}
+
+/// Which sides published no weights digest, and why, as a clause to append
+/// to an identity reason: that is the check that could have settled it.
+fn unpublished_digests(left: &Side, right: &Side) -> String {
+    let missing: Vec<String> = [left, right]
+        .into_iter()
+        .filter_map(|side| match &side.weights_digest {
+            WeightsDigest::Unavailable { reason } => Some(format!("{}: {reason}", side.label)),
+            WeightsDigest::Published { .. } => None,
+        })
+        .collect();
+    if missing.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; a weights digest would settle it, and none was published by {}",
+            missing.join("; ")
+        )
     }
 }
 
@@ -581,6 +734,14 @@ fn verdict_for(left: &Side, right: &Side, model_identity: ModelIdentity) -> Verd
         return Verdict::DifferentModels {
             left: served(left),
             right: served(right),
+        };
+    }
+    // Next, the bytes: two published digests that differ, or an engine that
+    // refused the other side's, are different weights however alike the ids.
+    if weights_disagree(left, right) {
+        return Verdict::DifferentModels {
+            left: named_by_weights(left),
+            right: named_by_weights(right),
         };
     }
     if model_identity == ModelIdentity::SameId {
@@ -666,7 +827,182 @@ mod tests {
             rendered_prompt: RenderedPrompt::Unavailable {
                 reason: "test".to_string(),
             },
+            weights_digest: WeightsDigest::Unavailable {
+                reason: "test publishes none".to_string(),
+            },
+            weights_check: None,
         }
+    }
+
+    const WEIGHTS_A: &str = "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3";
+    const WEIGHTS_B: &str = "36330585f362ee081a91cb45550c961dcdbff478f2d02e84e2ae5dc07505967d";
+
+    fn publishing(mut side: Side, digest: &str) -> Side {
+        side.weights_digest = WeightsDigest::Published {
+            digest: digest.to_string(),
+            source: "test".to_string(),
+        };
+        side
+    }
+
+    fn checked(mut side: Side, check: WeightsCheck) -> Side {
+        side.weights_check = Some(check);
+        side
+    }
+
+    /// C4. Two engines that each publish the digest of the weights they
+    /// serve, and publish the same one, are the same weights: that is shown,
+    /// not asserted, and nothing about identity is left uncontrolled.
+    #[test]
+    fn equal_published_weights_digests_verify_identity_whatever_the_ids() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            publishing(
+                side("win", NodeEngine::Camelid, "llama-1b", &["12", "12"]),
+                WEIGHTS_A,
+            ),
+            publishing(
+                side("studio", NodeEngine::Ollama, "llama32:latest", &["7", "7"]),
+                WEIGHTS_A,
+            ),
+            ModelIdentity::AssertedByOperator,
+        );
+        assert_eq!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+        assert_eq!(comparison.verdict, Verdict::Divergent);
+        assert!(
+            !comparison
+                .uncontrolled
+                .contains(&"model identity".to_string()),
+            "{:?}",
+            comparison.uncontrolled_detail
+        );
+        assert_eq!(
+            shared_weights_digest(&comparison.left, &comparison.right),
+            Some(WEIGHTS_A)
+        );
+    }
+
+    /// C4. Published digests that differ are different weights, however alike
+    /// the ids, and never a divergence between engines.
+    #[test]
+    fn published_weights_digests_that_differ_are_different_models_never_verified() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            publishing(
+                side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+                WEIGHTS_A,
+            ),
+            publishing(
+                side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
+                WEIGHTS_B,
+            ),
+            ModelIdentity::SameId,
+        );
+        assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+        match &comparison.verdict {
+            Verdict::DifferentModels { left, right } => {
+                assert!(left.contains("432f310a77f4"), "{left}");
+                assert!(right.contains("36330585f362"), "{right}");
+            }
+            other => panic!("different weights are different models: {other:?}"),
+        }
+        assert!(matches!(comparison.diff, Diff::Declined { .. }));
+    }
+
+    /// C4. A digest only one side published verifies nothing: identity rests
+    /// on the names, and the reason names the side that published none.
+    #[test]
+    fn a_weights_digest_published_by_one_side_only_verifies_nothing() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            publishing(
+                side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+                WEIGHTS_A,
+            ),
+            side("desk", NodeEngine::LmStudio, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(comparison.model_identity, ModelIdentity::SameId);
+        assert_eq!(comparison.verdict, Verdict::Divergent);
+        let identity = comparison
+            .uncontrolled_detail
+            .iter()
+            .find(|item| item.name == "model identity")
+            .expect("identity still rests on a name");
+        assert!(
+            identity
+                .reason
+                .contains("none was published by desk: test publishes none"),
+            "{}",
+            identity.reason
+        );
+
+        let neither = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(neither.model_identity, ModelIdentity::SameId);
+        assert_eq!(neither.verdict, Verdict::Divergent);
+    }
+
+    /// C4. An engine that refused to serve the other side's digest has said
+    /// its weights are different. That is a verdict, not a failed comparison.
+    #[test]
+    fn a_refused_weights_check_is_different_weights_rather_than_a_failure() {
+        let refused = checked(
+            side("win", NodeEngine::Camelid, "m", &[]),
+            WeightsCheck::Refused {
+                expected: WEIGHTS_A.to_string(),
+                detail: "model_artifact_mismatch".to_string(),
+            },
+        );
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            refused,
+            publishing(
+                side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
+                WEIGHTS_A,
+            ),
+            ModelIdentity::SameId,
+        );
+        match &comparison.verdict {
+            Verdict::DifferentModels { left, .. } => {
+                assert!(left.contains("not sha256 432f310a77f4"), "{left}")
+            }
+            other => panic!("a refusal is different weights: {other:?}"),
+        }
+        assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+    }
+
+    /// C4. A side whose engine checked its own bytes against the other's
+    /// published digest and served has vouched for that digest as surely as
+    /// publishing it.
+    #[test]
+    fn an_enforced_weights_check_vouches_for_the_digest_it_enforced() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            checked(
+                side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+                WeightsCheck::Enforced {
+                    expected: WEIGHTS_A.to_string(),
+                },
+            ),
+            publishing(
+                side("studio", NodeEngine::Ollama, "m", &["12", "12"]),
+                WEIGHTS_A,
+            ),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+        assert_eq!(comparison.verdict, Verdict::Identical);
     }
 
     fn advertising(mut side: Side, template: &str) -> Side {

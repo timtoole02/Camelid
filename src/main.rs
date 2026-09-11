@@ -1549,7 +1549,7 @@ fn compare_temperature(raw: &str) -> Result<f32, String> {
 fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
     use camelid::fabric::{
         Diff, Eol, ModelIdentity, Op, RenderedPrompt, Stability, TemplateEvidence, TextMatch,
-        Verdict,
+        Verdict, WeightsCheck, WeightsDigest,
     };
     use std::fmt::Write as _;
 
@@ -1570,7 +1570,7 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
             "DIVERGENT — both nodes were self-consistent and disagreed".to_string()
         }
         Verdict::DifferentModels { left, right } => {
-            format!("NOT COMPARABLE — the nodes are serving different models ({left} vs {right})")
+            format!("NOT COMPARABLE — the two sides are not shown to serve the same model ({left} vs {right})")
         }
         Verdict::NotAttributable { reason } => format!("NOT ATTRIBUTABLE — {reason}"),
     };
@@ -1607,6 +1607,11 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
             comparison.left.model.as_deref().unwrap_or("-")
         ),
         ModelIdentity::SameId => {}
+        ModelIdentity::VerifiedByDigest => say!(
+            "MODEL IDENTITY VERIFIED BY DIGEST: both sides serve the GGUF file sha256 {}",
+            camelid::fabric::shared_weights_digest(&comparison.left, &comparison.right)
+                .unwrap_or("-")
+        ),
     }
 
     for side in [&comparison.left, &comparison.right] {
@@ -1627,6 +1632,23 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
             Some(named) if named != asked => say!("   asked for {asked}; ANSWERED AS {named}"),
             Some(_) => say!("   asked for {asked}; answered as {asked}"),
             None => say!("   asked for {asked}; its answers did not name a model"),
+        }
+        match &side.weights_digest {
+            WeightsDigest::Published { digest, source } => {
+                say!("   GGUF file sha256 {digest} (via {source})")
+            }
+            WeightsDigest::Unavailable { reason } => {
+                say!("   weights digest: not published — {reason}")
+            }
+        }
+        match &side.weights_check {
+            Some(WeightsCheck::Enforced { expected }) => say!(
+                "   every run was bound to GGUF file sha256 {expected}, and the engine served them"
+            ),
+            Some(WeightsCheck::Refused { expected, detail }) => say!(
+                "   REFUSED a run bound to GGUF file sha256 {expected}: its loaded file is other bytes ({detail})"
+            ),
+            None => {}
         }
         match &side.stability {
             Stability::Stable => say!(
@@ -2277,7 +2299,54 @@ mod fabric_command_tests {
             rendered_prompt: camelid::fabric::RenderedPrompt::Unavailable {
                 reason: "test".to_string(),
             },
+            weights_digest: camelid::fabric::WeightsDigest::Unavailable {
+                reason: "test".to_string(),
+            },
+            weights_check: None,
         }
+    }
+
+    /// C4. An identity both sides' weights digests establish is printed as
+    /// verified, with the digest, and leaves nothing about identity
+    /// uncontrolled.
+    #[test]
+    fn an_identity_verified_by_digest_prints_the_digest_both_sides_serve() {
+        use camelid::fabric::{conclude, ModelIdentity, NodeEngine, SamplingPlan, WeightsDigest};
+        const DIGEST: &str = "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3";
+        let publishing = |mut side: camelid::fabric::Side, source: &str| {
+            side.weights_digest = WeightsDigest::Published {
+                digest: DIGEST.to_string(),
+                source: source.to_string(),
+            };
+            side
+        };
+        let rendered = render_comparison(&conclude(
+            "q",
+            SamplingPlan::default(),
+            publishing(
+                answered("win", NodeEngine::Camelid, "12"),
+                "GET /v1/models gguf_sha256",
+            ),
+            publishing(
+                answered("studio", NodeEngine::Ollama, "12"),
+                "POST /api/show modelfile FROM blob",
+            ),
+            ModelIdentity::SameId,
+        ));
+        assert!(
+            rendered.contains(&format!(
+                "MODEL IDENTITY VERIFIED BY DIGEST: both sides serve the GGUF file sha256 {DIGEST}"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "   GGUF file sha256 {DIGEST} (via POST /api/show modelfile FROM blob)"
+            )),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("NOT CONTROLLED"), "{rendered}");
+        assert!(!rendered.contains("NOT VERIFIED"), "{rendered}");
     }
 
     /// C3. The terminal printed "NOT CONTROLLED: model identity" beside a

@@ -213,6 +213,33 @@ function SidePicker({ side, label, nodes, fabric, value, onChange }) {
   )
 }
 
+/* Which weights this side serves, where its engine said, and whether its
+   engine checked them against the other side's. */
+function Weights({ side }) {
+  const { weightsDigest: digest, weightsCheck: check } = side
+  const testid = `weights-${side.label || 'unlabelled'}`
+  return (
+    <>
+      <p className="divergence-side__runtime" data-testid={testid} data-weights={digest.kind || (digest.reported ? 'unknown' : 'not_reported')}>
+        {digest.kind === 'published' && <>GGUF file sha256 <code>{digest.digest}</code> <span className="divergence-side__runtime-note">via {digest.source}</span></>}
+        {digest.kind === 'unavailable' && <>GGUF file digest not published: {digest.reason}</>}
+        {!digest.kind && digest.reported && <Unknown why="The proxy sent a weights-digest kind this build does not recognise." />}
+        {!digest.reported && <Unknown why="This proxy predates weights digests, so it read none.">weights digest not reported</Unknown>}
+      </p>
+      {check?.kind === 'enforced' && (
+        <p className="divergence-side__runtime" data-testid={`${testid}-check`} data-check="enforced">
+          Every run was bound to sha256 <code>{check.expected}</code>, and the engine served them.
+        </p>
+      )}
+      {check?.kind === 'refused' && (
+        <p className="divergence-side__reported" data-testid={`${testid}-check`} data-check="refused">
+          This node refused runs bound to sha256 <code>{check.expected}</code>: its loaded GGUF file is other bytes.
+        </p>
+      )}
+    </>
+  )
+}
+
 function Side({ side }) {
   if (!side) return null
   const stability = side.stability.kind
@@ -245,6 +272,8 @@ function Side({ side }) {
           Its response did not name a model.
         </p>
       )}
+
+      <Weights side={side} />
 
       {side.runtime && (
         <p className="divergence-side__runtime">
@@ -403,9 +432,9 @@ export default function DivergenceView() {
             <input type="checkbox" checked={asserted} onChange={(event) => setAsserted(event.target.checked)} />
             <span>
               These are two different ids — <code>{left.model}</code> and <code>{right.model}</code>.
-              Engines name weights differently and none of them publishes a digest this fabric can
-              check, so nothing here can verify they match. Tick to declare they are the same
-              weights; the result records that you asserted it.
+              Engines name weights differently. Where both engines publish a digest of the weights
+              they serve, the result checks it; otherwise nothing here can verify they match. Tick to
+              declare they are the same weights; the result records that you asserted it.
             </span>
           </label>
         )}

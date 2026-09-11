@@ -491,9 +491,10 @@ under a `divergent` verdict. The terminal draws them as `⏎`, `␍⏎` and `(no
 ### Telling the fabric that two names are the same model
 
 Engines do not agree on what to call the same weights. Ollama suffixes `:latest`, LM Studio does
-not, Camelid uses its catalog id — and none of them publishes a digest this fabric could compare
-(Ollama's `/api/tags` carries a *manifest* digest, not the GGUF's). Exact-match identity therefore
-refuses a cross-engine comparison even when the two nodes really are serving the same file.
+not, Camelid uses its catalog id. Exact-match identity therefore refuses a cross-engine comparison
+even when the two nodes really are serving the same file. Where both engines publish the digest of
+the GGUF file they serve, the digests settle it instead (see *Model identity by digest* below); LM
+Studio publishes none, so a comparison against it always needs the declaration described here.
 
 This build will not guess. Stripping a `:latest` suffix to make two ids match is an inference, and
 it would be wrong the first time somebody has two genuinely different builds under similar names.

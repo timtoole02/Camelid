@@ -148,8 +148,26 @@ const SAME_TEMPLATE = {
   },
 }
 
+/* The same GGUF on both engines: each side published its weights digest,
+   and the Camelid side was bound to the other's. */
+const WEIGHTS = '432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3'
+const VERIFIED = {
+  ...DIVERGENT,
+  left: {
+    ...DIVERGENT.left,
+    weights_digest: { kind: 'published', digest: WEIGHTS, source: 'GET /v1/models gguf_sha256' },
+    weights_check: { kind: 'enforced', expected: WEIGHTS },
+  },
+  right: {
+    ...DIVERGENT.right,
+    weights_digest: { kind: 'published', digest: WEIGHTS, source: 'POST /api/show modelfile FROM blob' },
+    weights_check: null,
+  },
+}
+
 const BODIES = {
   divergent: DIVERGENT,
+  verified: VERIFIED,
   same_template: SAME_TEMPLATE,
   unstable: UNSTABLE,
   different_models: DIFFERENT_MODELS,
@@ -249,6 +267,8 @@ function comparisonFor(fixture, request) {
     if (side.reported_model === ECHO_REQUESTED) side.reported_model = side.model
   }
   body.model_identity = leftId === rightId ? 'same_id' : 'asserted_by_operator'
+  // Two published digests that match settle identity whatever the ids were.
+  if (proxy.mode === 'verified') body.model_identity = 'verified_by_digest'
   body.uncontrolled_detail = body.uncontrolled_detail || []
   if (body.model_identity === 'asserted_by_operator') {
     body.uncontrolled = [...body.uncontrolled, 'model identity']
@@ -620,6 +640,36 @@ try {
     await page.close()
   }
 
+  /* ---- identity verified by the weights themselves (C4) ---- */
+  resetProxy({ mode: 'verified' })
+  {
+    const { page, errors } = await openDivergence()
+    await submit(page)
+    await page.waitForSelector('[data-testid="divergence-identity"]', { timeout: 10000 })
+    const identity = await page.$eval('[data-testid="divergence-identity"]', (el) => ({
+      kind: el.getAttribute('data-identity'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(identity.kind, 'verified_by_digest')
+    assert.match(identity.text, new RegExp(`Verified by digest: both sides serve the same GGUF file, sha256 ${WEIGHTS}`))
+    assert.doesNotMatch(identity.text, /Asserted by the operator/)
+    assert.doesNotMatch(await textOf(page, '[data-testid="divergence-uncontrolled"]'), /model identity/,
+      'a verified identity is not an uncontrolled one')
+    check('an identity verified by digest is stated with the digest, not as an assertion')
+
+    const weights = await page.$eval('[data-testid="weights-win"]', (el) => ({
+      kind: el.getAttribute('data-weights'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(weights.kind, 'published')
+    assert.match(weights.text, new RegExp(`GGUF file sha256 ${WEIGHTS} via GET /v1/models gguf_sha256`))
+    assert.equal(await page.$eval('[data-testid="weights-win-check"]', (el) => el.getAttribute('data-check')), 'enforced')
+    assert.equal(await page.$('[data-testid="weights-studio-check"]'), null, 'an engine never asked to check shows no check')
+    check('each side shows the weights digest it published, and the one its engine enforced')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
   /* ---- the same advertised template, and still a divergence ---- */
   resetProxy({ mode: 'same_template' })
   {
@@ -870,6 +920,11 @@ try {
       await page.$eval('[data-testid="rendered-win"]', (el) => el.getAttribute('data-rendered-kind')),
       'not_reported',
       'a proxy that captured no render is not one whose render failed',
+    )
+    assert.equal(
+      await page.$eval('[data-testid="weights-win"]', (el) => el.getAttribute('data-weights')),
+      'not_reported',
+      'a proxy that read no digest is not one whose node published none',
     )
     const legacyHeadings = await page.$$eval('[data-testid="divergence-templates"] .divergence-template h4', (els) =>
       els.map((el) => el.textContent.replace(/\s+/g, ' ').trim()))

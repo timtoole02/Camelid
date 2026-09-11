@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use super::camelid;
 use super::divergence::{
     stability_of, AppliedSampling, Ask, RenderedPrompt, Sample, SamplingPlan, Side,
-    TemplateEvidence, MAX_COMPARE_REPETITIONS,
+    TemplateEvidence, WeightsCheck, WeightsDigest, MAX_COMPARE_REPETITIONS,
 };
 use super::engine::NodeEngine;
 use super::lmstudio;
-use super::node::{NodeSpec, NodeStatus};
+use super::node::{NodeReady, NodeSpec, NodeStatus};
 use super::ollama;
 use super::probe::probe_node_with_transport;
 use super::transport::NodeTransport;
@@ -80,13 +80,27 @@ pub(crate) struct SideRequest<'a> {
     pub(crate) generation_timeout: Duration,
 }
 
-/// Probe the node, check it holds the model, run the prompt `plan.repetitions`
-/// times, and capture the template the engine advertises and the prompt it
-/// renders, where the engine exposes either.
-pub(crate) fn measure(
+/// What is learned about a side before anything generates: that it serves,
+/// that it holds the model, and which weights it says it holds.
+///
+/// Split from [`measure`] because each side's generations are bound to the
+/// digest the *other* side published, so both have to be read first.
+pub(crate) struct Prepared {
+    ready: NodeReady,
+    weights_digest: WeightsDigest,
+}
+
+impl Prepared {
+    pub(crate) fn published_digest(&self) -> Option<&str> {
+        self.weights_digest.digest()
+    }
+}
+
+/// Probe the node, check it holds the model, and read its weights digest.
+pub(crate) fn prepare(
     request: &SideRequest<'_>,
     transport: &NodeTransport,
-) -> Result<Side, SampleError> {
+) -> Result<Prepared, SampleError> {
     let label = request.spec.label.clone();
     // Through the configured transport, like every other read of a node. The
     // default one allows cleartext to loopback only, so a node `fabric status`
@@ -115,7 +129,38 @@ pub(crate) fn measure(
         });
     }
 
+    let weights_digest = capture_weights_digest(request, ready.engine, transport);
+    Ok(Prepared {
+        ready,
+        weights_digest,
+    })
+}
+
+/// Run the prompt `plan.repetitions` times on a prepared side, and capture the
+/// template the engine advertises and the prompt it renders, where the engine
+/// exposes either.
+///
+/// `bind_to` is the weights digest the other side published. An engine that
+/// can check its own loaded bytes against a digest is asked to on every run;
+/// one that refuses has answered the identity question, and the side records
+/// that rather than failing.
+pub(crate) fn measure(
+    request: &SideRequest<'_>,
+    prepared: Prepared,
+    bind_to: Option<&str>,
+    transport: &NodeTransport,
+) -> Result<Side, SampleError> {
+    let label = request.spec.label.clone();
+    let Prepared {
+        ready,
+        weights_digest,
+    } = prepared;
     let engine = ready.engine;
+    // Only our own engine takes a digest to enforce.
+    let bind_to = bind_to.filter(|_| engine == NodeEngine::Camelid);
+    let mut weights_check = bind_to.map(|expected| WeightsCheck::Enforced {
+        expected: expected.to_string(),
+    });
     let runs = request.plan.repetitions.clamp(1, MAX_COMPARE_REPETITIONS);
     let mut samples = Vec::with_capacity(runs);
     let mut named = Vec::with_capacity(runs);
@@ -131,13 +176,27 @@ pub(crate) fn measure(
     for _ in 0..runs {
         let started = Instant::now();
         let answer = match engine {
-            NodeEngine::Camelid => camelid::complete(
+            NodeEngine::Camelid => match camelid::complete(
                 request.spec,
                 &ask,
+                bind_to,
                 request.bearer,
                 request.generation_timeout,
                 transport,
-            ),
+            ) {
+                Ok(answer) => Ok(answer),
+                Err(camelid::AskError::OtherWeights(detail)) => match bind_to {
+                    Some(expected) => {
+                        weights_check = Some(WeightsCheck::Refused {
+                            expected: expected.to_string(),
+                            detail,
+                        });
+                        break;
+                    }
+                    None => Err(detail),
+                },
+                Err(camelid::AskError::Failed(detail)) => Err(detail),
+            },
             NodeEngine::Ollama => {
                 ollama::complete(request.spec, &ask, request.generation_timeout, transport)
             }
@@ -169,7 +228,51 @@ pub(crate) fn measure(
         samples,
         advertised_template: capture_template(request, engine, transport),
         rendered_prompt: capture_rendered_prompt(request, &ask, engine, transport),
+        weights_digest,
+        weights_check,
     })
+}
+
+/// The digest of the weights this side serves, where its engine publishes one.
+fn capture_weights_digest(
+    request: &SideRequest<'_>,
+    engine: NodeEngine,
+    transport: &NodeTransport,
+) -> WeightsDigest {
+    let (source, read) = match engine {
+        NodeEngine::Camelid => (
+            "GET /v1/models gguf_sha256",
+            camelid::weights_digest(
+                request.spec,
+                request.model,
+                request.bearer,
+                request.probe_timeout,
+                transport,
+            ),
+        ),
+        NodeEngine::Ollama => (
+            "POST /api/show modelfile FROM blob",
+            ollama::weights_digest(
+                request.spec,
+                request.model,
+                request.probe_timeout,
+                transport,
+            ),
+        ),
+        NodeEngine::LmStudio => {
+            return WeightsDigest::Unavailable {
+                reason: "LM Studio's documented API publishes no digest of the weights it serves"
+                    .to_string(),
+            }
+        }
+    };
+    match read {
+        Ok(digest) => WeightsDigest::Published {
+            digest,
+            source: source.to_string(),
+        },
+        Err(reason) => WeightsDigest::Unavailable { reason },
+    }
 }
 
 /// The prompt the engine builds from the messages this comparison sent, where

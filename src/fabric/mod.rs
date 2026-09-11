@@ -55,9 +55,10 @@ pub use aliases::{
 pub use cancel::Cancel;
 pub use capability::{Capabilities, Capability, Provenance};
 pub use divergence::{
-    check_temperature, conclude, sha256_hex, AppliedSampling, Comparison, Honoured, ModelIdentity,
-    RenderedPrompt, Sample, SamplingPlan, Side, Stability, TemplateEvidence, TextMatch,
-    Uncontrolled, Verdict, MAX_COMPARE_REPETITIONS, MAX_COMPARE_TEMPERATURE,
+    check_temperature, conclude, sha256_hex, shared_weights_digest, AppliedSampling, Comparison,
+    Honoured, ModelIdentity, RenderedPrompt, Sample, SamplingPlan, Side, Stability,
+    TemplateEvidence, TextMatch, Uncontrolled, Verdict, WeightsCheck, WeightsDigest,
+    MAX_COMPARE_REPETITIONS, MAX_COMPARE_TEMPERATURE,
 };
 pub use engine::NodeEngine;
 pub use forward::{
@@ -326,8 +327,10 @@ impl Fabric {
     ///
     /// `left_model` and `right_model` may differ, which is an operator saying
     /// two differently-named ids are the same weights. Engines do not agree on
-    /// naming, and none of them publishes a digest this fabric could check, so
-    /// that claim is recorded as unverified rather than inferred.
+    /// naming, so that claim is recorded as unverified rather than inferred —
+    /// unless both engines publish a digest of the weights they serve, in
+    /// which case the digests decide and the claim is either verified or
+    /// shown to be about different weights.
     ///
     /// Each node is probed within [`Fabric::with_timeout`] and each generation
     /// within [`Fabric::with_generation_timeout`]. `plan` is bounded to what
@@ -363,24 +366,45 @@ impl Fabric {
 
         let plan = plan.bounded();
         let bearer = self.bearer.as_deref();
-        let measure_side = |spec: &NodeSpec, model: &str| {
-            sample::measure(
-                &sample::SideRequest {
-                    spec,
-                    model,
-                    prompt,
-                    plan: &plan,
-                    bearer,
-                    probe_timeout: self.timeout,
-                    generation_timeout: self.generation_timeout,
-                },
-                &self.transport,
-            )
-            .map_err(CompareError::Side)
+        let left_request = sample::SideRequest {
+            spec: &left_spec,
+            model: left_model,
+            prompt,
+            plan: &plan,
+            bearer,
+            probe_timeout: self.timeout,
+            generation_timeout: self.generation_timeout,
+        };
+        let right_request = sample::SideRequest {
+            spec: &right_spec,
+            model: right_model,
+            ..left_request
         };
 
-        let left_side = measure_side(&left_spec, left_model)?;
-        let right_side = measure_side(&right_spec, right_model)?;
+        // Both sides are read before either generates: each side's runs are
+        // bound to the weights digest the other published, so an engine that
+        // can check its own loaded bytes does, instead of this fabric trusting
+        // a listing.
+        let left_prepared =
+            sample::prepare(&left_request, &self.transport).map_err(CompareError::Side)?;
+        let right_prepared =
+            sample::prepare(&right_request, &self.transport).map_err(CompareError::Side)?;
+        let left_bind = right_prepared.published_digest().map(str::to_string);
+        let right_bind = left_prepared.published_digest().map(str::to_string);
+        let left_side = sample::measure(
+            &left_request,
+            left_prepared,
+            left_bind.as_deref(),
+            &self.transport,
+        )
+        .map_err(CompareError::Side)?;
+        let right_side = sample::measure(
+            &right_request,
+            right_prepared,
+            right_bind.as_deref(),
+            &self.transport,
+        )
+        .map_err(CompareError::Side)?;
         let identity = if left_model == right_model {
             divergence::ModelIdentity::SameId
         } else {

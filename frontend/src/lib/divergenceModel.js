@@ -24,7 +24,9 @@ const KNOWN_RENDERED = ['captured', 'unavailable']
 const KNOWN_DIFF = ['identical', 'lines', 'declined']
 const KNOWN_OPS = ['same', 'removed', 'added']
 const KNOWN_HONOURED = ['sent', 'unsupported']
-const KNOWN_IDENTITY = ['same_id', 'asserted_by_operator']
+const KNOWN_IDENTITY = ['same_id', 'asserted_by_operator', 'verified_by_digest']
+const KNOWN_WEIGHTS = ['published', 'unavailable']
+const KNOWN_WEIGHTS_CHECK = ['enforced', 'refused']
 const KNOWN_EOL = ['lf', 'crlf', 'none']
 
 /** Bounds the proxy clamps to (MAX_COMPARE_* in src/fabric/server.rs). */
@@ -81,6 +83,31 @@ function describeRenderedPrompt(raw, present) {
   }
 }
 
+/* The digest of the weights a side serves, where its engine publishes one. A
+ * proxy from before the field sent none, which is "not reported". */
+function describeWeightsDigest(raw, present) {
+  if (!present) return { kind: null, reported: false, digest: null, source: null, reason: null }
+  if (!isPlainObject(raw)) return { kind: null, reported: true, digest: null, source: null, reason: null }
+  return {
+    kind: oneOf(KNOWN_WEIGHTS, raw.kind),
+    reported: true,
+    digest: stringOrNull(raw.digest),
+    source: stringOrNull(raw.source),
+    reason: stringOrNull(raw.reason),
+  }
+}
+
+/* Whether the side's engine checked its own loaded bytes against the other
+ * side's digest. Null when it was not asked, which is most engines. */
+function describeWeightsCheck(raw) {
+  if (!isPlainObject(raw)) return null
+  return {
+    kind: oneOf(KNOWN_WEIGHTS_CHECK, raw.kind),
+    expected: stringOrNull(raw.expected),
+    detail: stringOrNull(raw.detail),
+  }
+}
+
 /* The model the node's own response named. Three facts, kept apart: an older
  * proxy relays nothing (`not_relayed`), a response can name no model
  * (`unnamed`), or it names one (`named`). */
@@ -126,7 +153,23 @@ function describeSide(raw) {
     // applied. An older proxy sent the same capture as `template`.
     advertisedTemplate: describeTemplate('advertised_template' in raw ? raw.advertised_template : raw.template),
     renderedPrompt: describeRenderedPrompt(raw.rendered_prompt, 'rendered_prompt' in raw),
+    weightsDigest: describeWeightsDigest(raw.weights_digest, 'weights_digest' in raw),
+    weightsCheck: describeWeightsCheck(raw.weights_check),
   }
+}
+
+/* The one weights digest both sides are shown to serve, as the proxy judged
+ * it. Read only when the proxy says identity was verified by digest: this
+ * build never concludes that on its own from two strings. */
+function verifiedDigest(comparison) {
+  if (comparison?.modelIdentity !== 'verified_by_digest') return null
+  for (const side of [comparison.left, comparison.right]) {
+    if (side?.weightsDigest?.kind === 'published' && side.weightsDigest.digest) return side.weightsDigest.digest
+  }
+  for (const side of [comparison.left, comparison.right]) {
+    if (side?.weightsCheck?.kind === 'enforced' && side.weightsCheck.expected) return side.weightsCheck.expected
+  }
+  return null
 }
 
 function describeDiff(raw) {
@@ -235,8 +278,8 @@ export function verdictHeadline(comparison) {
       return 'Both nodes agreed with themselves, and disagreed with each other.'
     case 'different_models':
       return verdict.leftModel && verdict.rightModel
-        ? `Not comparable: these nodes are serving different models (${verdict.leftModel} and ${verdict.rightModel}).`
-        : 'Not comparable: these nodes are serving different models.'
+        ? `Not comparable: these nodes are not shown to serve the same model (${verdict.leftModel} and ${verdict.rightModel}).`
+        : 'Not comparable: these nodes are not shown to serve the same model.'
     case 'not_attributable':
       return verdict.reason
         ? `Nothing can be concluded: ${verdict.reason}.`
@@ -265,8 +308,16 @@ export function identityStatement(comparison) {
       return {
         kind: 'same_id',
         text: `Both sides were asked for the same id${leftId ? `, ${leftId}` : ''}. The id is all that was `
-          + 'compared: no engine publishes a digest this fabric can check.',
+          + 'compared: a weights digest was not available from both sides to check.',
       }
+    case 'verified_by_digest': {
+      const digest = verifiedDigest(comparison)
+      return {
+        kind: 'verified_by_digest',
+        text: `Verified by digest: both sides serve the same GGUF file${digest ? `, sha256 ${digest}` : ''}. `
+          + 'This rests on the bytes, not on the ids.',
+      }
+    }
     default:
       return comparison?.modelIdentityReported
         ? { kind: 'unrecognised', text: 'This proxy recorded a model identity this build does not recognise.' }

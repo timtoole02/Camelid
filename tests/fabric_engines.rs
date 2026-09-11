@@ -141,6 +141,12 @@ fn read_request(stream: &mut TcpStream) -> Option<Received> {
 
 impl StubEngine {
     fn start(bodies: Bodies) -> Self {
+        Self::start_with_statuses(bodies, HashMap::new())
+    }
+
+    /// Like [`Self::start`], answering the paths in `statuses` with that status
+    /// instead of 200, so a stub can refuse the way a real engine does.
+    fn start_with_statuses(bodies: Bodies, statuses: HashMap<&'static str, u16>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -162,9 +168,11 @@ impl StubEngine {
                 let path = request.path.clone();
                 thread_received.lock().expect("received").push(request);
 
+                let status = statuses.get(path.as_str()).copied().unwrap_or(200);
                 let response = match bodies.get(path.as_str()) {
                     Some(body) => format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        if status == 200 { "OK" } else { "Refused" },
                         body.len()
                     ),
                     None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
@@ -826,5 +834,213 @@ fn a_rendered_prompt_is_rendered_from_the_messages_the_comparison_sent() {
     assert!(
         comparison.unexplained_by_advertised_template().is_some(),
         "identical advertised templates cannot explain this divergence"
+    );
+}
+
+/// The digest of the GGUF both stand-ins serve, and a manifest digest that is
+/// not it: what `/api/tags` publishes for the same model.
+const GGUF_SHA256: &str = "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3";
+const MANIFEST_DIGEST: &str = "b9fb4b6364b05c8d9cf5bdb19445899a90a69c8f2a3363098828a0334e6342a7";
+const OTHER_GGUF_SHA256: &str = "36330585f362ee081a91cb45550c961dcdbff478f2d02e84e2ae5dc07505967d";
+
+fn camelid_listing(digest: &str) -> String {
+    format!(
+        r#"{{"object":"list","data":[{{"id":"m","object":"model","created":0,"owned_by":"camelid",
+            "filename":"Llama-3.2-1B-Instruct-Q8_0.gguf","gguf_sha256":"{digest}","meta":null}}]}}"#
+    )
+}
+
+fn camelid_answering(listing: Option<String>) -> Bodies {
+    let mut bodies = HashMap::from([
+        ("/v1/health", camelid_health("m")),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"12"}}]}"#
+                .to_string(),
+        ),
+    ]);
+    if let Some(listing) = listing {
+        bodies.insert("/v1/models", listing);
+    }
+    bodies
+}
+
+/// An Ollama whose `/api/tags` carries a manifest digest for `m`, and whose
+/// `/api/show` modelfile says `from`.
+fn ollama_showing(tags_digest: &str, from: &str) -> Bodies {
+    let mut bodies = ollama_bodies(&["m"], &["m"]);
+    bodies.insert(
+        "/api/tags",
+        format!(r#"{{"models":[{{"name":"m","model":"m","digest":"{tags_digest}","size":1}}]}}"#),
+    );
+    bodies.insert(
+        "/api/show",
+        serde_json::json!({ "template": "{{ .Prompt }}", "modelfile": format!("# FROM m\n\nFROM {from}\n") })
+            .to_string(),
+    );
+    bodies.insert(
+        "/api/chat",
+        r#"{"model":"m","message":{"role":"assistant","content":"12"},"done":true}"#.to_string(),
+    );
+    bodies
+}
+
+fn chat_bodies(node: &StubEngine) -> Vec<serde_json::Value> {
+    node.received()
+        .into_iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .map(|request| serde_json::from_str(&request.body).expect("a JSON body"))
+        .collect()
+}
+
+/// C4. Both engines publish the digest of the weights they serve, and it is
+/// the same digest: identity is verified, the Camelid side is bound to the
+/// Ollama side's digest on every run, and nothing about identity is left
+/// resting on a name.
+#[test]
+fn the_same_gguf_on_two_engines_is_verified_by_digest() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan, Verdict, WeightsCheck, WeightsDigest};
+
+    let camelid = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let studio = StubEngine::start(ollama_showing(
+        MANIFEST_DIGEST,
+        &format!("/srv/ollama/models/blobs/sha256-{GGUF_SHA256}"),
+    ));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+
+    assert_eq!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+    assert_eq!(comparison.verdict, Verdict::Identical);
+    for side in [&comparison.left, &comparison.right] {
+        assert_eq!(
+            side.weights_digest.digest(),
+            Some(GGUF_SHA256),
+            "{}: {:?}",
+            side.label,
+            side.weights_digest
+        );
+    }
+    assert!(matches!(
+        &comparison.right.weights_digest,
+        WeightsDigest::Published { source, .. } if source.contains("/api/show")
+    ));
+    assert_eq!(
+        comparison.left.weights_check,
+        Some(WeightsCheck::Enforced {
+            expected: GGUF_SHA256.to_string()
+        })
+    );
+    let chats = chat_bodies(&camelid);
+    assert!(!chats.is_empty());
+    for body in &chats {
+        assert_eq!(
+            body["camelid_expected_gguf_sha256"], GGUF_SHA256,
+            "every run is bound to the other side's digest: {body}"
+        );
+    }
+    assert!(
+        !comparison
+            .uncontrolled
+            .contains(&"model identity".to_string()),
+        "{:?}",
+        comparison.uncontrolled_detail
+    );
+}
+
+/// C4. `/api/tags` publishes a digest too, of a manifest. Here it is made
+/// equal to the Camelid side's GGUF digest, and the modelfile names no blob:
+/// reading the manifest digest as a weights digest would verify an identity
+/// nothing showed. It must stay resting on the name, and the Camelid side,
+/// whose partner published nothing, is sent no binding at all.
+#[test]
+fn a_manifest_digest_is_never_read_as_a_weights_digest() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan, WeightsDigest};
+
+    let camelid = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let studio = StubEngine::start(ollama_showing(GGUF_SHA256, "m:latest"));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+
+    assert!(
+        matches!(
+            comparison.right.weights_digest,
+            WeightsDigest::Unavailable { .. }
+        ),
+        "{:?}",
+        comparison.right.weights_digest
+    );
+    assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+    assert!(comparison
+        .uncontrolled
+        .contains(&"model identity".to_string()));
+    assert_eq!(comparison.left.weights_check, None);
+    for body in chat_bodies(&camelid) {
+        assert!(
+            body.get("camelid_expected_gguf_sha256").is_none(),
+            "nothing to bind to, so nothing is sent: {body}"
+        );
+    }
+}
+
+/// C4. A Camelid node that refuses the other side's digest has said its
+/// loaded GGUF file is other bytes. The comparison reports different models;
+/// it does not fail.
+#[test]
+fn a_camelid_refusal_of_the_other_sides_weights_is_different_models_not_a_failure() {
+    use camelid::fabric::{SamplingPlan, Verdict, WeightsCheck};
+
+    let refusing = StubEngine::start_with_statuses(
+        HashMap::from([
+            ("/v1/health", camelid_health("m")),
+            (
+                "/v1/chat/completions",
+                r#"{"error":{"message":"the selected model id now refers to different GGUF bytes","type":"invalid_request","code":"model_artifact_mismatch","param":"camelid_expected_gguf_sha256"}}"#
+                    .to_string(),
+            ),
+        ]),
+        HashMap::from([("/v1/chat/completions", 409)]),
+    );
+    let studio = StubEngine::start(ollama_showing(
+        MANIFEST_DIGEST,
+        &format!("/x/blobs/sha256-{OTHER_GGUF_SHA256}"),
+    ));
+    let fabric = Fabric::new(vec![
+        refusing.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+        .expect("a refusal of the other side's weights is an answer, not a failure");
+
+    assert!(matches!(
+        &comparison.left.weights_check,
+        Some(WeightsCheck::Refused { expected, .. }) if expected == OTHER_GGUF_SHA256
+    ));
+    assert!(comparison.left.samples.is_empty());
+    assert!(
+        matches!(comparison.verdict, Verdict::DifferentModels { .. }),
+        "{:?}",
+        comparison.verdict
+    );
+    assert_eq!(
+        chat_bodies(&refusing).len(),
+        1,
+        "the first refusal ends that side"
     );
 }

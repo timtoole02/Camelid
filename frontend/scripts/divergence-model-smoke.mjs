@@ -398,6 +398,53 @@ check('a same-id result says the id is all that was compared', () => {
   assert.match(statement.text, /digest/)
 })
 
+/* ---- model identity by weights digest (C4) ---- */
+
+const DIGEST = '432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3'
+const published = (source) => ({ kind: 'published', digest: DIGEST, source })
+
+check('an identity the proxy verified by digest is stated with the digest it rests on', () => {
+  const comparison = describeComparison(body({
+    model_identity: 'verified_by_digest',
+    left: side({ weights_digest: published('GET /v1/models gguf_sha256'), weights_check: { kind: 'enforced', expected: DIGEST } }),
+    right: side({ label: 'studio', weights_digest: published('POST /api/show modelfile FROM blob') }),
+  }))
+  const statement = identityStatement(comparison)
+  assert.equal(statement.kind, 'verified_by_digest')
+  assert.match(statement.text, new RegExp(`Verified by digest.*GGUF file, sha256 ${DIGEST}`))
+  assert.doesNotMatch(statement.text, /asserted|not verified/i)
+  assert.deepEqual(
+    [comparison.left.weightsDigest.kind, comparison.left.weightsDigest.digest, comparison.left.weightsCheck.kind],
+    ['published', DIGEST, 'enforced'],
+  )
+})
+
+check('this build never concludes identity from two digests the proxy did not call verified', () => {
+  // Two equal strings under a proxy that said same_id stay same_id: only the
+  // proxy knows whether they were weights digests or something else.
+  const comparison = describeComparison(body({
+    model_identity: 'same_id',
+    left: side({ weights_digest: published('x') }),
+    right: side({ label: 'studio', weights_digest: published('y') }),
+  }))
+  assert.equal(identityStatement(comparison).kind, 'same_id')
+})
+
+check('a refused weights check and an unreported digest are each their own fact', () => {
+  const refused = describeComparison(body({
+    left: side({
+      weights_digest: { kind: 'unavailable', reason: '/v1/models answered HTTP 404' },
+      weights_check: { kind: 'refused', expected: DIGEST, detail: 'model_artifact_mismatch: other bytes' },
+    }),
+  }))
+  assert.equal(refused.left.weightsDigest.kind, 'unavailable')
+  assert.equal(refused.left.weightsCheck.kind, 'refused')
+  assert.equal(refused.left.weightsCheck.expected, DIGEST)
+  const legacy = describeComparison(body())
+  assert.equal(legacy.left.weightsDigest.reported, false, 'an older proxy read no digest; that is not "unpublished"')
+  assert.equal(legacy.left.weightsCheck, null)
+})
+
 check('a proxy that records no identity is never read as "same id"', () => {
   const legacy = describeComparison(body())
   assert.equal(legacy.modelIdentity, null)
