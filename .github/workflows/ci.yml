@@ -499,6 +499,20 @@ jobs:
       - name: Frontend math browser smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:math-browser
+
+      # Mermaid fence routing: a CLOSED fence becomes a diagram, an open one
+      # stays a code card until it closes, and every other fence is untouched.
+      - name: Frontend diagram smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:diagram
+
+      # Mermaid draws in an effect, so only a real browser shows it draws at
+      # all: an SVG from the diagram's own source with no script in it, a theme
+      # switch redrawing without unmounting the app, and a malformed diagram
+      # degrading to the code card.
+      - name: Frontend diagram browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:diagram-browser
       # Continuing a reply that stopped on the response budget. Pure half:
       # which replies may be continued, how the resumed text rejoins the kept
       # text (mid-word resumes, restated sentences), and cumulative usage.
