@@ -300,6 +300,17 @@ fn main() {
             ui_storage::set_ui_storage_value,
             ui_storage::replace_ui_storage
         ])
+        .on_window_event(|window, event| {
+            // The `spotlight` window is created hidden and is never destroyed, so letting
+            // `main` close never empties the window set and never ends the app: since
+            // v0.7.0 a close left the desktop and its engine running with no window, which
+            // Reopen could not bring back. Closing the main window is a request to quit.
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .setup(|app| {
             let _ = app
                 .global_shortcut()
