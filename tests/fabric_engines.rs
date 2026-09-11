@@ -24,8 +24,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use camelid::fabric::{
-    parse_node_spec, probe_node, route, Cancel, Fabric, MixedEngines, NodeEngine, NodeSpec,
-    NodeStatus, Provenance, RouteError, RouteMode, RouteRequest,
+    parse_model_aliases, parse_node_spec, probe_node, route, Cancel, DispatchError, Fabric,
+    ForwardError, MixedEngines, NodeEngine, NodeSpec, NodeStatus, Provenance, Residency,
+    RouteError, RouteMode, RouteRequest, StreamOutcome,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -147,6 +148,18 @@ impl StubEngine {
     /// Like [`Self::start`], answering the paths in `statuses` with that status
     /// instead of 200, so a stub can refuse the way a real engine does.
     fn start_with_statuses(bodies: Bodies, statuses: HashMap<&'static str, u16>) -> Self {
+        Self::start_hanging_up_on(bodies, statuses, &[])
+    }
+
+    /// Like [`Self::start_with_statuses`], reading a request on any path in
+    /// `hang_up_on` and then closing without an answer: what a node that dies
+    /// mid-generation leaves on the wire, after it has the request.
+    fn start_hanging_up_on(
+        bodies: Bodies,
+        statuses: HashMap<&'static str, u16>,
+        hang_up_on: &[&'static str],
+    ) -> Self {
+        let hang_up_on: Vec<&'static str> = hang_up_on.to_vec();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -167,6 +180,10 @@ impl StubEngine {
                 };
                 let path = request.path.clone();
                 thread_received.lock().expect("received").push(request);
+                if hang_up_on.contains(&path.as_str()) {
+                    // Dropping the stream at the end of this turn is the hang-up.
+                    continue;
+                }
 
                 let status = statuses.get(path.as_str()).copied().unwrap_or(200);
                 let response = match bodies.get(path.as_str()) {
@@ -264,9 +281,12 @@ fn send_every_way(fabric: &Fabric, spec: &NodeSpec) {
     assert_eq!(streamed.placement.decision().label, spec.label);
     drop(streamed);
 
+    let placement = fabric
+        .place(&mixed)
+        .expect("mixed placement chooses the node");
     fabric
         .forward_to(
-            spec,
+            &placement,
             "/v1/chat/completions",
             &chat(false),
             PROBE_TIMEOUT,
@@ -441,6 +461,10 @@ fn a_node_whose_running_models_cannot_be_read_still_serves() {
 
     assert_eq!(ready.models, vec!["a:latest".to_string()]);
     assert_eq!(ready.active_model_id, None, "degrades to reporting none");
+    assert_eq!(
+        ready.resident_models, None,
+        "a running list that could not be read is unknown, not empty"
+    );
 }
 
 #[test]
@@ -1294,4 +1318,506 @@ fn each_run_after_the_first_follows_a_short_unrelated_request() {
         reason.contains("nothing was sent between a side's runs"),
         "{reason}"
     );
+}
+
+/* ---- mixed placement through the real dispatch path ----
+Everything below drives `Fabric::dispatch` and `dispatch_streaming` against
+stub engines on loopback, with requests built the way a library caller
+would build them. A guard that only held for callers who remembered to ask
+for it would not be a guard. */
+
+/// What the Camelid stub calls the shared model, and what the Ollama stub
+/// calls the same weights.
+const CAMELID_LOCAL: &str = "cam-1b";
+const OLLAMA_LOCAL: &str = "llama1b-q8:latest";
+
+fn camelid_health_carrying(model: &str, in_flight: usize) -> String {
+    format!(
+        r#"{{"ok":true,"generation_ready":true,"active_model_id":"{model}","backend":"llama",
+            "version":"0.5.4","engine_queued_tasks":0,"engine_queue_depth":{in_flight}}}"#
+    )
+}
+
+/// A Camelid node five requests deep, which an idle Ollama node (charged
+/// only the unreported-load price) outranks for any request both can take.
+fn busy_camelid() -> StubEngine {
+    StubEngine::start(HashMap::from([
+        ("/v1/health", camelid_health_carrying(CAMELID_LOCAL, 5)),
+        ("/v1/chat/completions", CHAT_COMPLETION.to_string()),
+    ]))
+}
+
+fn ollama_serving_chat() -> Bodies {
+    with_body(
+        ollama_bodies(&[OLLAMA_LOCAL], &[OLLAMA_LOCAL]),
+        "/v1/chat/completions",
+        CHAT_COMPLETION,
+    )
+}
+
+/// The two nodes, with the operator's declaration that their names are one
+/// model, and a budget of two attempts.
+fn fabric_over(camelid: &StubEngine, ollama: &StubEngine) -> Fabric {
+    let aliases = parse_model_aliases(&[
+        format!("llama-1b=a-camelid:{CAMELID_LOCAL}"),
+        format!("llama-1b=b-ollama:{OLLAMA_LOCAL}"),
+    ])
+    .expect("aliases parse");
+    Fabric::new(vec![
+        camelid.spec("a-camelid", "camelid"),
+        ollama.spec("b-ollama", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT)
+    .with_model_aliases(aliases)
+    .with_max_forward_attempts(2)
+}
+
+/// Mixed placement of `llama-1b`, built without `.requiring()`: what the body
+/// carries has to be found by the fabric itself.
+fn mixed_llama_1b() -> RouteRequest<'static> {
+    RouteRequest::new(RouteMode::Throughput)
+        .with_model(Some("llama-1b"))
+        .with_mixed_engines(MixedEngines::Allowed)
+}
+
+fn plain_chat(stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "llama-1b",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": stream,
+    })
+}
+
+fn chat_with_tools(stream: bool) -> serde_json::Value {
+    let mut body = plain_chat(stream);
+    body["tools"] = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+        }
+    }]);
+    body
+}
+
+fn chat_posts(node: &StubEngine) -> Vec<serde_json::Value> {
+    node.received()
+        .into_iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .map(|request| serde_json::from_str(&request.body).expect("a JSON body"))
+        .collect()
+}
+
+/// I5 at the chokepoint. The request is built without `.requiring()`, so the
+/// only thing that can keep this off the unmeasured engine is the fabric
+/// reading the body itself.
+#[test]
+fn a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = fabric_over(&camelid, &ollama);
+
+    for _ in 0..5 {
+        let answered = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &chat_with_tools(false),
+                &mixed_llama_1b(),
+                PROBE_TIMEOUT,
+                &Cancel::never(),
+            )
+            .expect("our engine takes it");
+        assert_eq!(answered.decision.engine, NodeEngine::Camelid);
+    }
+    assert_eq!(
+        chat_posts(&ollama).len(),
+        0,
+        "the unmeasured engine got a tools request"
+    );
+    let sent = chat_posts(&camelid);
+    assert_eq!(sent.len(), 5);
+    assert_eq!(
+        sent[0]["model"], CAMELID_LOCAL,
+        "sent under the name that node knows"
+    );
+
+    let control = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("placed");
+    assert_eq!(
+        control.decision.engine,
+        NodeEngine::Ollama,
+        "without tools the idle node takes it, so the zero above is the guard's doing"
+    );
+    assert_eq!(chat_posts(&ollama).len(), 1);
+}
+
+#[test]
+fn a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = fabric_over(&camelid, &ollama);
+
+    for _ in 0..3 {
+        let streamed = fabric
+            .dispatch_streaming(
+                "/v1/chat/completions",
+                &chat_with_tools(true),
+                &mixed_llama_1b(),
+                PROBE_TIMEOUT,
+                PROBE_TIMEOUT,
+                &Cancel::never(),
+            )
+            .expect("our engine takes it");
+        assert_eq!(streamed.placement.decision().engine, NodeEngine::Camelid);
+    }
+    assert_eq!(chat_posts(&ollama).len(), 0);
+
+    let control = fabric
+        .dispatch_streaming(
+            "/v1/chat/completions",
+            &plain_chat(true),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("placed");
+    assert_eq!(control.placement.decision().engine, NodeEngine::Ollama);
+}
+
+/// The one-shot path sends to a node already chosen. A placement is not a pass
+/// for whatever body is sent next.
+#[test]
+fn a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it() {
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = Fabric::new(vec![ollama.spec("b-ollama", "ollama")]).with_timeout(PROBE_TIMEOUT);
+    let placement = fabric
+        .place(
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some(OLLAMA_LOCAL))
+                .with_mixed_engines(MixedEngines::Allowed),
+        )
+        .expect("plain placement takes the node");
+
+    let mut body = chat_with_tools(false);
+    body["model"] = serde_json::json!(OLLAMA_LOCAL);
+    let error = fabric
+        .forward_to(
+            &placement,
+            "/v1/chat/completions",
+            &body,
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect_err("refused before sending");
+    match error {
+        ForwardError::Unsupported(message) => {
+            assert!(message.contains("tool_calls"), "{message}");
+            assert!(message.contains("b-ollama"), "{message}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    assert_eq!(chat_posts(&ollama).len(), 0);
+}
+
+/// Relay, don't re-place. A foreign node's refusal cannot be told from a real
+/// failure, and it may already be generating; sending the request to a
+/// sibling would turn one ambiguous failure into two generations.
+#[test]
+fn a_foreign_node_s_untyped_503_is_relayed_once_and_names_its_engine() {
+    let refusal =
+        r#"{"error":"server busy, please try again.  maximum pending requests exceeded"}"#;
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start_with_statuses(
+        with_body(
+            ollama_bodies(&[OLLAMA_LOCAL], &[OLLAMA_LOCAL]),
+            "/v1/chat/completions",
+            refusal,
+        ),
+        HashMap::from([("/v1/chat/completions", 503)]),
+    );
+    let fabric = fabric_over(&camelid, &ollama);
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("a node answered");
+    assert_eq!(answered.answer.status, 503);
+    assert_eq!(
+        answered.answer.body,
+        serde_json::from_str::<serde_json::Value>(refusal).expect("json")
+    );
+    assert_eq!(answered.attempts, 1);
+    assert_eq!(answered.decision.engine, NodeEngine::Ollama);
+    assert_eq!(
+        chat_posts(&camelid).len(),
+        0,
+        "the refusal was re-placed on a sibling"
+    );
+}
+
+/// The same, when the foreign node's 503 carries our own queue-full code. A
+/// label says which engine to expect, not which one answered.
+#[test]
+fn a_foreign_503_carrying_our_queue_full_code_is_still_relayed_once() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start_with_statuses(
+        with_body(
+            ollama_bodies(&[OLLAMA_LOCAL], &[OLLAMA_LOCAL]),
+            "/v1/chat/completions",
+            r#"{"error":{"message":"full","code":"engine_queue_full"}}"#,
+        ),
+        HashMap::from([("/v1/chat/completions", 503)]),
+    );
+    let fabric = fabric_over(&camelid, &ollama);
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("a node answered");
+    assert_eq!(answered.answer.status, 503);
+    assert_eq!(answered.attempts, 1);
+    assert_eq!(chat_posts(&camelid).len(), 0);
+}
+
+/// The paired control: our own engine's typed refusal is still handed on,
+/// under mixed placement, to the foreign sibling.
+#[test]
+fn a_camelid_queue_full_is_still_re_placed_under_mixed_mode() {
+    let camelid = StubEngine::start_with_statuses(
+        HashMap::from([
+            ("/v1/health", camelid_health_carrying(CAMELID_LOCAL, 0)),
+            (
+                "/v1/chat/completions",
+                r#"{"error":{"message":"the generation queue is full","type":"runtime_unavailable","code":"engine_queue_full"}}"#
+                    .to_string(),
+            ),
+        ]),
+        HashMap::from([("/v1/chat/completions", 503)]),
+    );
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = fabric_over(&camelid, &ollama);
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the sibling serves");
+    assert_eq!(answered.answer.status, 200);
+    assert_eq!(answered.attempts, 2);
+    assert_eq!(answered.decision.engine, NodeEngine::Ollama);
+    assert_eq!(
+        chat_posts(&camelid).len(),
+        1,
+        "the idle Camelid node was asked first"
+    );
+}
+
+/// A node never reached cannot have started the work, whatever its engine.
+#[test]
+fn a_foreign_node_never_reached_is_re_placed_like_any_other() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = fabric_over(&camelid, &ollama).with_max_observation_age(Duration::from_secs(30));
+    assert!(
+        fabric.observe().iter().all(|node| node.status.is_ready()),
+        "both nodes answer the observation this request will reuse"
+    );
+    drop(ollama);
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the sibling serves");
+    assert_eq!(answered.attempts, 2);
+    assert_eq!(answered.decision.engine, NodeEngine::Camelid);
+}
+
+/// Streaming inherits the rule: a refusal arrives buffered, before anything is
+/// relayed, and it is still relayed once.
+#[test]
+fn a_streaming_request_refused_by_a_foreign_node_is_relayed_once() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start_with_statuses(
+        with_body(
+            ollama_bodies(&[OLLAMA_LOCAL], &[OLLAMA_LOCAL]),
+            "/v1/chat/completions",
+            r#"{"error":{"message":"full","code":"engine_queue_full"}}"#,
+        ),
+        HashMap::from([("/v1/chat/completions", 503)]),
+    );
+    let fabric = fabric_over(&camelid, &ollama);
+
+    let streamed = fabric
+        .dispatch_streaming(
+            "/v1/chat/completions",
+            &plain_chat(true),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("a node answered");
+    match &streamed.outcome {
+        StreamOutcome::Buffered(answer) => assert_eq!(answer.status, 503),
+        StreamOutcome::Streaming(_) => panic!("a refusal arrives buffered"),
+    }
+    assert_eq!(streamed.attempts, 1);
+    assert_eq!(streamed.placement.decision().engine, NodeEngine::Ollama);
+    drop(streamed);
+    assert_eq!(chat_posts(&camelid).len(), 0);
+}
+
+/// I12: the one field placement writes is `model`, to the id the chosen node
+/// knows. Everything else reaches it as the client sent it.
+#[test]
+fn a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start(ollama_serving_chat());
+    let fabric = fabric_over(&camelid, &ollama);
+    let sent = serde_json::json!({
+        "model": "llama-1b",
+        "messages": [{ "role": "system", "content": "be brief" }, { "role": "user", "content": "hi" }],
+        "temperature": 0.2,
+        "max_tokens": 16,
+        "stream": false,
+        "user": "someone",
+    });
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &sent,
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("placed");
+    assert_eq!(answered.decision.engine, NodeEngine::Ollama);
+    let received = chat_posts(&ollama);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["model"], OLLAMA_LOCAL);
+
+    let without_model = |body: &serde_json::Value| {
+        let mut body = body.clone();
+        body.as_object_mut().expect("an object").remove("model");
+        body
+    };
+    assert_eq!(without_model(&received[0]), without_model(&sent));
+}
+
+/// I2 on a failure: the answer names the engine of the node it was sent to.
+#[test]
+fn a_failure_carries_the_engine_of_the_node_it_was_sent_to() {
+    let camelid = busy_camelid();
+    let ollama = StubEngine::start_hanging_up_on(
+        ollama_serving_chat(),
+        HashMap::new(),
+        &["/v1/chat/completions"],
+    );
+    let fabric = fabric_over(&camelid, &ollama);
+
+    let error = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &plain_chat(false),
+            &mixed_llama_1b(),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect_err("the node took the request and hung up");
+    match error {
+        DispatchError::Forward {
+            error: ForwardError::Transport { label, .. },
+            engine,
+        } => {
+            assert_eq!(label, "b-ollama");
+            assert_eq!(engine, Some(NodeEngine::Ollama));
+        }
+        other => panic!("expected a transport failure, got {other:?}"),
+    }
+    assert_eq!(
+        chat_posts(&camelid).len(),
+        0,
+        "a node that took the request is not asked to run it again elsewhere"
+    );
+}
+
+/// `fabric route` and the proxy answer the same question the same way,
+/// aliases and residency included.
+#[test]
+fn a_dry_run_and_the_proxy_agree_on_an_aliased_model() {
+    for resident in [&[OLLAMA_LOCAL][..], &[]] {
+        let camelid = busy_camelid();
+        let ollama = StubEngine::start(with_body(
+            ollama_bodies(&[OLLAMA_LOCAL], resident),
+            "/v1/chat/completions",
+            CHAT_COMPLETION,
+        ));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nodes");
+        std::fs::write(
+            &path,
+            format!(
+                "a-camelid=127.0.0.1:{}\nb-ollama=ollama://127.0.0.1:{}\n\
+                 alias llama-1b=a-camelid:{CAMELID_LOCAL}\n\
+                 alias llama-1b=b-ollama:{OLLAMA_LOCAL}\n",
+                camelid.port, ollama.port
+            ),
+        )
+        .expect("write node file");
+        let fabric = Fabric::from_node_file(path)
+            .expect("load")
+            .with_timeout(PROBE_TIMEOUT);
+
+        let predicted = fabric
+            .decide(&fabric.observe(), &mixed_llama_1b())
+            .expect("the dry run places it");
+        let dispatched = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &plain_chat(false),
+                &mixed_llama_1b(),
+                PROBE_TIMEOUT,
+                &Cancel::never(),
+            )
+            .expect("placed");
+        assert_eq!(predicted.label, dispatched.decision.label, "{resident:?}");
+        assert_eq!(predicted.model, dispatched.decision.model, "{resident:?}");
+        let expected = if resident.is_empty() {
+            // Cold: 2 + 4 against a Camelid node carrying 5.
+            ("a-camelid", CAMELID_LOCAL, Residency::Resident)
+        } else {
+            ("b-ollama", OLLAMA_LOCAL, Residency::Resident)
+        };
+        assert_eq!(predicted.label, expected.0, "{resident:?}");
+        assert_eq!(predicted.model.as_deref(), Some(expected.1), "{resident:?}");
+        assert_eq!(predicted.residency, Some(expected.2), "{resident:?}");
+    }
 }

@@ -13,6 +13,9 @@
 //!   the node holding it dies the request still gets served, and the decision
 //!   records that affinity was lost rather than silently pretending it held.
 
+use super::aliases::ModelAliases;
+use super::capability::Capabilities;
+use super::divergence::ModelIdentity;
 use super::engine::NodeEngine;
 use super::node::{NodeSnapshot, NodeStatus};
 
@@ -63,6 +66,23 @@ pub enum MixedEngines {
     Allowed,
 }
 
+impl MixedEngines {
+    /// The name health and the Routing screen report the mode under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Allowed => "allowed",
+        }
+    }
+}
+
+/// The command-line spelling that turns [`MixedEngines::Allowed`] on.
+///
+/// Published here, and in the proxy's health, so that anything telling an
+/// operator which flag to add — a refusal message, the Routing screen — quotes
+/// the build's own spelling rather than its own copy of it.
+pub const MIXED_ENGINES_FLAG: &str = "--allow-mixed-engines";
+
 /// What a node must be able to do before this request may land on it.
 ///
 /// Expressed as capabilities rather than engine names on purpose: placement
@@ -74,6 +94,21 @@ pub struct Requirements {
     /// handle them is not eligible, however confidently its vendor documents
     /// the feature.
     pub tool_calls: bool,
+    /// The request is for a rerank route. Only a node whose API has one can
+    /// take it; one without would answer 404 for a request another node
+    /// could have served.
+    pub rerank_route: bool,
+}
+
+impl Requirements {
+    /// Everything either side requires. How a caller adds to what the body
+    /// carries without being able to take any of it away.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            tool_calls: self.tool_calls || other.tool_calls,
+            rerank_route: self.rerank_route || other.rerank_route,
+        }
+    }
 }
 
 /// What the caller is asking the fabric to place.
@@ -89,6 +124,9 @@ pub struct RouteRequest<'a> {
     pub sticky: Option<&'a str>,
     pub mixed: MixedEngines,
     pub requires: Requirements,
+    /// What each node calls the requested model, where an operator said so.
+    /// `None` resolves every id to itself.
+    pub aliases: Option<&'a ModelAliases>,
 }
 
 impl<'a> RouteRequest<'a> {
@@ -100,7 +138,13 @@ impl<'a> RouteRequest<'a> {
             sticky: None,
             mixed: MixedEngines::Refused,
             requires: Requirements::default(),
+            aliases: None,
         }
+    }
+
+    pub fn with_aliases(mut self, aliases: &'a ModelAliases) -> Self {
+        self.aliases = Some(aliases);
+        self
     }
 
     pub fn with_model(mut self, model: Option<&'a str>) -> Self {
@@ -129,34 +173,107 @@ impl<'a> RouteRequest<'a> {
     }
 }
 
-/// Whether `snapshot` may be placed on for this request.
+/// Whether this fabric places on `snapshot` at all.
 ///
-/// Two independent gates. The first is whether this fabric places on such a
-/// node at all; the second is whether the node can do what the request needs,
-/// and applies to every engine including our own.
-fn eligible(snapshot: &NodeSnapshot, request: &RouteRequest<'_>) -> bool {
+/// The first of three stages, each refused in its own words: is the node
+/// admitted, does it hold the model, can it do what the request needs.
+/// Folding them together sent operators to fix healthy machines.
+fn admitted(snapshot: &NodeSnapshot, request: &RouteRequest<'_>) -> bool {
     // Mixed placement relaxes which engines are placed on, never whether the
     // node can take work now. With the two folded into one test, every down
     // or still-loading node became eligible the moment mixed placement was
     // asked for, and a request for a model against a dead fabric was refused
     // as permanently absent instead of as something that can clear.
-    let placeable = snapshot.status.is_ready()
-        && (snapshot.is_placeable() || request.mixed == MixedEngines::Allowed);
-    if !placeable {
-        return false;
+    snapshot.is_placeable_under(request.mixed)
+}
+
+/// Whether a node whose engine can be asked `capabilities` can take a request
+/// that requires `requires`, and if not, the capability it lacks.
+///
+/// Shared by placement and the one-shot send, so a request that names its node
+/// directly is held to the same rule as one placed.
+pub(crate) fn meets(
+    capabilities: &Capabilities,
+    requires: Requirements,
+) -> Result<(), &'static str> {
+    // `supported == Some(true)` is enough here, and deliberately so. The
+    // capability table never credits a foreign engine with tool calls on
+    // documentation alone -- it answers `not_probed` until somebody measures
+    // that exact version -- so a `true` can only have come from a measurement
+    // or from our own engine's test suite. Re-deriving that rule here would
+    // mean placement knowing which engine is ours, and would have refused every
+    // Camelid build not in the measurement table. The guarantee is pinned by
+    // `capability::tests`.
+    if requires.tool_calls && capabilities.tool_calls.supported != Some(true) {
+        return Err("tool_calls");
     }
-    if request.requires.tool_calls {
-        // `supported == Some(true)` is enough here, and deliberately so. The
-        // capability table never credits a foreign engine with tool calls on
-        // documentation alone -- it answers `not_probed` until somebody
-        // measures that exact version -- so a `true` can only have come from a
-        // measurement or from our own engine's test suite. Re-deriving that
-        // rule here would mean placement knowing which engine is ours, and
-        // would have refused every Camelid build not in the measurement table.
-        // The guarantee is pinned by `capability::tests`.
-        return snapshot.capabilities().tool_calls.supported == Some(true);
+    if requires.rerank_route && capabilities.rerank_route.supported != Some(true) {
+        return Err("rerank_route");
     }
-    true
+    Ok(())
+}
+
+/// Whether the model a request lands on is held in memory, as far as the
+/// node's own listing says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// The node's listing names it as loaded.
+    Resident,
+    /// The node's listing names what is loaded, and this is not among it: the
+    /// request will load it first.
+    NotResident,
+    /// The node did not say what is loaded. Never read as resident.
+    Unknown,
+}
+
+impl Residency {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::NotResident => "not_resident",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether `snapshot` can serve `model`, and how warm it is. `None` when it
+/// cannot. Pure.
+///
+/// A model held in memory is served. A model merely installed is served only
+/// where the engine declares that naming one loads it: "installed" is not
+/// "servable" on an engine that needs a person to load it first, and taking
+/// it as such would place requests that come back refused.
+pub(crate) fn serves(snapshot: &NodeSnapshot, model: &str) -> Option<Residency> {
+    let ready = snapshot.status.ready()?;
+    let resident = ready.active_model_id.as_deref() == Some(model)
+        || ready
+            .resident_models
+            .as_ref()
+            .is_some_and(|resident| resident.iter().any(|held| held == model));
+    if resident {
+        return Some(Residency::Resident);
+    }
+    let installed = ready.models.iter().any(|held| held == model);
+    if installed && snapshot.capabilities().loads_on_demand.supported == Some(true) {
+        return Some(match ready.resident_models {
+            Some(_) => Residency::NotResident,
+            None => Residency::Unknown,
+        });
+    }
+    None
+}
+
+/// What `label` calls `model` under this request's aliases, and whether that
+/// rests on a declaration.
+fn local_id<'a>(
+    request: &RouteRequest<'a>,
+    label: &str,
+    model: &'a str,
+) -> (&'a str, ModelIdentity) {
+    match request.aliases {
+        Some(aliases) => aliases.resolve_with_identity(label, model),
+        None => (model, ModelIdentity::SameId),
+    }
 }
 
 /// What a node that publishes no load is charged when ranking.
@@ -167,6 +284,19 @@ fn eligible(snapshot: &NodeSnapshot, request: &RouteRequest<'_>) -> bool {
 /// can least see it. A small positive cost makes it the choice only when the
 /// observable nodes are actually busier than this.
 pub const UNREPORTED_LOAD_COST: usize = 2;
+
+/// What a holder that must load the model first is charged when ranking, on
+/// top of its load.
+///
+/// A stated guess, like [`UNREPORTED_LOAD_COST`], not a measurement: nobody
+/// here has timed a cold load, which on a small machine takes seconds and may
+/// evict another model. It is a price rather than a rule that the warm holder
+/// always wins, because a rule would send every request for a model to the
+/// one node holding it warm — a node that, if foreign, publishes no load and
+/// sends no typed refusal — and never to an idle sibling that could load it.
+/// Once the warm holder carries more than this many requests beyond its
+/// sibling, the sibling is chosen. Unknown residency is priced as cold.
+pub const COLD_LOAD_COST: usize = 4;
 
 /// How the winning node was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +339,17 @@ pub struct RouteDecision {
     /// Previous node's label when affinity was requested but could not be
     /// honoured. Reported so a caller can tell a warm hit from a cold re-prefill.
     pub affinity_lost: Option<String>,
+    /// The model id to send the chosen node, which is the only thing about a
+    /// request placement ever writes. The requested id unless an alias names
+    /// the node's own; under mixed placement, the node's single active model
+    /// when the request named none. `None` leaves the body as it came.
+    pub model: Option<String>,
+    /// What `model` rests on when the request named one: the same id, or an
+    /// operator's word that a different id is the same weights.
+    pub model_identity: Option<ModelIdentity>,
+    /// How warm the chosen node's listing says the model is. `None` when no
+    /// model was matched, which is placement making no claim either way.
+    pub residency: Option<Residency>,
 }
 
 /// Why no node could take the request. Every variant carries enough detail to
@@ -235,6 +376,27 @@ pub enum RouteError {
         /// "the fabric cannot say yet": while any node is unaccounted for, one
         /// of them may be the node that owns the model.
         unobserved: usize,
+        /// Healthy nodes holding the model whose engine this fabric does not
+        /// place on. They were consulted, so they are not `unobserved`: the
+        /// refusal is settled, and what changes it is the operator's flag, not
+        /// time.
+        held_by_unplaced: Vec<String>,
+    },
+    /// Nodes hold the model, and none of them can do what the request needs.
+    RequirementUnmet {
+        /// The capability key: `tool_calls` or `rerank_route`.
+        requirement: &'static str,
+        model: Option<String>,
+        /// Each holder that lacks it, with its engine and reported version.
+        unmet: Vec<(String, String)>,
+        /// Nodes that meet it but do not hold the model.
+        capable_elsewhere: Vec<String>,
+        unobserved: usize,
+    },
+    /// Under mixed placement a request that names no model is placed only
+    /// where the model it will get is known, and no such node is ready.
+    ModelUnspecified {
+        unobserved: usize,
     },
     /// The session asked to go back to a node that cannot say whether its
     /// prefix is still warm. Refused rather than served there anyway, because
@@ -243,6 +405,66 @@ pub enum RouteError {
     AffinityUnsupported {
         label: String,
     },
+}
+
+fn unobserved_clause(unobserved: usize) -> String {
+    match unobserved {
+        0 => String::new(),
+        1 => "; 1 node could not be consulted, so this may change".to_string(),
+        many => format!("; {many} nodes could not be consulted, so this may change"),
+    }
+}
+
+fn requirement_lead(requirement: &str) -> &'static str {
+    match requirement {
+        "tool_calls" => "a request carrying tools is placed only on a node measured to handle them",
+        _ => "a rerank request is placed only on a node that exposes a rerank route",
+    }
+}
+
+impl RouteError {
+    /// The refusal as a listener reachable from off the machine may say it.
+    ///
+    /// Node labels and exact engine versions identify what is running where,
+    /// which the proxy's health already withholds off-box; a refusal must not
+    /// hand them out instead. Refusals that name no such thing read exactly as
+    /// their [`std::fmt::Display`].
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::ModelUnavailable {
+                model,
+                serving,
+                unobserved,
+                ..
+            } => Self::ModelUnavailable {
+                model: model.clone(),
+                serving: serving.clone(),
+                unobserved: *unobserved,
+                held_by_unplaced: Vec::new(),
+            }
+            .to_string(),
+            Self::RequirementUnmet {
+                requirement,
+                unmet,
+                unobserved,
+                ..
+            } => {
+                let mut message = requirement_lead(requirement).to_string();
+                match (*requirement, unmet.len()) {
+                    ("tool_calls", 1) => message.push_str(
+                        "; 1 node holding this model has not been measured handling tool calls",
+                    ),
+                    ("tool_calls", many) => message.push_str(&format!(
+                        "; {many} nodes holding this model have not been measured handling tool calls"
+                    )),
+                    _ => message.push_str("; no node holding this model exposes one"),
+                }
+                message.push_str(&unobserved_clause(*unobserved));
+                message
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for RouteError {
@@ -274,19 +496,83 @@ impl std::fmt::Display for RouteError {
                 model,
                 serving,
                 unobserved,
+                held_by_unplaced,
             } => {
                 write!(f, "no ready node is serving model `{model}`")?;
                 if !serving.is_empty() {
                     write!(f, "; ready nodes serve: {}", serving.join(", "))?;
                 }
-                match unobserved {
-                    0 => Ok(()),
-                    1 => write!(f, "; 1 node could not be consulted, so this may change"),
+                match held_by_unplaced.as_slice() {
+                    [] => {}
+                    [one] => write!(
+                        f,
+                        "; {one} holds it but runs an engine this fabric does not place on \
+                         (accept that with {MIXED_ENGINES_FLAG})"
+                    )?,
                     many => write!(
                         f,
-                        "; {many} nodes could not be consulted, so this may change"
-                    ),
+                        "; {} hold it but run engines this fabric does not place on \
+                         (accept that with {MIXED_ENGINES_FLAG})",
+                        many.join(", ")
+                    )?,
                 }
+                f.write_str(&unobserved_clause(*unobserved))
+            }
+            Self::RequirementUnmet {
+                requirement,
+                model,
+                unmet,
+                capable_elsewhere,
+                unobserved,
+            } => {
+                write!(f, "{}", requirement_lead(requirement))?;
+                let holders = unmet
+                    .iter()
+                    .map(|(label, engine)| format!("{label} ({engine})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let many = unmet.len() > 1;
+                if *requirement == "tool_calls" {
+                    write!(
+                        f,
+                        "; {holders} {} not been measured handling tool calls here",
+                        if many { "have" } else { "has" }
+                    )?;
+                } else {
+                    match model {
+                        Some(model) => {
+                            write!(f, "; no node holding `{model}` exposes a rerank route")?
+                        }
+                        None => write!(f, "; no node that would take it exposes a rerank route")?,
+                    }
+                    write!(f, ": {holders}")?;
+                }
+                if let (Some(model), false) = (model, capable_elsewhere.is_empty()) {
+                    let what = match (*requirement, capable_elsewhere.len() > 1) {
+                        ("tool_calls", _) => "can take tools",
+                        (_, true) => "expose one",
+                        (_, false) => "exposes one",
+                    };
+                    write!(
+                        f,
+                        "; {} {what} but {} not hold `{model}`",
+                        capable_elsewhere.join(", "),
+                        if capable_elsewhere.len() > 1 {
+                            "do"
+                        } else {
+                            "does"
+                        }
+                    )?;
+                }
+                f.write_str(&unobserved_clause(*unobserved))
+            }
+            Self::ModelUnspecified { unobserved } => {
+                write!(
+                    f,
+                    "this request names no model, and no ready node this fabric places on serves \
+                     exactly one, so which model it would get is not known; name the model"
+                )?;
+                f.write_str(&unobserved_clause(*unobserved))
             }
             Self::AffinityUnsupported { label } => write!(
                 f,
@@ -538,6 +824,17 @@ struct Candidate<'a> {
     load: usize,
     service_nanos: Option<u128>,
     last_selected: Option<std::time::Instant>,
+    model: Option<String>,
+    identity: Option<ModelIdentity>,
+    residency: Option<Residency>,
+}
+
+/// A ready node that can serve this request's model, with what to send it.
+struct Holder<'a> {
+    snapshot: &'a NodeSnapshot,
+    model: Option<String>,
+    identity: Option<ModelIdentity>,
+    residency: Option<Residency>,
 }
 
 /// What a node is carrying, as far as this fabric can tell. Pure.
@@ -609,12 +906,33 @@ fn route_reserved_with_estimates_at(
         return Err(RouteError::NoNodesConfigured);
     }
 
-    let ready: Vec<&NodeSnapshot> = snapshots
+    let admitted_nodes: Vec<&NodeSnapshot> = snapshots
         .iter()
-        .filter(|snapshot| eligible(snapshot, request))
+        .filter(|snapshot| admitted(snapshot, request))
         .collect();
 
-    if ready.is_empty() {
+    if admitted_nodes.is_empty() {
+        // A request that names a model only an unplaced engine holds is
+        // refused as that, settled and naming the node: what changes it is
+        // the operator's flag, and "no node can serve" would say nothing
+        // about which node holds it or why it was not used.
+        if let Some(model) = request.model {
+            let mut held_by_unplaced: Vec<String> = snapshots
+                .iter()
+                .filter(|s| s.status.is_ready())
+                .filter(|s| serves(s, local_id(request, s.label(), model).0).is_some())
+                .map(|s| s.label().to_string())
+                .collect();
+            if !held_by_unplaced.is_empty() {
+                held_by_unplaced.sort();
+                return Err(RouteError::ModelUnavailable {
+                    model: model.to_string(),
+                    serving: Vec::new(),
+                    unobserved: snapshots.iter().filter(|s| !s.status.is_ready()).count(),
+                    held_by_unplaced,
+                });
+            }
+        }
         let unreachable = snapshots
             .iter()
             .filter(|s| matches!(s.status, NodeStatus::Unreachable { .. }))
@@ -624,7 +942,7 @@ fn route_reserved_with_estimates_at(
         // fix a machine that is working perfectly.
         let not_placeable = snapshots
             .iter()
-            .filter(|s| s.status.is_ready() && !eligible(s, request))
+            .filter(|s| s.status.is_ready() && !admitted(s, request))
             .count();
         return Err(RouteError::AllNodesUnavailable {
             unreachable,
@@ -633,37 +951,131 @@ fn route_reserved_with_estimates_at(
         });
     }
 
-    let serving_model: Vec<&NodeSnapshot> = match request.model {
+    // Only a node that answered as ready was asked what it holds. A ready node
+    // this fabric does not place on still answered, so it is not unaccounted
+    // for: counting it would turn a refusal only a flag can clear into one a
+    // client is told to retry.
+    let unobserved = snapshots.iter().filter(|s| !s.status.is_ready()).count();
+
+    let holders: Vec<Holder<'_>> = match request.model {
         Some(model) => {
-            let matched: Vec<&NodeSnapshot> = ready
+            let matched: Vec<Holder<'_>> = admitted_nodes
                 .iter()
-                .copied()
-                .filter(|snapshot| snapshot.active_model_id() == Some(model))
+                .filter_map(|snapshot| {
+                    let (local, identity) = local_id(request, snapshot.label(), model);
+                    serves(snapshot, local).map(|residency| Holder {
+                        snapshot,
+                        model: Some(local.to_string()),
+                        identity: Some(identity),
+                        residency: Some(residency),
+                    })
+                })
                 .collect();
             if matched.is_empty() {
-                let mut serving: Vec<String> = ready
+                let mut serving: Vec<String> = admitted_nodes
                     .iter()
                     .filter_map(|s| s.active_model_id().map(str::to_string))
                     .collect();
                 serving.sort();
                 serving.dedup();
+                let mut held_by_unplaced: Vec<String> = snapshots
+                    .iter()
+                    .filter(|s| s.status.is_ready() && !admitted(s, request))
+                    .filter(|s| serves(s, local_id(request, s.label(), model).0).is_some())
+                    .map(|s| s.label().to_string())
+                    .collect();
+                held_by_unplaced.sort();
                 return Err(RouteError::ModelUnavailable {
                     model: model.to_string(),
                     serving,
-                    unobserved: snapshots.len() - ready.len(),
+                    unobserved,
+                    held_by_unplaced,
                 });
             }
             matched
         }
-        None => ready,
+        // Our own engine serves whatever it loaded to a request naming no
+        // model; another engine answers that it needs one. So under mixed
+        // placement such a request goes only where the model it will get is
+        // known, and that id is what is sent.
+        None if request.mixed == MixedEngines::Allowed => {
+            let matched: Vec<Holder<'_>> = admitted_nodes
+                .iter()
+                .filter_map(|snapshot| {
+                    snapshot.active_model_id().map(|active| Holder {
+                        snapshot,
+                        model: Some(active.to_string()),
+                        identity: None,
+                        residency: Some(Residency::Resident),
+                    })
+                })
+                .collect();
+            if matched.is_empty() {
+                return Err(RouteError::ModelUnspecified { unobserved });
+            }
+            matched
+        }
+        None => admitted_nodes
+            .iter()
+            .map(|snapshot| Holder {
+                snapshot,
+                model: None,
+                identity: None,
+                residency: None,
+            })
+            .collect(),
     };
+
+    // Asked of every engine, ours included. A holder that cannot do what the
+    // request needs is refused for exactly that, never as an unplaceable
+    // engine: the operator's next step is a different node or a measurement,
+    // not a restart.
+    let capable: Vec<&Holder<'_>> = holders
+        .iter()
+        .filter(|holder| meets(&holder.snapshot.capabilities(), request.requires).is_ok())
+        .collect();
+    if capable.is_empty() {
+        let requirement = holders
+            .iter()
+            .find_map(|holder| meets(&holder.snapshot.capabilities(), request.requires).err())
+            .unwrap_or("tool_calls");
+        let mut unmet: Vec<(String, String)> = holders
+            .iter()
+            .map(|holder| {
+                (
+                    holder.snapshot.label().to_string(),
+                    holder.snapshot.engine_and_version(),
+                )
+            })
+            .collect();
+        unmet.sort();
+        let mut capable_elsewhere: Vec<String> = admitted_nodes
+            .iter()
+            .filter(|s| meets(&s.capabilities(), request.requires).is_ok())
+            .filter(|s| {
+                !holders
+                    .iter()
+                    .any(|holder| holder.snapshot.label() == s.label())
+            })
+            .map(|s| s.label().to_string())
+            .collect();
+        capable_elsewhere.sort();
+        return Err(RouteError::RequirementUnmet {
+            requirement,
+            model: request.model.map(str::to_string),
+            unmet,
+            capable_elsewhere,
+            unobserved,
+        });
+    }
 
     // Every ready node serving the model is eligible. The fabric cannot tell
     // whether a node is at its bound — `/v1/health` publishes load, not capacity
     // — so it ranks by load and lets a genuinely full node answer its own 503.
-    let candidates: Vec<Candidate<'_>> = serving_model
+    let candidates: Vec<Candidate<'_>> = capable
         .iter()
-        .filter_map(|snapshot| {
+        .filter_map(|holder| {
+            let snapshot = holder.snapshot;
             snapshot.status.ready().map(|ready| {
                 let estimate = estimates.get(snapshot, request.model, request.service_class);
                 let current = estimate.filter(|estimate| {
@@ -671,23 +1083,31 @@ fn route_reserved_with_estimates_at(
                         now.saturating_duration_since(observed) <= MAX_SERVICE_TIME_AGE
                     })
                 });
+                // A node that publishes no load is not an idle one. Left at
+                // the reservation count it would outrank every node that
+                // honestly reported work and win every placement, so it
+                // carries a stated fixed cost instead. This is a deliberate
+                // guess about an unobservable node, which is why mixed
+                // placement is off by default.
+                let carrying = match ready.in_flight() {
+                    Some(observed) => load_of(observed, reserved.get(snapshot.label())),
+                    None => UNREPORTED_LOAD_COST.saturating_add(reserved.get(snapshot.label())),
+                };
+                let loading = match holder.residency {
+                    Some(Residency::Resident) | None => 0,
+                    Some(Residency::NotResident | Residency::Unknown) => COLD_LOAD_COST,
+                };
                 Candidate {
                     label: snapshot.label(),
                     engine: snapshot.engine(),
-                    // A node that publishes no load is not an idle one. Left
-                    // at the reservation count it would outrank every node
-                    // that honestly reported work and win every placement, so
-                    // it carries a stated fixed cost instead. This is a
-                    // deliberate guess about an unobservable node, which is
-                    // why mixed placement is off by default.
-                    load: match ready.in_flight() {
-                        Some(observed) => load_of(observed, reserved.get(snapshot.label())),
-                        None => UNREPORTED_LOAD_COST.saturating_add(reserved.get(snapshot.label())),
-                    },
+                    load: carrying.saturating_add(loading),
                     service_nanos: current
                         .filter(|estimate| estimate.samples >= MIN_SERVICE_TIME_SAMPLES)
                         .map(|estimate| estimate.mean_nanos),
                     last_selected: estimate.and_then(|estimate| estimate.last_selected),
+                    model: holder.model.clone(),
+                    identity: holder.identity,
+                    residency: holder.residency,
                 }
             })
         })
@@ -696,7 +1116,7 @@ fn route_reserved_with_estimates_at(
     if candidates.is_empty() {
         return Err(RouteError::AllNodesUnavailable {
             unreachable: 0,
-            not_ready: serving_model.len(),
+            not_ready: capable.len(),
             not_placeable: 0,
         });
     }
@@ -707,11 +1127,11 @@ fn route_reserved_with_estimates_at(
             // is still warm. A node that cannot is refused rather than
             // silently treated as a cache hit it never claimed.
             if let Some(hit) = candidates.iter().find(|c| c.label == sticky) {
-                let attests = serving_model
+                let attests = capable
                     .iter()
-                    .find(|snapshot| snapshot.label() == sticky)
-                    .is_some_and(|snapshot| {
-                        snapshot.capabilities().warm_prefix.supported == Some(true)
+                    .find(|holder| holder.snapshot.label() == sticky)
+                    .is_some_and(|holder| {
+                        holder.snapshot.capabilities().warm_prefix.supported == Some(true)
                     });
                 if !attests {
                     return Err(RouteError::AffinityUnsupported {
@@ -723,6 +1143,9 @@ fn route_reserved_with_estimates_at(
                     engine: hit.engine,
                     reason: RouteReason::Affinity,
                     affinity_lost: None,
+                    model: hit.model.clone(),
+                    model_identity: hit.identity,
+                    residency: hit.residency,
                 });
             }
         }
@@ -788,6 +1211,9 @@ fn route_reserved_with_estimates_at(
         engine: chosen.engine,
         reason,
         affinity_lost,
+        model: chosen.model.clone(),
+        model_identity: chosen.identity,
+        residency: chosen.residency,
     })
 }
 
@@ -808,6 +1234,7 @@ mod tests {
                 engine: NodeEngine::Camelid,
                 active_model_id: model.map(str::to_string),
                 models: model.map(str::to_string).into_iter().collect(),
+                resident_models: model.map(|model| vec![model.to_string()]),
                 backend: Some("llama".to_string()),
                 version: Some("0.5.4".to_string()),
                 load: Some(NodeLoad {
@@ -833,6 +1260,7 @@ mod tests {
                 engine,
                 active_model_id: Some(model.to_string()),
                 models: vec![model.to_string()],
+                resident_models: Some(vec![model.to_string()]),
                 backend: None,
                 version: None,
                 load: None,
@@ -911,7 +1339,10 @@ mod tests {
         let nodes = [foreign("studio", NodeEngine::Ollama, "m")];
         let needs_tools = RouteRequest::new(RouteMode::Throughput)
             .with_mixed_engines(MIXED)
-            .requiring(Requirements { tool_calls: true });
+            .requiring(Requirements {
+                tool_calls: true,
+                ..Requirements::default()
+            });
 
         assert!(
             route(&nodes, &needs_tools).is_err(),
@@ -934,7 +1365,10 @@ mod tests {
             &nodes,
             &RouteRequest::new(RouteMode::Throughput)
                 .with_model(Some("m"))
-                .requiring(Requirements { tool_calls: true }),
+                .requiring(Requirements {
+                    tool_calls: true,
+                    ..Requirements::default()
+                }),
         )
         .expect("our own engine's tool contract is covered by its test suite");
         assert_eq!(decision.label, "win");
@@ -1027,7 +1461,7 @@ mod tests {
     fn mixed_placement_does_not_make_a_node_that_is_still_loading_eligible() {
         let warming = not_ready("warming");
         let mixed = RouteRequest::new(RouteMode::Throughput).with_mixed_engines(MIXED);
-        assert!(!eligible(&warming, &mixed));
+        assert!(!admitted(&warming, &mixed));
 
         // And what that changes on the wire: while the loading node is
         // unaccounted for it may be the one that owns the model, so the
@@ -1584,6 +2018,7 @@ mod tests {
                 model: "gemma-27b".to_string(),
                 serving: vec!["llama-3b".to_string(), "qwen-4b".to_string()],
                 unobserved: 0,
+                held_by_unplaced: Vec::new(),
             })
         );
     }
@@ -1694,7 +2129,548 @@ mod tests {
                 model: "llama-3b".to_string(),
                 serving: Vec::new(),
                 unobserved: 0,
+                held_by_unplaced: Vec::new(),
             })
         );
+    }
+
+    /// A foreign node holding `installed`, with `resident` as its own listing
+    /// said it (`None` when the listing said nothing). Its active model is the
+    /// one resident model, when there is exactly one, as the adapters report.
+    fn holding(
+        label: &str,
+        engine: NodeEngine,
+        installed: &[&str],
+        resident: Option<&[&str]>,
+    ) -> NodeSnapshot {
+        let resident: Option<Vec<String>> =
+            resident.map(|models| models.iter().map(|m| m.to_string()).collect());
+        NodeSnapshot {
+            spec: NodeSpec {
+                label: label.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: engine.default_port(),
+                engine,
+            },
+            status: NodeStatus::Ready(NodeReady {
+                engine,
+                active_model_id: match resident.as_deref() {
+                    Some([only]) => Some(only.clone()),
+                    _ => None,
+                },
+                models: installed.iter().map(|m| m.to_string()).collect(),
+                resident_models: resident,
+                backend: None,
+                version: (engine == NodeEngine::Ollama).then(|| "0.33.2".to_string()),
+                load: None,
+            }),
+            latency: None,
+        }
+    }
+
+    fn tools() -> Requirements {
+        Requirements {
+            tool_calls: true,
+            ..Requirements::default()
+        }
+    }
+
+    fn rerank() -> Requirements {
+        Requirements {
+            rerank_route: true,
+            ..Requirements::default()
+        }
+    }
+
+    /// An unmet requirement is a fact about what the node can do, and saying
+    /// "this fabric does not place on that engine" instead sends an operator
+    /// to a flag they have already given.
+    #[test]
+    fn a_tool_calling_request_is_refused_for_the_capability_it_lacks_not_as_an_unplaceable_engine()
+    {
+        let nodes = [foreign("studio", NodeEngine::Ollama, "m")];
+        let error = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED)
+                .requiring(tools()),
+        )
+        .expect_err("nobody measured it");
+        match &error {
+            RouteError::RequirementUnmet {
+                requirement,
+                unmet,
+                unobserved,
+                ..
+            } => {
+                assert_eq!(*requirement, "tool_calls");
+                assert_eq!(unmet.len(), 1);
+                assert_eq!(unmet[0].0, "studio");
+                assert_eq!(*unobserved, 0);
+            }
+            other => panic!("expected RequirementUnmet, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains("studio"), "{message}");
+        assert!(message.contains("measured"), "{message}");
+    }
+
+    #[test]
+    fn a_tool_calling_request_goes_to_our_engine_even_when_the_foreign_node_is_idler() {
+        let nodes = [
+            ready("win", Some("m"), 5),
+            foreign("studio", NodeEngine::Ollama, "m"),
+        ];
+        let plain = RouteRequest::new(RouteMode::Throughput)
+            .with_model(Some("m"))
+            .with_mixed_engines(MIXED);
+        assert_eq!(
+            route(&nodes, &plain).expect("routes").label,
+            "studio",
+            "without tools the idler node wins, so the next assertion is the guard's doing"
+        );
+        let decision = route(&nodes, &plain.requiring(tools())).expect("our engine takes tools");
+        assert_eq!(decision.label, "win");
+        assert_eq!(decision.engine, NodeEngine::Camelid);
+    }
+
+    #[test]
+    fn an_installed_model_on_an_engine_that_loads_on_demand_is_matched_and_says_so() {
+        let nodes = [holding("studio", NodeEngine::Ollama, &["m"], Some(&[]))];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("an engine that loads on demand serves what it has installed");
+        assert_eq!(decision.label, "studio");
+        assert_eq!(decision.residency, Some(Residency::NotResident));
+        assert_eq!(decision.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn an_installed_model_on_an_engine_whose_loading_is_unprobed_is_not_matched() {
+        // LM Studio's listing says "not-loaded", and whether naming it loads it
+        // is a setting its API does not publish.
+        let nodes = [holding(
+            "desk",
+            NodeEngine::LmStudio,
+            &["m", "other"],
+            Some(&["other"]),
+        )];
+        let error = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect_err("installed is not servable without a declaration");
+        assert!(
+            matches!(error, RouteError::ModelUnavailable { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_residency_is_never_read_as_resident() {
+        let unknown = holding("a-unknown", NodeEngine::Ollama, &["m"], None);
+        let only = route(
+            std::slice::from_ref(&unknown),
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("still placed");
+        assert_eq!(only.residency, Some(Residency::Unknown));
+
+        // Equal load, and the unknown one sorts first: only the price can put
+        // the resident node ahead.
+        let nodes = [
+            unknown,
+            holding("b-warm", NodeEngine::Ollama, &["m"], Some(&["m"])),
+        ];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("routes");
+        assert_eq!(decision.label, "b-warm");
+        assert_eq!(decision.residency, Some(Residency::Resident));
+    }
+
+    #[test]
+    fn a_node_holding_two_resident_models_serves_either() {
+        let nodes = [holding(
+            "studio",
+            NodeEngine::Ollama,
+            &["a", "b"],
+            Some(&["a", "b"]),
+        )];
+        for model in ["a", "b"] {
+            let decision = route(
+                &nodes,
+                &RouteRequest::new(RouteMode::Throughput)
+                    .with_model(Some(model))
+                    .with_mixed_engines(MIXED),
+            )
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(decision.label, "studio");
+            assert_eq!(decision.residency, Some(Residency::Resident), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_resident_holder_outranks_a_cold_one_at_equal_load() {
+        // The cold node sorts first, so a tie would go to it.
+        let nodes = [
+            holding("a-cold", NodeEngine::Ollama, &["m"], Some(&[])),
+            holding("b-warm", NodeEngine::Ollama, &["m"], Some(&["m"])),
+        ];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("routes");
+        assert_eq!(decision.label, "b-warm");
+    }
+
+    /// A price, not a tier: a warm holder that publishes no load could
+    /// otherwise take every request for its model forever.
+    #[test]
+    fn a_cold_holder_is_chosen_once_the_resident_one_is_carrying_more_than_the_cold_price() {
+        // The warm node sorts first, so at a tie it keeps the work.
+        let nodes = [
+            holding("a-warm", NodeEngine::Ollama, &["m"], Some(&["m"])),
+            holding("b-cold", NodeEngine::Ollama, &["m"], Some(&[])),
+        ];
+        let request = RouteRequest::new(RouteMode::Throughput)
+            .with_model(Some("m"))
+            .with_mixed_engines(MIXED);
+
+        let mut reserved = Reservations::none();
+        for _ in 0..COLD_LOAD_COST {
+            reserved.take("a-warm");
+        }
+        assert_eq!(
+            route_reserved(&nodes, &request, &reserved)
+                .expect("routes")
+                .label,
+            "a-warm",
+            "carrying exactly the cold price is a tie, and ties keep the warm node"
+        );
+
+        reserved.take("a-warm");
+        let spilled = route_reserved(&nodes, &request, &reserved).expect("routes");
+        assert_eq!(spilled.label, "b-cold");
+        assert_eq!(spilled.residency, Some(Residency::NotResident));
+    }
+
+    #[test]
+    fn a_declared_alias_places_on_the_local_id_and_records_the_claim() {
+        let nodes = [foreign("studio", NodeEngine::Ollama, "llama1b-q8:latest")];
+        let aliases = crate::fabric::aliases::parse_model_aliases(&[
+            "llama-1b=studio:llama1b-q8:latest".to_string(),
+        ])
+        .expect("parses");
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("llama-1b"))
+                .with_mixed_engines(MIXED)
+                .with_aliases(&aliases),
+        )
+        .expect("the alias names what studio holds");
+        assert_eq!(decision.model.as_deref(), Some("llama1b-q8:latest"));
+        assert_eq!(
+            decision.model_identity,
+            Some(ModelIdentity::AssertedByOperator)
+        );
+
+        let direct = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("llama1b-q8:latest"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("its own id");
+        assert_eq!(direct.model.as_deref(), Some("llama1b-q8:latest"));
+        assert_eq!(direct.model_identity, Some(ModelIdentity::SameId));
+
+        assert!(
+            route(
+                &nodes,
+                &RouteRequest::new(RouteMode::Throughput)
+                    .with_model(Some("llama-1b"))
+                    .with_mixed_engines(MIXED),
+            )
+            .is_err(),
+            "without the declaration the canonical id names nothing studio holds"
+        );
+    }
+
+    #[test]
+    fn a_request_naming_no_model_is_placed_only_where_the_model_it_will_get_is_known() {
+        let two = holding("a-two", NodeEngine::Ollama, &["x", "y"], Some(&["x", "y"]));
+        let one = holding("b-one", NodeEngine::Ollama, &["z"], Some(&["z"]));
+        let mixed = RouteRequest::new(RouteMode::Throughput).with_mixed_engines(MIXED);
+
+        let decision = route(&[two.clone(), one], &mixed).expect("b-one is known");
+        assert_eq!(
+            decision.label, "b-one",
+            "a-two sorts first and would win a tie, but which of its models a request would get is unknown"
+        );
+        assert_eq!(decision.model.as_deref(), Some("z"));
+        assert_eq!(
+            route(std::slice::from_ref(&two), &mixed),
+            Err(RouteError::ModelUnspecified { unobserved: 0 })
+        );
+
+        // Camelid-only placement of a request naming no model is untouched:
+        // every ready node is a candidate and nothing is written.
+        let nodes = [ready("a", None, 0), ready("b", Some("m"), 0)];
+        let decision = route(&nodes, &RouteRequest::new(RouteMode::Throughput)).expect("routes");
+        assert_eq!(decision.label, "a");
+        assert_eq!(decision.reason, RouteReason::LeastLoaded);
+        assert_eq!(decision.model, None, "nothing is rewritten");
+        assert_eq!(decision.residency, None);
+    }
+
+    /// S5. Every Camelid-only decision this module made before, remade with
+    /// each requirement set: none of the new stages may move one.
+    #[test]
+    fn a_camelid_only_fabric_decides_exactly_as_before() {
+        type Expected = Result<(&'static str, RouteReason, Option<&'static str>), RouteError>;
+        let mut reserved_a = Reservations::none();
+        reserved_a.take("a");
+        let fast = ready("fast", Some("m"), 3);
+        let slow = ready("slow", Some("m"), 0);
+        let mut estimates = ServiceTimeEstimates::default();
+        observe_n(&mut estimates, &fast, 40);
+        observe_n(&mut estimates, &slow, 400);
+
+        let cases: Vec<(
+            &str,
+            Vec<NodeSnapshot>,
+            RouteRequest<'_>,
+            Reservations,
+            Expected,
+        )> = vec![
+            (
+                "an unreachable node is skipped",
+                vec![unreachable("a"), ready("b", None, 0)],
+                RouteRequest::new(RouteMode::Throughput),
+                Reservations::none(),
+                Ok(("b", RouteReason::OnlyCandidate, None)),
+            ),
+            (
+                "an idle fabric ties on label",
+                vec![ready("windows", None, 0), ready("mac", None, 0)],
+                RouteRequest::new(RouteMode::Throughput),
+                Reservations::none(),
+                Ok(("mac", RouteReason::LeastLoaded, None)),
+            ),
+            (
+                "least loaded wins",
+                vec![
+                    ready("a", None, 3),
+                    ready("b", None, 1),
+                    ready("c", None, 2),
+                ],
+                RouteRequest::new(RouteMode::Throughput),
+                Reservations::none(),
+                Ok(("b", RouteReason::LeastLoaded, None)),
+            ),
+            (
+                "a model matches only its server",
+                vec![
+                    ready("a", Some("llama-3b"), 0),
+                    ready("b", Some("qwen-4b"), 0),
+                ],
+                RouteRequest::new(RouteMode::Throughput).with_model(Some("qwen-4b")),
+                Reservations::none(),
+                Ok(("b", RouteReason::OnlyCandidate, None)),
+            ),
+            (
+                "a not-ready node is skipped",
+                vec![not_ready("a"), ready("b", Some("m"), 0)],
+                RouteRequest::new(RouteMode::Throughput).with_model(Some("m")),
+                Reservations::none(),
+                Ok(("b", RouteReason::OnlyCandidate, None)),
+            ),
+            (
+                "affinity holds on a busier warm node",
+                vec![ready("warm", None, 3), ready("idle", None, 0)],
+                RouteRequest::new(RouteMode::Affinity).with_sticky(Some("warm")),
+                Reservations::none(),
+                Ok(("warm", RouteReason::Affinity, None)),
+            ),
+            (
+                "affinity degrades when the warm node dies",
+                vec![unreachable("warm"), ready("idle", None, 0)],
+                RouteRequest::new(RouteMode::Affinity).with_sticky(Some("warm")),
+                Reservations::none(),
+                Ok(("idle", RouteReason::OnlyCandidate, Some("warm"))),
+            ),
+            (
+                "a reservation moves the next request along",
+                vec![
+                    ready("a", Some("m"), 0),
+                    ready("b", Some("m"), 0),
+                    ready("c", Some("m"), 0),
+                ],
+                RouteRequest::new(RouteMode::Throughput),
+                reserved_a.clone(),
+                Ok(("b", RouteReason::LeastLoaded, None)),
+            ),
+            (
+                "completion time prefers the fast busy node",
+                vec![fast.clone(), slow.clone()],
+                RouteRequest::new(RouteMode::CompletionTime)
+                    .with_model(Some("m"))
+                    .with_service_class(Some("/v1/chat/completions")),
+                Reservations::none(),
+                Ok(("fast", RouteReason::EstimatedCompletion, None)),
+            ),
+            (
+                "a dead fabric says how it died",
+                vec![unreachable("a"), not_ready("b")],
+                RouteRequest::new(RouteMode::Throughput),
+                Reservations::none(),
+                Err(RouteError::AllNodesUnavailable {
+                    unreachable: 1,
+                    not_ready: 1,
+                    not_placeable: 0,
+                }),
+            ),
+            (
+                "a missing model names what is served and what could not be asked",
+                vec![ready("a", Some("llama-3b"), 0), unreachable("b")],
+                RouteRequest::new(RouteMode::Throughput).with_model(Some("qwen-4b")),
+                Reservations::none(),
+                Err(RouteError::ModelUnavailable {
+                    model: "qwen-4b".to_string(),
+                    serving: vec!["llama-3b".to_string()],
+                    unobserved: 1,
+                    held_by_unplaced: Vec::new(),
+                }),
+            ),
+        ];
+
+        for (name, nodes, request, reserved, expected) in &cases {
+            for requires in [Requirements::default(), tools(), rerank()] {
+                let got = route_reserved_with_estimates(
+                    nodes,
+                    &request.requiring(requires),
+                    reserved,
+                    &estimates,
+                )
+                .map(|decision| {
+                    (
+                        decision.label,
+                        decision.reason,
+                        decision.affinity_lost,
+                        decision.model,
+                    )
+                });
+                let expected = expected.clone().map(|(label, reason, lost)| {
+                    (
+                        label.to_string(),
+                        reason,
+                        lost.map(str::to_string),
+                        request.model.map(str::to_string),
+                    )
+                });
+                assert_eq!(got, expected, "{name} with {requires:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rerank_request_never_lands_on_an_engine_without_the_route() {
+        let nodes = [
+            ready("win", Some("m"), 5),
+            foreign("studio", NodeEngine::Ollama, "m"),
+        ];
+        let mixed = RouteRequest::new(RouteMode::Throughput)
+            .with_model(Some("m"))
+            .with_mixed_engines(MIXED);
+        assert_eq!(route(&nodes, &mixed).expect("routes").label, "studio");
+        assert_eq!(
+            route(&nodes, &mixed.requiring(rerank()))
+                .expect("our engine has the route")
+                .label,
+            "win"
+        );
+
+        let error = route(&nodes[1..], &mixed.requiring(rerank())).expect_err("no route");
+        assert!(
+            matches!(
+                error,
+                RouteError::RequirementUnmet {
+                    requirement: "rerank_route",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("exposes a rerank route"), "{message}");
+        assert!(!message.contains("supports"), "{message}");
+    }
+
+    #[test]
+    fn a_model_only_an_unplaced_engine_holds_is_refused_as_settled_and_names_it() {
+        let nodes = [
+            ready("a-camelid", Some("a"), 0),
+            foreign("b-ollama", NodeEngine::Ollama, "x"),
+        ];
+        let error = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput).with_model(Some("x")),
+        )
+        .expect_err("refused: only a foreign node holds it");
+        assert_eq!(
+            error,
+            RouteError::ModelUnavailable {
+                model: "x".to_string(),
+                serving: vec!["a".to_string()],
+                unobserved: 0,
+                held_by_unplaced: vec!["b-ollama".to_string()],
+            },
+            "a node that answered was consulted, so the refusal is settled"
+        );
+        let message = error.to_string();
+        assert!(message.contains("b-ollama"), "{message}");
+        assert!(message.contains(MIXED_ENGINES_FLAG), "{message}");
+
+        let public = error.public_message();
+        assert!(!public.contains("b-ollama"), "{public}");
+        assert!(!public.contains(MIXED_ENGINES_FLAG), "{public}");
+        assert!(
+            public.contains("no ready node is serving model `x`"),
+            "{public}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_off_the_machine_names_no_node_and_no_engine_version() {
+        let error = route(
+            &[foreign("b-ollama", NodeEngine::Ollama, "m")],
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED)
+                .requiring(tools()),
+        )
+        .expect_err("unmeasured");
+        let public = error.public_message();
+        assert!(!public.contains("b-ollama"), "{public}");
+        assert!(!public.contains("ollama"), "{public}");
+        assert!(public.contains("1 node holding this model"), "{public}");
     }
 }

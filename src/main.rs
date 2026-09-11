@@ -1513,6 +1513,27 @@ fn mixed_engines(allowed: bool) -> camelid::fabric::MixedEngines {
     }
 }
 
+/// What `fabric run --json` prints. Pure, so the fields a script reads are
+/// pinned by a test rather than by a terminal.
+fn run_report_json(
+    decision: &camelid::fabric::RouteDecision,
+    answer: &camelid::fabric::Forwarded,
+    model_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "node": answer.label,
+        "engine": decision.engine.as_str(),
+        "reason": decision.reason.as_str(),
+        "affinity_lost": decision.affinity_lost,
+        "model": model_id,
+        "model_identity": decision.model_identity,
+        "residency": decision.residency.map(camelid::fabric::Residency::as_str),
+        "status": answer.status,
+        "elapsed_ms": answer.elapsed.as_millis() as u64,
+        "body": answer.body,
+    })
+}
+
 /// Parse `fabric compare --repeat`, refusing a count the comparison would not
 /// run as asked. The proxy clamps to the same bound; a terminal can be told.
 fn compare_repetitions(raw: &str) -> Result<usize, String> {
@@ -1871,6 +1892,10 @@ enum FabricAction {
         /// refused rather than silently degraded.
         #[arg(long)]
         allow_mixed_engines: bool,
+        /// Place the request as one carrying `tools` would be placed: only on
+        /// a node measured to handle them.
+        #[arg(long)]
+        with_tools: bool,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY.
         #[arg(long, value_name = "TOKEN")]
@@ -2128,6 +2153,18 @@ enum FabricAction {
         /// one value must not silently open both.
         #[arg(long = "cors-origin", value_name = "ORIGIN")]
         cors_origins: Vec<String>,
+        /// Also place on engines this fabric otherwise only reads.
+        ///
+        /// Off unless given, and fixed for the life of the process: restart to
+        /// change it. It accepts, for each such node, what `fabric route --help`
+        /// lists; the proxy prints each one at startup and `/v1/health`
+        /// reports them. With --nodes-file it also covers nodes of other
+        /// engines added to the file later, each announced as it arrives.
+        /// Deliberately reads no environment variable, unlike its neighbours:
+        /// one set in a service definition would turn this on with nothing on
+        /// the command line to show it.
+        #[arg(long)]
+        allow_mixed_engines: bool,
         /// JSON file naming the clients this proxy serves, of the form
         /// {"clients":[{"name":"...","key":"..."}]}.
         ///
@@ -2261,6 +2298,99 @@ mod fabric_command_tests {
                     panic!("{accepted:?} must be accepted: {error}");
                 }
             }
+        });
+    }
+
+    fn serve_allows_mixed_engines(argv: &[&str]) -> bool {
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Some(Command::Fabric {
+                action:
+                    FabricAction::Serve {
+                        allow_mixed_engines,
+                        ..
+                    },
+            }) => allow_mixed_engines,
+            other => panic!("expected fabric serve, got {other:?}"),
+        }
+    }
+
+    /// I1: the proxy places on Camelid nodes unless told otherwise, and the
+    /// spelling it tells operators to add is the one clap actually accepts.
+    #[test]
+    fn fabric_serve_places_on_camelid_only_unless_the_flag_is_given() {
+        on_cli_test_stack(|| {
+            let bare = ["camelid", "fabric", "serve", "--node", "a=127.0.0.1"];
+            assert!(!serve_allows_mixed_engines(&bare));
+            assert_eq!(mixed_engines(false), camelid::fabric::MixedEngines::Refused);
+            assert!(serve_allows_mixed_engines(&[
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+                camelid::fabric::MIXED_ENGINES_FLAG,
+            ]));
+            assert_eq!(mixed_engines(true), camelid::fabric::MixedEngines::Allowed);
+
+            use clap::CommandFactory;
+            let command = Cli::command();
+            let serve = command
+                .find_subcommand("fabric")
+                .and_then(|fabric| fabric.find_subcommand("serve"))
+                .expect("fabric serve exists");
+            let flag = serve
+                .get_arguments()
+                .find(|arg| arg.get_id() == "allow_mixed_engines")
+                .expect("the flag exists");
+            assert_eq!(
+                flag.get_long().map(|long| format!("--{long}")).as_deref(),
+                Some(camelid::fabric::MIXED_ENGINES_FLAG),
+                "health publishes this spelling, so it has to be the one that parses"
+            );
+            assert!(
+                flag.get_env().is_none(),
+                "the flag must not be reachable from the environment"
+            );
+        });
+
+        let decision = camelid::fabric::RouteDecision {
+            label: "b-ollama".to_string(),
+            engine: camelid::fabric::NodeEngine::Ollama,
+            reason: camelid::fabric::RouteReason::OnlyCandidate,
+            affinity_lost: None,
+            model: Some("llama1b-q8:latest".to_string()),
+            model_identity: Some(camelid::fabric::ModelIdentity::AssertedByOperator),
+            residency: Some(camelid::fabric::Residency::Resident),
+        };
+        let answer = camelid::fabric::Forwarded {
+            label: "b-ollama".to_string(),
+            status: 200,
+            body: serde_json::json!({}),
+            elapsed: std::time::Duration::from_millis(7),
+        };
+        let report = run_report_json(&decision, &answer, "llama1b-q8:latest");
+        assert_eq!(report["engine"], "ollama");
+        assert_eq!(report["model"], "llama1b-q8:latest");
+        assert_eq!(report["model_identity"], "asserted_by_operator");
+        assert_eq!(report["residency"], "resident");
+        assert_eq!(report["node"], "b-ollama");
+    }
+
+    /// An ambient variable in a service definition would place on engines
+    /// nobody measured with nothing on the command line to show it.
+    #[test]
+    fn fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment() {
+        on_cli_test_stack(|| {
+            std::env::set_var("CAMELID_ALLOW_MIXED_ENGINES", "1");
+            let allowed = serve_allows_mixed_engines(&[
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+            ]);
+            std::env::remove_var("CAMELID_ALLOW_MIXED_ENGINES");
+            assert!(!allowed, "the environment turned mixed placement on");
         });
     }
 
@@ -4986,6 +5116,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 sticky,
                 allow_mixed_engines,
+                with_tools,
                 bearer,
                 transport,
                 timeout_ms,
@@ -5000,11 +5131,18 @@ async fn main() -> anyhow::Result<()> {
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
                     .with_sticky(sticky.as_deref())
-                    .with_mixed_engines(mixed_engines(allow_mixed_engines));
+                    .with_mixed_engines(mixed_engines(allow_mixed_engines))
+                    .requiring(camelid::fabric::Requirements {
+                        tool_calls: with_tools,
+                        ..camelid::fabric::Requirements::default()
+                    });
 
                 // A fabric that cannot place the request is a failure the caller
-                // must see in the exit code, not only in the text.
-                let decision = camelid::fabric::route(&snapshots, &request)
+                // must see in the exit code, not only in the text. Decided by
+                // the fabric, so the node file's aliases apply exactly as they
+                // do when the proxy places the same request.
+                let decision = fabric
+                    .decide(&snapshots, &request)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
                 if json {
@@ -5012,8 +5150,12 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "label": decision.label,
+                            "engine": decision.engine.as_str(),
                             "reason": decision.reason.as_str(),
                             "affinity_lost": decision.affinity_lost,
+                            "model": decision.model,
+                            "model_identity": decision.model_identity,
+                            "residency": decision.residency.map(camelid::fabric::Residency::as_str),
                         }))?
                     );
                 } else {
@@ -5059,9 +5201,10 @@ async fn main() -> anyhow::Result<()> {
                 let decision = placement.decision();
                 let chosen = placement.node();
 
-                // The request must name a model. Prefer the operator's choice,
-                // otherwise use whatever the chosen node has loaded.
-                let model_id = match model {
+                // The request must name a model: the id placement settled on
+                // for the chosen node — the operator's, or what an alias says
+                // that node calls it — otherwise whatever it has loaded.
+                let model_id = match decision.model.clone().or(model) {
                     Some(model) => model,
                     None => chosen
                         .active_model_id()
@@ -5077,7 +5220,7 @@ async fn main() -> anyhow::Result<()> {
                 let body = camelid::fabric::forward::chat_request(&model_id, &prompt, max_tokens);
                 let answer = fabric
                     .forward_to(
-                        &chosen.spec,
+                        &placement,
                         "/v1/chat/completions",
                         &body,
                         std::time::Duration::from_secs(forward_timeout_s),
@@ -5090,15 +5233,20 @@ async fn main() -> anyhow::Result<()> {
                 if json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "node": answer.label,
-                            "reason": decision.reason.as_str(),
-                            "affinity_lost": decision.affinity_lost,
-                            "model": model_id,
-                            "status": answer.status,
-                            "elapsed_ms": answer.elapsed.as_millis() as u64,
-                            "body": answer.body,
-                        }))?
+                        serde_json::to_string_pretty(&run_report_json(
+                            decision, &answer, &model_id
+                        ))?
+                    );
+                } else if allow_mixed_engines {
+                    // Only when another engine could have answered: a
+                    // Camelid-only run prints exactly what it always did.
+                    println!(
+                        "[{} · {} · {} · {} · {} ms]",
+                        answer.label,
+                        decision.engine.as_str(),
+                        decision.reason.as_str(),
+                        model_id,
+                        answer.elapsed.as_millis()
                     );
                 } else {
                     println!(
@@ -5200,9 +5348,11 @@ async fn main() -> anyhow::Result<()> {
                 tls_key,
                 allow_cleartext_remote,
                 cors_origins,
+                allow_mixed_engines,
                 client_keys,
             } => {
                 let mode = route_mode(&mode)?;
+                let mixed = mixed_engines(allow_mixed_engines);
                 let bearer = fabric_bearer(bearer);
                 let auth = match client_keys {
                     Some(path) => camelid::fabric::server::ClientAuth::from_key_file(path)?,
@@ -5267,10 +5417,33 @@ async fn main() -> anyhow::Result<()> {
                          machine without a restart"
                     );
                 }
+                // Before the first look at the file, so that every foreign node
+                // added from here on is announced: the flag covers them too.
+                if mixed == camelid::fabric::MixedEngines::Allowed {
+                    fabric.announce_foreign_additions(true);
+                }
                 // Nothing is being served yet, so this probe costs no request, and
                 // it is the only chance to tell the operator about a node that is
                 // not there before a client discovers it for them.
-                print!("{}", camelid::fabric::startup_report(&fabric.observe()));
+                let snapshots = fabric.observe();
+                let served: Vec<String> = fabric
+                    .servable_models(&snapshots, mixed)
+                    .into_iter()
+                    .map(|model| model.id)
+                    .collect();
+                print!(
+                    "{}",
+                    camelid::fabric::startup_report_serving(&snapshots, &served)
+                );
+                print!(
+                    "{}",
+                    camelid::fabric::placement_report(
+                        &snapshots,
+                        mixed,
+                        fabric.is_reloadable(),
+                        &fabric.aliases_in_force(),
+                    )
+                );
                 camelid::fabric::server::serve_on(
                     listener,
                     fabric,
@@ -5280,6 +5453,7 @@ async fn main() -> anyhow::Result<()> {
                         auth,
                         tls,
                         cors,
+                        mixed,
                         bound,
                     },
                 )

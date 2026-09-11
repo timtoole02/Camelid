@@ -126,20 +126,34 @@ pub(crate) fn probe(spec: &NodeSpec, timeout: Duration, transport: &NodeTranspor
     }
 
     // A failure here is not fatal: the node can still serve, we simply do not
-    // learn which model is warm. Reporting none is the honest degradation.
-    let mut resident = get_json::<ModelListing>(spec, "/api/ps", timeout, transport)
+    // learn which model is warm. That is unknown, not "none resident": the two
+    // are priced differently by placement.
+    let resident = get_json::<ModelListing>(spec, "/api/ps", timeout, transport)
         .map(ModelListing::names)
-        .unwrap_or_default();
-    resident.retain(|name| installed.contains(name));
+        .ok();
 
+    ready_from(version, installed, resident)
+}
+
+/// Turn what the three listings said into a routing status. Pure.
+fn ready_from(
+    version: String,
+    installed: Vec<String>,
+    resident: Option<Vec<String>>,
+) -> NodeStatus {
+    let resident = resident.map(|mut resident| {
+        resident.retain(|name| installed.contains(name));
+        resident
+    });
     NodeStatus::Ready(NodeReady {
         engine: NodeEngine::Ollama,
         // Only when there is exactly one; see the module note.
-        active_model_id: match resident.as_slice() {
-            [only] => Some(only.clone()),
+        active_model_id: match resident.as_deref() {
+            Some([only]) => Some(only.clone()),
             _ => None,
         },
         models: installed,
+        resident_models: resident,
         // Ollama names no execution lane, and publishes no queue depth.
         backend: None,
         version: (!version.is_empty()).then_some(version),
@@ -397,6 +411,37 @@ mod tests {
         );
         let reason = weights_blob_digest(&two).expect_err("ambiguous");
         assert!(reason.contains("2 blobs"), "{reason}");
+    }
+
+    /// A running list that could not be read says nothing about what is warm.
+    /// Reported as empty it would claim every model is cold, and placement
+    /// prices a cold holder and an unknown one differently.
+    #[test]
+    fn a_running_list_that_cannot_be_read_is_unknown_not_empty() {
+        let installed = vec!["a:latest".to_string(), "b:latest".to_string()];
+        let unread = ready_from("0.33.2".to_string(), installed.clone(), None);
+        let ready = unread.ready().expect("still serving");
+        assert_eq!(ready.resident_models, None);
+        assert_eq!(ready.active_model_id, None);
+
+        let empty = ready_from("0.33.2".to_string(), installed.clone(), Some(Vec::new()));
+        assert_eq!(
+            empty.ready().expect("serving").resident_models,
+            Some(Vec::new())
+        );
+
+        let one = ready_from(
+            "0.33.2".to_string(),
+            installed,
+            Some(vec!["b:latest".to_string(), "gone:latest".to_string()]),
+        );
+        let ready = one.ready().expect("serving");
+        assert_eq!(
+            ready.resident_models,
+            Some(vec!["b:latest".to_string()]),
+            "a resident model that is not installed is not something it serves"
+        );
+        assert_eq!(ready.active_model_id.as_deref(), Some("b:latest"));
     }
 
     #[test]

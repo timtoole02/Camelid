@@ -87,6 +87,7 @@ fn classify(payload: &HealthPayload) -> NodeStatus {
         active_model_id: payload.active_model_id.clone(),
         // A Camelid node serves exactly the model it has loaded.
         models: payload.active_model_id.clone().into_iter().collect(),
+        resident_models: payload.active_model_id.clone().map(|model| vec![model]),
         backend: (!payload.backend.is_empty()).then(|| payload.backend.clone()),
         version: (!payload.version.is_empty()).then(|| payload.version.clone()),
         load: Some(NodeLoad {

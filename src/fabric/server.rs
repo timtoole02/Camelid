@@ -73,6 +73,15 @@
 //!   a node that took the request and then failed ends it, because this proxy
 //!   cannot know whether it started generating. See
 //!   [`super::DEFAULT_MAX_FORWARD_ATTEMPTS`].
+//! * **Mixed engines.** By default this proxy places on Camelid nodes only.
+//!   `--allow-mixed-engines`, fixed for the life of the process, also places
+//!   on engines it otherwise only reads. Every answer then also names the
+//!   model id sent and, where the node's own listing said, whether it was
+//!   resident; a request carrying tools, or for a rerank route, still never
+//!   lands on a node that cannot be shown to handle it; and a refusal from
+//!   such a node is relayed once, never re-placed, because nothing tells it
+//!   apart from a real failure. `/v1/health` reports the mode and, on
+//!   loopback, what it accepts about each node.
 //! * A client that hangs up takes its request's work with it. A dispatch runs
 //!   on a blocking thread and cannot be aborted, so it is told instead: the
 //!   frame that owns the request holds a [`Cancel`], dropping that frame is
@@ -108,9 +117,15 @@ use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
 use super::client_keys::Admission;
-use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
+use super::policy::{
+    MixedEngines, Residency, RouteDecision, RouteError, RouteMode, RouteRequest, COLD_LOAD_COST,
+    MIXED_ENGINES_FLAG, UNREPORTED_LOAD_COST,
+};
 use crate::api::{ApiAuth, DEFAULT_MAX_REQUEST_BODY_BYTES};
-use crate::fabric::{self as fabric, Cancel, DispatchError, Fabric, ForwardError, StreamOutcome};
+use crate::fabric::{
+    self as fabric, Cancel, DispatchError, Fabric, ForwardError, ModelIdentity, NodeEngine,
+    StreamOutcome,
+};
 use crate::tls_pair::resolve_tls;
 
 /// Optional header a client sends to request affinity to a specific node.
@@ -295,6 +310,10 @@ pub struct ServeConfig {
     /// Browser origins allowed to read this proxy. `None` — the default — sends
     /// no CORS header at all.
     pub cors: Option<ProxyCors>,
+    /// Whether this proxy also places on engines it otherwise only reads.
+    /// Fixed for the life of the process: a request is placed under the mode
+    /// the proxy started with, and there is no route that changes it.
+    pub mixed: MixedEngines,
     /// The address this proxy listens on.
     ///
     /// Read only to decide whether `/v1/health` may name the fabric's members:
@@ -318,6 +337,11 @@ struct ServerState {
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
     let auth = config.auth.clone();
     let cors = config.cors.clone();
+    // Under mixed placement a foreign node added to the node file is placed on
+    // at once, so from here on every such addition is announced.
+    if config.mixed == MixedEngines::Allowed {
+        fabric.announce_foreign_additions(true);
+    }
 
     let placed = PLACED_ROUTES.iter().fold(Router::new(), |router, path| {
         let path = *path;
@@ -811,9 +835,59 @@ async fn health(State(state): State<ServerState>) -> Response {
         }
     };
 
-    let (status, body) = health_report(&snapshots, state.config.bound.ip().is_loopback());
+    let view = PlacementView::of(&state.fabric, &snapshots, state.config.mixed);
+    let (status, body) = health_report(&snapshots, disclose(&state), &view);
     (status, Json(body)).into_response()
 }
+
+/// Whether this proxy may name its nodes and their engines' versions. Only a
+/// loopback listener may: this is decided by the address it is bound to, the
+/// same fact for health and for refusals.
+fn disclose(state: &ServerState) -> bool {
+    state.config.bound.ip().is_loopback()
+}
+
+/// How this proxy places, gathered from the fabric so the report that renders
+/// it stays pure.
+struct PlacementView {
+    mixed: MixedEngines,
+    served: Vec<String>,
+    served_if_mixed: Vec<String>,
+    max_forward_attempts: usize,
+    covers_nodes_added_later: bool,
+    foreign_added: Vec<fabric::ForeignAddition>,
+}
+
+impl PlacementView {
+    fn of(fabric: &Fabric, snapshots: &[fabric::NodeSnapshot], mixed: MixedEngines) -> Self {
+        let ids = |mode: MixedEngines| -> Vec<String> {
+            fabric
+                .servable_models(snapshots, mode)
+                .into_iter()
+                .map(|model| model.id)
+                .collect()
+        };
+        let served = ids(mixed);
+        let served_if_mixed = ids(MixedEngines::Allowed)
+            .into_iter()
+            .filter(|id| !served.contains(id))
+            .collect();
+        Self {
+            mixed,
+            served,
+            served_if_mixed,
+            max_forward_attempts: fabric.max_forward_attempts(),
+            covers_nodes_added_later: fabric.is_reloadable(),
+            foreign_added: fabric.foreign_added_since_start(),
+        }
+    }
+}
+
+/// The sentence the Routing screen shows for what the flag means over a node
+/// file that is re-read. Written here, where the behaviour is, so a page never
+/// describes a proxy it is not talking to.
+const STANDING_GRANT: &str = "This also applies to any node of another engine added to the nodes \
+     file later, without asking again.";
 
 /// Longest prompt this route will compare. A comparison is a diagnostic, not a
 /// serving path, and every byte here is generated against twice.
@@ -995,13 +1069,19 @@ fn compare_status(error: &fabric::CompareError) -> StatusCode {
 ///
 /// Kept pure so both rules are covered by unit tests rather than by starting a
 /// server and guessing which branch ran.
-fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (StatusCode, Value) {
+fn health_report(
+    snapshots: &[fabric::NodeSnapshot],
+    disclose_detail: bool,
+    view: &PlacementView,
+) -> (StatusCode, Value) {
     let summary = fabric::FabricSummary::of(snapshots);
     // Readiness is "a request placed now would find a node", which is not the
     // same as "some node is healthy": a fabric whose only healthy node runs an
     // engine this proxy does not place on can serve nothing, and reporting it
     // ready would keep it in a load balancer's rotation while every request 503s.
-    let ready = snapshots.iter().any(fabric::NodeSnapshot::is_placeable);
+    let ready = snapshots
+        .iter()
+        .any(|snapshot| snapshot.is_placeable_under(view.mixed));
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -1022,9 +1102,28 @@ fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (
                     "unreachable": summary.unreachable,
                 }),
             );
+            object.insert("models".to_string(), serde_json::json!(view.served));
+            // Configuration, not observation, so it lives with the rest of
+            // what only a loopback caller is told. Every sentence in it is
+            // this build's, for the reason given on `STANDING_GRANT`.
+            let consequences: Vec<Value> = if view.covers_nodes_added_later {
+                vec![serde_json::json!({ "key": "standing_grant", "text": STANDING_GRANT })]
+            } else {
+                Vec::new()
+            };
             object.insert(
-                "models".to_string(),
-                serde_json::json!(fabric::servable_models(snapshots)),
+                "placement".to_string(),
+                serde_json::json!({
+                    "mixed_engines": view.mixed.as_str(),
+                    "flag": MIXED_ENGINES_FLAG,
+                    "unreported_load_cost": UNREPORTED_LOAD_COST,
+                    "cold_load_cost": COLD_LOAD_COST,
+                    "max_forward_attempts": view.max_forward_attempts,
+                    "models_if_mixed": view.served_if_mixed,
+                    "covers_nodes_added_later": view.covers_nodes_added_later,
+                    "consequences": consequences,
+                    "foreign_nodes_added_since_start": view.foreign_added,
+                }),
             );
             // The shape `fabric status --json` already prints, plus two fields
             // only a fabric can answer: whether *this* proxy would place work on
@@ -1036,7 +1135,7 @@ fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (
                     if let Some(entry) = entry.as_object_mut() {
                         entry.insert(
                             "placeable".to_string(),
-                            serde_json::Value::Bool(snapshot.is_placeable()),
+                            serde_json::Value::Bool(snapshot.is_placeable_under(view.mixed)),
                         );
                         let capabilities = snapshot.capabilities();
                         if let Ok(value) = serde_json::to_value(capabilities) {
@@ -1045,6 +1144,18 @@ fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (
                         entry.insert(
                             "placement_blockers".to_string(),
                             serde_json::json!(capabilities.placement_blockers()),
+                        );
+                        entry.insert(
+                            "placement_blocker_detail".to_string(),
+                            serde_json::json!(
+                                capabilities.placement_blocker_detail(UNREPORTED_LOAD_COST)
+                            ),
+                        );
+                        entry.insert(
+                            "requirement_limits".to_string(),
+                            serde_json::json!(
+                                capabilities.requirement_limits(&snapshot.engine_and_version())
+                            ),
                         );
                     }
                 }
@@ -1085,9 +1196,11 @@ async fn models(State(state): State<ServerState>) -> Response {
         }
     };
 
-    let data: Vec<Value> = super::servable_models(&snapshots)
+    let data: Vec<Value> = state
+        .fabric
+        .servable_models(&snapshots, state.config.mixed)
         .into_iter()
-        .map(|id| model_object(&id))
+        .map(|model| listed(&model.id, model.identity))
         .collect();
 
     Json(serde_json::json!({ "object": "list", "data": data })).into_response()
@@ -1113,12 +1226,18 @@ async fn model(Path(id): Path<String>, State(state): State<ServerState>) -> Resp
         }
     };
 
-    match route(
+    match state.fabric.decide(
         &snapshots,
-        &RouteRequest::new(RouteMode::Throughput).with_model(Some(&id)),
+        &RouteRequest::new(RouteMode::Throughput)
+            .with_model(Some(&id))
+            .with_mixed_engines(state.config.mixed),
     ) {
-        Ok(_) => Json(model_object(&id)).into_response(),
-        Err(error) => route_error(error),
+        Ok(decision) => Json(listed(
+            &id,
+            decision.model_identity.unwrap_or(ModelIdentity::SameId),
+        ))
+        .into_response(),
+        Err(error) => route_error(error, disclose(&state)),
     }
 }
 
@@ -1130,6 +1249,16 @@ fn model_object(id: &str) -> Value {
         "created": 0,
         "owned_by": "camelid",
     })
+}
+
+/// A listed model, marked when what it names rests on an operator's word.
+/// Plain entries keep exactly the shape they always had.
+fn listed(id: &str, identity: ModelIdentity) -> Value {
+    let mut object = model_object(id);
+    if identity == ModelIdentity::AssertedByOperator {
+        object["x_camelid_identity"] = Value::String("asserted_by_operator".to_string());
+    }
+    object
 }
 
 /// Refuse a route whose answer lives on one node.
@@ -1229,7 +1358,7 @@ impl OwnedRequest {
     /// settles the mode for its own request. Without this the header would be
     /// dead under the throughput default, since placement only consults a
     /// sticky label in [`RouteMode::Affinity`].
-    fn as_route(&self, default_mode: RouteMode) -> RouteRequest<'_> {
+    fn as_route(&self, default_mode: RouteMode, mixed: MixedEngines) -> RouteRequest<'_> {
         let mode = match self.sticky {
             Some(_) => RouteMode::Affinity,
             None => default_mode,
@@ -1237,6 +1366,7 @@ impl OwnedRequest {
         RouteRequest::new(mode)
             .with_model(self.model.as_deref())
             .with_sticky(self.sticky.as_deref())
+            .with_mixed_engines(mixed)
     }
 }
 
@@ -1252,6 +1382,8 @@ async fn buffered_completion(
     // detaches a blocking task rather than aborting it. Named, because binding
     // to `_` would drop it here and cancel the request before it started.
     let _client = CancelOnDrop(cancel.clone());
+    let mixed = state.config.mixed;
+    let disclose = disclose(&state);
 
     // Fabric::dispatch is synchronous socket I/O (probes every node, then
     // forwards) and can legitimately run for the whole forward_timeout — up to
@@ -1263,7 +1395,7 @@ async fn buffered_completion(
         state.fabric.dispatch(
             path,
             &body,
-            &request.as_route(state.config.mode),
+            &request.as_route(state.config.mode, state.config.mixed),
             state.config.forward_timeout,
             &cancel,
         )
@@ -1279,11 +1411,12 @@ async fn buffered_completion(
                 response.headers_mut(),
                 &dispatched.decision,
                 dispatched.attempts,
+                mixed,
             );
             response
         }
-        Ok(Err(DispatchError::Route(error))) => route_error(error),
-        Ok(Err(DispatchError::Forward(error))) => forward_error(error),
+        Ok(Err(DispatchError::Route(error))) => route_error(error, disclose),
+        Ok(Err(DispatchError::Forward { error, engine })) => forward_error(error, engine),
         Err(join_error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("dispatch task did not complete: {join_error}"),
@@ -1336,6 +1469,8 @@ async fn stream_completion(
     // is a whole prefill long.
     let client = CancelOnDrop(cancel.clone());
     let dispatch_cancel = cancel.clone();
+    let mixed = state.config.mixed;
+    let disclose = disclose(&state);
 
     // Same reasoning as the buffered path: this is blocking socket I/O for the
     // whole life of the generation, so it belongs on the blocking pool. It also
@@ -1345,7 +1480,7 @@ async fn stream_completion(
         let outcome = state.fabric.dispatch_streaming(
             path,
             &body,
-            &request.as_route(state.config.mode),
+            &request.as_route(state.config.mode, state.config.mixed),
             state.config.forward_timeout,
             state.config.forward_timeout,
             &dispatch_cancel,
@@ -1435,8 +1570,10 @@ async fn stream_completion(
     };
 
     let (decision, attempts, status, content_type) = match start {
-        StreamStart::Failed(DispatchError::Route(error)) => return route_error(error),
-        StreamStart::Failed(DispatchError::Forward(error)) => return forward_error(error),
+        StreamStart::Failed(DispatchError::Route(error)) => return route_error(error, disclose),
+        StreamStart::Failed(DispatchError::Forward { error, engine }) => {
+            return forward_error(error, engine)
+        }
         StreamStart::Buffered {
             decision,
             attempts,
@@ -1444,7 +1581,7 @@ async fn stream_completion(
         } => {
             let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, Json(answer.body)).into_response();
-            tag(response.headers_mut(), &decision, attempts);
+            tag(response.headers_mut(), &decision, attempts, mixed);
             return response;
         }
         StreamStart::Streaming {
@@ -1477,12 +1614,21 @@ async fn stream_completion(
         insert(out, CONTENT_TYPE, content_type);
     }
     insert(out, CACHE_CONTROL, "no-cache");
-    tag(out, &decision, attempts);
+    tag(out, &decision, attempts, mixed);
     response
 }
 
 /// Record which node served a request and why, on any answer shape.
-fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize) {
+///
+/// Three headers are sent only where they say something a Camelid-only proxy
+/// never had to: the model id sent, under mixed placement or when an alias
+/// changed it; that the id rests on an operator's declaration, only then; and
+/// the residency the node's own listing reported, under mixed placement and
+/// only when it reported one. That last one is an observation, at most the
+/// proxy's observation age (500 ms by default) older than the send, and an
+/// engine that unloads on its own timer can make it stale. A default proxy
+/// answers with exactly the headers it always did.
+fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize, mixed: MixedEngines) {
     insert(headers, "x-camelid-fabric-node", &decision.label);
     // Always sent, in every routing mode, so a client never has to know which
     // engines this fabric is willing to place on to find out which one answered.
@@ -1493,6 +1639,31 @@ fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize) {
     insert(headers, "x-camelid-fabric-attempts", &attempts.to_string());
     if let Some(previous) = &decision.affinity_lost {
         insert(headers, "x-camelid-fabric-affinity-lost", previous);
+    }
+    let aliased = decision.model_identity == Some(ModelIdentity::AssertedByOperator);
+    if let Some(model) = decision.model.as_deref() {
+        if mixed == MixedEngines::Allowed || aliased {
+            insert(headers, "x-camelid-fabric-model", model);
+        }
+    }
+    if aliased {
+        insert(
+            headers,
+            "x-camelid-fabric-model-identity",
+            "asserted_by_operator",
+        );
+    }
+    if mixed == MixedEngines::Allowed {
+        match decision.residency {
+            Some(residency @ (Residency::Resident | Residency::NotResident)) => {
+                insert(
+                    headers,
+                    "x-camelid-fabric-residency-observed",
+                    residency.as_str(),
+                );
+            }
+            Some(Residency::Unknown) | None => {}
+        }
     }
 }
 
@@ -1522,7 +1693,14 @@ fn rejected_body(rejection: JsonRejection) -> Response {
     error_response(status, &rejection.to_string())
 }
 
-fn route_error(error: RouteError) -> Response {
+/// A refusal, in the words `disclose` allows: an off-box listener gets
+/// [`RouteError::public_message`], which names no node and no engine version.
+fn route_error(error: RouteError, disclose: bool) -> Response {
+    let message = if disclose {
+        error.to_string()
+    } else {
+        error.public_message()
+    };
     match &error {
         // The client asked to go back to a node that cannot say its prefix is
         // still warm. Repeating the request unchanged will never succeed, and
@@ -1532,7 +1710,7 @@ fn route_error(error: RouteError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": {
-                    "message": error.to_string(),
+                    "message": message,
                     "type": "invalid_request_error",
                     "code": "affinity_unsupported",
                 }
@@ -1550,7 +1728,7 @@ fn route_error(error: RouteError) -> Response {
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": {
-                    "message": error.to_string(),
+                    "message": message,
                     "type": "fabric_error",
                     "code": "model_not_found",
                     "param": "model",
@@ -1558,16 +1736,53 @@ fn route_error(error: RouteError) -> Response {
             })),
         )
             .into_response(),
+        // Every node was asked and none that holds the model can do what the
+        // request carries. Sending it again unchanged cannot succeed; sending
+        // it without tools, or to a node that has the route, can. A caller's
+        // request to change, so 400, like `affinity_unsupported`.
+        RouteError::RequirementUnmet {
+            requirement,
+            unobserved: 0,
+            ..
+        } => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": "capability_unavailable",
+                    "param": if *requirement == "tool_calls" { "tools" } else { "route" },
+                }
+            })),
+        )
+            .into_response(),
+        RouteError::ModelUnspecified { unobserved: 0 } => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": "model_required",
+                    "param": "model",
+                }
+            })),
+        )
+            .into_response(),
         // These can genuinely clear on their own, so they stay retryable.
         RouteError::ModelUnavailable { .. }
+        | RouteError::RequirementUnmet { .. }
+        | RouteError::ModelUnspecified { .. }
         | RouteError::NoNodesConfigured
         | RouteError::AllNodesUnavailable { .. } => {
-            error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+            error_response(StatusCode::SERVICE_UNAVAILABLE, &message)
         }
     }
 }
 
-fn forward_error(error: ForwardError) -> Response {
+/// A request that did not complete, naming the node and — when it was sent
+/// anywhere — the engine it was sent to, taken from the placement so a node
+/// file re-declared mid-request cannot change which engine the answer names.
+fn forward_error(error: ForwardError, engine: Option<NodeEngine>) -> Response {
     let message = error.to_string();
     // The node was reachable but refused unsupported input: that is the
     // caller's mistake, not the upstream's, so it is a 400 not a 502/503.
@@ -1589,6 +1804,13 @@ fn forward_error(error: ForwardError) -> Response {
     // failure that does not carry its node is one nobody can attribute.
     if let Some(label) = label {
         insert(response.headers_mut(), "x-camelid-fabric-node", &label);
+    }
+    if let Some(engine) = engine {
+        insert(
+            response.headers_mut(),
+            "x-camelid-fabric-engine",
+            engine.as_str(),
+        );
     }
     response
 }
@@ -1642,6 +1864,7 @@ mod tests {
             auth: ClientAuth::none(),
             tls: None,
             cors: None,
+            mixed: MixedEngines::default(),
             bound: "127.0.0.1:8490".parse().expect("loopback address"),
         }
     }
@@ -1698,6 +1921,7 @@ mod tests {
             engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: Some(model.to_string()),
             models: vec![model.to_string()],
+            resident_models: Some(vec![model.to_string()]),
             backend: Some("llama".to_string()),
             version: Some("0.6.1".to_string()),
             load: Some(crate::fabric::node::NodeLoad {
@@ -1709,6 +1933,89 @@ mod tests {
 
     fn proxy(fabric: Fabric) -> Router {
         router(fabric, open_config())
+    }
+
+    /// The health answer of a Camelid-only proxy over `snapshots`, which is
+    /// what every test written before mixed placement existed describes.
+    fn report(snapshots: &[NodeSnapshot], disclose_detail: bool) -> (StatusCode, Value) {
+        health_report(
+            snapshots,
+            disclose_detail,
+            &PlacementView::of(&Fabric::new(Vec::new()), snapshots, MixedEngines::Refused),
+        )
+    }
+
+    /// Node labels and engine versions identify what runs where. Health
+    /// withholds them off-box, so a refusal must not hand them out instead —
+    /// while the status a client acts on stays the same either way.
+    #[test]
+    fn an_exposed_listener_refuses_without_naming_engine_versions() {
+        let error = RouteError::RequirementUnmet {
+            requirement: "tool_calls",
+            model: Some("only-on-ollama:latest".to_string()),
+            unmet: vec![("b-ollama".to_string(), "ollama 0.33.2".to_string())],
+            capable_elsewhere: vec!["a-camelid".to_string()],
+            unobserved: 0,
+        };
+        let exposed = route_error(error.clone(), false);
+        let loopback = route_error(error, true);
+        assert_eq!(exposed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(exposed.status(), loopback.status());
+
+        let text = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            String::from_utf8(bytes.to_vec()).expect("utf-8")
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let exposed = runtime.block_on(text(exposed));
+        let loopback = runtime.block_on(text(loopback));
+        assert!(!exposed.contains("0.33.2"), "{exposed}");
+        assert!(!exposed.contains("b-ollama"), "{exposed}");
+        assert!(!exposed.contains("a-camelid"), "{exposed}");
+        assert!(exposed.contains("capability_unavailable"), "{exposed}");
+        assert!(loopback.contains("0.33.2"), "{loopback}");
+        assert!(loopback.contains("b-ollama"), "{loopback}");
+    }
+
+    #[test]
+    fn an_off_box_listener_does_not_disclose_the_routing_mode() {
+        let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
+        let (_, withheld) = report(&snapshots, false);
+        assert!(withheld.get("placement").is_none(), "{withheld}");
+        let (_, disclosed) = report(&snapshots, true);
+        assert_eq!(disclosed["placement"]["mixed_engines"], "refused");
+        assert_eq!(disclosed["placement"]["flag"], MIXED_ENGINES_FLAG);
+    }
+
+    /// S5: a Camelid-only answer carries exactly the headers it always did.
+    #[test]
+    fn a_camelid_only_answer_carries_no_new_header() {
+        let decision = RouteDecision {
+            label: "a".to_string(),
+            engine: NodeEngine::Camelid,
+            reason: RouteReason::OnlyCandidate,
+            affinity_lost: None,
+            model: Some("m".to_string()),
+            model_identity: Some(ModelIdentity::SameId),
+            residency: Some(Residency::Resident),
+        };
+        let mut headers = HeaderMap::new();
+        tag(&mut headers, &decision, 1, MixedEngines::Refused);
+        let mut names: Vec<&str> = headers.keys().map(|name| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "x-camelid-fabric-attempts",
+                "x-camelid-fabric-engine",
+                "x-camelid-fabric-node",
+                "x-camelid-fabric-reason",
+            ]
+        );
     }
 
     /// Collects formatted log output, so these tests assert on what was
@@ -1797,8 +2104,11 @@ mod tests {
                             engine: crate::fabric::engine::NodeEngine::Camelid,
                             reason: RouteReason::LeastLoaded,
                             affinity_lost: None,
+                            model: None,
+                            model_identity: None,
+                            residency: None,
                         };
-                        tag(response.headers_mut(), &decision, 1);
+                        tag(response.headers_mut(), &decision, 1, MixedEngines::Refused);
                     }
                     response
                 }),
@@ -1900,10 +2210,13 @@ mod tests {
             .route(
                 "/v1/chat/completions",
                 post(|| async {
-                    forward_error(ForwardError::Transport {
-                        label: "node-a".to_string(),
-                        detail: "connection refused".to_string(),
-                    })
+                    forward_error(
+                        ForwardError::Transport {
+                            label: "node-a".to_string(),
+                            detail: "connection refused".to_string(),
+                        },
+                        None,
+                    )
                 }),
             )
             .layer(middleware::from_fn(access_log));
@@ -2035,7 +2348,7 @@ mod tests {
                 },
             ),
         ];
-        let (status, body) = health_report(&snapshots, true);
+        let (status, body) = report(&snapshots, true);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["ready"], serde_json::json!(true));
@@ -2056,7 +2369,7 @@ mod tests {
                 reason: "no model loaded".to_string(),
             },
         )];
-        let (status, body) = health_report(&snapshots, true);
+        let (status, body) = report(&snapshots, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["ready"], serde_json::json!(false));
@@ -2076,6 +2389,7 @@ mod tests {
                 engine: crate::fabric::engine::NodeEngine::Ollama,
                 active_model_id: None,
                 models: vec!["mistral:latest".to_string()],
+                resident_models: Some(Vec::new()),
                 backend: None,
                 version: Some("0.33.3".to_string()),
                 load: None,
@@ -2083,7 +2397,7 @@ mod tests {
             latency: Some(Duration::from_millis(9)),
         };
 
-        let (status, body) = health_report(std::slice::from_ref(&foreign), true);
+        let (status, body) = report(std::slice::from_ref(&foreign), true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ready"], serde_json::json!(false));
         // The node is still reported as the healthy machine it is...
@@ -2109,8 +2423,8 @@ mod tests {
     #[test]
     fn the_readiness_verdict_is_the_same_off_box() {
         let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
-        let (disclosed, _) = health_report(&snapshots, true);
-        let (withheld, body) = health_report(&snapshots, false);
+        let (disclosed, _) = report(&snapshots, true);
+        let (withheld, body) = report(&snapshots, false);
         assert_eq!(disclosed, withheld);
         assert_eq!(body["ready"], serde_json::json!(true));
     }
@@ -2118,7 +2432,7 @@ mod tests {
     #[test]
     fn a_loopback_listener_may_name_the_fabric() {
         let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
-        let (_, body) = health_report(&snapshots, true);
+        let (_, body) = report(&snapshots, true);
         let detail = body["node_detail"].as_array().expect("node detail");
         assert_eq!(detail.len(), 1);
         assert_eq!(detail[0]["spec"]["label"], serde_json::json!("a"));
@@ -2131,7 +2445,7 @@ mod tests {
     #[test]
     fn an_exposed_listener_does_not_name_the_fabric() {
         let snapshots = vec![snapshot("a", ready_status("llama-3b"))];
-        let (_, body) = health_report(&snapshots, false);
+        let (_, body) = report(&snapshots, false);
         assert!(body.get("node_detail").is_none(), "{body}");
         assert!(body.get("nodes").is_none(), "{body}");
         assert!(!body.to_string().contains("192.0.2.10"), "{body}");
@@ -2143,7 +2457,7 @@ mod tests {
     #[test]
     fn an_exposed_listener_does_not_list_the_models() {
         let snapshots = vec![snapshot("a", ready_status("private-model"))];
-        let (_, body) = health_report(&snapshots, false);
+        let (_, body) = report(&snapshots, false);
         assert!(body.get("models").is_none(), "{body}");
         assert!(!body.to_string().contains("private-model"), "{body}");
     }
@@ -2718,7 +3032,7 @@ mod tests {
             model: None,
             sticky: Some("warm".to_string()),
         };
-        let route = pinned.as_route(RouteMode::Throughput);
+        let route = pinned.as_route(RouteMode::Throughput, MixedEngines::Refused);
         assert_eq!(route.mode, RouteMode::Affinity);
         assert_eq!(route.sticky, Some("warm"));
 
@@ -2728,11 +3042,15 @@ mod tests {
             sticky: None,
         };
         assert_eq!(
-            plain.as_route(RouteMode::Throughput).mode,
+            plain
+                .as_route(RouteMode::Throughput, MixedEngines::Refused)
+                .mode,
             RouteMode::Throughput
         );
         assert_eq!(
-            plain.as_route(RouteMode::Affinity).mode,
+            plain
+                .as_route(RouteMode::Affinity, MixedEngines::Refused)
+                .mode,
             RouteMode::Affinity
         );
     }
@@ -2778,9 +3096,12 @@ mod tests {
     /// back off, and 502 there would blame a healthy machine.
     #[test]
     fn a_request_whose_client_left_is_not_answered_as_a_node_failure() {
-        let abandoned = forward_error(ForwardError::Cancelled {
-            label: "node-a".to_string(),
-        });
+        let abandoned = forward_error(
+            ForwardError::Cancelled {
+                label: "node-a".to_string(),
+            },
+            None,
+        );
         assert_eq!(abandoned.status().as_u16(), 499);
         assert_eq!(
             abandoned
@@ -2791,10 +3112,13 @@ mod tests {
         );
 
         // The control: a node that really did fail still answers 502.
-        let failed = forward_error(ForwardError::Transport {
-            label: "node-a".to_string(),
-            detail: "connection reset".to_string(),
-        });
+        let failed = forward_error(
+            ForwardError::Transport {
+                label: "node-a".to_string(),
+                detail: "connection reset".to_string(),
+            },
+            None,
+        );
         assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
     }
 

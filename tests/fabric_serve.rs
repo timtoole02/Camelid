@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use camelid::fabric::server::{
     serve_on, serve_on_until, ClientAuth, ProxyCors, ProxyTls, ServeConfig,
 };
-use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
+use camelid::fabric::{Fabric, MixedEngines, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,6 +97,12 @@ struct StubConfig {
     live_completion_watch: Option<Arc<Mutex<Duration>>>,
     /// How far into `completion_watch` the caller went away, if it did.
     caller_left_after: Arc<Mutex<Option<Duration>>>,
+    /// When set, `/v1/health` reports `generation_ready` from this, so a test
+    /// can take the node's model away while the proxy is running.
+    live_ready: Option<Arc<AtomicBool>>,
+    /// Further paths answered 200 with a fixed body. How a stub reads as an
+    /// engine other than Camelid, whose listings live on other routes.
+    listings: Vec<(&'static str, String)>,
 }
 
 impl StubConfig {
@@ -125,6 +131,38 @@ impl StubConfig {
             completion_watch: Duration::ZERO,
             live_completion_watch: None,
             caller_left_after: Arc::new(Mutex::new(None)),
+            live_ready: None,
+            listings: Vec::new(),
+        }
+    }
+
+    /// An Ollama server holding `installed`, with `/api/ps` answering
+    /// `resident` or, for `None`, not answering at all. Completions are
+    /// answered like any other stub's.
+    fn ollama(installed: &[&str], resident: Option<&[&str]>) -> Self {
+        let entries = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!(r#"{{"name":"{name}","model":"{name}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut listings = vec![
+            ("/api/version", r#"{"version":"0.33.2"}"#.to_string()),
+            (
+                "/api/tags",
+                format!(r#"{{"models":[{}]}}"#, entries(installed)),
+            ),
+        ];
+        if let Some(resident) = resident {
+            listings.push((
+                "/api/ps",
+                format!(r#"{{"models":[{}]}}"#, entries(resident)),
+            ));
+        }
+        Self {
+            listings,
+            ..Self::ready(installed.first().copied().unwrap_or("none"), 0)
         }
     }
 
@@ -281,6 +319,12 @@ impl StubNode {
         NodeSpec::camelid(label, "127.0.0.1", self.port)
     }
 
+    /// This stub declared as `engine`, the way an operator writes it.
+    fn spec_as(&self, label: &str, engine: &str) -> NodeSpec {
+        camelid::fabric::parse_node_spec(&format!("{label}={engine}://127.0.0.1:{}", self.port))
+            .expect("spec parses")
+    }
+
     fn received(&self) -> Vec<Received> {
         self.requests.lock().expect("stub lock").clone()
     }
@@ -334,6 +378,9 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
         // Recorded first: the point of this stub is that the node did get the
         // request, whatever the caller ends up seeing.
         requests.lock().expect("stub lock").push(received);
+        if !config.completion_delay.is_zero() {
+            std::thread::sleep(config.completion_delay);
+        }
         return;
     }
 
@@ -357,6 +404,15 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
                 .to_string(),
         ),
         "/v1/health" => (200_u16, health_body(config)),
+        path if config.listings.iter().any(|(listed, _)| *listed == path) => (
+            200,
+            config
+                .listings
+                .iter()
+                .find(|(listed, _)| *listed == path)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_default(),
+        ),
         path if PLACED_ROUTES.contains(&path) => {
             // Counted for exactly as long as the node is working on it.
             let busy = config.live_in_flight.as_ref().map(|count| {
@@ -454,6 +510,9 @@ fn health_body(config: &StubConfig) -> String {
     }
     if let Some(model) = &config.live_model {
         body["active_model_id"] = Value::String(model.lock().expect("stub model lock").clone());
+    }
+    if let Some(ready) = &config.live_ready {
+        body["generation_ready"] = ready.load(Ordering::SeqCst).into();
     }
     body.to_string()
 }
@@ -608,6 +667,7 @@ async fn start_proxy_waiting(
         auth,
         tls: None,
         cors: None,
+        mixed: MixedEngines::default(),
         bound: addr,
     };
     tokio::spawn(async move {
@@ -632,6 +692,7 @@ async fn start_proxy_allowing(
         auth,
         tls: None,
         cors,
+        mixed: MixedEngines::default(),
         bound: addr,
     };
     tokio::spawn(async move {
@@ -874,6 +935,7 @@ async fn start_tls_proxy(fabric: Fabric, auth: ClientAuth) -> (SocketAddr, TestC
         auth,
         tls: Some(tls),
         cors: None,
+        mixed: MixedEngines::default(),
         bound: addr,
     };
     tokio::spawn(async move {
@@ -2609,6 +2671,7 @@ async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         auth: ClientAuth::none(),
         tls: None,
         cors: None,
+        mixed: MixedEngines::default(),
         bound: addr,
     };
 
@@ -3889,6 +3952,7 @@ async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
                 auth: ClientAuth::none(),
                 tls: Some(tls),
                 cors: None,
+                mixed: MixedEngines::default(),
                 bound: addr,
             },
             async move {
@@ -3990,4 +4054,627 @@ fn the_guide_describes_a_stream_failing_part_way_as_the_proxy_ends_it() {
         guide.contains("ends the response without the terminating chunk"),
         "the guide must say what a client actually sees"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Mixed engines
+//
+// A proxy started with `--allow-mixed-engines` also places on engines it
+// otherwise only reads. These are a client's view of what that does and does
+// not change: every answer still names its engine, a request carrying tools
+// never reaches a node nobody measured, and a default proxy answers exactly as
+// it always did.
+// ---------------------------------------------------------------------------
+
+/// The proxy in a given placement mode.
+async fn start_proxy_in(fabric: Fabric, mode: RouteMode, mixed: MixedEngines) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let config = ServeConfig {
+        mode,
+        forward_timeout: FORWARD_TIMEOUT,
+        auth: ClientAuth::none(),
+        tls: None,
+        cors: None,
+        mixed,
+        bound: addr,
+    };
+    tokio::spawn(async move {
+        let _ = serve_on(listener, fabric, config).await;
+    });
+    addr
+}
+
+async fn start_proxy_mixed(fabric: Fabric, mode: RouteMode) -> SocketAddr {
+    start_proxy_in(fabric, mode, MixedEngines::Allowed).await
+}
+
+async fn get_json(addr: SocketAddr, path: &str) -> (u16, Value) {
+    let (status, body) = get_raw(addr, path, &[]).await;
+    (status, serde_json::from_str(&body).expect("json body"))
+}
+
+fn fabric_headers(headers: &[(String, String)]) -> Vec<String> {
+    let mut names: Vec<String> = headers
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| name.starts_with("x-camelid-fabric-"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn tools_body(model: &str) -> Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "weather in Oslo?" }],
+        "tools": [{
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object", "properties": {} } }
+        }],
+    })
+}
+
+const ONLY_ON_OLLAMA: &str = "only-on-ollama:latest";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proxy_places_on_camelid_only_unless_started_with_mixed_engines() {
+    let ollama = StubNode::start(StubConfig::ollama(
+        &[ONLY_ON_OLLAMA],
+        Some(&[ONLY_ON_OLLAMA]),
+    ));
+    let body = serde_json::json!({ "model": ONLY_ON_OLLAMA });
+
+    let refused = start_proxy(
+        fabric_of(vec![ollama.spec_as("b-ollama", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, answer, _) = post_chat(refused, &body, &[]).await;
+    assert_eq!(status, 404, "{answer}");
+    assert_eq!(answer["error"]["code"], "model_not_found");
+    let message = answer["error"]["message"].as_str().expect("a message");
+    assert!(message.contains("b-ollama"), "{message}");
+    assert!(message.contains("--allow-mixed-engines"), "{message}");
+    assert_eq!(completions_served(std::slice::from_ref(&ollama)), vec![0]);
+
+    let mixed = start_proxy_mixed(
+        fabric_of(vec![ollama.spec_as("b-ollama", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, answer, headers) = post_chat(mixed, &body, &[]).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(header(&headers, "x-camelid-fabric-engine"), Some("ollama"));
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-model"),
+        Some(ONLY_ON_OLLAMA)
+    );
+    assert_eq!(completions_served(std::slice::from_ref(&ollama)), vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_answer_through_a_mixed_proxy_names_its_engine() {
+    let model = serde_json::json!({ "model": ONLY_ON_OLLAMA });
+
+    let serving = StubNode::start(StubConfig::ollama(
+        &[ONLY_ON_OLLAMA],
+        Some(&[ONLY_ON_OLLAMA]),
+    ));
+    let addr = start_proxy_mixed(
+        fabric_of(vec![serving.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, _, headers) = post_chat(addr, &model, &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-engine"),
+        Some("ollama"),
+        "served"
+    );
+
+    let refusing = StubNode::start(StubConfig {
+        completion_status: 503,
+        completion:
+            r#"{"error":"server busy, please try again.  maximum pending requests exceeded"}"#
+                .to_string(),
+        ..StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[ONLY_ON_OLLAMA]))
+    });
+    let addr = start_proxy_mixed(
+        fabric_of(vec![refusing.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, body, headers) = post_chat(addr, &model, &[]).await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body["error"],
+        "server busy, please try again.  maximum pending requests exceeded"
+    );
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-engine"),
+        Some("ollama"),
+        "relayed refusal"
+    );
+
+    let events = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let streaming = StubNode::start(StubConfig {
+        stream_events: events.iter().map(|event| event.to_string()).collect(),
+        ..StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[ONLY_ON_OLLAMA]))
+    });
+    let addr = start_proxy_mixed(
+        fabric_of(vec![streaming.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, headers, _) = post_chat_streaming(
+        addr,
+        &serde_json::json!({ "model": ONLY_ON_OLLAMA, "stream": true }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-engine"),
+        Some("ollama"),
+        "streamed"
+    );
+
+    let dying = StubNode::start(StubConfig {
+        hangs_up_on_completion: true,
+        ..StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[ONLY_ON_OLLAMA]))
+    });
+    let addr = start_proxy_mixed(
+        fabric_of(vec![dying.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, _, headers) = post_chat(addr, &model, &[]).await;
+    assert_eq!(status, 502);
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("b"));
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-engine"),
+        Some("ollama"),
+        "a failure"
+    );
+}
+
+/// The engine a failure names is the one the request was sent to. Looked up
+/// afterwards by label, it would be whatever the node file says by then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_names_the_engine_that_was_sent_the_request_even_if_the_file_changed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dying = StubNode::start(StubConfig {
+        hangs_up_on_completion: true,
+        completion_delay: Duration::from_millis(1_500),
+        ..StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[ONLY_ON_OLLAMA]))
+    });
+    let path = node_file(&dir, &[format!("b=ollama://127.0.0.1:{}", dying.port)]);
+    let addr = start_proxy_mixed(fabric_watching(path.clone()), RouteMode::Throughput).await;
+
+    let request = tokio::spawn(async move {
+        post_chat(addr, &serde_json::json!({ "model": ONLY_ON_OLLAMA }), &[]).await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The same label, re-declared as our own engine, at a different length so
+    // the re-read cannot be mistaken for an untouched file.
+    std::fs::write(&path, format!("b=127.0.0.1:{}\n", dying.port)).expect("re-declare b");
+
+    let (status, _, headers) = request.await.expect("request task");
+    assert_eq!(status, 502);
+    assert_eq!(header(&headers, "x-camelid-fabric-engine"), Some("ollama"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next() {
+    let ollama = StubNode::start(StubConfig::ollama(
+        &[ONLY_ON_OLLAMA],
+        Some(&[ONLY_ON_OLLAMA]),
+    ));
+    let addr = start_proxy_mixed(
+        fabric_of(vec![ollama.spec_as("b-ollama", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (status, body, _) = post_chat(addr, &tools_body(ONLY_ON_OLLAMA), &[]).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "capability_unavailable");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "tools");
+    let message = body["error"]["message"].as_str().expect("a message");
+    assert!(message.contains("b-ollama"), "{message}");
+    assert!(message.contains("measured"), "{message}");
+    assert_eq!(completions_served(std::slice::from_ref(&ollama)), vec![0]);
+}
+
+/// S5, over the wire: our own engine takes a tools request exactly as before,
+/// the body arrives untouched, and no new header appears on the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_camelid_only_proxy_serves_a_tool_calling_request_exactly_as_before() {
+    let node = StubNode::start(StubConfig::ready("m", 0));
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+    let sent = tools_body("m");
+
+    let (status, _, headers) = post_chat(addr, &sent, &[]).await;
+    assert_eq!(status, 200);
+    let received: Vec<Received> = node
+        .received()
+        .into_iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .collect();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&received[0].body).expect("json"),
+        sent,
+        "the node receives the body the client sent"
+    );
+    assert_eq!(
+        fabric_headers(&headers),
+        [
+            "x-camelid-fabric-attempts",
+            "x-camelid-fabric-engine",
+            "x-camelid-fabric-node",
+            "x-camelid-fabric-reason",
+        ]
+    );
+}
+
+/// I14 on the wire: an answer that rests on a declaration says so, and one
+/// that does not carries nothing extra.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_resting_on_a_declared_alias_says_so_and_one_that_does_not_does_not() {
+    let node = StubNode::start(StubConfig::ready("m", 0));
+    let aliases =
+        camelid::fabric::parse_model_aliases(&["llama-1b=only:m".to_string()]).expect("parses");
+    let fabric = fabric_of(vec![node.spec("only")]).with_model_aliases(aliases);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, _, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "llama-1b" }), &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        header(&headers, "x-camelid-fabric-model-identity"),
+        Some("asserted_by_operator")
+    );
+    assert_eq!(header(&headers, "x-camelid-fabric-model"), Some("m"));
+    let sent: Value =
+        serde_json::from_str(&node.received().last().expect("a request").body).expect("json");
+    assert_eq!(
+        sent["model"], "m",
+        "the node was asked by the name it knows"
+    );
+
+    let (status, _, headers) = post_chat(addr, &serde_json::json!({ "model": "m" }), &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "x-camelid-fabric-model-identity"), None);
+    assert_eq!(header(&headers, "x-camelid-fabric-model"), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn residency_is_reported_as_observed_and_absent_when_unknown() {
+    let body = serde_json::json!({ "model": ONLY_ON_OLLAMA });
+    for (config, expected) in [
+        (
+            StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[ONLY_ON_OLLAMA])),
+            Some("resident"),
+        ),
+        (
+            StubConfig::ollama(&[ONLY_ON_OLLAMA], Some(&[])),
+            Some("not_resident"),
+        ),
+        (StubConfig::ollama(&[ONLY_ON_OLLAMA], None), None),
+    ] {
+        let node = StubNode::start(config);
+        let addr = start_proxy_mixed(
+            fabric_of(vec![node.spec_as("b", "ollama")]),
+            RouteMode::Throughput,
+        )
+        .await;
+        let (status, answer, headers) = post_chat(addr, &body, &[]).await;
+        assert_eq!(status, 200, "{expected:?}: {answer}");
+        assert_eq!(
+            header(&headers, "x-camelid-fabric-residency-observed"),
+            expected,
+            "an unknown residency is not a value"
+        );
+    }
+}
+
+/// The service-time sites apply the same trust as re-placement: a foreign
+/// node's 503 that merely looks typed is a failure, so what was learned about
+/// it is forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed() {
+    let fast_status = Arc::new(AtomicUsize::new(200));
+    let fast = StubNode::start(StubConfig {
+        completion: format!(
+            r#"{{"error":{{"message":"full","code":"{ENGINE_QUEUE_FULL_CODE}"}}}}"#
+        ),
+        completion_delay: Duration::from_millis(20),
+        live_completion_status: Some(Arc::clone(&fast_status)),
+        ..StubConfig::ollama(&["m"], Some(&["m"]))
+    });
+    let slow = StubNode::start(StubConfig {
+        completion_delay: Duration::from_millis(200),
+        ..StubConfig::ollama(&["m"], Some(&["m"]))
+    });
+    let fabric = fabric_reusing_observations(
+        vec![
+            fast.spec_as("fast", "ollama"),
+            slow.spec_as("slow", "ollama"),
+        ],
+        Duration::from_secs(30),
+    );
+    let addr = start_proxy_mixed(fabric, RouteMode::CompletionTime).await;
+    let body = serde_json::json!({ "model": "m" });
+
+    for _ in 0..10 {
+        assert_eq!(post_chat(addr, &body, &[]).await.0, 200);
+    }
+    let (_, _, learned) = post_chat(addr, &body, &[]).await;
+    assert_eq!(header(&learned, "x-camelid-fabric-node"), Some("fast"));
+    assert_eq!(
+        header(&learned, "x-camelid-fabric-reason"),
+        Some("EstimatedCompletion"),
+        "the fast node's class must be warm before it fails"
+    );
+
+    fast_status.store(503, Ordering::SeqCst);
+    let (failed, _, failed_headers) = post_chat(addr, &body, &[]).await;
+    assert_eq!(failed, 503);
+    assert_eq!(
+        header(&failed_headers, "x-camelid-fabric-node"),
+        Some("fast")
+    );
+    assert_eq!(
+        header(&failed_headers, "x-camelid-fabric-attempts"),
+        Some("1")
+    );
+
+    let (_, _, after) = post_chat(addr, &body, &[]).await;
+    assert_eq!(
+        header(&after, "x-camelid-fabric-reason"),
+        Some("LeastLoaded"),
+        "an untrusted refusal must return the class to cold fallback"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_under_mixed_mode_reports_the_mode_the_nodes_it_accepts_and_their_consequences() {
+    let ollama = StubNode::start(StubConfig::ollama(
+        &[ONLY_ON_OLLAMA],
+        Some(&[ONLY_ON_OLLAMA]),
+    ));
+
+    let mixed = start_proxy_mixed(
+        fabric_of(vec![ollama.spec_as("b-ollama", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, health) = get_json(mixed, "/v1/health").await;
+    assert_eq!(
+        status, 200,
+        "a fabric whose only node is foreign is ready under the flag"
+    );
+    assert_eq!(health["ready"], true);
+    let placement = &health["placement"];
+    assert_eq!(placement["mixed_engines"], "allowed");
+    assert_eq!(placement["flag"], camelid::fabric::MIXED_ENGINES_FLAG);
+    assert_eq!(
+        placement["unreported_load_cost"],
+        camelid::fabric::UNREPORTED_LOAD_COST
+    );
+    assert_eq!(placement["cold_load_cost"], camelid::fabric::COLD_LOAD_COST);
+    assert_eq!(
+        placement["covers_nodes_added_later"], false,
+        "a fixed set covers nothing later"
+    );
+    assert_eq!(placement["consequences"], serde_json::json!([]));
+    let node = &health["node_detail"][0];
+    assert_eq!(node["placeable"], true);
+    let detail = node["placement_blocker_detail"].as_array().expect("detail");
+    assert_eq!(detail.len(), 3);
+    let blockers: Vec<&Value> = detail.iter().map(|entry| &entry["blocker"]).collect();
+    let listed: Vec<&Value> = node["placement_blockers"]
+        .as_array()
+        .expect("blockers")
+        .iter()
+        .collect();
+    assert_eq!(blockers, listed, "one table, one order");
+    assert!(detail.iter().all(|entry| entry["consequence"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty())));
+    let limits: Vec<&str> = node["requirement_limits"]
+        .as_array()
+        .expect("limits")
+        .iter()
+        .filter_map(|limit| limit["key"].as_str())
+        .collect();
+    assert_eq!(limits, ["tool_calls", "rerank_route"]);
+    assert_eq!(
+        node["status"]["resident_models"],
+        serde_json::json!([ONLY_ON_OLLAMA])
+    );
+
+    let refused = start_proxy(
+        fabric_of(vec![ollama.spec_as("b-ollama", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (status, health) = get_json(refused, "/v1/health").await;
+    assert_eq!(status, 503);
+    assert_eq!(health["placement"]["mixed_engines"], "refused");
+    assert_eq!(
+        health["placement"]["models_if_mixed"],
+        serde_json::json!([ONLY_ON_OLLAMA])
+    );
+    assert_eq!(health["node_detail"][0]["placeable"], false);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = node_file(
+        &dir,
+        &[format!("b-ollama=ollama://127.0.0.1:{}", ollama.port)],
+    );
+    let watching = start_proxy_mixed(fabric_watching(path), RouteMode::Throughput).await;
+    let (_, health) = get_json(watching, "/v1/health").await;
+    assert_eq!(health["placement"]["covers_nodes_added_later"], true);
+    assert_eq!(
+        health["placement"]["consequences"][0]["key"],
+        "standing_grant"
+    );
+    assert!(health["placement"]["consequences"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("added to the nodes file later")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_models_routes_follow_the_proxy_s_mode() {
+    let ollama = StubNode::start(StubConfig::ollama(
+        &[ONLY_ON_OLLAMA],
+        Some(&[ONLY_ON_OLLAMA]),
+    ));
+    let one = format!("/v1/models/{ONLY_ON_OLLAMA}");
+
+    let refused = start_proxy(
+        fabric_of(vec![ollama.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (_, list) = get_json(refused, "/v1/models").await;
+    assert_eq!(list["data"], serde_json::json!([]));
+    assert_eq!(get_json(refused, &one).await.0, 404);
+
+    let mixed = start_proxy_mixed(
+        fabric_of(vec![ollama.spec_as("b", "ollama")]),
+        RouteMode::Throughput,
+    )
+    .await;
+    let (_, list) = get_json(mixed, "/v1/models").await;
+    assert_eq!(list["data"][0]["id"], ONLY_ON_OLLAMA);
+    let (status, entry) = get_json(mixed, &one).await;
+    assert_eq!(status, 200, "{entry}");
+    assert_eq!(entry["id"], ONLY_ON_OLLAMA);
+}
+
+/// Placement and advertisement are one rule: an id is listed, retrievable and
+/// placed together, and refused together.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aliased_model_is_retrievable_and_listed_exactly_when_it_would_be_placed() {
+    let ready = Arc::new(AtomicBool::new(true));
+    let node = StubNode::start(StubConfig {
+        live_ready: Some(Arc::clone(&ready)),
+        ..StubConfig::ready("m", 0)
+    });
+    let aliases =
+        camelid::fabric::parse_model_aliases(&["llama-1b=only:m".to_string()]).expect("parses");
+    let addr = start_proxy(
+        fabric_of(vec![node.spec("only")]).with_model_aliases(aliases),
+        RouteMode::Throughput,
+    )
+    .await;
+    let body = serde_json::json!({ "model": "llama-1b" });
+
+    let (status, entry) = get_json(addr, "/v1/models/llama-1b").await;
+    assert_eq!(status, 200, "{entry}");
+    assert_eq!(entry["x_camelid_identity"], "asserted_by_operator");
+    let (_, list) = get_json(addr, "/v1/models").await;
+    let listed: Vec<&Value> = list["data"].as_array().expect("data").iter().collect();
+    let aliased = listed
+        .iter()
+        .find(|entry| entry["id"] == "llama-1b")
+        .unwrap_or_else(|| panic!("llama-1b is not listed: {list}"));
+    assert_eq!(aliased["x_camelid_identity"], "asserted_by_operator");
+    let plain = listed
+        .iter()
+        .find(|entry| entry["id"] == "m")
+        .expect("m is listed");
+    assert!(plain.get("x_camelid_identity").is_none(), "{plain}");
+    assert_eq!(post_chat(addr, &body, &[]).await.0, 200);
+
+    ready.store(false, Ordering::SeqCst);
+    assert_ne!(get_json(addr, "/v1/models/llama-1b").await.0, 200);
+    let (_, list) = get_json(addr, "/v1/models").await;
+    assert_eq!(list["data"], serde_json::json!([]));
+    assert_ne!(post_chat(addr, &body, &[]).await.0, 200);
+}
+
+/// The flag is a standing grant over a file that is re-read: a foreign node
+/// added later is placed on, so health says it arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_node_added_while_mixed_is_announced_in_health() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let camelid = StubNode::start(StubConfig::ready("m", 0));
+    let ollama = StubNode::start(StubConfig::ollama(&["x:latest"], Some(&[])));
+    let path = node_file(&dir, &[node_line(&camelid, "a")]);
+    let addr = start_proxy_mixed(fabric_watching(path.clone()), RouteMode::Throughput).await;
+    let (_, before) = get_json(addr, "/v1/health").await;
+    assert_eq!(
+        before["placement"]["foreign_nodes_added_since_start"],
+        serde_json::json!([])
+    );
+
+    std::fs::write(
+        &path,
+        format!(
+            "{}\nc-ollama2=ollama://127.0.0.1:{}\n",
+            node_line(&camelid, "a"),
+            ollama.port
+        ),
+    )
+    .expect("add a foreign node");
+
+    let deadline = Instant::now() + NODE_RELOAD_TIMEOUT;
+    loop {
+        let (_, health) = get_json(addr, "/v1/health").await;
+        let announced = &health["placement"]["foreign_nodes_added_since_start"];
+        if announced[0]["label"] == "c-ollama2" {
+            assert_eq!(announced[0]["engine"], "ollama");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never announced: {health}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Relay, don't re-place, on the streaming path too: a refusal that is not
+/// backpressure arrives buffered, before anything is relayed, and it is still
+/// handed back once rather than tried on a sibling.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed() {
+    let events = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let nodes = vec![
+        StubNode::start(StubConfig::refusing_with(
+            "shared-model",
+            "model_unavailable",
+            "no model is loaded",
+        )),
+        StubNode::start(StubConfig::streaming(
+            "shared-model",
+            &events,
+            Duration::ZERO,
+        )),
+    ];
+    let specs = vec![nodes[0].spec("a-refusing"), nodes[1].spec("b-ready")];
+    let addr = start_proxy(fabric_with_attempts(specs, 2), RouteMode::Throughput).await;
+
+    let (status, body, headers) = post_chat(
+        addr,
+        &serde_json::json!({ "model": "shared-model", "stream": true }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["message"], "no model is loaded");
+    assert_eq!(header(&headers, "x-camelid-fabric-attempts"), Some("1"));
+    assert_eq!(completions_served(&nodes), vec![1, 0]);
 }

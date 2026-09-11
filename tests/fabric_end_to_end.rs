@@ -381,11 +381,16 @@ fn an_unserved_model_is_refused_naming_what_the_fabric_does_serve() {
             model,
             serving,
             unobserved,
+            held_by_unplaced,
         } => {
             assert_eq!(model, "model-absent");
             assert_eq!(serving, vec!["model-alpha".to_string()]);
             // Every configured node answered, so this refusal is final.
             assert_eq!(unobserved, 0);
+            assert!(
+                held_by_unplaced.is_empty(),
+                "a Camelid-only fabric names none"
+            );
         }
         other => panic!("expected ModelUnavailable, got {other:?}"),
     }
@@ -858,7 +863,10 @@ fn a_cancelled_request_leaves_the_observation_that_placed_it_in_force() {
     assert!(
         matches!(
             error,
-            DispatchError::Forward(ForwardError::Cancelled { .. })
+            DispatchError::Forward {
+                error: ForwardError::Cancelled { .. },
+                ..
+            }
         ),
         "got {error:?}"
     );

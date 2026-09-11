@@ -10,14 +10,19 @@
 //! already takes, parsed by [`parse_node_spec`] through [`parse_fabric`], so
 //! there is one answer to "what is a node spec" and one place that answers it.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
+
 use super::aliases::{parse_model_aliases, ModelAliases, ALIAS_PREFIX};
+use super::capability::capabilities_of;
+use super::engine::NodeEngine;
 use super::node::{parse_fabric, NodeSpec};
 use super::watch::{Change, WatchedFile};
 
@@ -27,6 +32,22 @@ use super::watch::{Change, WatchedFile};
 /// enough that an operator does not wait on it and long enough that a busy
 /// proxy is not stat-ing a file on every placement.
 pub(crate) const DEFAULT_NODE_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How many announcements are kept for health. A file edited in a loop must
+/// not grow the proxy's memory; the log line carries every one regardless.
+const MAX_FOREIGN_ADDITIONS: usize = 32;
+
+/// A node of an engine this fabric does not place on by default, added to the
+/// node file while mixed placement was on — and so placed on without anyone
+/// having been shown it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForeignAddition {
+    pub label: String,
+    pub engine: NodeEngine,
+    /// What was accepted about it, in the words the operator saw at startup
+    /// for the nodes that were there then.
+    pub blockers: Vec<&'static str>,
+}
 
 enum Source {
     /// Specs given on the command line. They cannot change while the process
@@ -41,6 +62,23 @@ struct Inner {
     /// file was re-read. An observation is valid for the generation it was
     /// taken in and no other; see [`NodeSet::current`].
     generation: AtomicU64,
+    /// Set while mixed placement is on, because then a foreign node added to
+    /// the file is placed on at once: the flag is a standing grant, and a
+    /// grant nobody hears being used is not one anybody made.
+    announce_foreign_additions: AtomicBool,
+    /// The most recent of those, oldest first.
+    foreign_additions: Mutex<VecDeque<ForeignAddition>>,
+}
+
+impl Inner {
+    fn over(source: Source) -> Self {
+        Self {
+            source,
+            generation: AtomicU64::new(0),
+            announce_foreign_additions: AtomicBool::new(false),
+            foreign_additions: Mutex::new(VecDeque::new()),
+        }
+    }
 }
 
 /// The set of nodes a fabric places on.
@@ -58,10 +96,7 @@ impl NodeSet {
     /// A set that cannot change.
     pub(crate) fn fixed(specs: Vec<NodeSpec>) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                source: Source::Fixed(Arc::from(specs)),
-                generation: AtomicU64::new(0),
-            }),
+            inner: Arc::new(Inner::over(Source::Fixed(Arc::from(specs)))),
         }
     }
 
@@ -79,16 +114,59 @@ impl NodeSet {
         // rather than at the first request.
         let specs = load_specs(&path)?;
         Ok(Self {
-            inner: Arc::new(Inner {
-                source: Source::File(WatchedFile::new(path, interval, specs)),
-                generation: AtomicU64::new(0),
-            }),
+            inner: Arc::new(Inner::over(Source::File(WatchedFile::new(
+                path, interval, specs,
+            )))),
         })
     }
 
     /// Whether the set changes without a restart.
     pub(crate) fn is_reloadable(&self) -> bool {
         matches!(self.inner.source, Source::File(_))
+    }
+
+    /// Announce every foreign node added from now on. Nodes already in the set
+    /// were in front of the operator when they turned mixed placement on.
+    pub(crate) fn announce_foreign_additions(&self, on: bool) {
+        self.inner
+            .announce_foreign_additions
+            .store(on, Ordering::SeqCst);
+    }
+
+    /// The foreign nodes announced since this set was built, most recent last.
+    pub(crate) fn foreign_added_since_start(&self) -> Vec<ForeignAddition> {
+        self.inner
+            .foreign_additions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn announce(&self, additions: Vec<ForeignAddition>) {
+        if additions.is_empty() {
+            return;
+        }
+        let mut kept = self
+            .inner
+            .foreign_additions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for addition in additions {
+            tracing::warn!(
+                label = %addition.label,
+                engine = %addition.engine,
+                blockers = %addition.blockers.join("; "),
+                "node of another engine added while placing on other engines; accepted without asking"
+            );
+            // Printed as well: `RUST_LOG` is unset on a stock proxy.
+            eprintln!("{}", foreign_addition_notice(&addition));
+            if kept.len() == MAX_FOREIGN_ADDITIONS {
+                kept.pop_front();
+            }
+            kept.push_back(addition);
+        }
     }
 
     /// The set as it stands, and the generation it belongs to.
@@ -125,6 +203,9 @@ impl NodeSet {
                         "node set reloaded"
                     );
                     self.inner.generation.fetch_add(1, Ordering::SeqCst);
+                    if self.inner.announce_foreign_additions.load(Ordering::SeqCst) {
+                        self.announce(foreign_additions(&previous, &specs));
+                    }
                 }
                 if recovered {
                     eprintln!(
@@ -169,6 +250,42 @@ impl std::fmt::Debug for NodeSet {
             .field("generation", &generation)
             .finish()
     }
+}
+
+/// The nodes in `current` that were not in `previous` and whose engine this
+/// fabric would not place on by default. Pure.
+///
+/// A label that changed engine counts as added: the node it now names is one
+/// nobody was shown. Decided by the engine's blockers, not its name, and from
+/// the engine alone because they are known before its first probe.
+fn foreign_additions(previous: &[NodeSpec], current: &[NodeSpec]) -> Vec<ForeignAddition> {
+    current
+        .iter()
+        .filter(|spec| {
+            !previous
+                .iter()
+                .any(|before| before.label == spec.label && before.engine == spec.engine)
+        })
+        .filter_map(|spec| {
+            let blockers = capabilities_of(spec.engine, None).placement_blockers();
+            (!blockers.is_empty()).then(|| ForeignAddition {
+                label: spec.label.clone(),
+                engine: spec.engine,
+                blockers,
+            })
+        })
+        .collect()
+}
+
+/// The line an operator sees when the standing grant is used. Pure.
+fn foreign_addition_notice(addition: &ForeignAddition) -> String {
+    format!(
+        "fabric: {} ({}) added while placing on other engines; accepted without asking: {}. \
+         Tool-calling requests: not until measured.",
+        addition.label,
+        addition.engine,
+        addition.blockers.join("; ")
+    )
 }
 
 /// Read and validate a node file into the shape the set holds.
@@ -510,6 +627,56 @@ mod tests {
 
         NodeSet::from_file(dir.path().join("absent"))
             .expect_err("a missing file is not an empty fabric");
+    }
+
+    /// The flag is a standing grant over a file that is re-read. A node added
+    /// to it is placed on at once, so it has to be announced, and remembered
+    /// for health, the moment the set takes it in.
+    #[test]
+    fn a_foreign_node_added_under_mixed_mode_is_announced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a=127.0.0.1:8181\n");
+        let set = NodeSet::from_file_every(path.clone(), Duration::ZERO).expect("load");
+        set.announce_foreign_additions(true);
+
+        fs::write(&path, "a=127.0.0.1:8181\nb=ollama://127.0.0.1:1\n").expect("add b");
+        let (specs, _) = set.current();
+        assert_eq!(labels(&specs), ["a", "b"]);
+
+        let announced = set.foreign_added_since_start();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0].label, "b");
+        assert_eq!(announced[0].engine, NodeEngine::Ollama);
+        assert_eq!(announced[0].blockers.len(), 3, "{announced:?}");
+        let notice = foreign_addition_notice(&announced[0]);
+        assert!(notice.contains("b (ollama)"), "{notice}");
+        assert!(notice.contains("publishes no load to rank on"), "{notice}");
+
+        // The same edit with the flag off is no grant, so nothing to announce.
+        let quiet_dir = tempfile::tempdir().expect("temp dir");
+        let quiet_path = write(&quiet_dir, "a=127.0.0.1:8181\n");
+        let quiet = NodeSet::from_file_every(quiet_path.clone(), Duration::ZERO).expect("load");
+        fs::write(&quiet_path, "a=127.0.0.1:8181\nb=ollama://127.0.0.1:1\n").expect("add b");
+        assert_eq!(labels(&quiet.current().0), ["a", "b"]);
+        assert!(quiet.foreign_added_since_start().is_empty());
+    }
+
+    #[test]
+    fn a_node_of_our_own_engine_added_later_is_not_announced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a=127.0.0.1:8181\n");
+        let set = NodeSet::from_file_every(path.clone(), Duration::ZERO).expect("load");
+        set.announce_foreign_additions(true);
+        fs::write(&path, TWO).expect("add a Camelid node");
+        assert_eq!(labels(&set.current().0), ["a", "b"]);
+        assert!(set.foreign_added_since_start().is_empty());
+
+        // A label that changes engine names a node nobody was shown.
+        fs::write(&path, "a=127.0.0.1:8181\nb=lmstudio://127.0.0.1:8182\n").expect("re-declare b");
+        set.current();
+        let announced = set.foreign_added_since_start();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0].engine, NodeEngine::LmStudio);
     }
 
     /// Clones share one set, or two requests would disagree about which

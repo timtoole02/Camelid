@@ -151,6 +151,7 @@ pub(crate) fn probe(spec: &NodeSpec, timeout: Duration, transport: &NodeTranspor
             _ => None,
         },
         models: inventory.installed,
+        resident_models: inventory.resident,
         backend: None,
         // See the module note: there is no endpoint for it.
         version: None,

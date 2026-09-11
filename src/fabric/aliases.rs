@@ -102,6 +102,38 @@ impl ModelAliases {
             .contains_key(&(label.to_string(), canonical.to_string()))
     }
 
+    /// [`Self::resolve`], plus what the answer rests on: the id as given, or
+    /// an operator's word that a different id is the same weights.
+    pub fn resolve_with_identity<'a>(
+        &'a self,
+        label: &str,
+        canonical: &'a str,
+    ) -> (&'a str, super::divergence::ModelIdentity) {
+        let local = self.resolve(label, canonical);
+        let identity = if local == canonical {
+            super::divergence::ModelIdentity::SameId
+        } else {
+            super::divergence::ModelIdentity::AssertedByOperator
+        };
+        (local, identity)
+    }
+
+    /// Every declaration, ordered by canonical id then node, for listing what
+    /// is in force.
+    pub fn declared(&self) -> Vec<ModelAlias> {
+        let mut declared: Vec<ModelAlias> = self
+            .by_node
+            .iter()
+            .map(|((label, canonical), local)| ModelAlias {
+                canonical: canonical.clone(),
+                label: label.clone(),
+                local: local.clone(),
+            })
+            .collect();
+        declared.sort_by(|a, b| (&a.canonical, &a.label).cmp(&(&b.canonical, &b.label)));
+        declared
+    }
+
     pub fn insert(&mut self, alias: ModelAlias) -> Result<(), AliasParseError> {
         let key = (alias.label.clone(), alias.canonical.clone());
         if self.by_node.contains_key(&key) {

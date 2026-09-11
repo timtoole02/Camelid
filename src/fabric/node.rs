@@ -242,6 +242,13 @@ pub struct NodeReady {
     pub active_model_id: Option<String>,
     /// Every model this node can serve right now, sorted.
     pub models: Vec<String>,
+    /// The models held in memory right now, as the engine's own listing says.
+    ///
+    /// `None` when the engine did not say — its listing failed, or it named a
+    /// state this build does not understand — which is not the same as
+    /// `Some([])`, a listing that said nothing is resident. Serialised as
+    /// `null` and `[]` respectively, so no reader can mistake one for the other.
+    pub resident_models: Option<Vec<String>>,
     /// The execution lane the engine chose, when it names one.
     pub backend: Option<String>,
     /// The engine's own version string, when it publishes one.
@@ -325,7 +332,38 @@ impl NodeSnapshot {
     /// healthy and still not be somewhere work goes — see
     /// [`NodeEngine::is_placeable`].
     pub fn is_placeable(&self) -> bool {
-        self.spec.engine.is_placeable() && self.status.is_ready()
+        self.is_placeable_under(super::policy::MixedEngines::Refused)
+    }
+
+    /// Whether a fabric in `mixed` mode may place a request here.
+    ///
+    /// Mixed placement widens which engines are placed on. It never widens
+    /// which nodes can take work now: a node that is down or still loading is
+    /// no more placeable for the flag being on.
+    pub fn is_placeable_under(&self, mixed: super::policy::MixedEngines) -> bool {
+        self.status.is_ready()
+            && (self.spec.engine.is_placeable() || mixed == super::policy::MixedEngines::Allowed)
+    }
+
+    /// The models this node's own listing says are held in memory, or `None`
+    /// when it did not say.
+    pub fn resident_models(&self) -> Option<&[String]> {
+        self.status
+            .ready()
+            .and_then(|ready| ready.resident_models.as_deref())
+    }
+
+    /// The engine and the version it reported, in the form a measurement is
+    /// keyed on, for messages that have to say which build they are about.
+    pub fn engine_and_version(&self) -> String {
+        match self
+            .status
+            .ready()
+            .and_then(|ready| ready.version.as_deref())
+        {
+            Some(version) => format!("{} {version}", self.spec.engine),
+            None => format!("{}, version not published", self.spec.engine),
+        }
     }
 
     /// What this node's engine can be asked, and how we know.
@@ -537,6 +575,7 @@ mod tests {
             engine: NodeEngine::Camelid,
             active_model_id: Some("llama-3b".to_string()),
             models: vec!["llama-3b".to_string()],
+            resident_models: Some(vec!["llama-3b".to_string()]),
             backend: Some("llama".to_string()),
             version: Some("0.5.4".to_string()),
             load: Some(NodeLoad {
@@ -556,6 +595,7 @@ mod tests {
             engine: NodeEngine::Ollama,
             active_model_id: None,
             models: vec!["llama3.2:latest".to_string()],
+            resident_models: None,
             backend: None,
             version: Some("0.33.3".to_string()),
             load: None,
@@ -580,6 +620,7 @@ mod tests {
                 engine: NodeEngine::Camelid,
                 active_model_id: Some("llama-3b".to_string()),
                 models: vec!["llama-3b".to_string()],
+                resident_models: Some(vec!["llama-3b".to_string()]),
                 backend: Some("llama".to_string()),
                 version: Some("0.5.4".to_string()),
                 load: Some(NodeLoad {
@@ -598,6 +639,35 @@ mod tests {
         assert_eq!(value["latency_ms"], 7);
         assert_eq!(value["spec"]["label"], "windows");
         assert_eq!(value["spec"]["engine"], "camelid");
+    }
+
+    /// "The engine did not say what is resident" and "nothing is resident" lead
+    /// placement to different answers — the first is priced as unknown, the
+    /// second as a cold load — so the wire has to keep them apart too.
+    #[test]
+    fn resident_models_absent_and_empty_serialise_differently() {
+        let with = |resident_models: Option<Vec<String>>| {
+            serde_json::to_value(NodeStatus::Ready(NodeReady {
+                engine: NodeEngine::Ollama,
+                active_model_id: None,
+                models: vec!["a:latest".to_string()],
+                resident_models,
+                backend: None,
+                version: Some("0.33.2".to_string()),
+                load: None,
+            }))
+            .expect("serializes")
+        };
+        let unknown = with(None);
+        let empty = with(Some(Vec::new()));
+        let one = with(Some(vec!["a:latest".to_string()]));
+        assert_eq!(unknown["resident_models"], serde_json::Value::Null);
+        assert_eq!(empty["resident_models"], serde_json::json!([]));
+        assert_eq!(one["resident_models"], serde_json::json!(["a:latest"]));
+        assert_ne!(
+            unknown, empty,
+            "unknown and none-resident must not collapse"
+        );
     }
 
     #[test]

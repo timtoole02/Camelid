@@ -110,11 +110,37 @@ pub struct Capabilities {
     /// back-to-back self-consistency check cannot see an engine that fails
     /// this: it repeats itself run after run from the same history.
     pub history_neutral: Capability,
+    /// A request naming a model the node has installed but not loaded is
+    /// served by loading it. Placement matches such a model only where this is
+    /// declared, because otherwise "installed" says nothing about "servable".
+    pub loads_on_demand: Capability,
+    /// The API has a rerank route. That is all it says: on our own engine the
+    /// route answers only for a model that supports it, which no probe here
+    /// can see, so this is never read as the model supporting reranking.
+    pub rerank_route: Capability,
+}
+
+/// One reason a node is not placed on by default, with what placing on it
+/// anyway means. Built in Rust because the consequence is a claim about what
+/// this build does, and a page describing another build's behaviour would be
+/// describing a proxy it is not talking to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockerDetail {
+    pub key: &'static str,
+    pub blocker: &'static str,
+    pub consequence: String,
+}
+
+/// A kind of request a node is never given, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RequirementLimit {
+    pub key: &'static str,
+    pub consequence: String,
 }
 
 impl Capabilities {
     /// Name/answer pairs in a fixed order, for rendering.
-    pub fn entries(&self) -> [(&'static str, Capability); 6] {
+    pub fn entries(&self) -> [(&'static str, Capability); 8] {
         [
             ("load_reporting", self.load_reporting),
             ("typed_backpressure", self.typed_backpressure),
@@ -122,23 +148,101 @@ impl Capabilities {
             ("tool_calls", self.tool_calls),
             ("embeddings", self.embeddings),
             ("history_neutral", self.history_neutral),
+            ("loads_on_demand", self.loads_on_demand),
+            ("rerank_route", self.rerank_route),
         ]
+    }
+
+    /// Each blocker with the capability whose absence produced it. The one
+    /// table the string list, the key list and the detail are all read from,
+    /// so the three cannot disagree about which reason belongs to which key.
+    fn blocking(&self) -> Vec<(&'static str, &'static str)> {
+        let mut blocking = Vec::new();
+        if self.load_reporting.supported != Some(true) {
+            blocking.push(("load_reporting", "publishes no load to rank on"));
+        }
+        if self.typed_backpressure.supported != Some(true) {
+            blocking.push((
+                "typed_backpressure",
+                "a full queue is indistinguishable from a failure",
+            ));
+        }
+        if self.warm_prefix.supported != Some(true) {
+            blocking.push((
+                "warm_prefix",
+                "cannot attest a warm prefix, so affinity would be a guess",
+            ));
+        }
+        blocking
     }
 
     /// The reasons this engine cannot be placed on, in the order they matter.
     /// Empty for an engine the fabric routes to.
     pub fn placement_blockers(&self) -> Vec<&'static str> {
-        let mut blockers = Vec::new();
-        if self.load_reporting.supported != Some(true) {
-            blockers.push("publishes no load to rank on");
+        self.blocking()
+            .into_iter()
+            .map(|(_, blocker)| blocker)
+            .collect()
+    }
+
+    /// The capability behind each of [`Self::placement_blockers`], in the same
+    /// order.
+    pub fn placement_blocker_keys(&self) -> Vec<&'static str> {
+        self.blocking().into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// What `--allow-mixed-engines` accepts about this engine, blocker by
+    /// blocker. `unreported_load_cost` is the price placement charges a node
+    /// that publishes no load, passed in so the sentence quotes the number
+    /// the build actually uses.
+    pub fn placement_blocker_detail(&self, unreported_load_cost: usize) -> Vec<BlockerDetail> {
+        self.blocking()
+            .into_iter()
+            .map(|(key, blocker)| BlockerDetail {
+                key,
+                blocker,
+                consequence: match key {
+                    "load_reporting" => format!(
+                        "ranked as if already carrying {unreported_load_cost} requests, because it reports none"
+                    ),
+                    "typed_backpressure" => "any refusal it sends is relayed to the client once and never \
+                         retried on another node"
+                        .to_string(),
+                    _ => "a request pinned to it with x-camelid-fabric-sticky is refused rather than \
+                          silently re-routed"
+                        .to_string(),
+                },
+            })
+            .collect()
+    }
+
+    /// Requests this node never receives whatever the routing mode, because
+    /// it cannot be shown to handle them. `engine` names the engine and the
+    /// version the node reported, which is what a measurement is keyed on.
+    pub fn requirement_limits(&self, engine: &str) -> Vec<RequirementLimit> {
+        let mut limits = Vec::new();
+        if self.tool_calls.supported != Some(true) {
+            let why = match self.tool_calls.provenance {
+                Provenance::Measured => format!("tool calls were measured failing on {engine}"),
+                Provenance::Declared => format!("{engine} declares no tool calling"),
+                Provenance::NotProbed => format!("tool calls have not been measured on {engine}"),
+            };
+            limits.push(RequirementLimit {
+                key: "tool_calls",
+                consequence: format!("requests carrying tools are never placed here: {why}"),
+            });
         }
-        if self.typed_backpressure.supported != Some(true) {
-            blockers.push("a full queue is indistinguishable from a failure");
+        if self.rerank_route.supported != Some(true) {
+            let why = match self.rerank_route.provenance {
+                Provenance::NotProbed => "nobody has checked whether its API has a rerank route",
+                _ => "its API has no rerank route",
+            };
+            limits.push(RequirementLimit {
+                key: "rerank_route",
+                consequence: format!("rerank requests are never placed here: {why}"),
+            });
         }
-        if self.warm_prefix.supported != Some(true) {
-            blockers.push("cannot attest a warm prefix, so affinity would be a guess");
-        }
-        blockers
+        limits
     }
 }
 
@@ -234,8 +338,19 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
                 "one node owns one model and one session, so a sticky label really is a warm prefix",
             ),
             tool_calls: tool_calls_for(engine, version),
-            embeddings: Capability::declared(true, "`/v1/embeddings` is served by the engine"),
+            embeddings: Capability::declared(
+                true,
+                "`/v1/embeddings` exists; it answers only when an evidence-gated embedding model is loaded",
+            ),
             history_neutral: history_neutral_for(engine, version),
+            loads_on_demand: Capability::declared(
+                false,
+                "one node serves the one model it loaded",
+            ),
+            rerank_route: Capability::declared(
+                true,
+                "the route exists; it answers only when an evidence-gated embedding model is loaded",
+            ),
         },
         NodeEngine::Ollama => Capabilities {
             load_reporting: Capability::declared(
@@ -251,8 +366,16 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
                 "`/api/ps` says which models are resident, not whether a session's prefix survived",
             ),
             tool_calls: tool_calls_for(engine, version),
-            embeddings: Capability::declared(true, "`/api/embed` is documented"),
+            embeddings: Capability::declared(
+                true,
+                "`/v1/embeddings` is part of its documented OpenAI-compatible API",
+            ),
             history_neutral: history_neutral_for(engine, version),
+            loads_on_demand: Capability::declared(
+                true,
+                "a request naming an installed model loads it",
+            ),
+            rerank_route: Capability::declared(false, "the documented API has no rerank route"),
         },
         NodeEngine::LmStudio => Capabilities {
             load_reporting: Capability::declared(
@@ -268,8 +391,12 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
                 "model state is loaded or not loaded; nothing attests a session's prefix",
             ),
             tool_calls: tool_calls_for(engine, version),
-            embeddings: Capability::declared(true, "`/api/v0/embeddings` is documented"),
+            embeddings: Capability::declared(true, "`/v1/embeddings` is documented"),
             history_neutral: history_neutral_for(engine, version),
+            loads_on_demand: Capability::not_probed(
+                "just-in-time loading is a per-install setting its API does not publish",
+            ),
+            rerank_route: Capability::declared(false, "the documented API has no rerank route"),
         },
     }
 }
@@ -450,6 +577,166 @@ mod tests {
                 .provenance,
             Provenance::NotProbed,
             "a measurement belongs to the engine it was taken on"
+        );
+    }
+
+    /// Placement matches an installed-but-not-loaded model only where loading
+    /// on demand is declared, and places a rerank request only where the route
+    /// exists. Crediting either without the API saying so would put a request
+    /// on a node that answers it with a refusal.
+    #[test]
+    fn loading_on_demand_and_rerank_routes_are_never_credited_without_the_api_saying_so() {
+        let camelid = capabilities_of(NodeEngine::Camelid, None);
+        assert_eq!(camelid.loads_on_demand.supported, Some(false));
+        assert_eq!(camelid.loads_on_demand.provenance, Provenance::Declared);
+        assert_eq!(camelid.rerank_route.supported, Some(true));
+
+        let ollama = capabilities_of(NodeEngine::Ollama, Some("0.33.2"));
+        assert_eq!(ollama.loads_on_demand.supported, Some(true));
+        assert_eq!(ollama.loads_on_demand.provenance, Provenance::Declared);
+        assert_eq!(ollama.rerank_route.supported, Some(false));
+
+        let lmstudio = capabilities_of(NodeEngine::LmStudio, None);
+        assert_eq!(
+            lmstudio.loads_on_demand.supported, None,
+            "just-in-time loading is a setting LM Studio does not publish"
+        );
+        assert_eq!(lmstudio.loads_on_demand.provenance, Provenance::NotProbed);
+        assert_eq!(lmstudio.rerank_route.supported, Some(false));
+
+        for engine in [
+            NodeEngine::Camelid,
+            NodeEngine::Ollama,
+            NodeEngine::LmStudio,
+        ] {
+            let names: Vec<&str> = capabilities_of(engine, None)
+                .entries()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
+            assert!(names.contains(&"loads_on_demand"), "{engine}: {names:?}");
+            assert!(names.contains(&"rerank_route"), "{engine}: {names:?}");
+        }
+    }
+
+    /// Our engine has the route; whether the loaded model answers on it is a
+    /// property of the model. Saying "supported" would render a false yes on
+    /// every chat node.
+    #[test]
+    fn a_route_existing_is_not_the_model_supporting_it() {
+        let camelid = capabilities_of(NodeEngine::Camelid, None);
+        assert!(
+            camelid.rerank_route.detail.contains("only when"),
+            "{}",
+            camelid.rerank_route.detail
+        );
+        assert!(
+            camelid.embeddings.detail.contains("only when"),
+            "{}",
+            camelid.embeddings.detail
+        );
+        for engine in [
+            NodeEngine::Camelid,
+            NodeEngine::Ollama,
+            NodeEngine::LmStudio,
+        ] {
+            let capabilities = capabilities_of(engine, None);
+            for capability in [capabilities.rerank_route, capabilities.embeddings] {
+                assert!(
+                    !capability.detail.contains("supported"),
+                    "{engine}: {}",
+                    capability.detail
+                );
+            }
+        }
+    }
+
+    fn credit(capabilities: &mut Capabilities, key: &str) {
+        let credited = Capability::declared(true, "credited by the test");
+        match key {
+            "load_reporting" => capabilities.load_reporting = credited,
+            "typed_backpressure" => capabilities.typed_backpressure = credited,
+            "warm_prefix" => capabilities.warm_prefix = credited,
+            other => panic!("{other} is not a placement blocker key"),
+        }
+    }
+
+    /// The key a blocker travels under is what the Routing screen groups nodes
+    /// by, so a key attached to the wrong sentence would put one consequence
+    /// under another's heading. Proved by crediting each key in turn and
+    /// checking the sentence that disappears is the one it was paired with.
+    #[test]
+    fn each_blocker_key_names_the_capability_that_produced_its_string() {
+        for engine in [
+            NodeEngine::Camelid,
+            NodeEngine::Ollama,
+            NodeEngine::LmStudio,
+        ] {
+            let capabilities = capabilities_of(engine, Some("0.33.2"));
+            let keys = capabilities.placement_blocker_keys();
+            let blockers = capabilities.placement_blockers();
+            assert_eq!(keys.len(), blockers.len(), "{engine}");
+            let entries = capabilities.entries();
+            for (key, blocker) in keys.iter().zip(&blockers) {
+                let entry = entries
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .unwrap_or_else(|| panic!("{engine}: {key} is not a capability"));
+                assert_ne!(entry.1.supported, Some(true), "{engine}: {key}");
+
+                let mut credited = capabilities;
+                credit(&mut credited, key);
+                let remaining = credited.placement_blockers();
+                assert!(
+                    !remaining.contains(blocker),
+                    "{engine}: crediting {key} left `{blocker}` standing, so the two are not paired"
+                );
+                assert_eq!(remaining.len(), blockers.len() - 1, "{engine}: {key}");
+            }
+
+            let detail = capabilities.placement_blocker_detail(7);
+            assert_eq!(
+                detail.iter().map(|d| d.key).collect::<Vec<_>>(),
+                keys,
+                "{engine}"
+            );
+            assert_eq!(
+                detail.iter().map(|d| d.blocker).collect::<Vec<_>>(),
+                blockers,
+                "{engine}"
+            );
+            if let Some(load) = detail.iter().find(|d| d.key == "load_reporting") {
+                assert!(
+                    load.consequence.contains('7'),
+                    "the price quoted must be the one passed in: {}",
+                    load.consequence
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_is_limited_only_by_what_it_cannot_be_shown_to_do() {
+        assert!(capabilities_of(NodeEngine::Camelid, Some("v9.9.9"))
+            .requirement_limits("camelid v9.9.9")
+            .is_empty());
+        let limits =
+            capabilities_of(NodeEngine::Ollama, Some("0.33.2")).requirement_limits("ollama 0.33.2");
+        let keys: Vec<&str> = limits.iter().map(|limit| limit.key).collect();
+        assert_eq!(keys, ["tool_calls", "rerank_route"]);
+        assert!(
+            limits[0]
+                .consequence
+                .contains("not been measured on ollama 0.33.2"),
+            "{}",
+            limits[0].consequence
+        );
+        let measured =
+            capabilities_of(NodeEngine::Ollama, Some("0.33.1")).requirement_limits("ollama 0.33.1");
+        assert!(
+            measured[0].consequence.contains("measured failing"),
+            "a measured failure is not an absent measurement: {}",
+            measured[0].consequence
         );
     }
 

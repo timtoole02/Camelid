@@ -44,6 +44,7 @@ pub mod textdiff;
 mod transport;
 pub(crate) mod watch;
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,7 @@ pub use aliases::{
     parse_model_alias, parse_model_aliases, AliasParseError, ModelAlias, ModelAliases,
 };
 pub use cancel::Cancel;
-pub use capability::{Capabilities, Capability, Provenance};
+pub use capability::{BlockerDetail, Capabilities, Capability, Provenance, RequirementLimit};
 pub use divergence::{
     check_temperature, conclude, sha256_hex, shared_weights_digest, AppliedSampling, Comparison,
     Honoured, ModelIdentity, RenderedPrompt, Sample, SamplingPlan, Side, Stability,
@@ -70,11 +71,13 @@ pub use node::{
     parse_fabric, parse_node_spec, NodeLoad, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
 };
+pub use nodes::ForeignAddition;
 use nodes::NodeSet;
 use policy::{load_of, route_reserved_with_estimates, ServiceTimeEstimates};
 pub use policy::{
-    route, route_reserved, MixedEngines, Requirements, Reservations, RouteDecision, RouteError,
-    RouteMode, RouteReason, RouteRequest, UNREPORTED_LOAD_COST,
+    route, route_reserved, MixedEngines, Requirements, Reservations, Residency, RouteDecision,
+    RouteError, RouteMode, RouteReason, RouteRequest, COLD_LOAD_COST, MIXED_ENGINES_FLAG,
+    UNREPORTED_LOAD_COST,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 pub use sample::SampleError;
@@ -251,6 +254,90 @@ impl Fabric {
     /// otherwise.
     pub fn local_model_id<'a>(&'a self, label: &str, model: &'a str) -> &'a str {
         self.aliases.resolve(label, model)
+    }
+
+    /// The alias lines in force, for the startup line. Read once when the
+    /// fabric was built and never again, which that line has to say.
+    pub fn aliases_in_force(&self) -> Vec<ModelAlias> {
+        self.aliases.declared()
+    }
+
+    /// Where a request would be placed, given what the nodes say now.
+    ///
+    /// The one placement rule, with this fabric's aliases applied — what
+    /// `fabric route`, `GET /v1/models/{id}` and dispatch all go through, so
+    /// the dry run, the listing and the send cannot drift apart.
+    pub fn decide(
+        &self,
+        snapshots: &[NodeSnapshot],
+        request: &RouteRequest<'_>,
+    ) -> Result<RouteDecision, RouteError> {
+        route(snapshots, &request.with_aliases(&self.aliases))
+    }
+
+    /// Every model id a request could name and be placed, in `mixed` mode.
+    ///
+    /// Exactly what [`Self::decide`] would accept: a canonical id an alias
+    /// resolves to something a placeable node holds, and every id a placeable
+    /// node holds directly. An entry that exists only because of an alias says
+    /// so, because what it rests on is somebody's word.
+    pub fn servable_models(
+        &self,
+        snapshots: &[NodeSnapshot],
+        mixed: MixedEngines,
+    ) -> Vec<ServableModel> {
+        let placeable: Vec<&NodeSnapshot> = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.is_placeable_under(mixed))
+            .collect();
+        let mut listed: std::collections::BTreeMap<String, ModelIdentity> =
+            std::collections::BTreeMap::new();
+        for snapshot in &placeable {
+            let ready = snapshot.status.ready().expect("placeable nodes are ready");
+            let held = ready
+                .active_model_id
+                .iter()
+                .chain(ready.resident_models.iter().flatten())
+                .chain(ready.models.iter());
+            for id in held {
+                if policy::serves(snapshot, id).is_some() {
+                    listed.entry(id.clone()).or_insert(ModelIdentity::SameId);
+                }
+            }
+        }
+        for alias in self.aliases.declared() {
+            let held = placeable.iter().any(|snapshot| {
+                snapshot.label() == alias.label && policy::serves(snapshot, &alias.local).is_some()
+            });
+            if held && alias.local != alias.canonical {
+                // A claim that travels: an id also held directly can still be
+                // answered by the aliased node, so the entry says it may rest
+                // on the declaration.
+                listed.insert(alias.canonical, ModelIdentity::AssertedByOperator);
+            }
+        }
+        listed
+            .into_iter()
+            .map(|(id, identity)| ServableModel { id, identity })
+            .collect()
+    }
+
+    /// How many nodes one request may be sent to; see
+    /// [`Self::with_max_forward_attempts`].
+    pub fn max_forward_attempts(&self) -> usize {
+        self.max_forward_attempts
+    }
+
+    /// Announce each foreign node added to the node file from now on. The
+    /// proxy turns this on when it places on other engines, because then such
+    /// a node is placed on the moment it is added.
+    pub fn announce_foreign_additions(&self, on: bool) {
+        self.nodes.announce_foreign_additions(on);
+    }
+
+    /// The foreign nodes announced since this fabric was built.
+    pub fn foreign_added_since_start(&self) -> Vec<ForeignAddition> {
+        self.nodes.foreign_added_since_start()
     }
 
     /// Reuse an observation for up to `max_age` instead of probing again.
@@ -571,6 +658,7 @@ impl Fabric {
             .into_iter()
             .filter(|snapshot| !excluded.iter().any(|label| label == snapshot.label()))
             .collect();
+        let request = &request.with_aliases(&self.aliases);
 
         let (decision, service_model, service_ahead) = if request.mode == RouteMode::CompletionTime
         {
@@ -652,19 +740,33 @@ impl Fabric {
     ///
     /// This exists for the one-shot `fabric run` path, whose request body uses
     /// the chosen node's active model. Keeping the send here ensures it cannot
-    /// bypass the fabric's bearer or transport policy.
+    /// bypass the fabric's bearer or transport policy — or what the body
+    /// requires: a placement made for one request is not a pass for another,
+    /// so a body carrying tools is refused for a node not measured for them
+    /// however it was placed.
     pub fn forward_to(
         &self,
-        spec: &NodeSpec,
+        placement: &Placement,
         path: &str,
         body: &Value,
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<Forwarded, ForwardError> {
+        let node = placement.node();
+        if let Err(missing) =
+            policy::meets(&node.capabilities(), placement_requirements(path, body))
+        {
+            return Err(ForwardError::Unsupported(format!(
+                "node `{}` ({}) is not sent requests needing `{missing}`: nothing here shows it \
+                 can handle them",
+                node.label(),
+                node.engine_and_version()
+            )));
+        }
         forward::forward_with_transport(
-            spec,
+            &node.spec,
             path,
-            body,
+            &body_for(placement, body),
             self.bearer.as_deref(),
             timeout,
             cancel,
@@ -689,14 +791,18 @@ impl Fabric {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
+        // What the body requires is read here, at the one place every placed
+        // request passes, rather than trusted from whoever built `request`: a
+        // caller may add a requirement, never take one the body carries away.
+        let request = request.requiring(request.requires.union(placement_requirements(path, body)));
         let service_class =
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
-        let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
+        let mut sent = self.send_until_a_node_takes_it(&request, |placement| {
             forward::forward_with_transport(
-                spec,
+                &placement.node.spec,
                 path,
-                body,
+                &body_for(placement, body),
                 self.bearer.as_deref(),
                 forward_timeout,
                 cancel,
@@ -705,7 +811,7 @@ impl Fabric {
         })?;
         if sent.value.is_success() {
             sent.placement.record_success(sent.value.elapsed);
-        } else if sent.value.status >= 500 && !sent.value.refused_for_backpressure() {
+        } else if sent.value.status >= 500 && !trusted_backpressure(&sent.placement, &sent.value) {
             sent.placement.invalidate_service_time();
         }
         Ok(Dispatched {
@@ -734,14 +840,16 @@ impl Fabric {
         idle_timeout: Duration,
         cancel: &Cancel,
     ) -> Result<DispatchedStream, DispatchError> {
+        // The same chokepoint as `dispatch`: see there.
+        let request = request.requiring(request.requires.union(placement_requirements(path, body)));
         let service_class =
             (request.mode != RouteMode::Throughput).then(|| service_class(path, body));
         let request = request.with_service_class(service_class.as_deref());
-        let mut sent = self.send_until_a_node_takes_it(&request, |spec| {
+        let mut sent = self.send_until_a_node_takes_it(&request, |placement| {
             forward::forward_streaming_with_transport(
-                spec,
+                &placement.node.spec,
                 path,
-                body,
+                &body_for(placement, body),
                 self.bearer.as_deref(),
                 head_timeout,
                 idle_timeout,
@@ -752,7 +860,7 @@ impl Fabric {
         if let StreamOutcome::Buffered(answer) = &sent.value {
             if answer.is_success() {
                 sent.placement.record_success(answer.elapsed);
-            } else if answer.status >= 500 && !answer.refused_for_backpressure() {
+            } else if answer.status >= 500 && !trusted_backpressure(&sent.placement, answer) {
                 sent.placement.invalidate_service_time();
             }
         }
@@ -775,7 +883,12 @@ impl Fabric {
     /// A node that answers with a queue-full refusal gets the same treatment
     /// for the same reason ([`NodeAnswer::refused_for_backpressure`]): it
     /// rejected the request at its queue boundary rather than running it, so
-    /// another node can be asked. The two are tracked apart because only one of
+    /// another node can be asked. Only from an engine whose capabilities
+    /// declare that refusal, though: a label says which engine to expect, not
+    /// which one answered, and a gateway or impostor reusing the code would
+    /// otherwise get a request that may already be running sent a second time.
+    /// Any other answer — an untyped 5xx, a foreign node's anything — is
+    /// relayed once, because nothing distinguishes it from a real failure. The two are tracked apart because only one of
     /// them says the observation was wrong — a saturated node is exactly where
     /// the observation said it was, and re-probing on every refusal would spend
     /// a probe per request under load, which is the cost
@@ -793,11 +906,14 @@ impl Fabric {
     fn send_until_a_node_takes_it<T: NodeAnswer>(
         &self,
         request: &RouteRequest<'_>,
-        mut send: impl FnMut(&NodeSpec) -> Result<T, ForwardError>,
+        mut send: impl FnMut(&Placement) -> Result<T, ForwardError>,
     ) -> Result<Sent<T>, DispatchError> {
         let mut gone: Vec<String> = Vec::new();
         let mut saturated: Vec<String> = Vec::new();
-        let mut first_failure: Option<ForwardError> = None;
+        // With the engine of the node that failed, taken from the placement
+        // rather than looked up later: the node file can be re-declared while
+        // a request is out, and the answer must name what it was sent to.
+        let mut first_failure: Option<(ForwardError, NodeEngine)> = None;
         let mut refused: Option<(T, Placement)> = None;
         // Nodes actually asked, which is not the attempt number: placement can
         // run out before an attempt reaches one.
@@ -816,8 +932,8 @@ impl Fabric {
             };
             asked = attempt;
 
-            match send(&placement.node.spec) {
-                Ok(value) if value.refused_for_backpressure() => {
+            match send(&placement) {
+                Ok(value) if trusted_backpressure(&placement, &value) => {
                     saturated.push(placement.decision.label.clone());
                     // The first refusal is the one a client would have received
                     // before this existed, so it is the one to fall back to.
@@ -841,7 +957,7 @@ impl Fabric {
                 Err(error) if error.node_never_received_it() => {
                     placement.invalidate_service_time();
                     gone.push(placement.decision.label.clone());
-                    first_failure.get_or_insert(error);
+                    first_failure.get_or_insert((error, placement.decision.engine));
                 }
                 // The node that took the request is the one that ended it, so
                 // that is what gets reported. An earlier node found gone was
@@ -859,7 +975,10 @@ impl Fabric {
                         // outlive this request, however the request ended.
                         self.forget_observation();
                     }
-                    return Err(DispatchError::Forward(error));
+                    return Err(DispatchError::Forward {
+                        error,
+                        engine: Some(placement.decision.engine),
+                    });
                 }
             }
         }
@@ -870,9 +989,12 @@ impl Fabric {
 
         // The budget ran out with nodes possibly still untried. Say so with the
         // failure that started it, not with a count.
-        let exhausted = first_failure.expect("the budget can only run out after a failure");
+        let (error, engine) = first_failure.expect("the budget can only run out after a failure");
         self.forget_observation();
-        Err(DispatchError::Forward(exhausted))
+        Err(DispatchError::Forward {
+            error,
+            engine: Some(engine),
+        })
     }
 
     /// Settle on the failure to report when placement runs out of nodes.
@@ -906,13 +1028,16 @@ impl Fabric {
 
     fn ran_out_of_nodes(
         &self,
-        first_failure: Option<ForwardError>,
+        first_failure: Option<(ForwardError, NodeEngine)>,
         refusal: RouteError,
     ) -> DispatchError {
         match first_failure {
-            Some(error) => {
+            Some((error, engine)) => {
                 self.forget_observation();
-                DispatchError::Forward(error)
+                DispatchError::Forward {
+                    error,
+                    engine: Some(engine),
+                }
             }
             None => DispatchError::Route(refusal),
         }
@@ -944,6 +1069,63 @@ fn service_class(path: &str, body: &Value) -> String {
         bucket(request_bytes),
         bucket(output_tokens),
     )
+}
+
+/// What placement must hold a node to before this request may land on it,
+/// read from the request. Pure.
+///
+/// This and [`service_class`] are the only readers of a request body in
+/// placement, and between them they read: whether a top-level `tools` or
+/// `functions` key is present, never its contents; which route it came in on;
+/// and, for service time, `stream`, the token budget and the size bucket.
+/// Message content reaches placement only through that bucket. `tools: []`
+/// counts as carrying tools: failing closed costs our own engine nothing, and
+/// a client that always sends the key has told us nothing by sending it empty.
+/// A tool-loop follow-up carrying `role: "tool"` messages without `tools` is
+/// not detected, because seeing it would mean reading the messages.
+pub fn placement_requirements(path: &str, body: &Value) -> Requirements {
+    let present = |key: &str| body.get(key).is_some_and(|value| !value.is_null());
+    Requirements {
+        tool_calls: present("tools") || present("functions"),
+        rerank_route: matches!(
+            path,
+            "/rerank" | "/reranking" | "/v1/rerank" | "/v1/reranking"
+        ),
+    }
+}
+
+/// Whether `answer` is a queue-full refusal from a node whose engine declares
+/// that refusal, which is the only kind that can safely be sent elsewhere.
+fn trusted_backpressure(placement: &Placement, answer: &impl NodeAnswer) -> bool {
+    answer.refused_for_backpressure()
+        && placement.node().capabilities().typed_backpressure.supported == Some(true)
+}
+
+/// The body to send the node `placement` chose: the client's, with `model`
+/// set to the id that node knows the model by when that differs. Nothing
+/// else is ever written, and a body that needs no change is not copied.
+fn body_for<'b>(placement: &Placement, body: &'b Value) -> Cow<'b, Value> {
+    let Some(model) = placement.decision.model.as_deref() else {
+        return Cow::Borrowed(body);
+    };
+    if body.get("model").and_then(Value::as_str) == Some(model) {
+        return Cow::Borrowed(body);
+    }
+    let mut rewritten = body.clone();
+    match rewritten.as_object_mut() {
+        Some(object) => {
+            object.insert("model".to_string(), Value::String(model.to_string()));
+            Cow::Owned(rewritten)
+        }
+        None => Cow::Borrowed(body),
+    }
+}
+
+/// One model id a request could name, and what the listing rests on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServableModel {
+    pub id: String,
+    pub identity: ModelIdentity,
 }
 
 /// A request that a node took, and what it cost to get there.
@@ -1066,14 +1248,19 @@ pub enum DispatchError {
     /// No node could take the request.
     Route(RouteError),
     /// A node was chosen, but the request did not complete against it.
-    Forward(ForwardError),
+    Forward {
+        error: ForwardError,
+        /// The engine of the node it was sent to, when it was sent anywhere,
+        /// so a failure names its engine the way an answer does.
+        engine: Option<NodeEngine>,
+    },
 }
 
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Route(error) => write!(f, "{error}"),
-            Self::Forward(error) => write!(f, "{error}"),
+            Self::Forward { error, .. } => write!(f, "{error}"),
         }
     }
 }
@@ -1088,7 +1275,10 @@ impl From<RouteError> for DispatchError {
 
 impl From<ForwardError> for DispatchError {
     fn from(error: ForwardError) -> Self {
-        Self::Forward(error)
+        Self::Forward {
+            error,
+            engine: None,
+        }
     }
 }
 
@@ -1247,12 +1437,17 @@ pub fn render_status(snapshots: &[NodeSnapshot]) -> String {
 /// Kept pure so the wording is covered by a unit test rather than by starting a
 /// server, the same way [`render_status`] is.
 pub fn startup_report(snapshots: &[NodeSnapshot]) -> String {
+    startup_report_serving(snapshots, &servable_models(snapshots))
+}
+
+/// [`startup_report`], naming `models` as what is served — the listing the
+/// proxy will actually answer with, in its mode and with its aliases.
+pub fn startup_report_serving(snapshots: &[NodeSnapshot], models: &[String]) -> String {
     if snapshots.is_empty() {
         return "fabric: no nodes configured\n".to_string();
     }
 
     let summary = FabricSummary::of(snapshots);
-    let models = servable_models(snapshots);
     let mut out = format!(
         "fabric: {} of {} nodes ready",
         summary.ready,
@@ -1284,6 +1479,80 @@ pub fn startup_report(snapshots: &[NodeSnapshot]) -> String {
     out
 }
 
+/// What a starting proxy tells its operator about where it places work. Pure.
+///
+/// Under mixed placement each node of an engine not placed on by default is
+/// named with everything accepted about it and every request it will still
+/// never be sent, in the build's own words, because that is the grant the
+/// operator just made. `reloadable` adds that the grant covers nodes added to
+/// the file later, and `aliases` lists the declarations in force.
+pub fn placement_report(
+    snapshots: &[NodeSnapshot],
+    mixed: MixedEngines,
+    reloadable: bool,
+    aliases: &[ModelAlias],
+) -> String {
+    let mut out = String::new();
+    match mixed {
+        MixedEngines::Refused => out.push_str("placement: Camelid engines only\n"),
+        MixedEngines::Allowed => {
+            out.push_str(&format!(
+                "placement: ALSO placing on other engines ({MIXED_ENGINES_FLAG})\n"
+            ));
+            for snapshot in snapshots {
+                let capabilities = snapshot.capabilities();
+                let blockers = capabilities.placement_blockers();
+                if blockers.is_empty() {
+                    continue;
+                }
+                let engine = snapshot.engine_and_version();
+                let never: Vec<String> = capabilities
+                    .requirement_limits(&engine)
+                    .into_iter()
+                    .map(|limit| limit.consequence)
+                    .collect();
+                out.push_str(&format!(
+                    "  {} ({engine}): accepted without asking: {}.",
+                    snapshot.label(),
+                    blockers.join("; ")
+                ));
+                if !never.is_empty() {
+                    out.push_str(&format!(" {}.", never.join("; ")));
+                }
+                out.push('\n');
+            }
+            if reloadable {
+                out.push_str(
+                    "  note: nodes of other engines added to the nodes file later are accepted \
+                     too, and are announced here.\n",
+                );
+            }
+        }
+    }
+    if !aliases.is_empty() {
+        let mut by_canonical: Vec<(String, Vec<String>)> = Vec::new();
+        for alias in aliases {
+            let target = format!("{}:{}", alias.label, alias.local);
+            match by_canonical
+                .iter_mut()
+                .find(|(canonical, _)| *canonical == alias.canonical)
+            {
+                Some((_, targets)) => targets.push(target),
+                None => by_canonical.push((alias.canonical.clone(), vec![target])),
+            }
+        }
+        let listed: Vec<String> = by_canonical
+            .into_iter()
+            .map(|(canonical, targets)| format!("{canonical} -> {}", targets.join(", ")))
+            .collect();
+        out.push_str(&format!(
+            "aliases in force (read at startup; edit and restart to change): {}\n",
+            listed.join("; ")
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1576,7 @@ mod tests {
             engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: Some(model.to_string()),
             models: vec![model.to_string()],
+            resident_models: Some(vec![model.to_string()]),
             backend: Some("llama".to_string()),
             version: Some("0.5.4".to_string()),
             load: Some(crate::fabric::node::NodeLoad {
@@ -1549,6 +1819,154 @@ mod tests {
         assert!(!class.contains("prompt"), "{class}");
     }
 
+    /// I12, pinned. Two bodies that differ in every piece of content but not
+    /// in encoded size must be placed identically: what placement reads of
+    /// content is the size bucket and the presence of a key, nothing else.
+    #[test]
+    fn contents_of_equal_encoded_size_cannot_change_requirements_or_class() {
+        let one = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "aaaaaaaaaaaaaaaa" }],
+            "tools": [{ "type": "function", "function": { "name": "get_weather" } }],
+        });
+        let two = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "bbbbbbbbbbbbbbbb" }],
+            "tools": [{ "type": "function", "function": { "name": "put_weather" } }],
+        });
+        assert_eq!(
+            serde_json::to_vec(&one).expect("encodes").len(),
+            serde_json::to_vec(&two).expect("encodes").len(),
+            "the two bodies must be the same size for this test to mean anything"
+        );
+        for path in ["/v1/chat/completions", "/v1/embeddings"] {
+            assert_eq!(
+                placement_requirements(path, &one),
+                placement_requirements(path, &two)
+            );
+            assert_eq!(service_class(path, &one), service_class(path, &two));
+        }
+
+        let carries = |body: serde_json::Value| {
+            placement_requirements("/v1/chat/completions", &body).tool_calls
+        };
+        assert!(carries(
+            serde_json::json!({ "tools": [{ "type": "function" }] })
+        ));
+        assert!(
+            carries(serde_json::json!({ "tools": [] })),
+            "an empty list still fails closed"
+        );
+        assert!(carries(
+            serde_json::json!({ "functions": [{ "name": "f" }] })
+        ));
+        assert!(!carries(serde_json::json!({ "tools": null })));
+        assert!(!carries(serde_json::json!({})));
+        assert!(
+            !carries(serde_json::json!({
+                "messages": [{ "role": "tool", "content": "{}", "tool_call_id": "c" }]
+            })),
+            "messages are not read, so a tool-result turn without `tools` is not detected"
+        );
+
+        for path in ["/v1/rerank", "/v1/reranking", "/rerank", "/reranking"] {
+            assert!(placement_requirements(path, &one).rerank_route, "{path}");
+        }
+        assert!(!placement_requirements("/v1/chat/completions", &one).rerank_route);
+        assert!(!placement_requirements("/v1/embeddings", &one).rerank_route);
+    }
+
+    #[test]
+    fn only_the_size_bucket_of_content_reaches_the_service_class() {
+        let with = |content: String| {
+            serde_json::json!({
+                "model": "m",
+                "messages": [{ "role": "user", "content": content }],
+                "max_tokens": 64,
+            })
+        };
+        let small = with("x".repeat(40));
+        let large = with("y".repeat(4_000));
+        let small_class = service_class("/v1/chat/completions", &small);
+        let large_class = service_class("/v1/chat/completions", &large);
+        assert_ne!(
+            small_class, large_class,
+            "crossing a power of two moves the bucket"
+        );
+
+        let strip = |class: &str| -> Vec<String> {
+            class
+                .split('|')
+                .filter(|part| !part.starts_with("bytes="))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            strip(&small_class),
+            strip(&large_class),
+            "and nothing but the bucket"
+        );
+        assert_eq!(
+            placement_requirements("/v1/chat/completions", &small),
+            placement_requirements("/v1/chat/completions", &large)
+        );
+    }
+
+    #[test]
+    fn the_startup_placement_line_says_what_the_flag_accepts_and_that_it_stands() {
+        let mut foreign_spec = NodeSpec::camelid("b-ollama", "127.0.0.1", 11434);
+        foreign_spec.engine = NodeEngine::Ollama;
+        let foreign = NodeSnapshot {
+            spec: foreign_spec,
+            status: NodeStatus::Ready(NodeReady {
+                engine: NodeEngine::Ollama,
+                active_model_id: None,
+                models: vec!["m:latest".to_string()],
+                resident_models: Some(Vec::new()),
+                backend: None,
+                version: Some("0.33.2".to_string()),
+                load: None,
+            }),
+            latency: None,
+        };
+        let nodes = vec![snapshot("a-camelid", ready_status("m")), foreign];
+
+        assert_eq!(
+            placement_report(&nodes, MixedEngines::Refused, true, &[]),
+            "placement: Camelid engines only\n"
+        );
+        let mixed = placement_report(&nodes, MixedEngines::Allowed, true, &[]);
+        assert!(mixed.contains(MIXED_ENGINES_FLAG), "{mixed}");
+        assert!(
+            mixed.contains("b-ollama (ollama 0.33.2): accepted without asking"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("publishes no load to rank on"), "{mixed}");
+        assert!(
+            mixed.contains("requests carrying tools are never placed here"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("added to the nodes file later"), "{mixed}");
+        assert!(!mixed.contains("a-camelid"), "{mixed}");
+        assert!(
+            !placement_report(&nodes, MixedEngines::Allowed, false, &[])
+                .contains("added to the nodes file later"),
+            "a fixed set covers nothing added later"
+        );
+
+        let aliases = parse_model_aliases(&[
+            "llama-1b=a-camelid:m".to_string(),
+            "llama-1b=b-ollama:m:latest".to_string(),
+        ])
+        .expect("parses")
+        .declared();
+        let listed = placement_report(&nodes, MixedEngines::Refused, true, &aliases);
+        assert!(
+            listed.contains("aliases in force (read at startup; edit and restart to change): llama-1b -> a-camelid:m, b-ollama:m:latest"),
+            "{listed}"
+        );
+    }
+
     #[test]
     fn the_servable_list_is_the_union_of_ready_nodes() {
         let snapshots = vec![
@@ -1566,6 +1984,7 @@ mod tests {
             engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: None,
             models: Vec::new(),
+            resident_models: Some(Vec::new()),
             backend: Some("llama".to_string()),
             version: Some("0.5.4".to_string()),
             load: Some(crate::fabric::node::NodeLoad {
@@ -1773,7 +2192,13 @@ mod tests {
             )
             .expect_err("streaming is unsupported");
         assert!(
-            matches!(error, DispatchError::Forward(ForwardError::Unsupported(_))),
+            matches!(
+                error,
+                DispatchError::Forward {
+                    error: ForwardError::Unsupported(_),
+                    engine: None
+                }
+            ),
             "got {error:?}"
         );
     }
