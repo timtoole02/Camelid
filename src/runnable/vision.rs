@@ -178,6 +178,16 @@ pub struct PrismVisionProjector {
     cuda: PrismVisionCudaRuntime,
 }
 
+/// Whether this build has any lane that can *decode* with image embeddings.
+///
+/// Encoding an image is always possible — there is a CPU reference path — but
+/// generation with one is implemented only on Metal and CUDA. Health readiness
+/// has to answer for the whole request, so it consults this rather than asking
+/// the projector whether it can encode. Kept as a plain `const` rather than a
+/// `cfg!` at the use site so one cfg-independent test can pin it on every CI
+/// leg, including the legs that do not compile the arm it guards.
+pub(crate) const VISION_DECODE_LANE_EXISTS: bool = cfg!(any(target_os = "macos", feature = "cuda"));
+
 #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
 // The encoder is a single long-lived execution object behind a mutex. Keeping
 // it inline avoids an extra heap indirection on every image request; the small
@@ -302,19 +312,52 @@ impl PrismVisionProjector {
             })?;
             self.initialize_cuda_lane(&mut lane)?;
         }
+        // Must stay `Ok` here: this runs inside the serve-runtime load, and
+        // failing would make the row unloadable for text too. Say why the image
+        // affordance will be missing instead of leaving the operator guessing.
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+        {
+            eprintln!(
+                "[qwen3vl] projector loaded, but this build has no Metal or CUDA lane to decode \
+                 with image embeddings; image input stays unavailable and text is unaffected"
+            );
+        }
         Ok(())
     }
 
     /// Non-blocking readiness query for health/liveness endpoints. Image
     /// projection owns `cuda` for the duration of GPU execution; consulting
     /// that mutex here would let an ordinary image request stall health polls.
+    ///
+    /// This answers for the whole image request, not just the projector: a
+    /// build can encode an image on CPU and still have no lane that can decode
+    /// with it, so readiness has to account for [`VISION_DECODE_LANE_EXISTS`].
     pub fn backend_ready(&self) -> bool {
+        // A projector that can only encode is not readiness. CPU encode works
+        // everywhere, but generation with the result errors out unconditionally
+        // off Metal and CUDA, so a build with no decode lane must report false
+        // however healthy its projector is — reporting true would advertise a
+        // capability `src/api/contract.rs` scopes to
+        // `prism_single_image_data_url_metal_or_windows_cuda`.
+        if !VISION_DECODE_LANE_EXISTS {
+            return false;
+        }
+        // Truthful because both `mark_ready` call sites in `initialize_cuda_lane`
+        // now report the lane's actual final state rather than assuming success.
         #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
         {
             self.cuda.is_ready()
         }
+        // macOS. Load already proved the Metal graph: `PrismVisionProjector::load`
+        // fails unless `model.metal_encoder()` succeeded, and constructing that
+        // encoder forces the process-global pipeline cache, so a projector we
+        // hold has its weights uploaded and its pipelines compiled. This is a
+        // claim about the lane existing, not a promise that every image encodes
+        // — per-request geometry can still be rejected.
         #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
-        true
+        {
+            true
+        }
     }
 
     pub fn encode_image(
@@ -441,7 +484,10 @@ impl PrismVisionProjector {
                     "[qwen3vl] Windows CUDA projector not selected or unavailable; using CPU"
                 );
                 *lane = PrismVisionCudaLane::Disabled;
-                self.cuda.mark_ready(true);
+                // CPU encode still works, but nothing on this build can decode
+                // with the result, so readiness must reflect the lane, not the
+                // fact that we returned without an error.
+                self.cuda.mark_ready(false);
                 return Ok(());
             }
             *lane = match super::vision_cuda::CudaVisionEncoder::new() {
@@ -468,7 +514,11 @@ impl PrismVisionProjector {
             self.cuda.mark_ready(false);
             return Err(BackendError::UnsupportedGguf(diagnostic.clone()));
         }
-        self.cuda.mark_ready(true);
+        // Report the lane's actual state. Reaching here is not proof of success:
+        // a lane disabled during a previous encode is no longer `Pending`, so it
+        // skips the initialization block above and arrives here unchanged.
+        self.cuda
+            .mark_ready(matches!(*lane, PrismVisionCudaLane::Ready(_)));
         Ok(())
     }
 }
@@ -1207,6 +1257,21 @@ fn interpolate_positions_tile_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deliberately cfg-independent so it runs on every CI leg, including the
+    /// ones that never compile the CPU-only arm of `backend_ready`. The defect
+    /// this guards against — advertising vision readiness on a build with no
+    /// decode lane — lived only in a configuration no CI leg builds, so a
+    /// cfg-gated test would not have caught it.
+    #[test]
+    fn vision_decode_lane_constant_agrees_with_the_lanes_that_exist() {
+        assert_eq!(
+            VISION_DECODE_LANE_EXISTS,
+            cfg!(any(target_os = "macos", feature = "cuda")),
+            "VISION_DECODE_LANE_EXISTS must track the cfgs that actually \
+             implement image decode; readiness is derived from it"
+        );
+    }
 
     #[test]
     fn qwen3vl_smart_resize_is_merge_aligned_and_bounded() {

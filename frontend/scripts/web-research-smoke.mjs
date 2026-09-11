@@ -644,6 +644,18 @@ assert.match(dashboardHookSource, /fitWebResearchContext[\s\S]*deriveFittedWebRe
 assert.doesNotMatch(dashboardHookSource, /Math\.max\(1, Math\.floor\(fittedReplyBudget\.replyReserve\)\)/, 'known context overflow must never be coerced into a max_tokens=1 request')
 assert.match(dashboardHookSource, /activeContextLength:\s*runtime\?\.active_context_length/, 'send-time fitting must use the active runtime context rather than training metadata')
 assert.match(dashboardHookSource, /visionTokenAllowance:\s*runtime\?\.vision_token_allowance/, 'vision context must use a runtime allowance instead of base64 transport length')
+// The assertion above pins the CONSUMER, and passed for as long as the field
+// went unemitted — the estimator silently fell back to a stale default. Pin the
+// producer too. Three occurrences: the struct field and both HealthResponse
+// literals; a single-site check would still pass if only the busy-path
+// constructor kept it, which is the exact mistake api/mod.rs warns about.
+// Match the `field:` binding form only, so prose mentions in doc comments
+// cannot pad the count: one struct field plus two constructors.
+const apiSource = await readFile(resolve(scriptDir, '../../src/api/mod.rs'), 'utf8')
+assert.ok(
+  (apiSource.match(/vision_token_allowance:/g)?.length ?? 0) >= 3,
+  'the backend must declare vision_token_allowance and set it in BOTH health constructors, or the consumer above silently falls back to a default',
+)
 assert.doesNotMatch(dashboardHookSource, /\btools\s*:/, 'Gemma Web research must not add unsupported function tools to chat requests')
 assert.doesNotMatch(dashboardHookSource, /\btool_choice\s*:/, 'Web Auto must remain separate from native model tool selection')
 assert.doesNotMatch(dashboardHookSource, /\bcamelid_tools\s*:/, 'Web Auto must not enter a camelid_tools loop')

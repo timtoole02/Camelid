@@ -8,7 +8,9 @@ const MAX_CONTEXT_TOTAL_CHARS = 8_000
 const MIN_CONTEXT_SOURCE_CHARS = 256
 const MIN_CONTEXT_CHUNK_CHARS = 128
 const DEFAULT_RESEARCH_TIMEOUT_MS = 45_000
-const DEFAULT_VISION_TOKEN_ALLOWANCE = 1_024
+// Matches the serve path's default per-image token ceiling, used only when the
+// server does not advertise vision_token_allowance on /v1/health.
+const DEFAULT_VISION_TOKEN_ALLOWANCE = 128
 const MAX_VISION_TOKEN_ALLOWANCE = 8_192
 const CHAT_TEMPLATE_TOKENS_PER_MESSAGE = 16
 const CHAT_TEMPLATE_BASE_TOKENS = 8
