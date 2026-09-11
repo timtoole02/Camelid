@@ -145,7 +145,7 @@ fn client_closed_request() -> StatusCode {
 /// This list is the single source of truth. The router is built from it, and so
 /// is the refusal a client gets for a route that is not on it, so the two cannot
 /// drift apart.
-const PLACED_ROUTES: [&str; 5] = [
+pub const PLACED_ROUTES: [&str; 5] = [
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",

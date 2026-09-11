@@ -2020,11 +2020,15 @@ enum FabricAction {
     },
     /// Run a resident HTTP proxy in front of the fabric.
     ///
-    /// Every request to `/v1/chat/completions` is placed and forwarded through
-    /// the same placement `fabric run` uses, so a client can point at one
-    /// address instead of the operator invoking the CLI per request. A request
-    /// asking for `stream: true` is relayed as server-sent events, so a stock
-    /// OpenAI client works against this address unchanged.
+    /// Every request to `/v1/chat/completions`, `/v1/completions`,
+    /// `/v1/embeddings`, `/v1/rerank` and `/v1/reranking` is placed and
+    /// forwarded through the same placement `fabric run` uses, so a client can
+    /// point at one address instead of the operator invoking the CLI per
+    /// request. A request asking for `stream: true` is relayed as server-sent
+    /// events, so a stock OpenAI client works against this address unchanged.
+    /// `/v1/models` answers for the whole fabric, `/v1/fabric/compare` runs a
+    /// comparison, and the Responses and Conversations routes are refused,
+    /// because they keep state on the node that served them.
     ///
     /// Client authentication is separate from the bearer the proxy sends to
     /// its nodes. The proxy binds loopback by default; a routable address is
@@ -2361,6 +2365,27 @@ mod fabric_command_tests {
         );
         assert!(!rendered.contains("  - model identity:"), "{rendered}");
         assert!(!rendered.contains("NOT VERIFIED"), "{rendered}");
+    }
+
+    /// C5. The help said only chat was placed while five routes are. It is
+    /// checked against the list the proxy's router is built from.
+    #[test]
+    fn fabric_serve_help_names_every_route_it_places() {
+        on_cli_test_stack(|| {
+            use clap::CommandFactory;
+            let mut cli = Cli::command();
+            let serve = cli
+                .find_subcommand_mut("fabric")
+                .and_then(|fabric| fabric.find_subcommand_mut("serve"))
+                .expect("fabric serve exists");
+            let help = serve.render_long_help().to_string();
+            for route in camelid::fabric::server::PLACED_ROUTES {
+                assert!(
+                    help.contains(&format!("`{route}`")),
+                    "`fabric serve --help` does not name {route}:\n{help}"
+                );
+            }
+        });
     }
 
     /// C3. The terminal printed "NOT CONTROLLED: model identity" beside a

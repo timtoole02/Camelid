@@ -395,6 +395,11 @@ of its own answer:
 | `declared` | Follows from the documented API surface — the endpoint that would carry it does not exist |
 | `not_probed` | Nobody has checked; `supported` is `null` |
 
+`history_neutral` — whether an engine answers a request the same way whatever requests it served
+before — is `not_probed` for every engine, Camelid included, except where a measurement on that
+exact version recorded otherwise (`measured: false` for Ollama 0.33.2); see *Request history* under
+*Comparing two nodes*.
+
 `not_probed` is never rendered as a no. A capability nobody measured is unknown, and a build that
 answered "unsupported" there would be inventing a result. A measurement is bound to the version
 string the node reported, so a neighbouring version inherits nothing from it — this is why an Ollama
@@ -487,6 +492,86 @@ The diff keeps line terminators. Every line carries `eol` — `lf`, `crlf`, or `
 with no newline — beside its `text`, which never contains the terminator, so two answers that differ
 only in a trailing newline or in CRLF against LF show a changed line rather than an unchanged one
 under a `divergent` verdict. The terminal draws them as `⏎`, `␍⏎` and `(no newline at end)`.
+
+### What a comparison records, and what it does not control
+
+Every comparison carries, per side and for the whole run:
+
+| Field | What it is |
+|---|---|
+| `advertised_template` | The chat template the engine publishes for the model (see the table above). Never evidence of what it applied. |
+| `rendered_prompt` | The prompt the engine built from exactly the messages the comparison sent, where it can render without generating (Camelid only). `captured` with its `source` and `text`, or `unavailable` with a `reason`. |
+| `weights_digest` | The SHA-256 of the weights the side serves: `published` with its `digest` and `source`, or `unavailable` with a `reason`. |
+| `weights_check` | Whether the side's engine checked its own loaded bytes against the other side's digest: `enforced`, `refused`, or `null` when it was not asked. |
+| `plan.history_perturbed` | Whether each side was sent an unrelated request between its runs (below). |
+| `uncontrolled` / `uncontrolled_detail` | What the comparison did not control. `uncontrolled` is the bare list of names, as before; `uncontrolled_detail` carries a `{name, reason}` for each, in the same order, because the gaps are of different kinds — a seed is a parameter an engine may lack, model identity is a check nobody ran. |
+
+#### Model identity by digest
+
+Where both engines publish a digest of the weights they serve, the digests decide identity instead
+of the names:
+
+| Engine | Weights digest |
+|---|---|
+| Camelid | `GET /v1/models` → `gguf_sha256` of the loaded model: the SHA-256 of its exact GGUF |
+| Ollama | the content-addressed blob the `FROM` line of `POST /api/show`'s `modelfile` names (`…/blobs/sha256-<digest>`): the SHA-256 of the GGUF bytes Ollama stores and serves, which are not always the file it was given (below) |
+| LM Studio | **none** — its documented API publishes no digest |
+
+Ollama's `/api/tags` also carries a `digest`, of the *manifest*: it changes with a template or a
+parameter while the weights stay put, and is never read as a weights digest.
+
+Both sides are read before either generates, and a Camelid side's runs are sent
+`camelid_expected_gguf_sha256` set to the other side's published digest, so the engine itself
+checks its loaded bytes on every run. If it refuses (`model_artifact_mismatch`), its weights are
+other bytes and the comparison says so — `different_models` — rather than failing.
+
+| Evidence | Result |
+|---|---|
+| Both sides published, or enforced, one digest | `model_identity: verified_by_digest`, the digest shown, nothing about identity uncontrolled |
+| Published digests differ, or an engine refused the other's | `different_models`, naming each side's GGUF file digest. Different files are shown; different tensors are not, so the headline says the sides are *not shown to serve the same model* |
+| Anything else | `same_id` or `asserted_by_operator` as before, with the reason naming the side that published no digest |
+
+Measured with `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `432f310a…`) on mini2:
+
+- The same Camelid server under two labels published `432f310a…` on both sides, every run was
+  enforced against it, and the comparison reported `verified_by_digest` and `identical`.
+- Against Ollama 0.33.2 with a model made by `ollama create` from that same file, it did **not**
+  verify. Ollama stored a re-serialized copy — the same size, metadata keys reordered, sha256
+  `a2fa82e5…` — and its modelfile names that blob. Camelid refused runs bound to `a2fa82e5…` and the
+  comparison reported `different_models`. A whole-file digest cannot see past a re-serialization, so
+  Camelid against an Ollama model created from a local GGUF on that version cannot be compared as the
+  same model today; the `asserted_by_operator` path it used before cannot override bytes shown to
+  differ.
+
+#### Request history
+
+An engine's answer can depend on the requests it served before — a reused KV prefix, a prompt
+cache, a leftover slot — and an engine like that repeats itself run after run from the same history,
+so back-to-back self-consistency cannot see it. Measured on Ollama 0.33.2 with an unchanged GGUF at
+temperature 0 and a fixed seed: the same request answered one way on a fresh server and another way
+after other requests, then kept repeating whichever it had settled on, and `fabric compare`
+reported a confident `divergent` that was the engine's own history.
+
+So by default each side is sent one short unrelated request (`Reply with the single word: ok.`, at
+most one token, never compared) before every run after its first. A history-dependent answer then
+shows as instability and the verdict is `not_attributable`; `plan.history_perturbed` records that it
+happened. Measured on that Ollama, five comparisons per arm in both orders after one `Say hi.`, with
+Camelid stable at `adf8c6c4` throughout: without the request, 8 of 10 left Ollama stable at
+`8cd52013` — a confident `divergent` that was its history — and 2 unstable; with it, 8 of 10 were
+unstable and 2 stable at `adf8c6c4`, and none was a confident `divergent`. (Those verdicts are
+derived from each side's recorded samples: on that pair the fabric itself reported
+`different_models`, for the digest reason above.) `--no-history-perturbation` on the CLI, or `"perturb_history": false` on
+`POST /v1/fabric/compare`, turns it off.
+
+It exposes a dependence; it does not control one. `request history (prompt cache)` is listed as
+uncontrolled unless both engines are shown, on their exact versions, to answer independently of
+their history — which no engine is today: the `history_neutral` capability is `not_probed` for every
+engine including Camelid, and `measured: false` for Ollama 0.33.2. It is also listed whenever the
+perturbation was off.
+
+What it does not catch: an engine on a fresh start, where every run follows the same short request,
+gives a stable answer that holds only for that state; and a dependence the one-token request does
+not trigger. Both are why the item stays on the uncontrolled list.
 
 ### Telling the fabric that two names are the same model
 
@@ -781,11 +866,14 @@ The proxy re-probes its nodes at most once per `--observation-max-age-ms` (500 b
 than once per request. Inside that window its view can be wrong, so a request placed on a node that
 has gone since is placed again on another node serving the same model, up to `--max-forward-attempts`
 (2 by default) nodes in all. A request is only ever sent twice when the first node was never reached
-and so cannot have started it: a node that accepted the request and then failed, or that failed
-part-way through a stream, ends the request with 502 rather than risking a second generation. Set
-`--max-forward-attempts 1` to fail on the first node instead. Every answer carries
-`x-camelid-fabric-node`, `x-camelid-fabric-reason` and `x-camelid-fabric-attempts`, so a client can
-tell a first-choice placement from a failover.
+and so cannot have started it. A node that accepted the request and then failed before answering ends
+it with 502 rather than risking a second generation. One that fails part-way through a stream cannot
+be answered with 502: its `200` head and the events it produced have already been relayed, and a
+status cannot change after that. The proxy ends the response without the terminating chunk instead,
+so a client reading the chunked body sees it cut short rather than completed, and the request is not
+started again on another node. Set `--max-forward-attempts 1` to fail on the first node instead.
+Every answer carries `x-camelid-fabric-node`, `x-camelid-fabric-reason` and
+`x-camelid-fabric-attempts`, so a client can tell a first-choice placement from a failover.
 
 A client that hangs up takes its request's work with it. The proxy notices the connection going and
 hangs up on the node in turn, which that node reads as its own client leaving — it stops generating

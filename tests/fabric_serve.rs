@@ -3969,3 +3969,25 @@ async fn a_comparison_waits_for_a_generation_on_the_forward_budget_not_the_probe
         );
     }
 }
+
+/// C5. The configuration guide promised a 502 for a stream that fails
+/// part-way. The test above shows what happens instead: the 200 head has
+/// already gone, and the stream is cut short without its terminating chunk.
+/// The guide must describe that, not a status that cannot be sent.
+#[test]
+fn the_guide_describes_a_stream_failing_part_way_as_the_proxy_ends_it() {
+    let guide = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/CONFIGURATION.md"
+    ))
+    .expect("the configuration guide is readable");
+    let guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !guide.contains("or that failed part-way through a stream, ends the request with 502"),
+        "a status cannot change after the head is relayed"
+    );
+    assert!(
+        guide.contains("ends the response without the terminating chunk"),
+        "the guide must say what a client actually sees"
+    );
+}
