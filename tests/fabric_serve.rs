@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use camelid::fabric::server::{serve_on, serve_on_until, ClientAuth, ProxyTls, ServeConfig};
+use camelid::fabric::server::{
+    serve_on, serve_on_until, ClientAuth, ProxyCors, ProxyTls, ServeConfig,
+};
 use camelid::fabric::{Fabric, NodeSpec, RouteMode, ENGINE_QUEUE_FULL_CODE};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -605,12 +607,221 @@ async fn start_proxy_waiting(
         forward_timeout,
         auth,
         tls: None,
+        cors: None,
         bound: addr,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
     });
     addr
+}
+
+/// The proxy behind `auth`, allowing browser reads as `cors` says.
+async fn start_proxy_allowing(
+    fabric: Fabric,
+    auth: ClientAuth,
+    cors: Option<ProxyCors>,
+) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let config = ServeConfig {
+        mode: RouteMode::Throughput,
+        forward_timeout: FORWARD_TIMEOUT,
+        auth,
+        tls: None,
+        cors,
+        bound: addr,
+    };
+    tokio::spawn(async move {
+        let _ = serve_on(listener, fabric, config).await;
+    });
+    addr
+}
+
+/// Send one bodiless request and return the status and the lowercased headers:
+/// a preflight is read only for its head, and has no JSON to parse.
+async fn head_of(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to proxy");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let header_end = text.find("\r\n\r\n").expect("header terminator");
+    let mut lines = text[..header_end].lines();
+    let status = lines
+        .next()
+        .expect("status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("numeric status");
+    let headers = lines
+        .filter_map(|line| line.split_once(": "))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+        .collect();
+    (status, headers)
+}
+
+/// Where the web UI is served from in development.
+const UI_ORIGIN: &str = "http://127.0.0.1:5173";
+
+/// What a browser sends before it will POST a comparison with a key.
+fn preflight_for_compare(origin: &str) -> [(&str, &str); 3] {
+    [
+        ("Origin", origin),
+        ("Access-Control-Request-Method", "POST"),
+        (
+            "Access-Control-Request-Headers",
+            "content-type, authorization",
+        ),
+    ]
+}
+
+fn ui_origin_allowed() -> ProxyCors {
+    ProxyCors::resolve(&[UI_ORIGIN.to_string()])
+        .expect("an explicit origin")
+        .expect("one origin was named")
+}
+
+/// The WebUI is served from another origin, so without this a browser
+/// withholds every answer the proxy gives it — measured live, a preflight to
+/// the compare route got 405 and the comparison was never sent. The refusal a
+/// missing key earns has to be readable as well, or the page sees a network
+/// failure where the proxy said 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_origin_may_read_the_proxy_its_preflight_and_its_refusals() {
+    let addr = start_proxy_allowing(
+        fabric_of(Vec::new()),
+        authenticated("proxy-key"),
+        Some(ui_origin_allowed()),
+    )
+    .await;
+
+    let (_, health) = head_of(addr, "GET", "/v1/health", &[("Origin", UI_ORIGIN)]).await;
+    assert_eq!(
+        header(&health, "access-control-allow-origin"),
+        Some(UI_ORIGIN),
+        "{health:?}"
+    );
+
+    let (status, preflight) = head_of(
+        addr,
+        "OPTIONS",
+        "/v1/fabric/compare",
+        &preflight_for_compare(UI_ORIGIN),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "a refused preflight means the request is never sent: {status} {preflight:?}"
+    );
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin"),
+        Some(UI_ORIGIN)
+    );
+    let allowed = header(&preflight, "access-control-allow-headers")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for needed in ["content-type", "authorization"] {
+        assert!(
+            allowed.contains(needed),
+            "{needed} is not allowed: {allowed:?}"
+        );
+    }
+    assert!(
+        header(&preflight, "access-control-allow-methods")
+            .unwrap_or_default()
+            .contains("POST"),
+        "{preflight:?}"
+    );
+
+    // The key is still required for the request itself, and the refusal is
+    // readable by the page, so it can tell its user why.
+    let (status, refused) =
+        head_of(addr, "POST", "/v1/fabric/compare", &[("Origin", UI_ORIGIN)]).await;
+    assert_eq!(status, 401, "{refused:?}");
+    assert_eq!(
+        header(&refused, "access-control-allow-origin"),
+        Some(UI_ORIGIN)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_origin_nobody_named_is_not_allowed_to_read_the_proxy() {
+    let addr = start_proxy_allowing(
+        fabric_of(Vec::new()),
+        authenticated("proxy-key"),
+        Some(ui_origin_allowed()),
+    )
+    .await;
+    let stranger = "http://127.0.0.1:9999";
+
+    let (_, health) = head_of(addr, "GET", "/v1/health", &[("Origin", stranger)]).await;
+    assert_eq!(
+        header(&health, "access-control-allow-origin"),
+        None,
+        "{health:?}"
+    );
+    let (_, preflight) = head_of(
+        addr,
+        "OPTIONS",
+        "/v1/fabric/compare",
+        &preflight_for_compare(stranger),
+    )
+    .await;
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin"),
+        None,
+        "{preflight:?}"
+    );
+}
+
+/// The default is unchanged: with no origin named the proxy sends no CORS
+/// header at all, and an `OPTIONS` reaches the router exactly as it did before
+/// the flag existed — past the key, which exempts it, to a route that takes
+/// only POST.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxy_with_no_origin_named_sends_no_cors_header_and_answers_options_as_before() {
+    let addr = start_proxy_allowing(fabric_of(Vec::new()), authenticated("proxy-key"), None).await;
+
+    let (_, health) = head_of(addr, "GET", "/v1/health", &[("Origin", UI_ORIGIN)]).await;
+    let (status, preflight) = head_of(
+        addr,
+        "OPTIONS",
+        "/v1/fabric/compare",
+        &preflight_for_compare(UI_ORIGIN),
+    )
+    .await;
+
+    assert_eq!(status, 405, "{preflight:?}");
+    assert_eq!(header(&preflight, "allow"), Some("POST"), "{preflight:?}");
+    for headers in [&health, &preflight] {
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| !name.starts_with("access-control-")),
+            "{headers:?}"
+        );
+    }
 }
 
 /// A throwaway certificate for `localhost`, valid only for the test that mints
@@ -662,6 +873,7 @@ async fn start_tls_proxy(fabric: Fabric, auth: ClientAuth) -> (SocketAddr, TestC
         forward_timeout: FORWARD_TIMEOUT,
         auth,
         tls: Some(tls),
+        cors: None,
         bound: addr,
     };
     tokio::spawn(async move {
@@ -2396,6 +2608,7 @@ async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         forward_timeout: FORWARD_TIMEOUT,
         auth: ClientAuth::none(),
         tls: None,
+        cors: None,
         bound: addr,
     };
 
@@ -3675,6 +3888,7 @@ async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
                 forward_timeout: FORWARD_TIMEOUT,
                 auth: ClientAuth::none(),
                 tls: Some(tls),
+                cors: None,
                 bound: addr,
             },
             async move {

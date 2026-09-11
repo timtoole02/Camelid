@@ -105,6 +105,7 @@ use axum::{middleware, Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use serde_json::Value;
+use tower_http::cors::CorsLayer;
 
 use super::client_keys::Admission;
 use super::policy::{route, RouteDecision, RouteError, RouteMode, RouteRequest};
@@ -219,6 +220,43 @@ impl ProxyTls {
     }
 }
 
+/// Which browser origins may read this proxy.
+///
+/// The web UI is served from the engine's address or from a dev server, never
+/// from the proxy's own, so without an allowance a browser withholds every
+/// answer this proxy gives it. Validated and built by [`crate::cors_origins`],
+/// the engine's own rules, so the two front doors refuse a wildcard, `null`, a
+/// path or a query in the same words and allow the same request headers.
+#[derive(Debug, Clone)]
+pub struct ProxyCors {
+    layer: CorsLayer,
+    origins: usize,
+}
+
+impl ProxyCors {
+    /// `None` when no origin is named: no allowance at all, rather than a
+    /// layer that allows nothing, because even that answers every `OPTIONS`
+    /// itself and would change what an unconfigured proxy says.
+    pub fn resolve(origins: &[String]) -> std::io::Result<Option<Self>> {
+        if origins.is_empty() {
+            return Ok(None);
+        }
+        let allowed = origins
+            .iter()
+            .map(|origin| crate::cors_origins::parse_origin(origin))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Some(Self {
+            layer: crate::cors_origins::layer(&allowed),
+            origins: allowed.len(),
+        }))
+    }
+
+    /// How many origins are allowed, for the startup line.
+    pub fn origin_count(&self) -> usize {
+        self.origins
+    }
+}
+
 /// What the operator has explicitly accepted about exposing this proxy.
 ///
 /// Two separate acknowledgements because they are two separate risks: one is
@@ -254,6 +292,9 @@ pub struct ServeConfig {
     /// same value decides both what is served and whether [`bind`] considers
     /// a routable address safe to open.
     pub tls: Option<ProxyTls>,
+    /// Browser origins allowed to read this proxy. `None` — the default — sends
+    /// no CORS header at all.
+    pub cors: Option<ProxyCors>,
     /// The address this proxy listens on.
     ///
     /// Read only to decide whether `/v1/health` may name the fabric's members:
@@ -276,6 +317,7 @@ struct ServerState {
 /// Build the router without binding a socket, so tests can drive it directly.
 pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
     let auth = config.auth.clone();
+    let cors = config.cors.clone();
 
     let placed = PLACED_ROUTES.iter().fold(Router::new(), |router, path| {
         let path = *path;
@@ -294,7 +336,7 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         .iter()
         .fold(placed, |router, path| router.route(path, any(node_local)));
 
-    refusals
+    let guarded = refusals
         .route("/v1/models", get(models))
         .route("/v1/models/:model", get(model))
         .route("/v1/health", get(health))
@@ -312,9 +354,21 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         })
         // Wraps every route: an unauthenticated request is refused before
         // anything below reads its body or observes the fabric.
-        .layer(middleware::from_fn_with_state(auth, client_auth))
-        // Outermost, so a request refused above is still recorded.
-        .layer(middleware::from_fn(access_log))
+        .layer(middleware::from_fn_with_state(auth, client_auth));
+    // Outside the client key, so that key's refusals carry the allow-origin
+    // header too: without it a page sees an opaque network failure where the
+    // proxy said 401, and cannot tell its user a key is missing. The key
+    // already lets a preflight through, since a browser sends no credential
+    // on one; this is what answers it, instead of a route that only takes
+    // POST. Absent entirely unless an origin was named, because even a layer
+    // allowing nothing answers every `OPTIONS` itself, and a proxy nobody
+    // configured for a browser must answer exactly as it always has.
+    let reachable = match cors {
+        Some(cors) => guarded.layer(cors.layer),
+        None => guarded,
+    };
+    // Outermost, so a request refused above is still recorded.
+    reachable.layer(middleware::from_fn(access_log))
 }
 
 /// Refuse a request that presents no key this proxy knows, and name the client
@@ -1552,8 +1606,39 @@ mod tests {
             forward_timeout: Duration::from_millis(200),
             auth: ClientAuth::none(),
             tls: None,
+            cors: None,
             bound: "127.0.0.1:8490".parse().expect("loopback address"),
         }
+    }
+
+    #[test]
+    fn an_origin_the_engine_would_refuse_is_refused_by_the_proxy_too() {
+        for origin in [
+            "*",
+            "null",
+            "https://example.test/path",
+            "https://example.test/?query=1",
+        ] {
+            let error = ProxyCors::resolve(&[origin.to_string()]).expect_err("refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{origin}: {error}"
+            );
+        }
+        assert!(
+            ProxyCors::resolve(&[])
+                .expect("nothing to refuse")
+                .is_none(),
+            "naming no origin is no CORS at all, not a layer that allows nothing"
+        );
+        let allowed = ProxyCors::resolve(&[
+            "http://127.0.0.1:5173".to_string(),
+            "https://ui.example/".to_string(),
+        ])
+        .expect("both are explicit origins")
+        .expect("two origins were named");
+        assert_eq!(allowed.origin_count(), 2);
     }
 
     /// A proxy on an address the network can reach. Integration tests always

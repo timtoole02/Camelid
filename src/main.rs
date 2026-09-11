@@ -1979,6 +1979,13 @@ enum FabricAction {
         /// and every prompt would cross the network unencrypted.
         #[arg(long, env = "CAMELID_ALLOW_CLEARTEXT_REMOTE", default_value_t = false)]
         allow_cleartext_remote: bool,
+        /// Browser origin allowed to read this proxy — the address the web UI
+        /// is served from. Repeat for each. None by default, and validated
+        /// exactly like the engine's own --cors-origin. Deliberately does NOT
+        /// read CAMELID_CORS_ORIGINS: that variable configures the engine, and
+        /// one value must not silently open both.
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
         /// JSON file naming the clients this proxy serves, of the form
         /// {"clients":[{"name":"...","key":"..."}]}.
         ///
@@ -4743,6 +4750,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_cert,
                 tls_key,
                 allow_cleartext_remote,
+                cors_origins,
                 client_keys,
             } => {
                 let mode = route_mode(&mode)?;
@@ -4756,6 +4764,9 @@ async fn main() -> anyhow::Result<()> {
                 // must not arrive after the operator has been told the proxy is
                 // listening on an https address.
                 let tls = camelid::fabric::server::ProxyTls::resolve(tls_cert, tls_key).await?;
+                // Same reason: an origin the engine would refuse is refused
+                // here, before the listening line.
+                let cors = camelid::fabric::server::ProxyCors::resolve(&cors_origins)?;
                 // Same reason: a node file that cannot be read is a refusal,
                 // and it has to arrive before the listening line.
                 let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
@@ -4782,6 +4793,12 @@ async fn main() -> anyhow::Result<()> {
                 let scheme = if tls.is_some() { "https" } else { "http" };
                 println!("fabric serve listening on {scheme}://{bound}");
                 println!("node transport: {}", fabric.node_transport_description());
+                if let Some(cors) = &cors {
+                    println!(
+                        "allowing browser reads from {} origin(s)",
+                        cors.origin_count()
+                    );
+                }
                 // A key set is the only thing here an operator can get subtly
                 // wrong without being told: a file that parsed but named one
                 // client when they meant three looks exactly like success.
@@ -4813,6 +4830,7 @@ async fn main() -> anyhow::Result<()> {
                         forward_timeout: std::time::Duration::from_secs(forward_timeout_s),
                         auth,
                         tls,
+                        cors,
                         bound,
                     },
                 )

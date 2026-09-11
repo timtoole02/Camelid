@@ -6,6 +6,7 @@ pub mod capability;
 pub mod catalog;
 pub mod chat;
 pub mod cluster;
+pub(crate) mod cors_origins;
 pub mod cuda;
 pub mod cuda_parity;
 #[cfg(feature = "cuda")]

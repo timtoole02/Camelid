@@ -15,15 +15,16 @@ use std::{
 use axum::{
     extract::{Request, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
-        HeaderName, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        HeaderValue, Method, StatusCode,
     },
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::CorsLayer;
 
+use crate::cors_origins::X_API_KEY;
 use crate::tls_pair::{resolve_tls, TlsFiles};
 
 pub(crate) const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -31,8 +32,6 @@ pub(crate) const DEFAULT_MAX_PROMPT_TOKENS: usize = 131_072;
 pub(crate) const DEFAULT_MAX_GENERATION_TOKENS: u32 = 8_192;
 pub(crate) const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_API_KEY_BYTES: usize = 4 * 1024;
-
-static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
 /// HTTP surface exposed after authentication.
 ///
@@ -305,7 +304,7 @@ impl ServerPolicy {
         let cors_origins = options
             .cors_origins
             .iter()
-            .map(|origin| parse_origin(origin))
+            .map(|origin| crate::cors_origins::parse_origin(origin))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -332,15 +331,10 @@ impl ServerPolicy {
         .expect("built-in loopback policy is valid")
     }
 
+    /// Shared with the fabric proxy's `--cors-origin`, so the two front doors
+    /// allow the same things for the same flag.
     pub(crate) fn cors_layer(&self) -> CorsLayer {
-        let layer = CorsLayer::new()
-            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, X_API_KEY.clone()]);
-        if self.cors_origins.is_empty() {
-            layer
-        } else {
-            layer.allow_origin(AllowOrigin::list(self.cors_origins.iter().cloned()))
-        }
+        crate::cors_origins::layer(&self.cors_origins)
     }
 
     pub(crate) fn cors_origin_count(&self) -> usize {
@@ -432,29 +426,6 @@ pub(crate) fn resolve_api_key(
     }
 }
 
-fn parse_origin(origin: &str) -> Result<HeaderValue> {
-    let normalized = origin.trim().trim_end_matches('/');
-    if normalized.is_empty() || normalized == "*" || normalized.eq_ignore_ascii_case("null") {
-        return Err(invalid(
-            "CORS origins must be explicit http:// or https:// origins; wildcard and null are refused",
-        ));
-    }
-    let uri = normalized
-        .parse::<axum::http::Uri>()
-        .map_err(|_| invalid(format!("invalid CORS origin {origin:?}")))?;
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || uri.authority().is_none()
-        || (uri.path() != "" && uri.path() != "/")
-        || uri.query().is_some()
-    {
-        return Err(invalid(format!(
-            "CORS origin {origin:?} must contain only scheme and authority"
-        )));
-    }
-    HeaderValue::from_str(normalized)
-        .map_err(|_| invalid(format!("invalid CORS origin header {origin:?}")))
-}
-
 fn validate_positive<T>(label: &str, value: T) -> Result<()>
 where
     T: PartialEq + From<u8>,
@@ -475,7 +446,10 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{header::ORIGIN, Request},
+        http::{
+            header::{CONTENT_TYPE, ORIGIN},
+            Request,
+        },
     };
     use tower::ServiceExt;
 

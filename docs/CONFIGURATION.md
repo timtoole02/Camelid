@@ -320,6 +320,27 @@ target/release/camelid fabric serve \
   --addr 127.0.0.1:8282
 ```
 
+### Letting a browser read the proxy
+
+The web UI is served from the engine's address (`camelid serve`, `:8181` by default) or from a dev
+server (`:5173`), never from the proxy's, so a browser withholds every answer the proxy gives it —
+the fabric view and the Compare screen included — unless the proxy names that origin:
+
+```bash
+target/release/camelid fabric serve \
+  --node a=host-a --node b=host-b \
+  --cors-origin http://127.0.0.1:8181 --cors-origin http://127.0.0.1:5173
+```
+
+`--cors-origin` is repeatable and validated exactly as the engine validates its own: a wildcard,
+`null`, or an origin carrying a path or a query is refused at startup, before anything is bound. With
+no origin named — the default — the proxy sends no CORS header at all and answers `OPTIONS` exactly
+as before — a preflight to `POST /v1/fabric/compare` then gets `405`, and the browser never sends the
+request. A named origin's preflight is answered by the proxy itself; the request that follows still
+needs the client key, and a refusal of it carries the allow-origin header so the page can say why. The allowed
+request headers are `content-type`, `authorization` and `x-api-key`. The flag deliberately does not
+read `CAMELID_CORS_ORIGINS`: that variable configures the engine, and one value must not open both.
+
 ### Which engine a node runs
 
 A node is written `LABEL=[ENGINE://]HOST[:PORT]`. The engine is optional and defaults to `camelid`,
