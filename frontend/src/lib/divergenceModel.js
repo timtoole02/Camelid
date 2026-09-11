@@ -23,6 +23,12 @@ const KNOWN_TEMPLATE = ['captured', 'not_exposed', 'unavailable']
 const KNOWN_DIFF = ['identical', 'lines', 'declined']
 const KNOWN_OPS = ['same', 'removed', 'added']
 const KNOWN_HONOURED = ['sent', 'unsupported']
+const KNOWN_IDENTITY = ['same_id', 'asserted_by_operator']
+const KNOWN_EOL = ['lf', 'crlf', 'none']
+
+/** Bounds the proxy clamps to (MAX_COMPARE_* in src/fabric/server.rs). */
+export const COMPARE_MAX_TOKENS = { min: 1, max: 1024, fallback: 64 }
+export const COMPARE_REPETITIONS = { min: 1, max: 5, fallback: 2 }
 
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -59,6 +65,16 @@ function describeTemplate(raw) {
   }
 }
 
+/* The model the node's own response named. Three facts, kept apart: an older
+ * proxy relays nothing (`not_relayed`), a response can name no model
+ * (`unnamed`), or it names one (`named`). */
+function describeReportedModel(raw) {
+  if (!('reported_model' in raw)) return { state: 'not_relayed', model: null }
+  if (raw.reported_model === null) return { state: 'unnamed', model: null }
+  const model = stringOrNull(raw.reported_model)
+  return model ? { state: 'named', model } : { state: null, model: null }
+}
+
 function describeSide(raw) {
   if (!isPlainObject(raw)) return null
   const samples = Array.isArray(raw.samples)
@@ -79,7 +95,9 @@ function describeSide(raw) {
     // The inference runtime, where the engine names one. Never shown as the
     // engine's version: they are different facts about different software.
     runtime: stringOrNull(raw.runtime),
+    // The id this side was asked for.
     model: stringOrNull(raw.model),
+    reported: describeReportedModel(raw),
     samples,
     stability,
     // Only a side that agreed with itself has a digest that represents it.
@@ -99,6 +117,11 @@ function describeDiff(raw) {
     ? raw.lines.filter(isPlainObject).map((line) => ({
       op: oneOf(KNOWN_OPS, line.op),
       text: typeof line.text === 'string' ? line.text : '',
+      // How the line ended. The text never carries its terminator, so without
+      // this two answers differing only in CRLF against LF, or in a final
+      // newline, would render as two identical lines. Absent on older proxies.
+      eol: oneOf(KNOWN_EOL, line.eol),
+      eolUnrecognised: line.eol !== undefined && oneOf(KNOWN_EOL, line.eol) === null,
     }))
     : null
   return {
@@ -133,9 +156,15 @@ export function describeComparison(body) {
     left: describeSide(body.left),
     right: describeSide(body.right),
     diff: describeDiff(body.diff),
+    // How the proxy judged the two sides to be the same weights. Absent from a
+    // proxy that predates the field, which is not the same as "same id".
+    modelIdentity: oneOf(KNOWN_IDENTITY, body.model_identity),
+    modelIdentityReported: body.model_identity !== undefined,
     uncontrolled: Array.isArray(body.uncontrolled)
       ? body.uncontrolled.filter((name) => typeof name === 'string')
       : [],
+    // An absent list is "not reported", which must not render as "nothing".
+    uncontrolledReported: Array.isArray(body.uncontrolled),
   }
 }
 
@@ -169,6 +198,59 @@ export function verdictHeadline(comparison) {
   }
 }
 
+/* The model-identity claim this result rests on, in words.
+ *
+ * An operator's assertion travels with every result that depends on it, so it
+ * is stated on the result itself rather than left in a checkbox the reader
+ * never saw. */
+export function identityStatement(comparison) {
+  const leftId = comparison?.left?.model
+  const rightId = comparison?.right?.model
+  switch (comparison?.modelIdentity) {
+    case 'asserted_by_operator':
+      return {
+        kind: 'asserted_by_operator',
+        text: `Asserted by the operator, not verified: ${leftId || 'the left id'} and ${rightId || 'the right id'} `
+          + 'were declared to be the same weights. This result rests on that claim.',
+      }
+    case 'same_id':
+      return {
+        kind: 'same_id',
+        text: `Both sides were asked for the same id${leftId ? `, ${leftId}` : ''}. The id is all that was `
+          + 'compared: no engine publishes a digest this fabric can check.',
+      }
+    default:
+      return comparison?.modelIdentityReported
+        ? { kind: 'unrecognised', text: 'This proxy recorded a model identity this build does not recognise.' }
+        : { kind: 'not_reported', text: 'This proxy did not record how model identity was established.' }
+  }
+}
+
+/* How much of each answer the comparison covers. "Same bytes" under a 64-token
+ * cap is a claim about a 64-token prefix, and has to say so. */
+export function tokenCapStatement(comparison, requestedMaxTokens = null) {
+  const cap = comparison?.plan?.maxTokens
+  if (cap === null || cap === undefined) return null
+  const tokens = `${cap} token${cap === 1 ? '' : 's'}`
+  let text = `Each answer was capped at ${tokens}, so this compares at most the first ${tokens} of each.`
+  if (typeof requestedMaxTokens === 'number' && requestedMaxTokens !== cap) {
+    text += ` ${requestedMaxTokens} were asked for; the proxy applied ${cap}.`
+  }
+  return text
+}
+
+/* Whether a node answered under a different model name than the one it was
+ * asked for. Only a named, differing model counts: absent and unnamed are
+ * reported separately and are not evidence of a swap. */
+export function reportedModelMismatch(side) {
+  return Boolean(
+    side
+    && side.reported?.state === 'named'
+    && side.model
+    && side.reported.model !== side.model,
+  )
+}
+
 /* What still has to be said even when a verdict was reached: controls that did
  * not reach an engine, and sides that never proved they repeat themselves. */
 export function comparisonCaveats(comparison) {
@@ -176,10 +258,17 @@ export function comparisonCaveats(comparison) {
   const caveats = []
 
   for (const name of comparison.uncontrolled) {
-    caveats.push(`${name} was not controlled: at least one engine has no such parameter.`)
+    // Model identity is not an engine parameter; calling it one would misstate
+    // what is missing, which is a check nobody can run.
+    caveats.push(name === 'model identity'
+      ? "model identity was not verified: it rests on the operator's assertion that the two ids are the same weights."
+      : `${name} was not controlled: at least one engine has no such parameter.`)
   }
   for (const side of [comparison.left, comparison.right]) {
     if (!side) continue
+    if (reportedModelMismatch(side)) {
+      caveats.push(`${side.label || 'a node'} answered as ${side.reported.model}, not the requested ${side.model}.`)
+    }
     if (side.stability.kind === 'unmeasured') {
       caveats.push(`${side.label || 'a node'} was run once, so it was never shown to repeat itself.`)
     }
@@ -212,13 +301,16 @@ export function templateDivergence(comparison) {
 
 /* What a node can be asked about, for the model picker.
  *
- * Four outcomes, and collapsing any of them into "no models" would be a lie:
- * a proxy that withholds its node detail is not a fabric of empty nodes, and a
- * node that is not ready has no list rather than an empty one. */
+ * Five outcomes, and collapsing any of them into "no models" would be a lie:
+ * a fabric we could not read is not one that withholds its detail, a proxy that
+ * withholds its node detail is not a fabric of empty nodes, and a node that is
+ * not ready has no list rather than an empty one. */
 export function modelChoices(fabric, label) {
   if (!label) return { kind: 'no_node' }
+  // Not read yet, or the read failed: there is no list because we could not look.
+  if (!fabric || fabric.problem) return { kind: 'unread' }
   // The proxy discloses node detail only on loopback; absent is not empty.
-  if (!fabric || fabric.nodes === null) return { kind: 'withheld' }
+  if (fabric.nodes === null) return { kind: 'withheld' }
   const node = fabric.nodes.find((entry) => entry.label === label)
   if (!node) return { kind: 'no_node' }
   if (node.state !== 'ready') return { kind: 'not_ready', reason: node.reason }
@@ -241,4 +333,37 @@ export function modelLooksAbsent(choices, model) {
  * digest, so this is a claim only a person can make. */
 export function needsIdentityAssertion(leftModel, rightModel) {
   return Boolean(leftModel) && Boolean(rightModel) && leftModel !== rightModel
+}
+
+function boundedInteger(value, { min, max, fallback }) {
+  if (value === null || value === undefined || String(value).trim() === '') return fallback
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.min(max, Math.max(min, Math.round(number)))
+}
+
+/* The body `POST /v1/fabric/compare` receives.
+ *
+ * Per-side ids are sent only when the operator paired two different names. The
+ * proxy treats any per-side id as an explicit override and skips its alias
+ * table, so sending both on every request would ask a node for a name it may
+ * only know under an alias, and be refused for no visible reason.
+ *
+ * `max_tokens` is always sent, so the cap the result reports is the one the
+ * operator chose rather than a default they never saw. */
+export function buildCompareRequest({ left, right, prompt, repetitions, maxTokens }) {
+  const request = {
+    left: left.node,
+    right: right.node,
+    model: left.model,
+    prompt,
+    repetitions: boundedInteger(repetitions, COMPARE_REPETITIONS),
+    max_tokens: boundedInteger(maxTokens, COMPARE_MAX_TOKENS),
+    temperature: 0,
+  }
+  if (needsIdentityAssertion(left.model, right.model)) {
+    request.left_model = left.model
+    request.right_model = right.model
+  }
+  return request
 }

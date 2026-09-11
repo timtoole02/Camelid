@@ -2,7 +2,12 @@
  *
  * The visual rules follow the honesty rules. A verdict that concluded nothing
  * is never styled like one that concluded something, and a refusal is never
- * given the colour of a difference. */
+ * given the colour of a difference.
+ *
+ * Every token here is defined in tokens.css for the dark root and both light
+ * blocks. An undefined custom property has no fallback: it silently drops the
+ * declaration, which is how this sheet once shipped borderless inputs and an
+ * uncoloured warning. */
 
 .divergence {
   display: flex;
@@ -53,6 +58,18 @@
   min-width: 0;
 }
 
+.divergence__fabric-slot {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.divergence__fabric-slot:empty { display: none; }
+
+.divergence__fabric-state {
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 .divergence-pick {
   display: flex;
   flex-direction: column;
@@ -72,7 +89,7 @@
 .divergence-pick select {
   font: inherit;
   padding: var(--space-2);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: var(--color-text);
@@ -92,7 +109,7 @@
 .divergence-pick__warn {
   margin: 0;
   font-size: var(--text-2xs);
-  color: var(--color-warn);
+  color: var(--color-warning);
   overflow-wrap: anywhere;
 }
 
@@ -105,7 +122,7 @@
   align-items: start;
   font-size: var(--text-xs);
   padding: var(--space-3);
-  border: 1px dashed var(--color-warn);
+  border: 1px dashed var(--color-warning);
   border-radius: var(--radius-sm);
   min-width: 0;
 }
@@ -117,13 +134,14 @@
   margin: 0;
   font-size: var(--text-xs);
   color: var(--color-text-muted);
+  overflow-wrap: anywhere;
 }
 
 .divergence__form input,
 .divergence__form textarea {
   font: inherit;
   padding: var(--space-2);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: var(--color-text);
@@ -139,8 +157,8 @@
   font: inherit;
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--color-border);
-  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface-strong);
   color: var(--color-text);
   cursor: pointer;
 }
@@ -154,7 +172,11 @@
   border: 1px solid var(--color-error);
   color: var(--color-error);
   font-size: var(--text-sm);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
+
+.divergence__problem > p { margin: 0; }
 
 /* A verdict that established something is stated plainly; one that refused to
    conclude is deliberately not given a result colour. */
@@ -162,12 +184,12 @@
   margin: 0;
   padding: var(--space-3);
   border-radius: var(--radius-md);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   font-size: var(--text-sm);
   font-weight: 600;
 }
 
-.divergence__verdict[data-tone='differ'] { border-color: var(--color-warn); }
+.divergence__verdict[data-tone='differ'] { border-color: var(--color-warning); }
 .divergence__verdict[data-tone='same'] { border-color: var(--color-ready); }
 .divergence__verdict[data-tone='refused'] {
   border-style: dashed;
@@ -175,12 +197,31 @@
   font-weight: 500;
 }
 
+.divergence__cap,
 .divergence__plan {
   margin: 0;
   font-size: var(--text-xs);
   color: var(--color-text-muted);
   overflow-wrap: anywhere;
 }
+
+/* What the result rests on. An asserted identity is the one claim on this page
+   nobody checked, so it carries the same dashed warning as the checkbox that
+   made it. */
+.divergence__basis {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.divergence__basis p { margin: 0; }
+.divergence__basis[data-identity='asserted_by_operator'] { border: 1px dashed var(--color-warning); }
 
 .divergence__caveats {
   margin: 0;
@@ -224,6 +265,23 @@
   color: var(--color-text-muted);
 }
 
+.divergence-side__model {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* A node that answered under another model name may be serving other weights;
+   nothing else on the page would show it, so it is not a muted detail. */
+.divergence-side__reported {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--color-warning);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 .divergence-side__stability {
   margin: 0 0 var(--space-2);
   font-size: var(--text-xs);
@@ -241,7 +299,7 @@
 
 /* A side that did not repeat itself invalidates the comparison, so it is not
    allowed to look like an ordinary detail. */
-.divergence-side__stability[data-stability='unstable'] { color: var(--color-warn); }
+.divergence-side__stability[data-stability='unstable'] { color: var(--color-warning); }
 .divergence-side__stability[data-stability='unmeasured'] { color: var(--color-text-muted); }
 
 .divergence-side__samples {
@@ -288,6 +346,19 @@
 .divergence-diff__line[data-op='removed'] { color: var(--color-error); }
 .divergence-diff__line[data-op='added'] { color: var(--color-ready); }
 .divergence-diff__line[data-op='unknown'] { color: var(--color-text-muted); font-style: italic; }
+
+/* A line terminator, made visible. Muted and boxed so it reads as a mark about
+   the line rather than as part of the answer's text. */
+.divergence-diff__eol {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-2xs);
+  font-style: italic;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
 
 .divergence-note {
   margin: 0;
