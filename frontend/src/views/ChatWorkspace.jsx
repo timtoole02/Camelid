@@ -133,6 +133,11 @@ async function prepareVisionAttachment(file) {
   const image = await loadBrowserImage(file)
   let blob = file
   let type = file.type
+  // Track the dimensions alongside the bytes: the resize branch below replaces
+  // the blob, and reporting the source dimensions for the resized bytes would
+  // describe an image that was never sent.
+  let width = image.naturalWidth
+  let height = image.naturalHeight
   if (file.size > MAX_VISION_UPLOAD_BYTES || Math.max(image.naturalWidth, image.naturalHeight) > MAX_VISION_EDGE) {
     const scale = Math.min(1, MAX_VISION_EDGE / Math.max(image.naturalWidth, image.naturalHeight))
     const canvas = document.createElement('canvas')
@@ -146,6 +151,10 @@ async function prepareVisionAttachment(file) {
     if (blob?.size > MAX_VISION_UPLOAD_BYTES) blob = await canvasBlob(canvas, 0.72)
     if (!blob) throw new Error('Could not prepare the selected image.')
     type = 'image/jpeg'
+    // Both canvasBlob calls encode this same canvas, so these describe the
+    // bytes actually sent under the 0.9 and the 0.72 retry path alike.
+    width = canvas.width
+    height = canvas.height
   }
   if (blob.size > MAX_VISION_UPLOAD_BYTES) {
     throw new Error('The prepared image is still too large. Choose an image under 3 MB.')
@@ -154,8 +163,8 @@ async function prepareVisionAttachment(file) {
     name: file.name,
     type,
     size: blob.size,
-    width: image.naturalWidth,
-    height: image.naturalHeight,
+    width,
+    height,
     data_url: await readAsDataUrl(blob),
   }
 }

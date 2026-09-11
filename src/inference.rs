@@ -34,11 +34,9 @@ mod kv_f16;
 pub mod kv_pool;
 mod metal_resident;
 mod metal_seam;
-pub mod paged_kv;
 mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
-pub mod radix_cache;
 mod rope;
 /// Test-only re-export: the gemma3 self-parity/full-forward tests in
 /// `crate::metal::tests` build their RoPE tables with the SAME oracle-form

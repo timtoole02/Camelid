@@ -1603,11 +1603,10 @@ fn clip_retained(messages: &mut [AgentMsg], target_tokens: u32, calibration: Opt
                 "\n...[{} more bytes elided to fit the context budget - re-read if needed]",
                 text.len().saturating_sub(excerpt.len())
             ));
-            let clipped = if outcome.is_err() {
-                ToolOutcome::Err(excerpt)
-            } else {
-                ToolOutcome::Ok(excerpt)
-            };
+            // Rebuild through with_text rather than from text() + is_err():
+            // reconstructing the variant by hand is what silently discards any
+            // payload the reconstruction does not know about.
+            let clipped = outcome.clone().with_text(excerpt);
             messages[index] = AgentMsg::ToolResult {
                 name: name.clone(),
                 outcome: clipped,

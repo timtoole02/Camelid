@@ -8,10 +8,14 @@ const MESSAGE_EXPORT_FIELDS = [
   'id', 'role', 'content', 'created_at', 'model_id', 'model_name',
   'finish_reason', 'usage', 'usage_source', 'elapsed_ms',
   'first_content_ms', 'tokens_out_per_sec', 'support_row',
-  'web_research',
+  'web_research', 'image',
 ]
 
 const SUPPORT_ROW_FIELDS = ['id', 'status', 'supported']
+/* data_url LAST on purpose: pick() preserves this order, so the multi-megabyte
+   string lands at the end of each message object and the descriptive fields
+   stay readable at the top instead of sitting behind a wall of base64. */
+const IMAGE_EXPORT_FIELDS = ['name', 'type', 'size', 'width', 'height', 'data_url']
 const WEB_RESEARCH_FIELDS = ['reason', 'query', 'sources', 'warnings']
 const WEB_SOURCE_FIELDS = ['title', 'url']
 
@@ -49,6 +53,7 @@ export function exportableConversation(conversation) {
     messages: (conversation?.messages || []).map((message) => {
       const picked = pick(message, MESSAGE_EXPORT_FIELDS)
       if (picked.support_row) picked.support_row = pick(picked.support_row, SUPPORT_ROW_FIELDS)
+      if (picked.image) picked.image = pick(picked.image, IMAGE_EXPORT_FIELDS)
       if (picked.web_research) {
         picked.web_research = pick(picked.web_research, WEB_RESEARCH_FIELDS)
         picked.web_research.sources = (picked.web_research.sources || [])
@@ -115,6 +120,19 @@ export function conversationToMarkdown(conversation) {
     if (message.role !== 'user' && message.role !== 'assistant') continue
     lines.push(`## ${message.role === 'user' ? 'You' : 'Camelid'}`, '')
     lines.push(message.content || '', '')
+    /* Outside the assistant branch below: the attachment rides on the user
+       turn. Metadata only — a data URL would put megabytes on one line and
+       destroy the pasteability every other note here preserves. */
+    if (message.role === 'user' && message.image) {
+      const size = `${Math.round((message.image.size || 0) / 1024)} KB`
+      const dims = message.image.width && message.image.height
+        ? ` · ${message.image.width}×${message.image.height}`
+        : ''
+      lines.push(
+        `> Attached image: ${markdownLabel(message.image.name)} (${markdownLabel(message.image.type)} · ${size}${dims}) — image data is not included in Markdown; export JSON to keep it.`,
+        '',
+      )
+    }
     if (message.role === 'assistant') {
       const meta = []
       if (message.model_id) meta.push(`model \`${message.model_id}\``)

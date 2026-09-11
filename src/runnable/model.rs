@@ -1891,7 +1891,7 @@ impl RunnableModel {
             {
                 let _ = (prefix, image, suffix, max_new, stop, on_token);
                 Err(BackendError::UnsupportedGguf(
-                    "Prism image generation requires Metal or CUDA".into(),
+                    "generating with an attached image requires a Metal or CUDA build; this build can encode the image but has no lane to decode with it".into(),
                 ))
             }
         }
@@ -1952,7 +1952,7 @@ impl RunnableModel {
                     on_token,
                 );
                 Err(BackendError::UnsupportedGguf(
-                    "Prism image generation requires Metal or CUDA".into(),
+                    "generating with an attached image requires a Metal or CUDA build; this build can encode the image but has no lane to decode with it".into(),
                 ))
             }
         }

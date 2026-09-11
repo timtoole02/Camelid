@@ -668,8 +668,9 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       max_generation_tokens: Number(health?.max_generation_tokens) || null,
       model_family: optionalString(health?.model_family),
       vision_ready: Boolean(health?.vision_ready),
-      // Optional future/runtime hint. Older servers omit it, in which case the
-      // bounded estimator default matches Camelid's current image-token ceiling.
+      // Servers before this field existed omit it; the estimator then falls back
+      // to its own default, which now matches the serve path's image-token
+      // ceiling. A server that sends it stays authoritative either way.
       vision_token_allowance: Number(health?.vision_token_allowance) || null,
       q8_runtime: health?.q8_runtime || null,
       // Required for lane-scoped support truth. All Gemma 4 serve variants use
