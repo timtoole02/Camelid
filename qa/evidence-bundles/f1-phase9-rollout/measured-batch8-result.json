@@ -1,0 +1,37 @@
+{
+  "schema": "camelid.f1-phase9-batch8-public-summary/v1",
+  "status": "pass",
+  "source_commit": "f6c546a45e49bbed252d2305c84021e58de91908",
+  "release_binary_sha256": "989bb5d1c70e595e7d0bd35a1d9d7ae5717f7fc98f471dc89e650392d20b60f4",
+  "model_sha256": "3f87a880027e7b9ea8e0da9e4009584336f352af444a0e6e5c20721ac4c7ffd1",
+  "hardware": "NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9, 8187 MiB total VRAM",
+  "configuration": {
+    "prefill_quantum_tokens": 4,
+    "sequence_slots": 8,
+    "paged_kv": true,
+    "true_batch": true,
+    "cross_request_prefill": true,
+    "resident_context_limit": 512
+  },
+  "product_gate": {
+    "eight_request_wall_ratio": 1.708,
+    "slowest_fastest_ttft_ratio": 1.286,
+    "size_8_decode_forwards": 59,
+    "size_8_prefill_forwards": 44,
+    "independent_sequences": 8,
+    "exact_serial_output_and_completion_parity": true,
+    "short_finished_before_long": true,
+    "ninth_request_status": 503,
+    "ninth_request_code": "no_available_slot",
+    "retry_after_seconds": 1,
+    "cancelled_request_outcome": "cancelled",
+    "survivors_completed": 7,
+    "sustained_churn_requests": 48,
+    "sustained_churn_completed": 48,
+    "idle_allocated_pages": 0,
+    "idle_device_bytes": 0,
+    "idle_sequences": 0,
+    "recovery_completed": true
+  },
+  "claim_boundary": "Exact default-off Windows RTX 4060 / CUDA 12.9 / Llama 3.2 1B Q8_0 / 512-position release gate only. No arbitrary-model, other-GPU, longer-context, portable-throughput, or default-enable claim."
+}

@@ -108,6 +108,8 @@ export default function ArenaView({ models = [], runtime, apiBase = '', loadDash
   const [vote, setVote] = useState(null)
   const activeControllerRef = useRef(null)
   const runIdRef = useRef(0)
+  const residentArena = runtime?.cuda_resident_arena
+  const keepsBothResident = Number(residentArena?.capacity_models) >= 2
 
   useEffect(() => {
     setModelA((current) => eligibleIds.has(current) ? current : arenaDefaultModelA(models, runtime))
@@ -165,6 +167,7 @@ export default function ArenaView({ models = [], runtime, apiBase = '', loadDash
           model,
           fetchImpl: fetchWithSignal,
           onStage: (stage) => updateIfCurrent((state) => ({ ...state, status: stage === 'loading' ? 'loading' : 'checking' })),
+          preserveLoadedModels: keepsBothResident,
         })
 
     if (controller.signal.aborted || runIdRef.current !== runId) return false
@@ -297,8 +300,16 @@ export default function ArenaView({ models = [], runtime, apiBase = '', loadDash
         {vote && <div className="arena-vote-receipt"><IconCheck size={14} /> Voted: {vote}</div>}
       </header>
 
-      <div className="arena-safety-note" role="note">
-        Camelid runs Model A, then safely switches to Model B. This avoids loading two large models into memory at once.
+      <div className="arena-residency" role="status" aria-live="polite">
+        <div>
+          <span className={`arena-residency__dot ${keepsBothResident ? 'is-ready' : ''}`} />
+          <strong>{keepsBothResident ? 'Two-model CUDA residency enabled' : 'Sequential model switching'}</strong>
+        </div>
+        <span>
+          {keepsBothResident
+            ? `${residentArena?.resident_models || 0} of ${residentArena.capacity_models} resident · active models are never evicted`
+            : 'Camelid runs Model A, then replaces it with Model B to preserve memory headroom.'}
+        </span>
       </div>
 
       {eligibleModels.length < 2 ? (

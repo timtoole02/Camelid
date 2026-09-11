@@ -2,6 +2,16 @@
 
 Last updated: 2026-08-11
 
+CUDA continuous-batching rollout note (2026-09-11): the explicit-opt-in Phase 7/8 runtime project
+is implemented and observable without changing any model-support row. Generation-safe paged KV,
+same-model true batches 2–8, cross-request prefill, and one-or-two main-model CUDA residency are
+reported through `/api/capabilities`, health, runtime memory, `/props`, `/slots`, and bounded-name
+Prometheus metrics. The exact RTX 4060 / CUDA 12.9 / 512-position / Llama 1B Q8_0 + 3B Q5_K_M
+gate and its non-claims are recorded in `docs/CUDA_CONTINUOUS_BATCHING.md`; frontend normal,
+legacy, mobile, active, empty, long-ID, and HTTP-error states are sealed under
+`qa/evidence-bundles/f1-phase9-rollout/`. Defaults remain one CUDA sequence and one resident main
+model; no portable throughput or broad CUDA/model support claim moves.
+
 Phi-3 Windows note (2026-08-11): the exact, hash-pinned `Phi-3-mini-4k-instruct-Q8_0.gguf` artifact is promoted to `supported_exact_row_smoke` on the Windows x86_64 CPU-reference prefill/decode lane. The stale incremental-decode HOLD is cleared: the current API path loads generation-ready and emits the pinned llama.cpp `acd79d603` five-token sequence exactly. Receipt: `qa/model-qualification/phi3-mini-windows-support-20260811.json`. This does not claim bounded context, performance, tools, neighboring Phi files or quants, Linux, or macOS; the older MUSTER HOLD note below remains historical context and is superseded for this exact Windows lane.
 
 PrismML/Bonsai macOS note (2026-08-01): seven hash-pinned Bonsai artifacts are promoted to `supported_exact_row_smoke` on Apple Silicon Metal: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. The packed Prism Q1_0, structurally resolved type-id-42 Q2_0-G128, and PQ2_0 linears stay wire-resident while the complete qwen35 hybrid graph runs on Metal. The checked 27B Q1/Q2 rows also run the real Qwen3-VL Q8_0 projector; `/v1/chat/completions` and its SSE path accept one local PNG/JPEG data URL, `/v1/health` reports `vision_ready`, and the browser composer exposes a gated Image control. All seven language files are downloadable from the Models page and derive a Supported label from exact `/api/capabilities` rows. Receipt: `qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`. Scope remains exact-file and macOS Apple Silicon Metal only: Windows, broad qwen35/quant support, bounded context, batched vision prefill, and production throughput remain unclaimed.

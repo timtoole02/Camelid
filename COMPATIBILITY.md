@@ -154,6 +154,19 @@ LFM2.5 2.6B Q8_0 is supported exact-row smoke only on its hash-pinned Windows CP
 
 ## Platform support
 
+### CUDA continuous batching and resident-model boundary
+
+The CUDA runtime includes an explicit-opt-in, machine-readable project for generation-safe paged
+KV, true batches of 2–8 same-model sequences, cross-request prefill, and a bounded one-or-two
+main-model resident arena. The retained physical gate is limited to Windows, one RTX 4060 Laptop
+GPU (compute capability 8.9, 8 GiB VRAM), CUDA/NVRTC 12.9, a 512-position cap, and the exact Llama
+3.2 1B Q8_0 plus 3B Q5_K_M artifacts named in
+[`docs/CUDA_CONTINUOUS_BATCHING.md`](docs/CUDA_CONTINUOUS_BATCHING.md). It proves lifecycle,
+isolation, deterministic reuse, unload refusal, and same-model batch-eight behavior on that
+envelope. It does **not** promote arbitrary models, other NVIDIA hardware/drivers, longer context,
+MoE/windowed/sharded batching, portable throughput, or default enablement. Model support remains
+row-scoped elsewhere in this ledger.
+
 Support rows are model-exact and do not spread across platforms any more than they spread across sizes or quantizations: each platform claim needs its own evidence. Camelid's primary validated hosts are macOS (Apple Silicon / Metal) and Ubuntu x86_64. **Windows x86_64 (`x86_64-pc-windows-msvc`, MSVC toolchain) is now a tracked CPU platform** with the following exact, artifact-backed evidence — and nothing broader.
 
 **Proven on Windows x86_64 (CPU, MSVC):**

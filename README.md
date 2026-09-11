@@ -146,6 +146,7 @@ See the [contributor quick start](docs/CONTRIBUTOR_QUICKSTART.md) for prerequisi
 - [Model catalog and validation](docs/MODELS.md)
 - [Remote browser chat](docs/REMOTE_CHAT.md)
 - [Configuration reference](docs/CONFIGURATION.md)
+- [CUDA continuous batching and model residency](docs/CUDA_CONTINUOUS_BATCHING.md)
 - [Architecture](docs/architecture/ARCHITECTURE.md)
 - [Validation matrix](docs/VALIDATION_MATRIX.md)
 - [Roadmap](ROADMAP.md)

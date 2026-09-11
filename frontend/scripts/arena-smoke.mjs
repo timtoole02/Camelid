@@ -8,6 +8,7 @@ import {
   arenaSelectionsAreReady,
   runArenaSequentially,
 } from '../src/lib/arenaModels.js'
+import { loadLocalModelForChat } from '../src/lib/modelActivation.js'
 
 const runtime = { active_model_id: 'llama-3b', generation_ready: true }
 const models = [
@@ -64,5 +65,36 @@ await runArenaSequentially({
   },
 })
 assert.deepEqual(abortedOrder, ['a'], 'stopping Model A must prevent Model B from starting')
+
+async function activationReplaceValue(preserveLoadedModels) {
+  const requests = []
+  const fetchImpl = async (url, init = {}) => {
+    requests.push({ url, body: init.body ? JSON.parse(init.body) : null })
+    if (url.endsWith('/api/models/inspect')) {
+      return new Response(JSON.stringify({ architecture: 'llama', generation_capable: true }), { status: 200 })
+    }
+    if (url.endsWith('/api/models/load')) {
+      return new Response(JSON.stringify({ id: 'arena-b' }), { status: 200 })
+    }
+    if (url.endsWith('/api/models/current')) {
+      return new Response(JSON.stringify({ path: '/models/arena-b.gguf' }), { status: 200 })
+    }
+    if (url.endsWith('/v1/health')) {
+      return new Response(JSON.stringify({ loaded_now: true, generation_ready: true, active_model_id: 'arena-b' }), { status: 200 })
+    }
+    throw new Error(`unexpected Arena activation request: ${url}`)
+  }
+  const result = await loadLocalModelForChat({
+    filename: 'arena-b.gguf',
+    modelId: 'arena-b',
+    fetchImpl,
+    preserveLoadedModels,
+  })
+  assert.equal(result.ok, true)
+  return requests.find((request) => request.url.endsWith('/api/models/load')).body.replace
+}
+
+assert.equal(await activationReplaceValue(false), true, 'default Arena activation must retain one-model replacement semantics')
+assert.equal(await activationReplaceValue(true), false, 'capacity-two Arena activation must preserve the first loaded model')
 
 console.log('Model Arena smoke passed')

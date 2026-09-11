@@ -2693,8 +2693,8 @@ pub struct LlamaInferenceSession {
     /// across separately-loaded `Arc<LlamaLoadedWeights>` for the same model (e.g. a
     /// prompt-prefix-cache-restored session vs a freshly loaded one). When two such
     /// Arcs alternate, the single-slot engine cache thrashes ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a multi-second 3.4 GB
-    /// re-upload on every request. The API sets this from the model id plus exact
-    /// GGUF digest; when unset (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
+    /// re-upload on every request. The API sets this from the model id; when unset
+    /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
     /// copied by Clone/take_for_step so restored sessions keep the same key.
     resident_cache_key: Option<u64>,
     #[cfg(feature = "cuda")]
@@ -2735,8 +2735,7 @@ impl Drop for LlamaInferenceSession {
 
 impl LlamaInferenceSession {
     /// Set the stable resident-engine cache key (see field docs). The API derives it
-    /// from the model id plus exact GGUF digest so every session for one artifact
-    /// shares an engine without aliasing same-id replacement bytes.
+    /// from the model id so every session for one model shares an engine.
     pub fn set_resident_cache_key(&mut self, key: u64) {
         self.resident_cache_key = Some(key);
     }

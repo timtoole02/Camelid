@@ -656,12 +656,6 @@ pub struct HealthResponse {
     /// True when the active runnable model has a resident Prism/Qwen3-VL
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
-    /// Merged image tokens one attached image is charged by default, so a client
-    /// can budget its context window without guessing. `None` when the active
-    /// model cannot accept an image at all. This is the default ceiling only: a
-    /// request that sets `camelid_image_max_tokens` may legitimately cost more,
-    /// up to the hard bound this server enforces.
-    pub vision_token_allowance: Option<u32>,
     pub active_model_id: Option<String>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
@@ -3637,7 +3631,6 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         max_prompt_tokens,
         max_generation_tokens,
         vision_ready,
-        vision_token_allowance: vision_ready.then_some(DEFAULT_MAX_IMAGE_TOKENS),
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
         execution_plan,
@@ -3763,9 +3756,6 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         max_prompt_tokens: state.server_limits.max_prompt_tokens,
         max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready: false,
-        // The busy snapshot cannot read the runnable registry, so it cannot know
-        // whether vision is ready — reporting an allowance here would be a guess.
-        vision_token_allowance: None,
         active_model_id: None,
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
@@ -14451,16 +14441,6 @@ async fn load_runnable_serve_runtime(
 const PRISM_IMAGE_PAD: &str = "<|image_pad|>";
 const MAX_PRISM_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Merged image-token floor a chat request is charged when it does not set
-/// `camelid_image_min_tokens`.
-const DEFAULT_MIN_IMAGE_TOKENS: u32 = 8;
-/// Merged image-token ceiling a chat request is charged when it does not set
-/// `camelid_image_max_tokens`. `/v1/health` advertises this as
-/// `vision_token_allowance` so a client can budget context without guessing.
-const DEFAULT_MAX_IMAGE_TOKENS: u32 = 128;
-/// Hard bound on either override, whatever the request asks for.
-const IMAGE_TOKEN_HARD_CEILING: u32 = 1024;
-
 enum RunnablePreparedPrompt {
     Text(Vec<u32>),
     Vision {
@@ -14619,7 +14599,7 @@ fn prepare_runnable_prompt(
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "vision_projector_not_ready",
-            "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
+            "the language model is loaded, but no Prism mmproj GGUF was found; place a *mmproj*.gguf beside the model or set CAMELID_MMPROJ before loading it"
                 .to_string(),
             Some("model"),
         ));
@@ -14664,13 +14644,10 @@ fn prepare_runnable_prompt(
                 None,
             )
         })?;
-    let min_image_tokens = image_min_tokens
-        .unwrap_or(DEFAULT_MIN_IMAGE_TOKENS)
-        .clamp(1, IMAGE_TOKEN_HARD_CEILING) as usize;
+    let min_image_tokens = image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
     let max_image_tokens = image_max_tokens
-        .unwrap_or(DEFAULT_MAX_IMAGE_TOKENS)
-        .clamp(min_image_tokens as u32, IMAGE_TOKEN_HARD_CEILING)
-        as usize;
+        .unwrap_or(128)
+        .clamp(min_image_tokens as u32, 1024) as usize;
     Ok(RunnablePreparedPrompt::Vision {
         prefix,
         image_bytes: decode_prism_image_data_url(image_urls[0])?,
@@ -17698,12 +17675,6 @@ async fn llama_server_apply_template(
             )
         }
     };
-    // Ahead of validate_chat_messages: an audio-only or video-only message
-    // renders to empty content, so the generic empty-content refusal would
-    // otherwise answer first and hide which part type was actually rejected.
-    if let Some(response) = reject_unsupported_multimodal_content(&messages) {
-        return response;
-    }
     if let Err(response) = validate_chat_messages(&messages) {
         return *response;
     }
@@ -17712,49 +17683,6 @@ async fn llama_server_apply_template(
         Ok(model) => model,
         Err(response) => return response,
     };
-    // An image_url part renders to a Qwen vision marker unconditionally (see the
-    // ChatMessage Deserialize impl), so without this ladder every non-vision row
-    // answers 200 with `<|vision_start|>` sitting in the returned prompt. Refuse
-    // on the same three rungs, codes and wording the chat lane uses, so a client
-    // cannot tell the two routes apart. Architecture alone is not the predicate:
-    // the text-only qwen35 rows share it with the two Prism vision rows and are
-    // only separated by projector readiness.
-    let image_count: usize = messages
-        .iter()
-        .map(|message| message.image_urls.len())
-        .sum();
-    if image_count > 0 {
-        if image_count != 1 {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "unsupported_image_count",
-                "Prism chat currently accepts exactly one image per request".to_string(),
-                Some("messages"),
-            );
-        }
-        if model.gguf.architecture() != Some("qwen35") {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "vision_model_required",
-                "image_url content requires a Prism/Qwen3.5 vision model".to_string(),
-                Some("model"),
-            );
-        }
-        let vision_ready = match resolve_runnable_runtime(&state, &None).await {
-            Ok(Some((_, runtime))) => runtime.vision_ready(),
-            Ok(None) => false,
-            Err(response) => return response,
-        };
-        if !vision_ready {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "vision_projector_not_ready",
-                "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
-                    .to_string(),
-                Some("model"),
-            );
-        }
-    }
     let tokenizer = match model.tokenizer_runtime.clone() {
         Some(tokenizer) => tokenizer,
         None => match Tokenizer::from_gguf(&model.gguf) {
@@ -20325,7 +20253,6 @@ pub(super) fn model_resident_cache_key(model_id: &str, gguf_sha256: &str) -> u64
 fn phase8_resident_cache_key_is_stable_and_artifact_sensitive() {
     let artifact_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let artifact_b = "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
     let first = model_resident_cache_key("model-a", artifact_a);
     assert_eq!(first, model_resident_cache_key("model-a", artifact_a));
     assert_ne!(first, model_resident_cache_key("model-a", artifact_b));
@@ -28477,6 +28404,44 @@ mod tests {
         assert_eq!(purged.released_bytes_estimate, 0);
     }
 
+    #[tokio::test]
+    async fn phase9_read_only_surfaces_expose_cuda_resident_arena() {
+        let state = AppState::default();
+        let health = serde_json::to_value(busy_health_response(&state)).unwrap();
+        let props = llama_server_props(
+            State(state.clone()),
+            Query(LlamaServerReadOnlyQuery {
+                unsupported_fields: HashMap::new(),
+            }),
+        )
+        .await;
+        let props: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(props.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let slots = llama_server_slots(
+            State(state),
+            Query(LlamaServerSlotsQuery {
+                fail_on_no_slot: None,
+                unsupported_fields: HashMap::new(),
+            }),
+        )
+        .await;
+        let slots: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(slots.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = &health["cuda_resident_arena"];
+        assert_eq!(&props["camelid"]["cuda_resident_arena"], expected);
+        for slot in slots.as_array().expect("slots response is an array") {
+            assert_eq!(&slot["camelid"]["cuda_resident_arena"], expected);
+        }
+    }
+
     #[test]
     fn streaming_error_preserves_the_structured_api_failure() {
         let response = api_error(
@@ -30156,8 +30121,8 @@ mod tests {
             .iter()
             .map(|item| (item.project, item))
             .collect();
-        assert_eq!(projects.len(), 7);
-        for project in [2u32, 3, 4, 5, 6, 7, 8] {
+        assert_eq!(projects.len(), 8);
+        for project in [2u32, 3, 4, 5, 6, 7, 8, 9] {
             let item = projects
                 .get(&project)
                 .unwrap_or_else(|| panic!("project {project} missing"));
@@ -30181,6 +30146,14 @@ mod tests {
         assert!(
             projects[&8].default_enabled,
             "production server guardrails are active by default"
+        );
+        assert_eq!(
+            projects[&9].id, "cuda-continuous-batching-residency",
+            "project 9 must remain separate from model support rows"
+        );
+        assert!(
+            !projects[&9].default_enabled,
+            "CUDA batching and two-model residency remain explicit opt-ins"
         );
     }
 

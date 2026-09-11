@@ -46,11 +46,14 @@ const checks = [
   },
   {
     file: 'src/inference.rs',
-    label: 'server routes GPU prefill through the batched path',
+    label: 'server routes GPU prefill through transactional paged paths',
     needs: [
-      // `_from` is the resume-capable entry (prefix continuation); the zero-start
-      // wrapper `prefill_batched` is the same code path with start = 0.
-      'prefill_batched_from(',
+      // Phase 7 replaced the contiguous `_from` serving call with generation-safe
+      // paged append. Keep both the single-sequence and cross-request routes wired.
+      'slot.prefill_paged_append(',
+      'slot.prefill_paged_batch_append(',
+      'fn prefill_paged_append(',
+      'fn prefill_paged_batch_append(',
       // The serial path stays as an A/B escape hatch for parity bisection.
       'CAMELID_CUDA_RESIDENT_PREFILL_BATCHED',
     ],
