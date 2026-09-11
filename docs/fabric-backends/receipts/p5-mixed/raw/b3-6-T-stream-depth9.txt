@@ -1,0 +1,15 @@
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+x-camelid-fabric-node: a-camelid
+x-camelid-fabric-engine: camelid
+x-camelid-fabric-reason: OnlyCandidate
+x-camelid-fabric-attempts: 1
+x-camelid-fabric-model: Llama 3.2 1B Instruct
+x-camelid-fabric-model-identity: asserted_by_operator
+x-camelid-fabric-residency-observed: resident
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: aabd3d9d-563f-49c8-9786-486a12ae3ead
+content-length: 178
+date: Fri, 11 Sep 2026 21:08:48 GMT
+
+{"error":{"message":"the generation queue is full; retry shortly (depth is bounded by CAMELID_QUEUE_DEPTH)","type":"runtime_unavailable","code":"engine_queue_full","param":null}}

@@ -1,0 +1,11 @@
+fabric serve listening on http://127.0.0.1:8282
+node transport: cleartext restricted to loopback/tunnels
+allowing browser reads from 1 origin(s)
+watching the node file; editing it adds or removes a machine without a restart
+fabric: 2 of 2 nodes ready; serving Llama 3.2 1B Instruct, llama-1b
+placement: Camelid engines only
+aliases in force (read at startup; edit and restart to change): llama-1b -> a-camelid:Llama 3.2 1B Instruct, b-ollama:llama32-1b-q8-r1:latest
+[2m2026-09-11T21:12:10.887625Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request [3mmethod[0m[2m=[0mGET [3mpath[0m[2m=[0m/v1/health [3mstatus[0m[2m=[0m200 [3mnode[0m[2m=[0m"-" [3mreason[0m[2m=[0m"-" [3melapsed_ms[0m[2m=[0m0 [3mclient[0m[2m=[0m"127.0.0.1:53489" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"018a600d-7464-4585-8c6d-10c877de691e"
+[2m2026-09-11T21:12:10.893860Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request [3mmethod[0m[2m=[0mGET [3mpath[0m[2m=[0m/v1/health [3mstatus[0m[2m=[0m200 [3mnode[0m[2m=[0m"-" [3mreason[0m[2m=[0m"-" [3melapsed_ms[0m[2m=[0m0 [3mclient[0m[2m=[0m"127.0.0.1:53490" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"e8338dbf-aa9f-41a7-86b2-e6eea402a1a9"
+[2m2026-09-11T21:12:11.798164Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request [3mmethod[0m[2m=[0mGET [3mpath[0m[2m=[0m/v1/health [3mstatus[0m[2m=[0m200 [3mnode[0m[2m=[0m"-" [3mreason[0m[2m=[0m"-" [3melapsed_ms[0m[2m=[0m2 [3mclient[0m[2m=[0m"127.0.0.1:53519" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"acbea5ed-c537-44c4-8d48-4e7c8d9f9b63"
+[2m2026-09-11T21:12:12.227365Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m stopping: no longer accepting requests, finishing the ones in flight

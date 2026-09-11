@@ -1,0 +1,5 @@
+git HEAD: 42561ea83a300777a0c9acc3ea0be615fca3c67b
+binary sha256: eead05a22a9ee3f458c03f10c0c71e832b874407e232e39e9c58b299bad2b0c8
+camelid --version: camelid v0.7.3-29-g42561ea8
+ollama --version: Warning: could not connect to a running Ollama instance Warning: client version is 0.33.2 
+gguf sha256: 432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3  Llama-3.2-1B-Instruct-Q8_0.gguf

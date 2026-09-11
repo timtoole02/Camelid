@@ -1,0 +1,396 @@
+[
+ {
+  "id": "A05-D11",
+  "rule": "I12: tool-call detection reads presence of `tools` or `functions`",
+  "sabotage": "placement_requirements ignores `functions`",
+  "catchers": {
+   "contents_of_equal_encoded_size_cannot_change_requirements_or_class": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric::http::tests::an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http",
+   "fabric::http::tests::bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated",
+   "fabric::tests::contents_of_equal_encoded_size_cannot_change_requirements_or_class"
+  ],
+  "seconds": 179,
+  "log": "/tmp/pr756-p5/ablations/A05-D11.log"
+ },
+ {
+  "id": "A06-D12",
+  "rule": "I12: placement never reads messages",
+  "sabotage": "placement_requirements also scans messages for role:\"tool\"",
+  "catchers": {
+   "contents_of_equal_encoded_size_cannot_change_requirements_or_class": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric::http::tests::an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http",
+   "fabric::http::tests::bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated",
+   "fabric::tests::contents_of_equal_encoded_size_cannot_change_requirements_or_class"
+  ],
+  "seconds": 13,
+  "log": "/tmp/pr756-p5/ablations/A06-D12.log"
+ },
+ {
+  "id": "A09-ready",
+  "rule": "Readiness required under mixed mode",
+  "sabotage": "is_placeable_under admits any node, ready or not, under Allowed",
+  "catchers": {
+   "mixed_placement_refuses_an_unreachable_node_exactly_as_camelid_only_placement_does": true,
+   "mixed_placement_does_not_make_a_node_that_is_still_loading_eligible": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric::http::tests::an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http",
+   "fabric::http::tests::bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated",
+   "fabric::policy::tests::mixed_placement_does_not_make_a_node_that_is_still_loading_eligible",
+   "fabric::policy::tests::mixed_placement_refuses_an_unreachable_node_exactly_as_camelid_only_placement_does",
+   "fabric::server::tests::health_is_ready_when_one_node_can_serve",
+   "fabric::server::tests::health_refuses_traffic_when_no_node_is_ready"
+  ],
+  "seconds": 13,
+  "log": "/tmp/pr756-p5/ablations/A09-ready.log"
+ },
+ {
+  "id": "A17-S5",
+  "rule": "S5: a Camelid-only fabric decides exactly as before",
+  "sabotage": "the mixed-mode model-less rule (only nodes with an active model) applied in every mode",
+  "catchers": {
+   "a_camelid_only_fabric_decides_exactly_as_before": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric::http::tests::an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http",
+   "fabric::http::tests::bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated",
+   "fabric::policy::tests::a_busy_node_still_receives_work_when_it_is_the_only_one",
+   "fabric::policy::tests::a_camelid_only_fabric_decides_exactly_as_before",
+   "fabric::policy::tests::a_request_naming_no_model_is_placed_only_where_the_model_it_will_get_is_known",
+   "fabric::policy::tests::a_wholly_idle_fabric_routes",
+   "fabric::policy::tests::affinity_degrades_instead_of_failing_when_the_warm_node_dies",
+   "fabric::policy::tests::affinity_keeps_a_session_on_its_warm_node_even_when_busier",
+   "fabric::policy::tests::an_unreachable_node_is_never_selected",
+   "fabric::policy::tests::the_least_loaded_eligible_node_wins",
+   "fabric::policy::tests::throughput_mode_ignores_a_sticky_hint_entirely",
+   "fabric::policy::tests::ties_break_on_label_so_a_dry_run_predicts_the_real_decision"
+  ],
+  "seconds": 379,
+  "log": "/tmp/pr756-p5/ablations/A17-S5.log"
+ },
+ {
+  "id": "A01-D9",
+  "rule": "I5: a tool-carrying request never reaches an unmeasured backend",
+  "sabotage": "meets() passes every node whatever tool_calls says",
+  "catchers": {
+   "a_tool_calling_request_never_lands_on_a_backend_nobody_measured": true,
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine": true,
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101,
+   101,
+   101
+  ],
+  "failed_tests": [
+   "a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it",
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine",
+   "a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine",
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next",
+   "fabric::policy::tests::a_refusal_off_the_machine_names_no_node_and_no_engine_version",
+   "fabric::policy::tests::a_tool_calling_request_goes_to_our_engine_even_when_the_foreign_node_is_idler",
+   "fabric::policy::tests::a_tool_calling_request_is_refused_for_the_capability_it_lacks_not_as_an_unplaceable_engine",
+   "fabric::policy::tests::a_tool_calling_request_never_lands_on_a_backend_nobody_measured"
+  ],
+  "seconds": 31,
+  "log": "/tmp/pr756-p5/ablations/A01-D9.log"
+ },
+ {
+  "id": "A02-D10",
+  "rule": "I5 at the chokepoint: Fabric::dispatch reads the body's requirements itself",
+  "sabotage": "the requirements union deleted from Fabric::dispatch (policy unit tests must stay green)",
+  "catchers": {
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine": true,
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   0,
+   101,
+   101
+  ],
+  "failed_tests": [
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine",
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next"
+  ],
+  "seconds": 27,
+  "log": "/tmp/pr756-p5/ablations/A02-D10.log"
+ },
+ {
+  "id": "A03-D10b",
+  "rule": "I5 at the chokepoint, streaming",
+  "sabotage": "the requirements union deleted from Fabric::dispatch_streaming only",
+  "catchers": {
+   "a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine"
+  ],
+  "seconds": 7,
+  "log": "/tmp/pr756-p5/ablations/A03-D10b.log"
+ },
+ {
+  "id": "A04-D29",
+  "rule": "I5 on the one-shot path",
+  "sabotage": "Fabric::forward_to checks no requirement",
+  "catchers": {
+   "a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it"
+  ],
+  "seconds": 8,
+  "log": "/tmp/pr756-p5/ablations/A04-D29.log"
+ },
+ {
+  "id": "A07-D18",
+  "rule": "I12: `model` is written to the id the chosen node knows",
+  "sabotage": "the per-attempt model write dropped",
+  "catchers": {
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed",
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine"
+  ],
+  "seconds": 8,
+  "log": "/tmp/pr756-p5/ablations/A07-D18.log"
+ },
+ {
+  "id": "A08-I12w",
+  "rule": "I12: only `model` is ever written",
+  "sabotage": "the body rewrite also removes the client's `user` field",
+  "catchers": {
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed"
+  ],
+  "seconds": 8,
+  "log": "/tmp/pr756-p5/ablations/A08-I12w.log"
+ },
+ {
+  "id": "A13-D13",
+  "rule": "Typed backpressure trusted only from an engine that declares it",
+  "sabotage": "the re-place arm trusts engine_queue_full from any engine",
+  "catchers": {
+   "a_foreign_503_carrying_our_queue_full_code_is_still_relayed_once": true,
+   "a_streaming_request_refused_by_a_foreign_node_is_relayed_once": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_foreign_503_carrying_our_queue_full_code_is_still_relayed_once",
+   "a_streaming_request_refused_by_a_foreign_node_is_relayed_once"
+  ],
+  "seconds": 9,
+  "log": "/tmp/pr756-p5/ablations/A13-D13.log"
+ },
+ {
+  "id": "A11-D15b",
+  "rule": "Default Refused: ServeConfig without the flag places on Camelid only",
+  "sabotage": "MixedEngines::default() is Allowed",
+  "catchers": {
+   "the_proxy_places_on_camelid_only_unless_started_with_mixed_engines": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_camelid_only_proxy_serves_a_tool_calling_request_exactly_as_before",
+   "an_answer_resting_on_a_declared_alias_says_so_and_one_that_does_not_does_not",
+   "health_under_mixed_mode_reports_the_mode_the_nodes_it_accepts_and_their_consequences",
+   "the_models_routes_follow_the_proxy_s_mode",
+   "the_proxy_places_on_camelid_only_unless_started_with_mixed_engines"
+  ],
+  "seconds": 14,
+  "log": "/tmp/pr756-p5/ablations/A11-D15b.log"
+ },
+ {
+  "id": "A14-D30",
+  "rule": "Typed backpressure trusted only if declared, at the service-time site",
+  "sabotage": "dispatch's service-time branch uses the ungated refused_for_backpressure()",
+  "catchers": {
+   "completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed"
+  ],
+  "seconds": 13,
+  "log": "/tmp/pr756-p5/ablations/A14-D30.log"
+ },
+ {
+  "id": "A15-relay",
+  "rule": "Relay, don't re-place: an untyped refusal is relayed once (buffered and streaming)",
+  "sabotage": "any 503 is read as a queue-full refusal",
+  "catchers": {
+   "a_refusal_that_is_not_backpressure_is_relayed_untouched": true,
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "a_refusal_that_is_not_backpressure_is_relayed_untouched",
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed"
+  ],
+  "seconds": 14,
+  "log": "/tmp/pr756-p5/ablations/A15-relay.log"
+ },
+ {
+  "id": "A16-relay-stream",
+  "rule": "Relay, don't re-place, on the streaming path",
+  "sabotage": "a buffered answer to a stream re-placed on any 503",
+  "catchers": {
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed"
+  ],
+  "seconds": 13,
+  "log": "/tmp/pr756-p5/ablations/A16-relay-stream.log"
+ },
+ {
+  "id": "A10-D15",
+  "rule": "Default Refused: the flag is off unless given",
+  "sabotage": "--allow-mixed-engines defaults to true",
+  "catchers": {
+   "fabric_serve_places_on_camelid_only_unless_the_flag_is_given": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric_command_tests::fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment",
+   "fabric_command_tests::fabric_serve_places_on_camelid_only_unless_the_flag_is_given"
+  ],
+  "seconds": 9,
+  "log": "/tmp/pr756-p5/ablations/A10-D15.log"
+ },
+ {
+  "id": "A12-D33",
+  "rule": "Default Refused: no environment variable turns it on",
+  "sabotage": "the flag reads CAMELID_ALLOW_MIXED_ENGINES",
+  "catchers": {
+   "fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment": true
+  },
+  "all_named_failed": true,
+  "ran": true,
+  "compiled": true,
+  "restored_sha256_ok": true,
+  "exit_codes": [
+   101
+  ],
+  "failed_tests": [
+   "fabric_command_tests::a_client_key_set_cannot_be_combined_with_a_single_key",
+   "fabric_command_tests::completion_time_is_available_only_to_the_resident_command",
+   "fabric_command_tests::every_fabric_subcommand_accepts_a_bearer",
+   "fabric_command_tests::every_fabric_subcommand_accepts_a_node_file",
+   "fabric_command_tests::every_fabric_subcommand_has_the_same_node_transport_contract",
+   "fabric_command_tests::fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment",
+   "fabric_command_tests::fabric_serve_places_on_camelid_only_unless_the_flag_is_given",
+   "fabric_command_tests::the_nodes_come_from_a_file_or_from_flags_but_never_both",
+   "fabric_command_tests::the_proxy_takes_every_browser_origin_it_is_given"
+  ],
+  "seconds": 4,
+  "log": "/tmp/pr756-p5/ablations/A12-D33.log"
+ }
+]

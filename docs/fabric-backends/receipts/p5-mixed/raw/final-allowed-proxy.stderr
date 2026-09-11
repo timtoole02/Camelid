@@ -1,0 +1,1 @@
+fabric: c-ollama2 (ollama) added while placing on other engines; accepted without asking: publishes no load to rank on; a full queue is indistinguishable from a failure; cannot attest a warm prefix, so affinity would be a guess. Tool-calling requests: not until measured.

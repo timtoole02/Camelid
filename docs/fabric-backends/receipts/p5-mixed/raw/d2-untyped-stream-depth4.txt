@@ -1,0 +1,15 @@
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+x-camelid-fabric-node: c-standin
+x-camelid-fabric-engine: ollama
+x-camelid-fabric-reason: LeastLoaded
+x-camelid-fabric-attempts: 1
+x-camelid-fabric-model: standin-1b:latest
+x-camelid-fabric-model-identity: asserted_by_operator
+x-camelid-fabric-residency-observed: resident
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 34f0b8bd-cc56-45f6-8042-91f41d9da137
+content-length: 77
+date: Fri, 11 Sep 2026 21:09:50 GMT
+
+{"error":"server busy, please try again.  maximum pending requests exceeded"}

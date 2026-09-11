@@ -199,6 +199,30 @@ Rules already ablated and caught (8 ablations, 7 guarded, D5 declared unguarded)
 | D7 | give an unstable side a settled digest | `an unstable side is not attributable and carries no settled digest` |
 | D8 | render a proxy refusal as an empty comparison | `a refused comparison shows the refusal, not an empty result` |
 
+P5 remainder (mixed-engine placement), run on the M4 node against `42561ea8`, one edit per row,
+each restored and verified by SHA-256; every named check failed (receipt:
+`receipts/p5-mixed/README.md`):
+
+| # | Sabotage | Caught by |
+|---|---|---|
+| D9 | `meets()` passes every node whatever `tool_calls` says | `a_tool_calling_request_never_lands_on_a_backend_nobody_measured`, `a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine`, `a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next` |
+| D10 | delete the requirements union in `Fabric::dispatch` (policy unit tests stay green) | `a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine`, `a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next` |
+| D10b | the same, in `dispatch_streaming` only | `a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine` |
+| D29 | `forward_to` checks no requirement | `a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it` |
+| D11 | `placement_requirements` ignores `functions` | `contents_of_equal_encoded_size_cannot_change_requirements_or_class` |
+| D12 | `placement_requirements` also scans messages for `role: "tool"` | `contents_of_equal_encoded_size_cannot_change_requirements_or_class` |
+| D18 | drop the per-attempt `model` write | `a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed` |
+| D41 | the body rewrite also removes the client's `user` field | `a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed` |
+| D42 | `is_placeable_under` admits any node under Allowed, ready or not | `mixed_placement_refuses_an_unreachable_node_exactly_as_camelid_only_placement_does`, `mixed_placement_does_not_make_a_node_that_is_still_loading_eligible` |
+| D15 | `--allow-mixed-engines` defaults to true | `fabric_serve_places_on_camelid_only_unless_the_flag_is_given` |
+| D15b | `MixedEngines::default()` is `Allowed` | `the_proxy_places_on_camelid_only_unless_started_with_mixed_engines` |
+| D33 | the flag reads `CAMELID_ALLOW_MIXED_ENGINES` | `fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment` |
+| D13 | the re-place arm trusts `engine_queue_full` from any engine | `a_foreign_503_carrying_our_queue_full_code_is_still_relayed_once`, `a_streaming_request_refused_by_a_foreign_node_is_relayed_once` |
+| D30 | dispatch's service-time branch uses the ungated predicate | `completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed` |
+| D43 | any 503 is read as a queue-full refusal | `a_refusal_that_is_not_backpressure_is_relayed_untouched`, `an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed` |
+| D44 | a buffered answer to a stream is re-placed on any 503 | `an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed` |
+| D45 | the mixed-mode model-less rule applied in every mode | `a_camelid_only_fabric_decides_exactly_as_before` |
+
 **Any new guard in P4/P5/P7 needs the same treatment.**
 
 ### 5.3 Receipts — against real software, not stubs

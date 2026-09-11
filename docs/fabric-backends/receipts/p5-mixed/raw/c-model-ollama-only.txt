@@ -1,0 +1,8 @@
+HTTP/1.1 404 Not Found
+content-type: application/json
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 5df8852e-cd3d-400a-b703-6122dc8152db
+content-length: 294
+date: Fri, 11 Sep 2026 21:07:42 GMT
+
+{"error":{"message":"no ready node is serving model `llama32-1b-q8-r1:latest`; ready nodes serve: Llama 3.2 1B Instruct; b-ollama holds it but runs an engine this fabric does not place on (accept that with --allow-mixed-engines)","type":"fabric_error","code":"model_not_found","param":"model"}}

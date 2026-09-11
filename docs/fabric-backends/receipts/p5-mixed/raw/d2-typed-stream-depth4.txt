@@ -1,0 +1,15 @@
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+x-camelid-fabric-node: c-standin
+x-camelid-fabric-engine: ollama
+x-camelid-fabric-reason: LeastLoaded
+x-camelid-fabric-attempts: 1
+x-camelid-fabric-model: standin-1b:latest
+x-camelid-fabric-model-identity: asserted_by_operator
+x-camelid-fabric-residency-observed: resident
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 415d76be-c71f-487c-a1ba-5a46dde2c89b
+content-length: 55
+date: Fri, 11 Sep 2026 21:09:54 GMT
+
+{"error":{"message":"full","code":"engine_queue_full"}}

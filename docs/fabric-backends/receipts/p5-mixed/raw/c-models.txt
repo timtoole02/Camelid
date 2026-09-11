@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+content-type: application/json
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 4cc8b37e-2126-4911-9ac7-c06e72e7e94c
+content-length: 219
+date: Fri, 11 Sep 2026 21:07:42 GMT
+
+{"object":"list","data":[{"id":"Llama 3.2 1B Instruct","object":"model","created":0,"owned_by":"camelid"},{"id":"llama-1b","object":"model","created":0,"owned_by":"camelid","x_camelid_identity":"asserted_by_operator"}]}

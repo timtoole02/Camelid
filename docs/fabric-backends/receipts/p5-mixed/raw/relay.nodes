@@ -1,0 +1,4 @@
+a-camelid=127.0.0.1:18181
+c-standin=ollama://127.0.0.1:11500
+alias llama-1b=a-camelid:Llama 3.2 1B Instruct
+alias llama-1b=c-standin:standin-1b:latest

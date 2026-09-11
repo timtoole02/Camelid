@@ -1,0 +1,250 @@
+[
+ {
+  "id": "A05-D11",
+  "rule": "I12: tool-call detection reads presence of `tools` or `functions`",
+  "sabotage": "placement_requirements ignores `functions`",
+  "file": "src/fabric/mod.rs",
+  "old": "        tool_calls: present(\"tools\") || present(\"functions\"),",
+  "new": "        tool_calls: present(\"tools\"),",
+  "catchers": [
+   "contents_of_equal_encoded_size_cannot_change_requirements_or_class"
+  ],
+  "cargo": [
+   "--lib fabric::"
+  ]
+ },
+ {
+  "id": "A06-D12",
+  "rule": "I12: placement never reads messages",
+  "sabotage": "placement_requirements also scans messages for role:\"tool\"",
+  "file": "src/fabric/mod.rs",
+  "old": "        tool_calls: present(\"tools\") || present(\"functions\"),",
+  "new": "        tool_calls: present(\"tools\") || present(\"functions\") || body.get(\"messages\").and_then(Value::as_array).is_some_and(|messages| messages.iter().any(|m| m.get(\"role\").and_then(Value::as_str) == Some(\"tool\"))),",
+  "catchers": [
+   "contents_of_equal_encoded_size_cannot_change_requirements_or_class"
+  ],
+  "cargo": [
+   "--lib fabric::"
+  ]
+ },
+ {
+  "id": "A09-ready",
+  "rule": "Readiness required under mixed mode",
+  "sabotage": "is_placeable_under admits any node, ready or not, under Allowed",
+  "file": "src/fabric/node.rs",
+  "old": "        self.status.is_ready()\n            && (self.spec.engine.is_placeable() || mixed == super::policy::MixedEngines::Allowed)",
+  "new": "        (self.status.is_ready() || mixed == super::policy::MixedEngines::Allowed)\n            && (self.spec.engine.is_placeable() || mixed == super::policy::MixedEngines::Allowed)",
+  "catchers": [
+   "mixed_placement_refuses_an_unreachable_node_exactly_as_camelid_only_placement_does",
+   "mixed_placement_does_not_make_a_node_that_is_still_loading_eligible"
+  ],
+  "cargo": [
+   "--lib fabric::"
+  ]
+ },
+ {
+  "id": "A17-S5",
+  "rule": "S5: a Camelid-only fabric decides exactly as before",
+  "sabotage": "the mixed-mode model-less rule (only nodes with an active model) applied in every mode",
+  "file": "src/fabric/policy.rs",
+  "old": "        None if request.mixed == MixedEngines::Allowed => {",
+  "new": "        None => {",
+  "catchers": [
+   "a_camelid_only_fabric_decides_exactly_as_before"
+  ],
+  "cargo": [
+   "--lib fabric::"
+  ]
+ },
+ {
+  "id": "A01-D9",
+  "rule": "I5: a tool-carrying request never reaches an unmeasured backend",
+  "sabotage": "meets() passes every node whatever tool_calls says",
+  "file": "src/fabric/policy.rs",
+  "old": "    if requires.tool_calls && capabilities.tool_calls.supported != Some(true) {",
+  "new": "    if requires.tool_calls && capabilities.tool_calls.supported != Some(true) && false {",
+  "catchers": [
+   "a_tool_calling_request_never_lands_on_a_backend_nobody_measured",
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine",
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next"
+  ],
+  "cargo": [
+   "--lib fabric::policy",
+   "--test fabric_engines",
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A02-D10",
+  "rule": "I5 at the chokepoint: Fabric::dispatch reads the body's requirements itself",
+  "sabotage": "the requirements union deleted from Fabric::dispatch (policy unit tests must stay green)",
+  "file": "src/fabric/mod.rs",
+  "old": "        // caller may add a requirement, never take one the body carries away.\n        let request = request.requiring(request.requires.union(placement_requirements(path, body)));",
+  "new": "        // caller may add a requirement, never take one the body carries away.\n        let request = *request;",
+  "catchers": [
+   "a_request_carrying_tools_is_never_sent_to_an_unmeasured_engine",
+   "a_tool_calling_request_through_the_proxy_is_refused_with_what_to_do_next"
+  ],
+  "cargo": [
+   "--lib fabric::policy",
+   "--test fabric_engines",
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A03-D10b",
+  "rule": "I5 at the chokepoint, streaming",
+  "sabotage": "the requirements union deleted from Fabric::dispatch_streaming only",
+  "file": "src/fabric/mod.rs",
+  "old": "        // The same chokepoint as `dispatch`: see there.\n        let request = request.requiring(request.requires.union(placement_requirements(path, body)));",
+  "new": "        // The same chokepoint as `dispatch`: see there.\n        let request = *request;",
+  "catchers": [
+   "a_streaming_request_carrying_tools_is_never_sent_to_an_unmeasured_engine"
+  ],
+  "cargo": [
+   "--test fabric_engines"
+  ]
+ },
+ {
+  "id": "A04-D29",
+  "rule": "I5 on the one-shot path",
+  "sabotage": "Fabric::forward_to checks no requirement",
+  "file": "src/fabric/mod.rs",
+  "old": "        if let Err(missing) =\n            policy::meets(&node.capabilities(), placement_requirements(path, body))",
+  "new": "        if let Err(missing) =\n            policy::meets(&node.capabilities(), Requirements::default())",
+  "catchers": [
+   "a_one_shot_send_refuses_a_tool_carrying_body_for_a_node_not_measured_for_it"
+  ],
+  "cargo": [
+   "--test fabric_engines"
+  ]
+ },
+ {
+  "id": "A07-D18",
+  "rule": "I12: `model` is written to the id the chosen node knows",
+  "sabotage": "the per-attempt model write dropped",
+  "file": "src/fabric/mod.rs",
+  "old": "    let Some(model) = placement.decision.model.as_deref() else {",
+  "new": "    let Some(model) = None::<&str> else {",
+  "catchers": [
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed"
+  ],
+  "cargo": [
+   "--test fabric_engines"
+  ]
+ },
+ {
+  "id": "A08-I12w",
+  "rule": "I12: only `model` is ever written",
+  "sabotage": "the body rewrite also removes the client's `user` field",
+  "file": "src/fabric/mod.rs",
+  "old": "            object.insert(\"model\".to_string(), Value::String(model.to_string()));",
+  "new": "            object.insert(\"model\".to_string(), Value::String(model.to_string()));\n            object.remove(\"user\");",
+  "catchers": [
+   "a_forwarded_request_carries_the_node_s_own_model_id_and_nothing_else_changed"
+  ],
+  "cargo": [
+   "--test fabric_engines"
+  ]
+ },
+ {
+  "id": "A13-D13",
+  "rule": "Typed backpressure trusted only from an engine that declares it",
+  "sabotage": "the re-place arm trusts engine_queue_full from any engine",
+  "file": "src/fabric/mod.rs",
+  "old": "                Ok(value) if trusted_backpressure(&placement, &value) => {",
+  "new": "                Ok(value) if value.refused_for_backpressure() => {",
+  "catchers": [
+   "a_foreign_503_carrying_our_queue_full_code_is_still_relayed_once",
+   "a_streaming_request_refused_by_a_foreign_node_is_relayed_once"
+  ],
+  "cargo": [
+   "--test fabric_engines"
+  ]
+ },
+ {
+  "id": "A11-D15b",
+  "rule": "Default Refused: ServeConfig without the flag places on Camelid only",
+  "sabotage": "MixedEngines::default() is Allowed",
+  "file": "src/fabric/policy.rs",
+  "old": "    #[default]\n    Refused,\n    Allowed,",
+  "new": "    Refused,\n    #[default]\n    Allowed,",
+  "catchers": [
+   "the_proxy_places_on_camelid_only_unless_started_with_mixed_engines"
+  ],
+  "cargo": [
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A14-D30",
+  "rule": "Typed backpressure trusted only if declared, at the service-time site",
+  "sabotage": "dispatch's service-time branch uses the ungated refused_for_backpressure()",
+  "file": "src/fabric/mod.rs",
+  "old": "        } else if sent.value.status >= 500 && !trusted_backpressure(&sent.placement, &sent.value) {",
+  "new": "        } else if sent.value.status >= 500 && !sent.value.refused_for_backpressure() {",
+  "catchers": [
+   "completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed"
+  ],
+  "cargo": [
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A15-relay",
+  "rule": "Relay, don't re-place: an untyped refusal is relayed once (buffered and streaming)",
+  "sabotage": "any 503 is read as a queue-full refusal",
+  "file": "src/fabric/forward.rs",
+  "old": "        self.status == 503\n            && self.body.pointer(\"/error/code\").and_then(Value::as_str)\n                == Some(ENGINE_QUEUE_FULL_CODE)",
+  "new": "        self.status == 503",
+  "catchers": [
+   "a_refusal_that_is_not_backpressure_is_relayed_untouched",
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed"
+  ],
+  "cargo": [
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A16-relay-stream",
+  "rule": "Relay, don't re-place, on the streaming path",
+  "sabotage": "a buffered answer to a stream re-placed on any 503",
+  "file": "src/fabric/forward.rs",
+  "old": "            Self::Buffered(answer) => answer.refused_for_backpressure(),",
+  "new": "            Self::Buffered(answer) => answer.status == 503,",
+  "catchers": [
+   "an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed"
+  ],
+  "cargo": [
+   "--test fabric_serve"
+  ]
+ },
+ {
+  "id": "A10-D15",
+  "rule": "Default Refused: the flag is off unless given",
+  "sabotage": "--allow-mixed-engines defaults to true",
+  "file": "src/main.rs",
+  "old": "        /// the command line to show it.\n        #[arg(long)]\n        allow_mixed_engines: bool,",
+  "new": "        /// the command line to show it.\n        #[arg(long, default_value_t = true)]\n        allow_mixed_engines: bool,",
+  "catchers": [
+   "fabric_serve_places_on_camelid_only_unless_the_flag_is_given"
+  ],
+  "cargo": [
+   "--bin camelid fabric_"
+  ]
+ },
+ {
+  "id": "A12-D33",
+  "rule": "Default Refused: no environment variable turns it on",
+  "sabotage": "the flag reads CAMELID_ALLOW_MIXED_ENGINES",
+  "file": "src/main.rs",
+  "old": "        /// the command line to show it.\n        #[arg(long)]\n        allow_mixed_engines: bool,",
+  "new": "        /// the command line to show it.\n        #[arg(long, env = \"CAMELID_ALLOW_MIXED_ENGINES\")]\n        allow_mixed_engines: bool,",
+  "catchers": [
+   "fabric_serve_mixed_mode_cannot_be_turned_on_by_the_environment"
+  ],
+  "cargo": [
+   "--bin camelid fabric_"
+  ]
+ }
+]

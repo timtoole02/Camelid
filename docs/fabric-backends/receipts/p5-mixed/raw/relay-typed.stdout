@@ -1,0 +1,14 @@
+fabric serve listening on http://127.0.0.1:8283
+node transport: cleartext restricted to loopback/tunnels
+allowing browser reads from 1 origin(s)
+watching the node file; editing it adds or removes a machine without a restart
+fabric: 1 of 2 nodes ready; serving Llama 3.2 1B Instruct, llama-1b
+  c-standin (127.0.0.1:11500) unreachable: cannot connect: 127.0.0.1:11500: Connection refused (os error 61)
+placement: ALSO placing on other engines (--allow-mixed-engines)
+  c-standin (ollama, version not published): accepted without asking: publishes no load to rank on; a full queue is indistinguishable from a failure; cannot attest a warm prefix, so affinity would be a guess. requests carrying tools are never placed here: tool calls have not been measured on ollama, version not published; rerank requests are never placed here: its API has no rerank route.
+  note: nodes of other engines added to the nodes file later are accepted too, and are announced here.
+aliases in force (read at startup; edit and restart to change): llama-1b -> a-camelid:Llama 3.2 1B Instruct, c-standin:standin-1b:latest
+[2m2026-09-11T21:09:53.816488Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request [3mmethod[0m[2m=[0mGET [3mpath[0m[2m=[0m/v1/health [3mstatus[0m[2m=[0m200 [3mnode[0m[2m=[0m"-" [3mreason[0m[2m=[0m"-" [3melapsed_ms[0m[2m=[0m0 [3mclient[0m[2m=[0m"127.0.0.1:53435" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"5fdce84a-b01e-46a9-a0be-f4bf756c6aaa"
+[2m2026-09-11T21:09:54.494733Z[0m [33m WARN[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request failed [3mmethod[0m[2m=[0mPOST [3mpath[0m[2m=[0m/v1/chat/completions [3mstatus[0m[2m=[0m503 [3mnode[0m[2m=[0m"c-standin" [3mreason[0m[2m=[0m"LeastLoaded" [3melapsed_ms[0m[2m=[0m1 [3mclient[0m[2m=[0m"127.0.0.1:53445" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"f2023346-d85e-44df-b371-126df2a2b8bf"
+[2m2026-09-11T21:09:54.534689Z[0m [33m WARN[0m [2mcamelid::fabric::server[0m[2m:[0m fabric request failed [3mmethod[0m[2m=[0mPOST [3mpath[0m[2m=[0m/v1/chat/completions [3mstatus[0m[2m=[0m503 [3mnode[0m[2m=[0m"c-standin" [3mreason[0m[2m=[0m"LeastLoaded" [3melapsed_ms[0m[2m=[0m0 [3mclient[0m[2m=[0m"127.0.0.1:53453" [3mclient_name[0m[2m=[0m"-" [3mrequest_id[0m[2m=[0m"415d76be-c71f-487c-a1ba-5a46dde2c89b"
+[2m2026-09-11T21:09:55.605811Z[0m [32m INFO[0m [2mcamelid::fabric::server[0m[2m:[0m stopping: no longer accepting requests, finishing the ones in flight

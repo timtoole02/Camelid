@@ -1,0 +1,8 @@
+HTTP/1.1 400 Bad Request
+content-type: application/json
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 9d32434c-8d20-40b8-8f6c-33e81cfce3e2
+content-length: 319
+date: Fri, 11 Sep 2026 21:08:45 GMT
+
+{"error":{"message":"a request carrying tools is placed only on a node measured to handle them; b-ollama (ollama 0.33.2) has not been measured handling tool calls here; a-camelid can take tools but does not hold `llama32-1b-q8-r1:latest`","type":"invalid_request_error","code":"capability_unavailable","param":"tools"}}

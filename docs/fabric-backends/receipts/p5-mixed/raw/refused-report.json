@@ -1,0 +1,18 @@
+{
+ "mode": "refused",
+ "routing": "Routing\nCamelid engines only\nCamelid engines only\nAlso place on other engines",
+ "confirmation": "Also placing on other engines would accept this\npublishes no load to rank on\n\nranked as if already carrying 2 requests, because it reports none\n\nb-ollama\nollama 0.33.2\nthe API has no queue-depth or capacity endpoint\nfrom the API\na full queue is indistinguishable from a failure\n\nany refusal it sends is relayed to the client once and never retried on another node\n\nb-ollama\nollama 0.33.2\nno typed queue-full refusal, so a busy node cannot be told from a broken one\nfrom the API\ncannot attest a warm prefix, so affinity would be a guess\n\na request pinned to it with x-camelid-fabric-sticky is refused rather than silently re-routed\n\nb-ollama\nollama 0.33.2\n`/api/ps` says which models are resident, not whether a session's prefix survived\nfrom the API\nb-ollama requests carrying tools are never placed here: tool calls have not been measured on ollama 0.33.2\nb-ollama rerank requests are never placed here: its API has no rerank route\nThis also applies to any node of another engine added to the nodes file later, without asking again.\n\nThis would start serving:\n\nllama32-1b-q8-r1:latest\nCancel\nShow the command",
+ "commandBeforeConfirm": null,
+ "command": "Restart the proxy with this, keeping the other flags it was started with. This page cannot change a running proxy.\n\ncamelid fabric serve … --allow-mixed-engines\nCopy",
+ "requests": [
+  "GET http://127.0.0.1:8181/v1/health",
+  "GET http://127.0.0.1:8181/__camelid/backend/status",
+  "GET http://127.0.0.1:8181/v1/models",
+  "GET http://127.0.0.1:8181/api/capabilities",
+  "GET http://127.0.0.1:8181/api/models/catalog/downloads",
+  "GET http://127.0.0.1:8181/api/models/local",
+  "GET http://127.0.0.1:8181/api/models/current",
+  "GET http://127.0.0.1:8282/v1/health"
+ ],
+ "errors": []
+}

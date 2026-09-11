@@ -1,0 +1,15 @@
+HTTP/1.1 200 OK
+content-type: application/json
+x-camelid-fabric-node: b-ollama
+x-camelid-fabric-engine: ollama
+x-camelid-fabric-reason: LeastLoaded
+x-camelid-fabric-attempts: 1
+x-camelid-fabric-model: llama32-1b-q8-r1:latest
+x-camelid-fabric-model-identity: asserted_by_operator
+x-camelid-fabric-residency-observed: resident
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 53abe6ca-0ebf-438c-ae6d-6a7ef059b3c4
+content-length: 302
+date: Fri, 11 Sep 2026 21:08:47 GMT
+
+{"id":"chatcmpl-687","object":"chat.completion","created":1789160927,"model":"llama32-1b-q8-r1:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"message":{"role":"assistant","content":"Hello."},"finish_reason":"stop"}],"usage":{"prompt_tokens":41,"completion_tokens":3,"total_tokens":44}}

@@ -1,0 +1,5 @@
+a-camelid=127.0.0.1:18181
+b-ollama=ollama://127.0.0.1:11434
+alias llama-1b=a-camelid:Llama 3.2 1B Instruct
+alias llama-1b=b-ollama:llama32-1b-q8-r1:latest
+c-ollama2=ollama://127.0.0.1:11434

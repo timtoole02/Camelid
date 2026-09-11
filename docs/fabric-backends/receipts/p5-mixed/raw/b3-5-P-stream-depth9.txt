@@ -1,0 +1,23 @@
+HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+x-camelid-fabric-node: b-ollama
+x-camelid-fabric-engine: ollama
+x-camelid-fabric-reason: LeastLoaded
+x-camelid-fabric-attempts: 1
+x-camelid-fabric-model: llama32-1b-q8-r1:latest
+x-camelid-fabric-model-identity: asserted_by_operator
+x-camelid-fabric-residency-observed: resident
+vary: origin, access-control-request-method, access-control-request-headers
+x-request-id: 5bc75392-3a92-467e-b4c2-e9129b6de50d
+transfer-encoding: chunked
+date: Fri, 11 Sep 2026 21:08:48 GMT
+
+data: {"id":"chatcmpl-855","object":"chat.completion.chunk","created":1789160928,"model":"llama32-1b-q8-r1:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-855","object":"chat.completion.chunk","created":1789160928,"model":"llama32-1b-q8-r1:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-855","object":"chat.completion.chunk","created":1789160928,"model":"llama32-1b-q8-r1:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
