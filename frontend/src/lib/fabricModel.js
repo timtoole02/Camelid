@@ -160,8 +160,16 @@ export function describeFabric(probe) {
   }
 
   if (probe.outcome !== 'answered') {
-    const code = probe.outcome === 'malformed' ? 'malformed_answer' : 'unreachable'
-    return { ...UNKNOWN_FABRIC, problem: { code, detail: stringOrNull(probe.detail) } }
+    const code = probe.outcome === 'malformed'
+      ? 'malformed_answer'
+      : (probe.outcome === 'blocked' ? 'origin_not_allowed' : 'unreachable')
+    // `cause` separates a network failure, which may be a CORS refusal in
+    // disguise, from a timeout or a bad address, which cannot be.
+    const cause = stringOrNull(probe.cause)
+    return {
+      ...UNKNOWN_FABRIC,
+      problem: { code, detail: stringOrNull(probe.detail), ...(cause ? { cause } : {}) },
+    }
   }
 
   const body = probe.body
@@ -217,6 +225,8 @@ export function fabricProblemMessage(problem, endpoint) {
       return `No fabric proxy answered${where}.${problem.detail ? ` ${problem.detail}` : ''}`
     case 'malformed_answer':
       return `Something answered${where}, but not with a health report we could read.`
+    case 'origin_not_allowed':
+      return `Something answered${where}, but the browser did not let this page read the answer.`
     case 'is_an_engine':
       return `That address${where} is a Camelid engine, not a fabric proxy. Point this at a \`camelid fabric serve\` address, or add this engine to a fabric as a node.`
     case 'not_a_fabric':
@@ -224,6 +234,28 @@ export function fabricProblemMessage(problem, endpoint) {
     default:
       return `Could not read the fabric${where}.`
   }
+}
+
+/** The exact command that lets a page on `pageOrigin` read a fabric proxy.
+   `--cors-origin` is off by default, so a proxy started without it answers no
+   page but its own origin, and the WebUI is never served from the proxy. */
+export function corsCommand(pageOrigin) {
+  return `camelid fabric serve --cors-origin ${pageOrigin}`
+}
+
+/** Whether a failed read may be the proxy refusing this page's origin.
+
+   `blocked` when an opaque follow-up proved something answered. `possible` on a
+   plain network failure, because the browser reports a CORS refusal and a dead
+   socket identically and saying only "nothing answered" would be a guess.
+   Never for a timeout or a bad address, and never for a same-origin read, which
+   CORS does not govern. */
+export function crossOriginDiagnosis(problem, pageOrigin, proxyOrigin) {
+  if (!problem || !pageOrigin) return null
+  if (problem.code === 'origin_not_allowed') return 'blocked'
+  if (proxyOrigin && pageOrigin === proxyOrigin) return null
+  if (problem.code === 'unreachable' && problem.cause === 'network') return 'possible'
+  return null
 }
 
 /** Why node detail is missing, when it is. Only ever called for a real fabric. */

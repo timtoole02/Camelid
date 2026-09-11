@@ -132,6 +132,16 @@
   min-width: 0;
 }
 
+.fabric-cors-hint {
+  margin-top: var(--space-2);
+  min-width: 0;
+}
+
+.fabric-cors-hint code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 .fabric-cmd code {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -237,7 +247,24 @@
 
 .fabric-row:last-child { border-bottom: 0; }
 .fabric-row:hover { background: var(--color-surface-hover); }
-.fabric-row:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+
+/* The real control inside each row. Styled as the label it replaces, so the
+   table reads the same; the focus ring is the one place it looks like a button. */
+.fabric-row__open {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius-sm);
+}
+
+.fabric-row__open:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
 .fabric-row.is-selected {
   background: var(--color-selected-row);
@@ -354,6 +381,10 @@
   background: var(--color-surface);
   min-width: 0;
 }
+
+/* It takes focus when opened, so a keyboard user can see where they landed. */
+.fabric-detail:focus { outline: none; }
+.fabric-detail:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
 .fabric-detail__head {
   display: flex;

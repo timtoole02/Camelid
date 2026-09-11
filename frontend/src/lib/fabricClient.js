@@ -1,9 +1,12 @@
 /* Reads a fabric proxy's `/v1/health` straight from the browser.
 
    The WebUI is served by an engine, not by the proxy, so this is a cross-origin
-   request by construction. That works without a dev hook because Camelid answers
-   with a permissive `access-control-allow-origin` — the same route the Cluster
-   page already used for per-node telemetry.
+   request by construction, and `camelid fabric serve` sends no CORS headers
+   unless it was started with `--cors-origin <ORIGIN>` naming this page's origin.
+   Without that the browser keeps the answer from this page, and it reports the
+   refusal exactly as it reports a dead socket. So a failed read is followed by
+   one opaque request, which CORS does not govern: if that gets any answer back,
+   something is listening and it is the origin rule that stopped us.
 
    A failed read is reported as a failure, never as an empty fabric: the caller
    needs to tell "no nodes" apart from "could not look". */
@@ -57,12 +60,16 @@ export function endpointLabel(origin) {
   return origin.replace(/^https?:\/\//i, '')
 }
 
+/* The node list from the most recent read that disclosed one. A read that did
+   not — a failure, a withheld list — clears it, and so does pointing the page
+   at another proxy: a node drawn from an older answer is a claim that the
+   machine is still there. */
 let lastGoodNodes = null
 
 /** The most recent disclosed node list, for surfaces that render fabric identity
-   but do not own the fetch (the Observatory constellation). Empty until the
-   Cluster page has successfully looked — which is the honest default, because
-   until then we genuinely do not know of any nodes. */
+   but do not own the fetch (the Observatory constellation). Empty until a page
+   has successfully looked, and again as soon as a look fails — which is the
+   honest default, because then we genuinely do not know of any nodes. */
 export function readCachedFabricNodes() {
   return lastGoodNodes ? lastGoodNodes.slice() : []
 }
@@ -71,24 +78,50 @@ export function clearCachedFabricNodes() {
   lastGoodNodes = null
 }
 
+/* Whether anything at all answers `url`. An opaque request is not subject to
+   CORS: it resolves wherever a server replied, whatever its headers said, and
+   rejects only when no answer came back. Its response is unreadable by design
+   and is never looked at. */
+async function answersOpaquely(url, signal) {
+  try {
+    await fetch(url, { mode: 'no-cors', cache: 'no-store', signal })
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * Probe one fabric proxy.
  *
- * Resolves to `{ outcome: 'answered', httpStatus, body }` or
- * `{ outcome: 'unreachable' | 'malformed', detail }` — it never rejects, because
- * every failure mode here is information the view has to render.
+ * Resolves to `{ outcome: 'answered', httpStatus, body }`; to
+ * `{ outcome: 'blocked', detail, cause: 'cross_origin' }` when something
+ * answered but the browser would not let this page read it; or to
+ * `{ outcome: 'unreachable' | 'malformed', detail, cause }`. It never rejects,
+ * because every failure mode here is information the view has to render.
  */
 export async function probeFabric({ endpoint, timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   const origin = normalizeEndpoint(endpoint)
-  if (!origin) return { outcome: 'unreachable', detail: 'That is not a usable address.' }
+  if (!origin) return { outcome: 'unreachable', detail: 'That is not a usable address.', cause: 'address' }
 
+  const url = `${origin}/v1/health`
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   const onAbort = () => controller.abort()
-  signal?.addEventListener('abort', onAbort)
+  if (signal?.aborted) controller.abort()
+  else signal?.addEventListener('abort', onAbort)
+
+  // Our own abort, not the network: either the caller gave up or we timed out.
+  const stopped = () => {
+    if (signal?.aborted) return { outcome: 'unreachable', detail: 'Cancelled.', cause: 'cancelled' }
+    if (controller.signal.aborted) {
+      return { outcome: 'unreachable', detail: `No answer within ${timeoutMs}ms.`, cause: 'timeout' }
+    }
+    return null
+  }
 
   try {
-    const response = await fetch(`${origin}/v1/health`, {
+    const response = await fetch(url, {
       signal: controller.signal,
       mode: 'cors',
       cache: 'no-store',
@@ -101,13 +134,17 @@ export async function probeFabric({ endpoint, timeoutMs = DEFAULT_TIMEOUT_MS, si
       return { outcome: 'malformed', detail: `Answered ${response.status} with something that is not JSON.` }
     }
     return { outcome: 'answered', httpStatus: response.status, body }
-  } catch (error) {
-    if (signal?.aborted) return { outcome: 'unreachable', detail: 'Cancelled.' }
-    const timedOut = controller.signal.aborted
-    return {
-      outcome: 'unreachable',
-      detail: timedOut ? `No answer within ${timeoutMs}ms.` : 'The connection failed.',
+  } catch {
+    const early = stopped()
+    if (early) return early
+    if (await answersOpaquely(url, controller.signal)) {
+      return {
+        outcome: 'blocked',
+        detail: 'The browser did not let this page read the answer.',
+        cause: 'cross_origin',
+      }
     }
+    return stopped() || { outcome: 'unreachable', detail: 'The connection failed.', cause: 'network' }
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
@@ -115,8 +152,12 @@ export async function probeFabric({ endpoint, timeoutMs = DEFAULT_TIMEOUT_MS, si
 }
 
 /** Probe and describe in one step, keeping the node cache current. */
-export async function readFabric(options) {
+export async function readFabric(options = {}) {
   const fabric = describeFabric(await probeFabric(options))
-  if (fabric.detail === 'disclosed') lastGoodNodes = fabric.nodes
+  // A cancelled read — superseded, or its page closed — says nothing about the
+  // fabric, so it neither refreshes nor clears what the last read saw.
+  if (!options.signal?.aborted) {
+    lastGoodNodes = fabric.detail === 'disclosed' ? fabric.nodes : null
+  }
   return fabric
 }

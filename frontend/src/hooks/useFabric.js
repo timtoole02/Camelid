@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  DEFAULT_FABRIC_ENDPOINT,
   FABRIC_ENDPOINT_KEY,
+  clearCachedFabricNodes,
   loadFabricEndpoint,
   normalizeEndpoint,
   readFabric,
@@ -52,6 +52,9 @@ export function useFabric({ pollMs = POLL_MS } = {}) {
     setEndpointState(stored)
     try { appStorage.setItem(ENDPOINT_KEY, stored) } catch { /* storage is best-effort */ }
     // Drop the previous fabric immediately: it describes a different address.
+    // The shared node cache goes too, or the Observatory would keep drawing the
+    // old proxy's machines as present.
+    clearCachedFabricNodes()
     setFabric(null)
     setPhase('never')
     setCheckedAt(null)

@@ -14,7 +14,9 @@
  * plus pointing the view at an engine by mistake, which must say so.
  *
  * The proxy runs on its own origin, so this also exercises the cross-origin
- * read the shipped app really performs.
+ * read the shipped app really performs. Most scenarios play a proxy started
+ * with `--cors-origin`; scenario 9 plays the default one, which sends no CORS
+ * header at all, because that is what an operator meets first.
  *
  * Requires `npm run build` first (it serves frontend/dist) and Chrome/Edge.
  */
@@ -64,7 +66,7 @@ const appServer = createServer((req, res) => {
 
 let proxy
 function resetProxy() {
-  proxy = { mode: 'down', requests: 0 }
+  proxy = { mode: 'down', requests: 0, cors: 'allow' }
 }
 resetProxy()
 
@@ -163,9 +165,10 @@ function proxyBody() {
 }
 
 const proxyServer = createServer((req, res) => {
-  // The shipped proxy answers cross-origin; without this the browser blocks the
-  // read and the smoke would be testing CORS, not the view.
-  res.setHeader('Access-Control-Allow-Origin', '*')
+  // The real proxy sends this only when started with `--cors-origin`. The
+  // happy-path scenarios play one that was; scenario 9 turns it off, because
+  // off is the default and the view has to say so rather than look empty.
+  if (proxy.cors === 'allow') res.setHeader('Access-Control-Allow-Origin', '*')
   const url = new URL(req.url, 'http://127.0.0.1')
   if (url.pathname !== '/v1/health') {
     res.writeHead(404, { 'Content-Type': 'application/json' })
@@ -353,6 +356,35 @@ try {
     assert.doesNotMatch(drawer, /Start worker|Stop worker|Restart worker/, 'the drawer must not offer a control it cannot perform')
     check('the node drawer reports state and offers no control it cannot perform')
 
+    // A row that can be opened has to be announced as something to press, and
+    // opened and closed without a mouse.
+    const winRow = await page.$eval('.fabric-row[data-node-label="win"]', (el) => ({
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role'),
+      button: Boolean(el.querySelector('button.fabric-row__open')),
+    }))
+    assert.equal(winRow.role, 'row')
+    assert.notEqual(winRow.tag, 'button', 'a button given role="row" is no longer announced as a button')
+    assert.ok(winRow.button, 'each row carries a real button that opens it')
+    check('each row is a table row holding a real button, so it is announced as something to press')
+
+    await page.focus('.fabric-row[data-node-label="win"] .fabric-row__open')
+    await page.keyboard.press('Enter')
+    await page.waitForFunction(
+      () => document.querySelector('.fabric-detail')?.getAttribute('aria-label') === 'Node win',
+      { timeout: 5000 },
+    )
+    await page.waitForFunction(() => Boolean(document.activeElement?.closest('.fabric-detail')), { timeout: 5000 })
+    check('opening a node from the keyboard moves focus into its detail')
+
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('.fabric-detail'), { timeout: 5000 })
+    await page.waitForFunction(
+      () => document.activeElement?.closest('.fabric-row')?.getAttribute('data-node-label') === 'win',
+      { timeout: 5000 },
+    )
+    check('Escape closes the detail and returns focus to the row it was opened from')
+
     assert.deepEqual(errors, [], 'no page errors')
     check('the disclosed view raises no page error')
     await page.close()
@@ -408,6 +440,14 @@ try {
     assert.match(body, /No fabric proxy answered/)
     assert.match(body, /camelid fabric serve --node/)
     check('an unreachable proxy renders an honest failure and no fabricated fabric')
+
+    const hint = await page.$eval('[data-testid="fabric-cors-hint"]', (el) => ({
+      diagnosis: el.getAttribute('data-diagnosis'),
+      command: el.querySelector('.fabric-cmd code')?.textContent.trim(),
+    }))
+    assert.equal(hint.diagnosis, 'possible', 'nothing answered the follow-up either, so this stays a possibility')
+    assert.equal(hint.command, `camelid fabric serve --cors-origin ${appOrigin}`)
+    check('a dead address still offers the origin fix, because a browser cannot tell the two apart')
 
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()
@@ -481,6 +521,36 @@ try {
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()
   }
+
+  /* ---- 9. a proxy that sends no CORS header, which is the real default ---- */
+  resetProxy()
+  proxy.mode = 'nodes'
+  proxy.cors = 'none'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    assert.ok(proxy.requests > 0, 'the proxy was really asked, so what failed is the origin rule and not the address')
+    assert.ok(await present(page, '[data-testid="fabric-problem"]'), 'an answer the page could not read is a failure')
+    assert.equal(await present(page, '.fabric-row'), false, 'nothing may be listed from an answer the page could not read')
+    assert.equal(await present(page, '[data-testid="fabric-counts"]'), false)
+    const body = await page.$eval('.fabric-view', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    assert.doesNotMatch(body, /This proxy has no nodes/, 'a blocked read must never render as an empty fabric')
+    const hint = await page.$eval('[data-testid="fabric-cors-hint"]', (el) => ({
+      diagnosis: el.getAttribute('data-diagnosis'),
+      command: el.querySelector('.fabric-cmd code')?.textContent.trim(),
+    }))
+    assert.equal(hint.command, `camelid fabric serve --cors-origin ${appOrigin}`)
+    check("a proxy that does not allow this page's origin shows the exact --cors-origin command, not an empty fabric")
+
+    assert.equal(hint.diagnosis, 'blocked')
+    assert.equal(await page.$eval('[data-testid="fabric-problem"]', (el) => el.getAttribute('data-code')), 'origin_not_allowed')
+    assert.match(body, /Something answered at/)
+    assert.doesNotMatch(body, /No fabric proxy answered/, 'something did answer, and saying otherwise sends the operator to the wrong fix')
+    check('an opaque follow-up tells an origin refusal apart from a dead address')
+
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+  resetProxy()
 
   console.log(`\nfabric view smoke: ${checks} checks passed`)
 } finally {

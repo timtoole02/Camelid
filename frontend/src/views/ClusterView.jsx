@@ -2,14 +2,20 @@ import { useMemo, useState } from 'react'
 import { useFabric } from '../hooks/useFabric'
 import { FabricNodeTable } from '../components/fabric/FabricNodeTable'
 import { FabricNodeDrawer } from '../components/fabric/FabricNodeDrawer'
+import { CopyableCommand } from '../components/fabric/CopyableCommand'
+import { CorsHint } from '../components/fabric/CorsHint'
 import { Unknown } from '../components/fabric/Unknown'
 import { Button } from '../components/ui/Button'
 import { Chip } from '../components/ui/Chip'
 import { EmptyState } from '../components/ui/EmptyState'
 import { Field } from '../components/ui/Field'
-import { IconCopy, IconNetwork, IconRefresh, IconServer } from '../components/ui/icons'
-import { copyText } from '../lib/markdown.jsx'
-import { DETAIL_WITHHELD_REASON, fabricPosture, fabricProblemMessage } from '../lib/fabricModel.js'
+import { IconNetwork, IconRefresh, IconServer } from '../components/ui/icons'
+import {
+  DETAIL_WITHHELD_REASON,
+  crossOriginDiagnosis,
+  fabricPosture,
+  fabricProblemMessage,
+} from '../lib/fabricModel.js'
 import { endpointLabel, normalizeEndpoint } from '../lib/fabricClient.js'
 
 /* The Cluster view reports one fabric proxy, live.
@@ -41,35 +47,29 @@ function CountCell({ label, value, tone }) {
   )
 }
 
-function CopyableCommand({ command }) {
-  const [copied, setCopied] = useState(false)
-  return (
-    <div className="fabric-cmd">
-      <code>{command}</code>
-      <Button
-        variant="ghost"
-        size="sm"
-        icon={<IconCopy size={14} />}
-        onClick={async () => {
-          const ok = await copyText(command)
-          setCopied(ok)
-          window.setTimeout(() => setCopied(false), 2000)
-        }}
-      >
-        {copied ? 'Copied' : 'Copy'}
-      </Button>
-    </div>
-  )
-}
-
 export default function ClusterView() {
   const { endpoint, setEndpoint, fabric, phase, checkedAt, refresh, valid } = useFabric()
   const [draft, setDraft] = useState(endpoint)
   const [selectedLabel, setSelectedLabel] = useState(null)
 
-  const shown = endpointLabel(normalizeEndpoint(endpoint)) || endpoint
+  const proxyOrigin = normalizeEndpoint(endpoint)
+  const shown = endpointLabel(proxyOrigin) || endpoint
   const posture = POSTURE[fabricPosture(fabric)]
   const problem = fabric?.problem ? fabricProblemMessage(fabric.problem, shown) : null
+  const pageOrigin = typeof window === 'undefined' ? null : window.location.origin
+  const diagnosis = fabric?.problem ? crossOriginDiagnosis(fabric.problem, pageOrigin, proxyOrigin) : null
+
+  // Hand focus back to the row the detail was opened from, so closing it does
+  // not drop a keyboard user at the top of the page.
+  const closeDetail = () => {
+    const label = selectedLabel
+    setSelectedLabel(null)
+    window.requestAnimationFrame(() => {
+      const rows = document.querySelectorAll('.fabric-row')
+      const row = [...rows].find((element) => element.getAttribute('data-node-label') === (label || ''))
+      row?.querySelector('.fabric-row__open')?.focus()
+    })
+  }
   const nodes = fabric?.nodes ?? null
   const selected = useMemo(
     () => (nodes && selectedLabel ? nodes.find((node) => node.label === selectedLabel) || null : null),
@@ -136,14 +136,20 @@ export default function ClusterView() {
       </section>
 
       {problem && (
-        <div className="fabric-panel fabric-panel--problem" data-testid="fabric-problem" role="status">
+        <div
+          className="fabric-panel fabric-panel--problem"
+          data-testid="fabric-problem"
+          data-code={fabric.problem.code}
+          role="status"
+        >
           <p>{problem}</p>
           {fabric.problem.code === 'unreachable' && (
             <>
-              <p className="fabric-note">Start one on this machine, then Refresh:</p>
+              <p className="fabric-note">If nothing is running there, start one on this machine, then Refresh:</p>
               <CopyableCommand command={SERVE_COMMAND} />
             </>
           )}
+          <CorsHint pageOrigin={pageOrigin} diagnosis={diagnosis} />
         </div>
       )}
 
@@ -198,7 +204,7 @@ export default function ClusterView() {
       )}
 
       {selected && (
-        <FabricNodeDrawer node={selected} checkedAt={checkedAt} onClose={() => setSelectedLabel(null)} />
+        <FabricNodeDrawer node={selected} checkedAt={checkedAt} onClose={closeDetail} />
       )}
     </div>
   )

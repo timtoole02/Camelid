@@ -17,12 +17,21 @@
 import assert from 'node:assert/strict'
 import {
   classifyHealthBody,
+  corsCommand,
+  crossOriginDiagnosis,
   describeFabric,
   fabricPosture,
   fabricProblemMessage,
   modelPlacements,
 } from '../src/lib/fabricModel.js'
-import { endpointLabel, normalizeEndpoint } from '../src/lib/fabricClient.js'
+import {
+  clearCachedFabricNodes,
+  endpointLabel,
+  normalizeEndpoint,
+  probeFabric,
+  readCachedFabricNodes,
+  readFabric,
+} from '../src/lib/fabricClient.js'
 
 let checks = 0
 function check(name, fn) {
@@ -30,6 +39,28 @@ function check(name, fn) {
   checks += 1
   process.stdout.write(`  ok  ${name}\n`)
 }
+
+async function checkAsync(name, fn) {
+  await fn()
+  checks += 1
+  process.stdout.write(`  ok  ${name}\n`)
+}
+
+/* The client half needs a network; a stubbed `fetch` stands in for the browser's.
+   Restored even when a check throws, so one failure cannot leak into the next. */
+async function withFetch(stub, fn) {
+  const original = globalThis.fetch
+  globalThis.fetch = stub
+  try {
+    return await fn()
+  } finally {
+    globalThis.fetch = original
+  }
+}
+
+// What a browser does with a cross-origin read the server did not allow, and
+// with a dead socket: the same rejection, with nothing in it to tell them apart.
+const refuse = () => Promise.reject(new TypeError('Failed to fetch'))
 
 const answered = (body, httpStatus = 200) => ({ outcome: 'answered', httpStatus, body })
 
@@ -365,6 +396,84 @@ check('an unusable address is refused rather than fetched as a guess', () => {
 check('the displayed address drops only the scheme', () => {
   assert.equal(endpointLabel('http://127.0.0.1:8282'), '127.0.0.1:8282')
   assert.equal(endpointLabel(null), null)
+})
+
+/* ---- a proxy that does not allow this page's origin ----
+   `camelid fabric serve` sends no CORS headers unless started with
+   `--cors-origin`, so this is the default outcome for a page on another origin,
+   not an edge case. */
+
+const PAGE = 'http://127.0.0.1:8181'
+const PROXY = 'http://127.0.0.1:8282'
+
+check('a read the browser blocked is named as such, with the exact flag that fixes it', () => {
+  const blocked = describeFabric({
+    outcome: 'blocked', detail: 'The browser did not let this page read the answer.', cause: 'cross_origin',
+  })
+  assert.equal(blocked.problem.code, 'origin_not_allowed')
+  assert.equal(blocked.nodes, null, 'an answer the page could not read is not an empty fabric')
+  assert.match(fabricProblemMessage(blocked.problem, '127.0.0.1:8282'), /Something answered at 127\.0\.0\.1:8282/)
+  assert.equal(crossOriginDiagnosis(blocked.problem, PAGE, PROXY), 'blocked')
+  assert.equal(corsCommand(PAGE), 'camelid fabric serve --cors-origin http://127.0.0.1:8181')
+})
+
+check('a plain network failure may be a CORS refusal; a timeout, a bad address or a same-origin read cannot be', () => {
+  const network = describeFabric({ outcome: 'unreachable', detail: 'The connection failed.', cause: 'network' }).problem
+  assert.equal(network.cause, 'network')
+  assert.equal(crossOriginDiagnosis(network, PAGE, PROXY), 'possible')
+  const timeout = describeFabric({ outcome: 'unreachable', detail: 'No answer within 4000ms.', cause: 'timeout' }).problem
+  assert.equal(crossOriginDiagnosis(timeout, PAGE, PROXY), null, 'a timeout got past CORS to wait')
+  const address = describeFabric({ outcome: 'unreachable', detail: 'That is not a usable address.', cause: 'address' }).problem
+  assert.equal(crossOriginDiagnosis(address, PAGE, PROXY), null)
+  assert.equal(crossOriginDiagnosis(network, PROXY, PROXY), null, 'CORS does not govern a same-origin read')
+  assert.equal(crossOriginDiagnosis(null, PAGE, PROXY), null)
+})
+
+await checkAsync('an opaque follow-up separates "answered, but not to this page" from "nothing there"', async () => {
+  const modes = []
+  const blocked = await withFetch((url, init = {}) => {
+    modes.push(init.mode)
+    // CORS does not govern an opaque request, so a live server answers it.
+    return init.mode === 'no-cors' ? Promise.resolve(new Response(null, { status: 200 })) : refuse()
+  }, () => probeFabric({ endpoint: '127.0.0.1:8282' }))
+  assert.deepEqual(modes, ['cors', 'no-cors'])
+  assert.equal(blocked.outcome, 'blocked')
+
+  const dead = await withFetch(refuse, () => probeFabric({ endpoint: '127.0.0.1:8282' }))
+  assert.equal(dead.outcome, 'unreachable')
+  assert.equal(dead.cause, 'network', 'still possibly CORS, so the view keeps offering the flag')
+})
+
+await checkAsync('the shared node cache is cleared by any read that did not disclose, but not by a cancelled one', async () => {
+  const disclosed = () => Promise.resolve(new Response(JSON.stringify({
+    ok: true, service: 'camelid-fabric', ready: true,
+    nodes: { total: 1, ready: 1, not_ready: 0, unreachable: 0 }, models: [], node_detail: [READY_NODE],
+  }), { status: 200 }))
+  const withheld = () => Promise.resolve(new Response(JSON.stringify({
+    ok: true, service: 'camelid-fabric', ready: true,
+  }), { status: 200 }))
+
+  clearCachedFabricNodes()
+  await withFetch(disclosed, () => readFabric({ endpoint: '127.0.0.1:8282' }))
+  assert.equal(readCachedFabricNodes().length, 1)
+
+  // The Observatory draws from this cache. A node kept after the read that
+  // should have refreshed it failed is drawn as present when nobody knows.
+  await withFetch(refuse, () => readFabric({ endpoint: '127.0.0.1:8282' }))
+  assert.deepEqual(readCachedFabricNodes(), [], 'a failed read clears the nodes it can no longer vouch for')
+
+  await withFetch(disclosed, () => readFabric({ endpoint: '127.0.0.1:8282' }))
+  await withFetch(withheld, () => readFabric({ endpoint: '127.0.0.1:8282' }))
+  assert.deepEqual(readCachedFabricNodes(), [], 'a withheld list is not the old list')
+
+  await withFetch(disclosed, () => readFabric({ endpoint: '127.0.0.1:8282' }))
+  const cancelled = new AbortController()
+  cancelled.abort()
+  await withFetch(refuse, () => readFabric({ endpoint: '127.0.0.1:8282', signal: cancelled.signal }))
+  assert.equal(readCachedFabricNodes().length, 1, 'a superseded read says nothing about the fabric')
+
+  clearCachedFabricNodes()
+  assert.deepEqual(readCachedFabricNodes(), [], 'changing the proxy address clears it (useFabric.setEndpoint)')
 })
 
 console.log(`\nfabric model smoke: ${checks} checks passed`)
