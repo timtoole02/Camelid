@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '../ui/Button'
 import { Chip } from '../ui/Chip'
 import { IconClose, IconCopy } from '../ui/icons'
@@ -71,12 +71,40 @@ function CopyButton({ value, label }) {
 }
 
 export function FabricNodeDrawer({ node, checkedAt, onClose }) {
+  const panelRef = useRef(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  const label = node ? node.label : null
+  const open = Boolean(node)
+
+  // Focus follows the operator into the detail they asked for. Keyed on which
+  // node is open, not on the node object: the 5s poll replaces that object, and
+  // re-focusing on every poll would pull focus away from wherever it had gone.
+  useEffect(() => {
+    if (open) panelRef.current?.focus()
+  }, [open, label])
+
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (event) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) onCloseRef.current?.()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
+
   if (!node) return null
   const tone = node.state ? STATE_TONE[node.state] : 'neutral'
   const healthUrl = node.authority ? `http://${node.authority}/v1/health` : null
 
   return (
-    <aside className="fabric-detail" aria-label={`Node ${node.label || 'detail'}`}>
+    <aside
+      ref={panelRef}
+      tabIndex={-1}
+      className="fabric-detail"
+      aria-label={`Node ${node.label || 'detail'}`}
+      data-testid="fabric-detail"
+    >
       <header className="fabric-detail__head">
         <div>
           <h2 className="fabric-detail__title">{node.label || 'Unlabelled node'}</h2>

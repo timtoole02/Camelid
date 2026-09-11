@@ -93,6 +93,11 @@ function LatencyCell({ node }) {
   return <span className="fabric-row__latency">{node.latencyMs} ms</span>
 }
 
+/* A row is a row, so assistive tech can read the table as a table; the thing
+   that opens a node's detail is a real button in its first cell. A button
+   given `role="row"` loses its button semantics, so nobody using a screen
+   reader was told the rows could be opened. The row keeps a click handler
+   only as a larger mouse target for the same action. */
 export function FabricNodeTable({ nodes, selectedLabel, onSelect }) {
   return (
     <div className="fabric-table" role="table" aria-label="Fabric nodes">
@@ -107,19 +112,30 @@ export function FabricNodeTable({ nodes, selectedLabel, onSelect }) {
       </div>
       {nodes.map((node, index) => {
         const key = node.label || `node-${index}`
+        const selected = Boolean(selectedLabel && selectedLabel === node.label)
         return (
-          <button
+          <div
             key={key}
-            type="button"
             role="row"
-            className={`fabric-row${selectedLabel && selectedLabel === node.label ? ' is-selected' : ''}`}
+            className={`fabric-row${selected ? ' is-selected' : ''}`}
             onClick={() => onSelect?.(node.label)}
             data-node-label={node.label || ''}
             data-node-state={node.state || 'unknown'}
             data-node-engine={node.engine || 'unknown'}
           >
             <span role="cell" data-label="Node" className="fabric-row__label">
-              {node.label || <Unknown why="This entry arrived without a label." />}
+              <button
+                type="button"
+                className="fabric-row__open"
+                aria-expanded={selected}
+                aria-label={`Show detail for node ${node.label || 'without a label'}`}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onSelect?.(node.label)
+                }}
+              >
+                {node.label || <Unknown why="This entry arrived without a label." />}
+              </button>
             </span>
             <span role="cell" data-label="Engine"><EngineCell node={node} /></span>
             <span role="cell" data-label="State"><StateCell node={node} /></span>
@@ -129,7 +145,7 @@ export function FabricNodeTable({ nodes, selectedLabel, onSelect }) {
             <span role="cell" data-label="Serving"><ModelCell node={node} /></span>
             <span role="cell" data-label="Load"><LoadCell node={node} /></span>
             <span role="cell" data-label="Probe"><LatencyCell node={node} /></span>
-          </button>
+          </div>
         )
       })}
     </div>

@@ -1,66 +1,41 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { loadFabricEndpoint, normalizeEndpoint } from '../lib/fabricClient.js'
-import { describeComparison } from '../lib/divergenceModel.js'
+import { requestComparison } from '../lib/divergenceClient.js'
+
+const IDLE = { phase: 'idle', comparison: null, problem: null, requested: null }
 
 /* Ask the proxy to compare two nodes.
  *
  * Deliberately not on the 5s poll the Cluster view uses: this request makes two
  * machines generate, so it happens when a person asks for it and at no other
- * time. */
+ * time. Leaving the page aborts it, so a slow comparison does not keep a
+ * connection open for a screen nobody is looking at. */
 export function useDivergence(endpointInput) {
-  const [state, setState] = useState({ phase: 'idle', comparison: null, problem: null })
+  const [state, setState] = useState(IDLE)
+  const inFlight = useRef(null)
 
-  async function run(request) {
+  useEffect(() => () => inFlight.current?.abort(), [])
+
+  async function run(request, { clientKey = '' } = {}) {
     const base = normalizeEndpoint(endpointInput || loadFabricEndpoint())
     if (!base) {
-      setState({ phase: 'failed', comparison: null, problem: { code: 'bad_endpoint' } })
-      return
-    }
-    setState({ phase: 'running', comparison: null, problem: null })
-
-    let response
-    try {
-      response = await fetch(`${base}/v1/fabric/compare`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(request),
-      })
-    } catch (error) {
-      setState({
-        phase: 'failed',
-        comparison: null,
-        problem: { code: 'unreachable', detail: String(error?.message || error) },
-      })
+      setState({ ...IDLE, phase: 'failed', problem: { code: 'bad_endpoint' } })
       return
     }
 
-    let body = null
-    try {
-      body = await response.json()
-    } catch {
-      setState({
-        phase: 'failed',
-        comparison: null,
-        problem: { code: 'malformed', detail: `Answered ${response.status} with something that is not JSON.` },
-      })
-      return
-    }
+    inFlight.current?.abort()
+    const controller = new AbortController()
+    inFlight.current = controller
+    setState({ phase: 'running', comparison: null, problem: null, requested: request })
 
-    if (!response.ok) {
-      // The proxy refuses a comparison it could not set up or run. That is a
-      // failure, and must never be rendered as a comparison that found nothing.
-      setState({
-        phase: 'failed',
-        comparison: null,
-        problem: {
-          code: 'refused',
-          detail: body?.error?.message || body?.message || `The proxy answered ${response.status}.`,
-        },
-      })
-      return
-    }
+    const outcome = await requestComparison({ base, request, clientKey, signal: controller.signal })
+    // Unmounted or superseded: nobody is waiting for this answer.
+    if (controller.signal.aborted) return
+    inFlight.current = null
 
-    setState({ phase: 'settled', comparison: describeComparison(body), problem: null })
+    setState(outcome.comparison
+      ? { phase: 'settled', comparison: outcome.comparison, problem: null, requested: request }
+      : { phase: 'failed', comparison: null, problem: outcome.problem, requested: request })
   }
 
   return { ...state, run }

@@ -386,10 +386,16 @@ try {
     /online and requires the laptop's LAN Chat key/i,
     'reachable-but-protected must not be described as an offline server',
   )
+  // Anchored on the card itself, not its wording: a text match on the old title
+  // kept passing once the card was renamed, whether or not it leaked.
   assert.equal(
-    await page.evaluate(() => document.body.textContent.includes('Cluster Topology')),
+    await page.evaluate(() => Boolean(
+      document.querySelector('.settings-cluster-card')
+      || [...document.querySelectorAll('main[data-view="settings"] *')]
+        .some((node) => node.childElementCount === 0 && /^Cluster( Topology)?$/.test(node.textContent.trim())),
+    )),
     false,
-    'restricted Settings must not expose Cluster Topology before the key is accepted',
+    'restricted Settings must not expose the Cluster card before the key is accepted',
   )
   assert.ok(
     observed.some((request) => request.path === '/v1/models' && request.apiKey === ''),

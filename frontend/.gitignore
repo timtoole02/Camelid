@@ -1,3 +1,3 @@
-# Personal/local cluster bootstrap — contains real machine addresses, not for the repo.
-# The Cluster UI fetches /cluster-import.json once on load and merges it; keep yours local.
+# Personal cluster bootstrap from the removed Cluster Topology page. Nothing reads it any more,
+# but a leftover local copy holds real machine addresses, so it must still never be committed.
 public/cluster-import.json

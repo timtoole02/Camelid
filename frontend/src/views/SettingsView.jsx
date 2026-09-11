@@ -264,10 +264,10 @@ export default function SettingsView({
           <CardHeader
             icon={<IconNetwork size={20} />}
             eyebrow="Infrastructure"
-            title="Cluster Topology"
+            title="Cluster"
             actions={<IconChevronRight size={20} />}
           />
-          <CardBody>Connect Macs, Windows PCs, Linux servers, and Raspberry Pis into one local Camelid compute fabric — add machines, assign roles, and see how everything is wired.</CardBody>
+          <CardBody>See the machines a Camelid fabric proxy routes across — which are serving, which are not, and why — read live from the proxy itself.</CardBody>
         </Card>
       )}
 

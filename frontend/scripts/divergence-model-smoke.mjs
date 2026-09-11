@@ -9,19 +9,30 @@
  */
 import assert from 'node:assert/strict'
 import {
+  buildCompareRequest,
   comparisonCaveats,
   describeComparison,
+  identityStatement,
   isAttributable,
   modelChoices,
   modelLooksAbsent,
   needsIdentityAssertion,
+  reportedModelMismatch,
   templateDivergence,
+  tokenCapStatement,
   verdictHeadline,
 } from '../src/lib/divergenceModel.js'
+import { requestComparison } from '../src/lib/divergenceClient.js'
 
 let checks = 0
 function check(name, fn) {
   fn()
+  checks += 1
+  process.stdout.write(`  ok  ${name}\n`)
+}
+
+async function checkAsync(name, fn) {
+  await fn()
   checks += 1
   process.stdout.write(`  ok  ${name}\n`)
 }
@@ -250,7 +261,13 @@ check('a proxy that withholds its node detail offers no list, and is not an empt
   // Off-loopback the proxy discloses no node_detail. Rendering an empty picker
   // would tell the operator the node holds nothing.
   assert.equal(modelChoices({ nodes: null }, 'studio').kind, 'withheld')
-  assert.equal(modelChoices(null, 'studio').kind, 'withheld')
+})
+
+check('a fabric that could not be read is neither withheld nor empty', () => {
+  // Not having looked is its own fact. This used to be reported as "withheld",
+  // which told an operator whose proxy was down that it was hiding its nodes.
+  assert.equal(modelChoices(null, 'studio').kind, 'unread')
+  assert.equal(modelChoices({ nodes: null, problem: { code: 'unreachable' } }, 'studio').kind, 'unread')
 })
 
 check('a node that is not ready has no list rather than an empty one, and says why', () => {
@@ -291,6 +308,168 @@ check('two ids that differ require an explicit assertion, and identical ones do 
   )
   assert.equal(needsIdentityAssertion('', 'a'), false, 'an unfilled field asserts nothing')
   assert.equal(needsIdentityAssertion('a', ''), false)
+})
+
+/* ---- the claim a result rests on travels with it ---- */
+
+check('an asserted identity is read from the result and stated as unverified, naming both ids', () => {
+  const comparison = describeComparison(body({
+    left: side({ model: 'llama-3.2-1b-instruct:latest' }),
+    right: side({ label: 'desk', model: 'llama-3.2-1b-instruct' }),
+    model_identity: 'asserted_by_operator',
+    uncontrolled: ['model identity'],
+  }))
+  assert.equal(comparison.modelIdentity, 'asserted_by_operator')
+  const statement = identityStatement(comparison)
+  assert.equal(statement.kind, 'asserted_by_operator')
+  assert.match(statement.text, /not verified/)
+  assert.match(statement.text, /llama-3\.2-1b-instruct:latest/)
+  assert.match(statement.text, /llama-3\.2-1b-instruct was|and llama-3\.2-1b-instruct /)
+})
+
+check('a same-id result says the id is all that was compared', () => {
+  const statement = identityStatement(describeComparison(body({ model_identity: 'same_id' })))
+  assert.equal(statement.kind, 'same_id')
+  assert.match(statement.text, /same id, llama-3\.2-1b/)
+  assert.match(statement.text, /digest/)
+})
+
+check('a proxy that records no identity is never read as "same id"', () => {
+  const legacy = describeComparison(body())
+  assert.equal(legacy.modelIdentity, null)
+  assert.equal(identityStatement(legacy).kind, 'not_reported')
+  assert.equal(identityStatement(describeComparison(body({ model_identity: 'digest_match' }))).kind, 'unrecognised',
+    'a future identity kind must not read as one this build knows')
+})
+
+check('an unverified identity is disclosed as unverified, not as a missing engine parameter', () => {
+  const caveats = comparisonCaveats(describeComparison(body({ uncontrolled: ['seed', 'model identity'] })))
+  assert.ok(caveats.some((c) => /model identity was not verified/.test(c)), caveats.join(' | '))
+  assert.ok(!caveats.some((c) => /model identity was not controlled/.test(c)),
+    'no engine has a "model identity" parameter to lack')
+  assert.ok(caveats.some((c) => /seed was not controlled/.test(c)))
+})
+
+check('an absent uncontrolled list is "not reported", never "nothing uncontrolled"', () => {
+  const legacy = { ...body() }
+  delete legacy.uncontrolled
+  assert.equal(describeComparison(legacy).uncontrolledReported, false)
+  assert.equal(describeComparison(body()).uncontrolledReported, true)
+})
+
+/* ---- what the bytes cover ---- */
+
+check('a line ending is carried per line, so a terminator-only difference can be shown', () => {
+  const comparison = describeComparison(body({
+    diff: {
+      kind: 'lines',
+      lines: [
+        { op: 'removed', text: '12', eol: 'crlf' },
+        { op: 'added', text: '12', eol: 'none' },
+        { op: 'same', text: 'x', eol: 'lf' },
+        { op: 'same', text: 'y' },
+        { op: 'same', text: 'z', eol: 'cr' },
+      ],
+    },
+  }))
+  const lines = comparison.diff.lines
+  assert.deepEqual(lines.map((line) => line.eol), ['crlf', 'none', 'lf', null, null])
+  assert.equal(lines[0].text, lines[1].text, 'the text is identical; only the terminator differs')
+  assert.equal(lines[3].eolUnrecognised, false, 'an older proxy that sends no eol renders as before')
+  assert.equal(lines[4].eolUnrecognised, true, 'an eol this build does not know is unknown, not LF')
+})
+
+check('the token cap is stated, and a clamped request says what was applied', () => {
+  assert.match(tokenCapStatement(describeComparison(body())), /capped at 64 tokens, so this compares at most the first 64 tokens/)
+  const clamped = tokenCapStatement(describeComparison(body({ plan: { temperature: 0, seed: 0, max_tokens: 1024, repetitions: 2 } })), 5000)
+  assert.match(clamped, /5000 were asked for; the proxy applied 1024/)
+  assert.match(tokenCapStatement(describeComparison(body({ plan: { max_tokens: 1 } }))), /capped at 1 token,/)
+  assert.equal(tokenCapStatement(describeComparison(body({ plan: {} }))), null, 'an unreported cap is unknown, not 64')
+})
+
+check('a node answering under another model name is flagged; absent and unnamed are not', () => {
+  const named = describeComparison(body({ right: side({ label: 'desk', reported_model: 'llama-3.2-3b-instruct' }) }))
+  assert.equal(reportedModelMismatch(named.right), true)
+  assert.ok(comparisonCaveats(named).some((c) => /desk answered as llama-3\.2-3b-instruct, not the requested llama-3\.2-1b/.test(c)))
+  const same = describeComparison(body({ right: side({ reported_model: 'llama-3.2-1b' }) }))
+  assert.equal(reportedModelMismatch(same.right), false)
+  const unnamed = describeComparison(body({ right: side({ reported_model: null }) }))
+  assert.equal(unnamed.right.reported.state, 'unnamed')
+  assert.equal(reportedModelMismatch(unnamed.right), false)
+  assert.equal(describeComparison(body()).right.reported.state, 'not_relayed')
+})
+
+/* ---- the request ---- */
+
+const LEFT = { node: 'studio', model: 'llama-3.2-1b-instruct:latest' }
+
+check('per-side ids are sent only when the operator paired two different names', () => {
+  // Any per-side id makes the proxy skip its alias table, so a same-name
+  // request that carried them would be refused for a name only an alias knows.
+  const same = buildCompareRequest({ left: LEFT, right: { node: 'desk', model: LEFT.model }, prompt: 'p', repetitions: '2', maxTokens: '64' })
+  assert.equal('left_model' in same, false)
+  assert.equal('right_model' in same, false)
+  assert.equal(same.model, LEFT.model)
+  const paired = buildCompareRequest({ left: LEFT, right: { node: 'desk', model: 'llama-3.2-1b-instruct' }, prompt: 'p', repetitions: '2', maxTokens: '64' })
+  assert.equal(paired.left_model, 'llama-3.2-1b-instruct:latest')
+  assert.equal(paired.right_model, 'llama-3.2-1b-instruct')
+})
+
+check('the token cap and run count are always sent, bounded as the proxy bounds them', () => {
+  const cap = (maxTokens) => buildCompareRequest({ left: LEFT, right: LEFT, prompt: 'p', repetitions: '2', maxTokens }).max_tokens
+  assert.equal(cap('64'), 64)
+  assert.equal(cap('200'), 200)
+  assert.equal(cap('0'), 1)
+  assert.equal(cap('5000'), 1024)
+  assert.equal(cap(''), 64, 'an emptied field falls back to the default, never to 0')
+  assert.equal(cap('abc'), 64)
+  assert.equal(buildCompareRequest({ left: LEFT, right: LEFT, prompt: 'p', repetitions: '9', maxTokens: '64' }).repetitions, 5)
+})
+
+/* ---- the transport: every failure is named, none is an empty comparison ---- */
+
+const json = (status, value) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
+const ask = (overrides) => requestComparison({ base: 'http://127.0.0.1:8282', request: { left: 'a' }, ...overrides })
+
+await checkAsync('a client key is sent as a bearer token, and only when one was entered', async () => {
+  const seen = []
+  const capture = (url, init) => { seen.push(init.headers.authorization ?? null); return Promise.resolve(json(200, body())) }
+  await ask({ fetchImpl: capture })
+  await ask({ fetchImpl: capture, clientKey: '  k-9f3a  ' })
+  assert.deepEqual(seen, [null, 'Bearer k-9f3a'])
+})
+
+await checkAsync('a 401 says a key is needed, or that the key sent was not accepted', async () => {
+  const deny = () => Promise.resolve(json(401, { error: { message: 'unauthorized' } }))
+  assert.equal((await ask({ fetchImpl: deny })).problem.code, 'key_required')
+  assert.equal((await ask({ fetchImpl: deny, clientKey: 'wrong' })).problem.code, 'key_refused')
+})
+
+await checkAsync('a hung proxy times out with its own answer, and leaving the page is not a failure', async () => {
+  const hang = (url, init) => new Promise((_, reject) => {
+    init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+  })
+  const timedOut = await ask({ fetchImpl: hang, timeoutMs: 30 })
+  assert.equal(timedOut.problem.code, 'timeout')
+  assert.equal(timedOut.problem.timeoutMs, 30)
+
+  const left = new AbortController()
+  const pending = ask({ fetchImpl: hang, signal: left.signal })
+  left.abort()
+  assert.equal((await pending).problem.code, 'cancelled', 'an unmount is not reported as the proxy failing')
+})
+
+await checkAsync('a network failure, a refusal and a non-comparison are each named', async () => {
+  const offline = await ask({ fetchImpl: () => Promise.reject(new TypeError('Failed to fetch')) })
+  assert.equal(offline.problem.code, 'unreachable')
+  assert.equal(offline.problem.cause, 'network', 'which from a browser may be a CORS refusal')
+  const refused = await ask({ fetchImpl: () => Promise.resolve(json(400, { error: { message: 'studio does not hold x' } })) })
+  assert.deepEqual(refused.problem, { code: 'refused', detail: 'studio does not hold x' })
+  const notAComparison = await ask({ fetchImpl: () => Promise.resolve(json(200, [])) })
+  assert.equal(notAComparison.problem.code, 'malformed')
+  assert.equal(notAComparison.comparison, undefined, 'never an empty comparison')
+  const ok = await ask({ fetchImpl: () => Promise.resolve(json(200, body())) })
+  assert.equal(ok.comparison.verdict.kind, 'divergent')
 })
 
 console.log(`\ndivergence model smoke: ${checks} checks passed`)

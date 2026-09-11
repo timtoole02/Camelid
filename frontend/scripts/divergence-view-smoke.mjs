@@ -7,6 +7,12 @@
  * before the reader compares anything, and that a request the proxy refused is
  * not shown as a comparison that found nothing.
  *
+ * The scripted proxy mirrors the real one wherever the page depends on it: it
+ * records `model_identity` from the ids it was asked for, applies and reports
+ * the token cap, refuses without its client key when it has one, and — like
+ * `camelid fabric serve` started without `--cors-origin` — can send no CORS
+ * header at all.
+ *
  * Requires `npm run build` first (it serves frontend/dist) and Chrome/Edge.
  */
 import assert from 'node:assert/strict'
@@ -14,7 +20,7 @@ import { createServer } from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const distDir = resolve(scriptDir, '../dist')
@@ -39,6 +45,9 @@ const appServer = createServer((req, res) => {
 
 const CAMELID_TEMPLATE = '{{- bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}'
 const OLLAMA_TEMPLATE = '{{ if .System }}Cutting Knowledge Date: December 2023{{ end }}{{ .Prompt }}'
+
+/* A side whose response named exactly the model it was asked for. */
+const ECHO_REQUESTED = '<echo the requested id>'
 
 const DIVERGENT = {
   prompt: 'What is 7 plus 5?',
@@ -93,7 +102,43 @@ const LMSTUDIO_UNSEEDED = {
   uncontrolled: ['seed'],
 }
 
-const proxy = { mode: 'divergent', detail: true }
+/* Two answers that differ only in how their last line ends, from a pair of
+   nodes one of which answered under another model's name. */
+const LINE_ENDINGS = {
+  ...DIVERGENT,
+  left: {
+    ...DIVERGENT.left,
+    reported_model: ECHO_REQUESTED,
+    samples: [
+      { text: 'The answer is\n12\r\n', sha256: 'dddd', elapsed_ms: 30 },
+      { text: 'The answer is\n12\r\n', sha256: 'dddd', elapsed_ms: 29 },
+    ],
+  },
+  right: {
+    ...DIVERGENT.right,
+    reported_model: 'llama-3.2-3b-instruct',
+    samples: [
+      { text: 'The answer is\n12', sha256: 'eeee', elapsed_ms: 41 },
+      { text: 'The answer is\n12', sha256: 'eeee', elapsed_ms: 40 },
+    ],
+  },
+  diff: {
+    kind: 'lines',
+    lines: [
+      { op: 'same', text: 'The answer is', eol: 'lf' },
+      { op: 'removed', text: '12', eol: 'crlf' },
+      { op: 'added', text: '12', eol: 'none' },
+    ],
+  },
+}
+
+const BODIES = {
+  divergent: DIVERGENT,
+  unstable: UNSTABLE,
+  different_models: DIFFERENT_MODELS,
+  lmstudio: LMSTUDIO_UNSEEDED,
+  eol: LINE_ENDINGS,
+}
 
 /* The view populates its pickers from the fabric, so the stub has to be a
    fabric proxy as well as a comparison endpoint. */
@@ -123,41 +168,110 @@ const NODE_DETAIL = [
   },
 ]
 
+const proxy = {}
+function resetProxy(overrides = {}) {
+  for (const key of Object.keys(proxy)) delete proxy[key]
+  Object.assign(proxy, {
+    mode: 'divergent',
+    // 'disclosed' | 'withheld' (an off-loopback proxy) | 'empty'
+    detail: 'disclosed',
+    // 'allow' plays a proxy started with --cors-origin; 'none' plays the default.
+    cors: 'allow',
+    requireKey: null,
+    // A proxy from before model_identity, uncontrolled and eol existed.
+    legacy: false,
+    lastRequest: null,
+    hung: null,
+  }, overrides)
+}
+resetProxy()
+
 function healthBody() {
   const body = {
     ok: true, service: 'camelid-fabric', version: '0.6.1', build: 'v0.6.1-349', ready: true,
   }
   // Absent node_detail is what an off-loopback proxy sends. It is not an empty
   // fabric, and the picker has to say so rather than offer an empty list.
-  if (proxy.detail) {
+  if (proxy.detail === 'disclosed') {
     body.nodes = { total: 3, ready: 2, not_ready: 1, unreachable: 0 }
     body.models = []
     body.node_detail = NODE_DETAIL
   }
+  if (proxy.detail === 'empty') {
+    body.ready = false
+    body.nodes = { total: 0, ready: 0, not_ready: 0, unreachable: 0 }
+    body.models = []
+    body.node_detail = []
+  }
   return body
 }
 
+/* What the real proxy does with a request, where the page depends on it. */
+function comparisonFor(fixture, request) {
+  const body = structuredClone(fixture)
+  // The proxy clamps rather than rejects, and reports the cap it applied.
+  body.plan = { ...body.plan, max_tokens: Math.min(1024, Math.max(1, request.max_tokens ?? 64)) }
+  if (proxy.legacy) {
+    delete body.uncontrolled
+    for (const line of body.diff.lines || []) delete line.eol
+    return body
+  }
+  const leftId = request.left_model ?? request.model
+  const rightId = request.right_model ?? request.model
+  if (proxy.mode !== 'different_models') {
+    body.left.model = leftId
+    body.right.model = rightId
+  }
+  for (const side of [body.left, body.right]) {
+    if (side.reported_model === ECHO_REQUESTED) side.reported_model = side.model
+  }
+  body.model_identity = leftId === rightId ? 'same_id' : 'asserted_by_operator'
+  if (body.model_identity === 'asserted_by_operator') body.uncontrolled = [...body.uncontrolled, 'model identity']
+  return body
+}
+
+function answerCompare(req, res, raw) {
+  const request = JSON.parse(raw)
+  proxy.lastRequest = { body: request, authorization: req.headers.authorization ?? null }
+  const reply = (status, value) => {
+    res.writeHead(status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(value))
+  }
+  if (proxy.requireKey && req.headers.authorization !== `Bearer ${proxy.requireKey}`) {
+    return reply(401, { error: { message: 'missing or invalid API key', type: 'authentication_error' } })
+  }
+  if (proxy.mode === 'hang') {
+    // Never answers. The only way this connection closes is the page giving up.
+    const hung = { closed: false }
+    proxy.hung = hung
+    res.on('close', () => { hung.closed = true })
+    return undefined
+  }
+  if (proxy.mode === 'refused') {
+    return reply(400, { error: { message: 'studio does not hold llama-3.2-1b; it holds qwen3:8b' } })
+  }
+  return reply(200, comparisonFor(BODIES[proxy.mode], request))
+}
+
 const proxyServer = createServer((req, res) => {
-  res.setHeader('access-control-allow-origin', '*')
-  res.setHeader('access-control-allow-headers', 'content-type')
+  if (proxy.cors === 'allow') {
+    res.setHeader('access-control-allow-origin', '*')
+    // A JSON POST carrying a bearer token is preflighted, so a proxy has to
+    // allow both headers before this page can send either.
+    res.setHeader('access-control-allow-headers', 'content-type, authorization')
+  }
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
   if (req.url === '/v1/health') {
-    res.writeHead(200, { 'content-type': 'application/json' })
+    res.writeHead(proxy.detail === 'empty' ? 503 : 200, { 'content-type': 'application/json' })
     return res.end(JSON.stringify(healthBody()))
   }
 
   if (req.url === '/v1/fabric/compare' && req.method === 'POST') {
-    if (proxy.mode === 'refused') {
-      res.writeHead(400, { 'content-type': 'application/json' })
-      return res.end(JSON.stringify({ error: { message: 'studio does not hold llama-3.2-1b; it holds qwen3:8b' } }))
-    }
-    const bodies = {
-      divergent: DIVERGENT, unstable: UNSTABLE,
-      different_models: DIFFERENT_MODELS, lmstudio: LMSTUDIO_UNSEEDED,
-    }
-    res.writeHead(200, { 'content-type': 'application/json' })
-    return res.end(JSON.stringify(bodies[proxy.mode]))
+    let raw = ''
+    req.on('data', (chunk) => { raw += chunk })
+    req.on('end', () => answerCompare(req, res, raw))
+    return undefined
   }
   res.writeHead(404, { 'content-type': 'application/json' })
   return res.end(JSON.stringify({ error: 'unknown' }))
@@ -165,21 +279,6 @@ const proxyServer = createServer((req, res) => {
 
 function listen(server) {
   return new Promise((done) => server.listen(0, '127.0.0.1', () => done(server.address().port)))
-}
-
-function findBrowser() {
-  const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    'C:/Program Files/Google/Chrome/Application/chrome.exe',
-    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-    'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-    'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium-browser',
-  ].filter(Boolean)
-  const found = candidates.find((path) => existsSync(path))
-  if (!found) throw new Error('no Chrome or Edge found; set PUPPETEER_EXECUTABLE_PATH')
-  return found
 }
 
 let checks = 0
@@ -190,27 +289,41 @@ function check(name) {
 
 const appPort = await listen(appServer)
 const proxyPort = await listen(proxyServer)
-const browser = await puppeteer.launch({
-  executablePath: findBrowser(),
-  headless: 'new',
-  args: ['--no-sandbox', '--disable-dev-shm-usage'],
-})
+const appOrigin = `http://127.0.0.1:${appPort}`
+const proxyEndpoint = `127.0.0.1:${proxyPort}`
+const browser = await launchBrowser({ purpose: 'the divergence view smoke', headless: 'new' })
 
-async function openDivergence() {
+async function until(predicate, ms = 5000) {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start > ms) return false
+    await new Promise((done) => setTimeout(done, 50))
+  }
+  return true
+}
+
+/* `expect` is 'listed' when the pickers should fill from a disclosed fabric,
+   otherwise the data-state the fabric panel should settle on. */
+async function openDivergence({ endpoint = proxyEndpoint, expect = 'listed', viewport = { width: 1280, height: 900 } } = {}) {
   const page = await browser.newPage()
-  await page.setViewport({ width: 1280, height: 900 })
+  await page.setViewport(viewport)
   const errors = []
   page.on('pageerror', (error) => errors.push(String(error)))
-  await page.evaluateOnNewDocument((endpoint) => {
-    window.localStorage.setItem('camelid.fabricEndpoint', endpoint)
-  }, `127.0.0.1:${proxyPort}`)
-  await page.goto(`http://127.0.0.1:${appPort}/#divergence`, { waitUntil: 'networkidle0' })
+  await page.evaluateOnNewDocument((value) => {
+    window.localStorage.clear()
+    window.localStorage.setItem('camelid.fabricEndpoint', value)
+  }, endpoint)
+  await page.goto(`${appOrigin}/#divergence`, { waitUntil: 'networkidle0' })
   await page.waitForSelector('.divergence__form', { timeout: 10000 })
-  // The pickers are populated from the fabric read, which lands after mount.
-  await page.waitForFunction(
-    () => document.querySelectorAll('.divergence-pick[data-side="left"] option').length > 1,
-    { timeout: 10000 },
-  )
+  if (expect === 'listed') {
+    // The pickers are populated from the fabric read, which lands after mount.
+    await page.waitForFunction(
+      () => document.querySelectorAll('.divergence-pick[data-side="left"] option').length > 1,
+      { timeout: 10000 },
+    )
+  } else {
+    await page.waitForSelector(`[data-state="${expect}"]`, { timeout: 10000 })
+  }
   return { page, errors }
 }
 
@@ -237,14 +350,52 @@ async function submit(page, opts = {}) {
   await page.click('.divergence__form button[type="submit"]')
 }
 
+/* Free-text sides, for a proxy that gave no node list to pick from. */
+async function typeSides(page, { left, leftModel, right, rightModel }) {
+  await page.type('[data-testid="node-input-left"]', left)
+  await page.type('.divergence-pick[data-side="left"] input[placeholder="model id"]', leftModel)
+  await page.type('[data-testid="node-input-right"]', right)
+  await page.type('.divergence-pick[data-side="right"] input[placeholder="model id"]', rightModel)
+}
+
+/* Replace a controlled input's value the way React observes it. Selecting by
+   triple-click does not select a number input's text in Chrome, so typing over
+   it appended instead ("64" became "6200"), which the field's own max then
+   refused to submit. */
+async function setField(page, selector, value) {
+  await page.$eval(selector, (el, next) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    setter.call(el, next)
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  }, value)
+  const now = await page.$eval(selector, (el) => el.value)
+  assert.equal(now, value, `could not set ${selector}`)
+}
+
+/* Leave through the app's own navigation, so the view unmounts while the page
+   stays open: closing the page would abort the request whatever the code did. */
+async function leaveTo(page, label) {
+  await page.evaluate((wanted) => {
+    const entries = [...document.querySelectorAll('#camelid-sidebar button, #camelid-sidebar a')]
+    const target = entries.find((el) => (el.getAttribute('aria-label') || el.textContent || '').trim() === wanted)
+    if (!target) throw new Error(`no navigation entry named ${wanted}`)
+    target.click()
+  }, label)
+}
+
 const textOf = (page, selector) =>
   page.$eval(selector, (el) => el.textContent.replace(/\s+/g, ' ').trim())
+
+const corsHintOf = (page, scope) => page.$eval(`${scope} [data-testid="fabric-cors-hint"]`, (el) => ({
+  diagnosis: el.getAttribute('data-diagnosis'),
+  command: el.querySelector('.fabric-cmd code')?.textContent.trim(),
+}))
 
 console.log('divergence view')
 
 try {
   /* ---- choosing a model, rather than typing one blind ---- */
-  proxy.mode = 'divergent'
+  resetProxy()
   {
     const { page } = await openDivergence()
 
@@ -294,6 +445,22 @@ try {
       await page.$eval('.divergence__form button[type="submit"]', (el) => el.disabled),
       false,
     )
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForSelector('[data-testid="divergence-identity"]', { timeout: 10000 })
+    const identity = await page.$eval('[data-testid="divergence-identity"]', (el) => ({
+      kind: el.getAttribute('data-identity'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(identity.kind, 'asserted_by_operator', 'the proxy recorded the assertion and the page read it')
+    assert.match(identity.text, /Asserted by the operator, not verified/)
+    assert.match(
+      identity.text,
+      /llama-3\.2-1b-instruct:latest and llama-3\.2-1b-instruct were declared to be the same weights/,
+      'the result names both ids the claim was made about',
+    )
+    assert.match(await textOf(page, '[data-testid="divergence-uncontrolled"]'), /model identity/)
+    assert.equal(proxy.lastRequest.body.left_model, 'llama-3.2-1b-instruct:latest')
+    assert.equal(proxy.lastRequest.body.right_model, 'llama-3.2-1b-instruct')
     check('ticking the assertion unblocks it, and the result records the claim')
     await page.close()
   }
@@ -340,13 +507,26 @@ try {
     }
     check('nothing the comparison reports says which side is correct')
 
+    // "Same bytes" under a cap is a claim about a prefix, so the cap is sent
+    // explicitly and the result says how much it covered.
+    assert.equal(proxy.lastRequest.body.max_tokens, 64, 'the default cap is sent, not left to the proxy')
+    assert.match(await textOf(page, '[data-testid="divergence-token-cap"]'), /capped at 64 tokens/)
+    await setField(page, '[data-testid="divergence-max-tokens"]', '200')
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForFunction(
+      () => /capped at 200 tokens/.test(document.querySelector('[data-testid="divergence-token-cap"]')?.textContent || ''),
+      { timeout: 10000 },
+    )
+    assert.equal(proxy.lastRequest.body.max_tokens, 200)
+    check('the token cap is sent, and the result says how much of each answer was compared')
+
     assert.deepEqual(errors, [], 'no page errors')
     check('the divergence view raises no page error')
     await page.close()
   }
 
   /* ---- refusals must not read as findings ---- */
-  proxy.mode = 'unstable'
+  resetProxy({ mode: 'unstable' })
   {
     const { page } = await openDivergence()
     await submit(page)
@@ -381,7 +561,7 @@ try {
     await page.close()
   }
 
-  proxy.mode = 'different_models'
+  resetProxy({ mode: 'different_models' })
   {
     const { page } = await openDivergence()
     await submit(page)
@@ -399,7 +579,7 @@ try {
   }
 
   /* ---- disclosure on a verdict that WAS reached ---- */
-  proxy.mode = 'lmstudio'
+  resetProxy({ mode: 'lmstudio' })
   {
     const { page } = await openDivergence()
     await submit(page)
@@ -422,7 +602,7 @@ try {
   }
 
   /* ---- a refused request is not an empty comparison ---- */
-  proxy.mode = 'refused'
+  resetProxy({ mode: 'refused' })
   {
     const { page } = await openDivergence()
     await submit(page)
@@ -435,20 +615,182 @@ try {
     await page.close()
   }
 
-  /* ---- layout ---- */
-  proxy.mode = 'divergent'
+  /* ---- no node list: each reason is its own fact ---- */
+  resetProxy({ detail: 'withheld' })
   {
-    const page = await browser.newPage()
-    await page.setViewport({ width: 390, height: 844 })
-    await page.evaluateOnNewDocument((endpoint) => {
-      window.localStorage.setItem('camelid.fabricEndpoint', endpoint)
-    }, `127.0.0.1:${proxyPort}`)
-    await page.goto(`http://127.0.0.1:${appPort}/#divergence`, { waitUntil: 'networkidle0' })
-    await page.waitForSelector('.divergence__form', { timeout: 10000 })
-    await page.waitForFunction(
-      () => document.querySelectorAll('.divergence-pick[data-side="left"] option').length > 1,
-      { timeout: 10000 },
+    const { page, errors } = await openDivergence({ expect: 'withheld' })
+    const state = await textOf(page, '[data-testid="divergence-fabric-state"]')
+    assert.match(state, /not bound to loopback/, 'the operator is told why there is no list')
+    assert.match(state, /type each node's label/)
+    assert.equal(await page.$('[data-testid="divergence-no-nodes"]'), null, 'withheld detail is not an empty fabric')
+    assert.equal(await page.$('.divergence-pick select'), null, 'there is no list to pick from, so none is drawn')
+    check('a proxy that withholds its node detail offers typed labels and says why, never "no nodes"')
+
+    await typeSides(page, { left: 'studio', leftModel: 'llama-3.2-1b', right: 'desk', rightModel: 'llama-3.2-1b' })
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForSelector('[data-testid="divergence-verdict"]', { timeout: 10000 })
+    assert.equal(proxy.lastRequest.body.left, 'studio')
+    assert.equal(proxy.lastRequest.body.right, 'desk')
+    check('typed labels reach the proxy, which resolves them itself')
+
+    assert.equal('left_model' in proxy.lastRequest.body, false)
+    assert.equal('right_model' in proxy.lastRequest.body, false)
+    assert.equal(proxy.lastRequest.body.model, 'llama-3.2-1b')
+    const identity = await page.$eval('[data-testid="divergence-identity"]', (el) => ({
+      kind: el.getAttribute('data-identity'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(identity.kind, 'same_id')
+    assert.match(identity.text, /same id, llama-3\.2-1b/)
+    check("one name on both sides sends no per-side ids, so the proxy's alias table still applies")
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  resetProxy({ detail: 'empty' })
+  {
+    const { page } = await openDivergence({ expect: 'empty' })
+    assert.match(await textOf(page, '[data-testid="divergence-no-nodes"]'), /has no nodes/)
+    assert.equal(await page.$('[data-testid="divergence-fabric-state"]'), null, 'an empty fabric is not a failure')
+    check('a proxy with genuinely no nodes says so, and only then')
+    await page.close()
+  }
+
+  resetProxy()
+  {
+    const { page } = await openDivergence({ endpoint: '127.0.0.1:9', expect: 'problem' })
+    const state = await page.$eval('[data-testid="divergence-fabric-state"]', (el) => ({
+      code: el.getAttribute('data-code'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(state.code, 'unreachable')
+    assert.match(state.text, /No fabric proxy answered/)
+    assert.equal(await page.$('[data-testid="divergence-no-nodes"]'), null, 'an unreachable proxy is not an empty one')
+    check('an unreachable proxy is named as such, never as an empty node list')
+    await page.close()
+  }
+
+  /* ---- a proxy that does not allow this page's origin, the real default ---- */
+  resetProxy({ cors: 'none' })
+  {
+    const { page, errors } = await openDivergence({ expect: 'problem' })
+    const code = await page.$eval('[data-testid="divergence-fabric-state"]', (el) => el.getAttribute('data-code'))
+    assert.equal(code, 'origin_not_allowed')
+    const hint = await corsHintOf(page, '[data-testid="divergence-fabric-state"]')
+    assert.equal(hint.diagnosis, 'blocked')
+    assert.equal(hint.command, `camelid fabric serve --cors-origin ${appOrigin}`)
+    assert.equal(await page.$('[data-testid="divergence-no-nodes"]'), null)
+    check("a proxy that does not allow this page's origin shows the exact --cors-origin command")
+
+    await typeSides(page, { left: 'studio', leftModel: 'llama-3.2-1b', right: 'desk', rightModel: 'llama-3.2-1b' })
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForSelector('[data-testid="divergence-problem"]', { timeout: 10000 })
+    assert.equal(await page.$eval('[data-testid="divergence-problem"]', (el) => el.getAttribute('data-code')), 'unreachable')
+    const requestHint = await corsHintOf(page, '[data-testid="divergence-problem"]')
+    assert.equal(requestHint.command, `camelid fabric serve --cors-origin ${appOrigin}`)
+    // Whether the body itself reached this fake depends on the browser's
+    // preflight cache, which an earlier scenario (CORS on) may have filled. It
+    // is not asserted: either way the page cannot read the answer, and that is
+    // what it must say.
+    check('a comparison whose answer the browser withheld offers the same fix')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- a proxy with client keys ---- */
+  resetProxy({ requireKey: 'k-9f3a' })
+  {
+    const { page } = await openDivergence()
+    await submit(page)
+    await page.waitForSelector('[data-testid="divergence-problem"][data-code="key_required"]', { timeout: 10000 })
+    assert.match(await textOf(page, '[data-testid="divergence-problem"]'), /requires a client key/)
+    assert.equal(proxy.lastRequest.authorization, null)
+    assert.equal(await page.$('[data-testid="divergence-verdict"]'), null)
+    check('a keyed proxy that got no key says a client key is needed')
+
+    await page.type('[data-testid="divergence-client-key"]', 'wrong')
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForSelector('[data-testid="divergence-problem"][data-code="key_refused"]', { timeout: 10000 })
+    await setField(page, '[data-testid="divergence-client-key"]', 'k-9f3a')
+    await page.click('.divergence__form button[type="submit"]')
+    await page.waitForSelector('[data-testid="divergence-verdict"]', { timeout: 10000 })
+    assert.equal(proxy.lastRequest.authorization, 'Bearer k-9f3a')
+    check('a wrong key is named as refused, and the right one is sent as a bearer token')
+
+    const kept = await page.evaluate(() => JSON.stringify({
+      local: { ...window.localStorage },
+      session: { ...window.sessionStorage },
+      href: window.location.href,
+    }))
+    assert.doesNotMatch(kept, /k-9f3a/, 'a secret the operator typed must not outlive the page')
+    check('the client key is never written to browser storage or the address bar')
+    await page.close()
+  }
+
+  /* ---- a proxy that never answers ---- */
+  resetProxy({ mode: 'hang' })
+  {
+    const { page } = await openDivergence()
+    await submit(page)
+    assert.ok(await until(() => proxy.hung !== null), 'the comparison reached the proxy')
+    assert.equal(await textOf(page, '.divergence__form button[type="submit"]'), 'Asking both nodes…')
+    await leaveTo(page, 'Cluster')
+    await page.waitForFunction(() => !document.querySelector('.divergence__form'), { timeout: 5000 })
+    assert.ok(await until(() => proxy.hung.closed), 'leaving the view must abort the request it started')
+    check('leaving the page aborts a comparison still waiting on the proxy')
+    await page.close()
+  }
+
+  /* ---- differences the text alone would hide ---- */
+  resetProxy({ mode: 'eol' })
+  {
+    const { page, errors } = await openDivergence()
+    await submit(page)
+    await page.waitForSelector('[data-testid="divergence-diff"]', { timeout: 10000 })
+    const lines = await page.$$eval('.divergence-diff__line', (els) => els.map((el) => ({
+      op: el.getAttribute('data-op'),
+      marker: el.querySelector('[data-eol-marker]')?.textContent.trim() ?? null,
+    })))
+    assert.deepEqual(lines.map((line) => line.op), ['same', 'removed', 'added'])
+    assert.deepEqual(lines.map((line) => line.marker), [null, '␍␊ CRLF', 'no newline at end'])
+    check('a difference that is only a line ending is marked, not drawn as two identical lines')
+
+    const warning = await textOf(page, '[data-testid="reported-model-studio"]')
+    assert.match(warning, /response named llama-3\.2-3b-instruct, not the requested llama-3\.2-1b-instruct/)
+    assert.equal(await page.$('[data-testid="reported-model-win"]'), null,
+      'a node that named the model it was asked for carries no warning')
+    check('a node that answered under another model name is shown prominently')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- a proxy from before these fields ---- */
+  resetProxy({ legacy: true })
+  {
+    const { page, errors } = await openDivergence()
+    await submit(page)
+    await page.waitForSelector('[data-testid="divergence-verdict"]', { timeout: 10000 })
+    const identity = await page.$eval('[data-testid="divergence-identity"]', (el) => ({
+      kind: el.getAttribute('data-identity'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(identity.kind, 'not_reported')
+    assert.match(identity.text, /did not record how model identity was established/)
+    assert.equal(
+      await page.$$eval('[data-testid="divergence-uncontrolled"] [data-unknown="true"]', (els) => els.length),
+      1,
+      'an unreported list is unknown, never "nothing uncontrolled"',
     )
+    assert.equal(await page.$$eval('[data-eol-marker]', (els) => els.length), 0, 'no eol, rendered as before')
+    check('an older proxy that records no identity says so, rather than implying one')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- layout ---- */
+  resetProxy()
+  {
+    const { page } = await openDivergence({ viewport: { width: 390, height: 844 } })
     await submit(page)
     await page.waitForSelector('[data-testid="divergence-verdict"]', { timeout: 10000 })
     const overflow = await page.evaluate(() =>
