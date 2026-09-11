@@ -1,10 +1,14 @@
 /* ClusterConstellation — the local compute fabric as a small constellation
-   in the lower-left sky. Node identity comes from the Cluster Topology
-   page's saved model; node activity comes only from real worker telemetry
+   in the lower-left sky. Node identity comes from the last fabric the Cluster
+   page actually read; node activity comes only from real worker telemetry
    (worker_node_active/idle/error). The serving machine is always present.
-   Nodes with no live signal render as quiet stars — never as "working". */
+   Nodes with no live signal render as quiet stars — never as "working".
 
-import { loadTopology } from '../clusterModel'
+   Until the Cluster page has successfully read a proxy there are no known
+   nodes, and the constellation stays empty rather than drawing a fabric that
+   was only ever sketched in browser storage. */
+
+import { readCachedFabricNodes } from '../fabricClient.js'
 
 const REFRESH_MS = 5000
 
@@ -19,15 +23,23 @@ export class ClusterConstellation {
     if (t - this.lastLoad < REFRESH_MS && this.nodes.length) return
     this.lastLoad = t
     try {
-      const topology = loadTopology()
-      this.nodes = (topology?.nodes || []).slice(0, 12)
+      this.nodes = readCachedFabricNodes()
+        .filter((node) => node.label)
+        .slice(0, 12)
+        .map((node) => ({
+          id: node.label,
+          display_name: node.label,
+          hostname: node.host,
+          ip_address: node.host,
+          status: node.state === 'ready' ? 'online' : 'offline',
+        }))
     } catch {
       this.nodes = []
     }
   }
 
   matchKey(workerNode) {
-    // Worker telemetry identifies nodes by "host:port"; topology nodes by ip/hostname.
+    // Worker telemetry identifies nodes by "host:port"; fabric nodes by host.
     const host = String(workerNode || '').split(':')[0]
     const hit = this.nodes.find((n) => n.ip_address === host || n.hostname === host)
     return hit ? hit.id : workerNode

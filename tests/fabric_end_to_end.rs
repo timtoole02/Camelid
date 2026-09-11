@@ -137,11 +137,7 @@ impl StubNode {
     }
 
     fn spec(&self, label: &str) -> NodeSpec {
-        NodeSpec {
-            label: label.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: self.port,
-        }
+        NodeSpec::camelid(label, "127.0.0.1", self.port)
     }
 
     fn received(&self) -> Vec<Received> {
@@ -216,11 +212,7 @@ impl TlsStubNode {
     }
 
     fn spec(&self, label: &str) -> NodeSpec {
-        NodeSpec {
-            label: label.to_string(),
-            host: "localhost".to_string(),
-            port: self.port,
-        }
+        NodeSpec::camelid(label, "localhost", self.port)
     }
 
     fn received(&self) -> Vec<Received> {
@@ -331,11 +323,7 @@ fn content_length(head: &str) -> Option<usize> {
 
 /// A port that nothing listens on.
 fn dead_spec(label: &str) -> NodeSpec {
-    NodeSpec {
-        label: label.to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 9,
-    }
+    NodeSpec::camelid(label, "127.0.0.1", 9)
 }
 
 fn fabric_of(specs: Vec<NodeSpec>) -> Fabric {

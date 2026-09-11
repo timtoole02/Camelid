@@ -21,6 +21,7 @@ const TITLES = {
   system: 'System',
   settings: 'Settings',
   cluster: 'Cluster',
+  divergence: 'Compare nodes',
   observatory: 'Observatory',
 }
 

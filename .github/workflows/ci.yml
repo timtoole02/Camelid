@@ -621,6 +621,33 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:workspace
 
+      # The Cluster view reports other people's machines, so its whole job is to
+      # tell "no nodes" apart from "we were not allowed to look" and "nothing
+      # answered". These prove that distinction in the pure layer and then again
+      # in a browser against a scripted proxy on its own origin, because the
+      # defect this view replaced was a rendering one: it used to draw a fabric
+      # from browser storage and colour it live from a string.
+      - name: Frontend fabric model smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:fabric-model
+
+      - name: Frontend fabric view smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:fabric-view
+
+      # The divergence view is the one screen most able to mislead: two answers
+      # side by side invite a reader to decide which is right. These prove the
+      # page keeps saying what was and was not established -- that a refusal to
+      # conclude never renders as a finding, and that a request the proxy
+      # refused never renders as a comparison that found nothing.
+      - name: Frontend divergence model smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:divergence-model
+
+      - name: Frontend divergence view smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:divergence-view
+
       - name: Workspace read-only visual smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |

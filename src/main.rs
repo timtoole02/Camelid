@@ -1505,6 +1505,132 @@ fn configure_node_transport(
     )?)
 }
 
+fn mixed_engines(allowed: bool) -> camelid::fabric::MixedEngines {
+    if allowed {
+        camelid::fabric::MixedEngines::Allowed
+    } else {
+        camelid::fabric::MixedEngines::Refused
+    }
+}
+
+/// Render a comparison for a terminal.
+///
+/// The verdict comes first and the answers come second, because the answers are
+/// the thing a reader will over-interpret. Nothing here ranks the two sides.
+fn print_comparison(comparison: &camelid::fabric::Comparison) {
+    use camelid::fabric::{Diff, Op, Stability, TemplateEvidence, Verdict};
+
+    let headline = match &comparison.verdict {
+        Verdict::Identical => "IDENTICAL — both nodes returned the same bytes".to_string(),
+        Verdict::Divergent => {
+            "DIVERGENT — both nodes were self-consistent and disagreed".to_string()
+        }
+        Verdict::DifferentModels { left, right } => {
+            format!("NOT COMPARABLE — the nodes are serving different models ({left} vs {right})")
+        }
+        Verdict::NotAttributable { reason } => format!("NOT ATTRIBUTABLE — {reason}"),
+    };
+    println!("{headline}");
+    println!("prompt sha256 {}", comparison.prompt_sha256);
+    println!(
+        "temperature {} · seed {} · max_tokens {} · {} run(s) each",
+        comparison.plan.temperature,
+        comparison
+            .plan
+            .seed
+            .map_or_else(|| "none".to_string(), |seed| seed.to_string()),
+        comparison.plan.max_tokens,
+        comparison.plan.repetitions
+    );
+    if !comparison.uncontrolled.is_empty() {
+        println!(
+            "NOT CONTROLLED: {} — at least one engine has no such parameter",
+            comparison.uncontrolled.join(", ")
+        );
+    }
+    if comparison.model_identity == camelid::fabric::ModelIdentity::AssertedByOperator {
+        println!(
+            "MODEL IDENTITY ASSERTED, NOT VERIFIED: `{}` and `{}` were declared to be the same weights",
+            comparison.left.model.as_deref().unwrap_or("-"),
+            comparison.right.model.as_deref().unwrap_or("-")
+        );
+    }
+
+    for side in [&comparison.left, &comparison.right] {
+        println!();
+        println!(
+            "── {} · {} {}",
+            side.label,
+            side.engine.as_str(),
+            side.engine_version
+                .as_deref()
+                .unwrap_or("(version unknown)")
+        );
+        if let Some(runtime) = side.runtime.as_deref() {
+            println!("   runtime: {runtime}");
+        }
+        if let Some(runtime) = side.runtime.as_deref() {
+            println!("   runtime: {runtime}");
+        }
+        match &side.stability {
+            Stability::Stable => println!(
+                "   agreed with itself across {} runs · sha256 {}",
+                side.samples.len(),
+                side.settled_digest().unwrap_or("-")
+            ),
+            Stability::Unstable { digests } => println!(
+                "   DID NOT agree with itself: {} distinct answers across {} runs",
+                digests.len(),
+                side.samples.len()
+            ),
+            Stability::Unmeasured => {
+                println!("   run once, so self-consistency was never tested")
+            }
+        }
+        match &side.template {
+            TemplateEvidence::Captured { source, template } => {
+                println!("   template via {source}:");
+                for line in template.lines() {
+                    println!("     {line}");
+                }
+            }
+            TemplateEvidence::NotExposed { detail } => println!("   template: {detail}"),
+            TemplateEvidence::Unavailable { detail } => {
+                println!("   template could not be read: {detail}")
+            }
+        }
+        for (index, sample) in side.samples.iter().enumerate() {
+            println!("   [{}] {} ms", index + 1, sample.elapsed_ms);
+            for line in sample.text.lines() {
+                println!("     {line}");
+            }
+        }
+    }
+
+    match &comparison.diff {
+        Diff::Identical => {}
+        Diff::Lines { lines } => {
+            println!();
+            println!(
+                "── diff ({} → {})",
+                comparison.left.label, comparison.right.label
+            );
+            for line in lines {
+                let marker = match line.op {
+                    Op::Same => ' ',
+                    Op::Removed => '-',
+                    Op::Added => '+',
+                };
+                println!("{marker} {}", line.text);
+            }
+        }
+        Diff::Declined { reason } => {
+            println!();
+            println!("── no diff: {reason}");
+        }
+    }
+}
+
 /// Resolve the token the fabric authenticates to its nodes with.
 ///
 /// Deliberately not `#[arg(env = "CAMELID_API_KEY")]`: clap prints an env var's
@@ -1611,6 +1737,16 @@ enum FabricAction {
         /// Label of the node that served this session previously.
         #[arg(long)]
         sticky: Option<String>,
+        /// Also place on engines this fabric only reads by default.
+        ///
+        /// Off unless asked for. A foreign engine publishes no load to rank on,
+        /// cannot tell a full queue from a failure, and cannot attest that a
+        /// session's prefix is still warm; turning this on accepts all three.
+        /// Requests carrying tools still never land on a backend nobody has
+        /// measured, and affinity to a node that cannot attest warmth is
+        /// refused rather than silently degraded.
+        #[arg(long)]
+        allow_mixed_engines: bool,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY.
         #[arg(long, value_name = "TOKEN")]
@@ -1650,6 +1786,10 @@ enum FabricAction {
         model: Option<String>,
         #[arg(long)]
         sticky: Option<String>,
+        /// Also place on engines this fabric only reads by default. See
+        /// `fabric route --help` for what turning it on accepts.
+        #[arg(long)]
+        allow_mixed_engines: bool,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY. Without it, a node that requires a key observes as
         /// ready and then answers this request with 401.
@@ -1665,6 +1805,78 @@ enum FabricAction {
         /// Budget for the generation itself, which can legitimately take minutes.
         #[arg(long, default_value_t = 300)]
         forward_timeout_s: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask two nodes the same question and report what differed.
+    ///
+    /// This is measurement, not placement: both nodes are named, nothing fails
+    /// over, and a foreign engine may be compared even though the fabric will
+    /// not route to it. Each side is run more than once, because a difference
+    /// between two nodes means nothing until each node has been shown to agree
+    /// with itself.
+    ///
+    /// It never says which answer is correct. It reports difference, how the
+    /// two sides were sampled, and — where the engine exposes one — the chat
+    /// template each applied, which is usually the explanation.
+    Compare {
+        #[arg(
+            long = "node",
+            required_unless_present = "nodes_file",
+            conflicts_with = "nodes_file",
+            value_name = "LABEL=[ENGINE://]HOST[:PORT]"
+        )]
+        nodes: Vec<String>,
+        /// Read the nodes from the same file `fabric serve` takes.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
+        /// Label of the node on the left of the comparison.
+        #[arg(long, value_name = "LABEL")]
+        left: String,
+        /// Label of the node on the right.
+        #[arg(long, value_name = "LABEL")]
+        right: String,
+        /// The model id both nodes must hold. A node that does not hold it is
+        /// refused rather than asked about whatever it does hold.
+        #[arg(long)]
+        model: String,
+        /// Override the id on one side only. Engines do not agree on naming --
+        /// Ollama suffixes `:latest`, LM Studio does not -- so this is how an
+        /// operator states that two names mean the same weights. Nothing
+        /// verifies that claim, and the receipt records it as unverified.
+        #[arg(long, value_name = "MODEL")]
+        left_model: Option<String>,
+        #[arg(long, value_name = "MODEL")]
+        right_model: Option<String>,
+        /// Declare what one node calls a model, so `--model` can be the same
+        /// everywhere. Repeatable, and the same syntax an `alias` line in the
+        /// nodes file uses, which is where it belongs once it is settled.
+        #[arg(long = "model-alias", value_name = "CANONICAL=LABEL:LOCAL")]
+        model_alias: Vec<String>,
+        /// The user message to send to both.
+        #[arg(long)]
+        prompt: String,
+        /// How many times to ask each node. Two is the minimum that can show a
+        /// side agrees with itself; one yields no attributable verdict.
+        #[arg(long, default_value_t = 2)]
+        repeat: usize,
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Omit to run unseeded. Engines without a seed parameter are reported
+        /// as uncontrolled either way.
+        #[arg(long)]
+        seed: Option<u64>,
+        #[arg(long, default_value_t = 64)]
+        max_tokens: u32,
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
+        /// Budget for each generation, which can legitimately take minutes.
+        #[arg(long, default_value_t = 300)]
+        timeout_s: u64,
+        /// Print the whole comparison as JSON, in the shape the evidence
+        /// bundles use.
         #[arg(long)]
         json: bool,
     },
@@ -1862,6 +2074,10 @@ mod fabric_command_tests {
                 vec!["camelid", "fabric", "status"],
                 vec!["camelid", "fabric", "route"],
                 vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec![
+                    "camelid", "fabric", "compare", "--left", "a", "--right", "b", "--model", "m",
+                    "--prompt", "hi",
+                ],
                 vec!["camelid", "fabric", "serve"],
             ] {
                 let mut argv = argv;
@@ -1872,6 +2088,7 @@ mod fabric_command_tests {
                         FabricAction::Status { bearer, .. }
                         | FabricAction::Route { bearer, .. }
                         | FabricAction::Run { bearer, .. }
+                        | FabricAction::Compare { bearer, .. }
                         | FabricAction::Serve { bearer, .. } => bearer,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
@@ -1888,6 +2105,10 @@ mod fabric_command_tests {
                 vec!["camelid", "fabric", "status"],
                 vec!["camelid", "fabric", "route"],
                 vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec![
+                    "camelid", "fabric", "compare", "--left", "a", "--right", "b", "--model", "m",
+                    "--prompt", "hi",
+                ],
                 vec!["camelid", "fabric", "serve"],
             ] {
                 let mut tls = argv.clone();
@@ -1898,6 +2119,7 @@ mod fabric_command_tests {
                         FabricAction::Status { transport, .. }
                         | FabricAction::Route { transport, .. }
                         | FabricAction::Run { transport, .. }
+                        | FabricAction::Compare { transport, .. }
                         | FabricAction::Serve { transport, .. } => transport,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
@@ -1934,6 +2156,10 @@ mod fabric_command_tests {
                 vec!["camelid", "fabric", "status"],
                 vec!["camelid", "fabric", "route"],
                 vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec![
+                    "camelid", "fabric", "compare", "--left", "a", "--right", "b", "--model", "m",
+                    "--prompt", "hi",
+                ],
                 vec!["camelid", "fabric", "serve"],
             ] {
                 let mut argv = argv;
@@ -1944,6 +2170,7 @@ mod fabric_command_tests {
                         FabricAction::Status { nodes_file, .. }
                         | FabricAction::Route { nodes_file, .. }
                         | FabricAction::Run { nodes_file, .. }
+                        | FabricAction::Compare { nodes_file, .. }
                         | FabricAction::Serve { nodes_file, .. } => nodes_file,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
@@ -4305,6 +4532,7 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                allow_mixed_engines,
                 bearer,
                 transport,
                 timeout_ms,
@@ -4318,7 +4546,8 @@ async fn main() -> anyhow::Result<()> {
                 let snapshots = fabric.observe();
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
-                    .with_sticky(sticky.as_deref());
+                    .with_sticky(sticky.as_deref())
+                    .with_mixed_engines(mixed_engines(allow_mixed_engines));
 
                 // A fabric that cannot place the request is a failure the caller
                 // must see in the exit code, not only in the text.
@@ -4351,6 +4580,7 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                allow_mixed_engines,
                 bearer,
                 transport,
                 max_tokens,
@@ -4366,7 +4596,8 @@ async fn main() -> anyhow::Result<()> {
 
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
-                    .with_sticky(sticky.as_deref());
+                    .with_sticky(sticky.as_deref())
+                    .with_mixed_engines(mixed_engines(allow_mixed_engines));
                 // Held until the forward below returns: the node is busy for
                 // exactly that long.
                 let placement = fabric
@@ -4438,6 +4669,61 @@ async fn main() -> anyhow::Result<()> {
                         answer.label,
                         answer.status
                     );
+                }
+            }
+            FabricAction::Compare {
+                nodes,
+                nodes_file,
+                left,
+                right,
+                model,
+                left_model,
+                right_model,
+                model_alias,
+                prompt,
+                repeat,
+                temperature,
+                seed,
+                max_tokens,
+                bearer,
+                transport,
+                timeout_s,
+                json,
+            } => {
+                let declared = camelid::fabric::parse_model_aliases(&model_alias)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let mut fabric =
+                    configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
+                        .with_bearer(fabric_bearer(bearer).as_deref())
+                        .with_timeout(std::time::Duration::from_secs(timeout_s));
+                if !declared.is_empty() {
+                    fabric = fabric.with_model_aliases(declared);
+                }
+                let plan = camelid::fabric::SamplingPlan {
+                    temperature,
+                    seed,
+                    max_tokens,
+                    repetitions: repeat,
+                };
+                // An explicit per-side id wins over anything declared, because
+                // it is the more specific statement of the same claim.
+                let comparison = match (&left_model, &right_model) {
+                    (None, None) => fabric.compare_model(&left, &right, &model, &prompt, plan),
+                    _ => fabric.compare(
+                        &left,
+                        &right,
+                        left_model.as_deref().unwrap_or(&model),
+                        right_model.as_deref().unwrap_or(&model),
+                        &prompt,
+                        plan,
+                    ),
+                }
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&comparison)?);
+                } else {
+                    print_comparison(&comparison);
                 }
             }
             FabricAction::Serve {

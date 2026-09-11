@@ -59,6 +59,10 @@
     "smoke:organization-browser": "node scripts/conversation-organization-browser-smoke.mjs",
     "smoke:variants-browser": "node scripts/message-variants-browser-smoke.mjs",
     "smoke:continuation-browser": "node scripts/chat-continuation-browser-smoke.mjs",
+    "smoke:fabric-model": "node scripts/fabric-model-smoke.mjs",
+    "smoke:fabric-view": "node scripts/fabric-view-smoke.mjs",
+    "smoke:divergence-model": "node scripts/divergence-model-smoke.mjs",
+    "smoke:divergence-view": "node scripts/divergence-view-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {

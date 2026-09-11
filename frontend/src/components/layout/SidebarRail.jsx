@@ -45,6 +45,7 @@ const NAV_SECTIONS = [
       { tab: 'api', label: 'API', Icon: IconApi },
       { tab: 'compatibility', label: 'Compatibility', Icon: IconReceipt },
       { tab: 'cluster', label: 'Cluster', Icon: IconNetwork },
+      { tab: 'divergence', label: 'Compare', Icon: IconNetwork },
     ],
   },
 ]

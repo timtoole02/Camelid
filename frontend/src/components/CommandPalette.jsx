@@ -21,6 +21,7 @@ const VIEW_LABELS = [
   ['api', 'API'],
   ['compatibility', 'Compatibility'],
   ['cluster', 'Cluster'],
+  ['divergence', 'Compare nodes'],
   ['observatory', 'Observatory'],
   ['settings', 'Settings'],
 ]
