@@ -593,7 +593,20 @@
   cursor: pointer;
 }
 
-.fabric-routing__option input:focus-visible {
+/* The generic form-field rule in base.css gives every input a full width, a
+   border and padding, which turns a radio into a wide box that squeezes its
+   own label onto three lines. */
+.fabric-routing__option input[type='radio'] {
+  flex: 0 0 auto;
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  accent-color: var(--color-accent);
+}
+
+.fabric-routing__option input[type='radio']:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }

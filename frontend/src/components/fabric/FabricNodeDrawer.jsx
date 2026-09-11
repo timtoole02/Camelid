@@ -135,12 +135,12 @@ export function FabricNodeDrawer({ node, checkedAt, onClose }) {
                 {node.placementBlockerDetail && node.placementBlockerDetail.length > 0
                   ? node.placementBlockerDetail.map((entry) => (
                     <li key={entry.key} data-blocker-key={entry.key}>
-                      <span className="fabric-detail__blocker">it {entry.blocker}</span>
+                      <span className="fabric-detail__blocker">{entry.blocker}</span>
                       {' — '}
                       {entry.consequence}
                     </li>
                   ))
-                  : node.placementBlockers.map((blocker) => <li key={blocker}>it {blocker}</li>)}
+                  : node.placementBlockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
               </ul>
             </div>
           )}
