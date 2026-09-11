@@ -33,6 +33,7 @@
     "smoke:tool-calling": "node scripts/tool-calling-smoke.mjs",
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
     "smoke:arena": "node scripts/arena-smoke.mjs",
+    "smoke:arena-browser": "node scripts/arena-residency-browser-smoke.mjs",
     "smoke:harness": "node scripts/smoke-harness-self-test.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",

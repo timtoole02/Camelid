@@ -93,7 +93,7 @@ mod tests {
         let manifest = runtime_capability_manifest();
         assert_eq!(manifest.schema_version, 1);
         let projects: HashSet<_> = manifest.projects.iter().map(|item| item.project).collect();
-        assert_eq!(projects, HashSet::from([2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(projects, HashSet::from([2, 3, 4, 5, 6, 7, 8, 9]));
     }
 
     #[test]

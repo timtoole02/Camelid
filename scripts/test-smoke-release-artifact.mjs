@@ -61,6 +61,13 @@ const healthyBody = JSON.stringify({
   active_model_id: null,
   backend: 'none',
   engine_queue_depth: 0,
+  cuda_resident_arena: {
+    capacity_models: 1,
+    resident_models: 0,
+    active_models: 0,
+    evictions: 0,
+    admission_failures: 0,
+  },
 })
 assert.deepEqual(assertHealthPayload(200, healthyBody), [], 'a model-less engine at rest must pass')
 assert.ok(has(assertHealthPayload(503, healthyBody), /expected 200, got 503/), 'a non-200 health must fail')
@@ -85,6 +92,17 @@ assert.ok(
 assert.ok(
   has(assertHealthPayload(200, JSON.stringify({ ...JSON.parse(healthyBody), backend: 7 })), /backend must be a string/),
   'a malformed backend field must fail',
+)
+assert.ok(
+  has(assertHealthPayload(200, JSON.stringify({ ...JSON.parse(healthyBody), cuda_resident_arena: null })), /must be an object/),
+  'a missing arena object must fail the packaged Phase 9 contract',
+)
+assert.ok(
+  has(assertHealthPayload(200, JSON.stringify({
+    ...JSON.parse(healthyBody),
+    cuda_resident_arena: { capacity_models: 1, resident_models: 1, active_models: 0 },
+  })), /resident_models=1/),
+  'a model-less release must not retain a resident CUDA model',
 )
 
 // ---------------------------------------------------------------------------

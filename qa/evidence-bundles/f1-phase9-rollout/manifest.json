@@ -1,0 +1,26 @@
+{
+  "schema": "camelid.f1-phase9-visual-evidence/v1",
+  "status": "pass",
+  "generated_date": "2026-09-11",
+  "upstream_base": "fb6245139bcdf36fa2ca3fe51a1b61d4417df5a3",
+  "scope": "frontend presentation only",
+  "runner": "frontend/scripts/arena-residency-browser-smoke.mjs",
+  "assertions": [
+    "real App and ArenaView/AnalyticsView components render",
+    "capacity-two, default-one, and omitted-field contracts are distinct",
+    "one-model, active, long-identity, and HTTP-error edge cases render",
+    "desktop and mobile layouts have no horizontal overflow or pane overlap",
+    "resident status uses role=status and aria-live=polite"
+  ],
+  "screenshots": [
+    { "file": "screenshots/analytics-long-id-light-mobile.png", "bytes": 44128, "sha256": "6e56d3bfe5281b14c643215b905b65efb43804e179717a9fd0e4ec22586b811c", "width": 390, "height": 844 },
+    { "file": "screenshots/analytics-memory-error-dark-desktop.png", "bytes": 108722, "sha256": "11d9a0c8baa46d83c91e972c94ee50915085a6f4609948a06f1bbb21421dc8d3", "width": 1280, "height": 800 },
+    { "file": "screenshots/analytics-resident-active-dark-desktop.png", "bytes": 140807, "sha256": "0755173214c5b8ab7b843e7aadf257b8492c079dfd3cc01786f083751f5e8f30", "width": 1440, "height": 900 },
+    { "file": "screenshots/arena-capacity-two-dark-desktop.png", "bytes": 89608, "sha256": "45f4d901633d6a2e088d6d0238e14edf71d037cd10940f7589076b1d54e16521", "width": 1440, "height": 900 },
+    { "file": "screenshots/arena-default-one-light-mobile.png", "bytes": 36924, "sha256": "1d58469076500e14cd9ddaa319e80e8518c6e6fe4414c5be842ff2bc7cc96553", "width": 390, "height": 1056 },
+    { "file": "screenshots/arena-legacy-backend-dark-desktop.png", "bytes": 84924, "sha256": "87485b8239339957e0aab781d9289199ed809713a31391b0ed2d06c98adb807c", "width": 1280, "height": 800 },
+    { "file": "screenshots/arena-one-model-empty-light-desktop.png", "bytes": 70477, "sha256": "53a3ce7c5a8808bd9475365f3e40a25e17eb891fcdfb0a3693945e095a1f1633", "width": 1280, "height": 800 },
+    { "file": "screenshots/measured-batch8-proof-desktop.png", "bytes": 182822, "sha256": "24d687d2e0e70d9707ee9787a85c12bfbd6d67979e565fedc8037f1055f4f556", "width": 1440, "height": 900 },
+    { "file": "screenshots/measured-batch8-proof-mobile.png", "bytes": 125084, "sha256": "69670c9d8e96d070c78f6766c69969e1e8e6b3ea674a840a19ebb4aa0d7efaba", "width": 390, "height": 1933 }
+  ]
+}

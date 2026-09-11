@@ -665,7 +665,17 @@ pub(super) fn resident_prefill_rope_tables(
     config: &LlamaModelConfig,
     rope_freqs: Option<&CpuTensor>,
 ) -> Result<Option<ResidentRopeTables>> {
-    let first = match resident_decode_rope_tables(0, head_dim, config, rope_freqs)? {
+    resident_prefill_rope_tables_at(0, n_positions, head_dim, config, rope_freqs)
+}
+
+pub(super) fn resident_prefill_rope_tables_at(
+    base_position: usize,
+    n_positions: usize,
+    head_dim: usize,
+    config: &LlamaModelConfig,
+    rope_freqs: Option<&CpuTensor>,
+) -> Result<Option<ResidentRopeTables>> {
+    let first = match resident_decode_rope_tables(base_position, head_dim, config, rope_freqs)? {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -701,9 +711,11 @@ pub(super) fn resident_prefill_rope_tables(
     let mscale = rope_magnitude_scale(scaling);
     let mut cos_all = Vec::with_capacity(n_positions * half);
     let mut sin_all = Vec::with_capacity(n_positions * half);
-    cos_all.extend_from_slice(&first.cos);
-    sin_all.extend_from_slice(&first.sin);
-    for pos in 1..n_positions {
+    if n_positions > 0 {
+        cos_all.extend_from_slice(&first.cos);
+        sin_all.extend_from_slice(&first.sin);
+    }
+    for pos in base_position.saturating_add(1)..base_position.saturating_add(n_positions) {
         let eff = position_mode.effective_position(pos) as f32;
         for &f in &freqs {
             let (s, c) = (eff * f).sin_cos();

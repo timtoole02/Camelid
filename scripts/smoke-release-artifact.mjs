@@ -111,6 +111,20 @@ export function assertHealthPayload(status, bodyText) {
   if (body.engine_queue_depth !== 0) {
     failures.push(`/v1/health: engine_queue_depth=${JSON.stringify(body.engine_queue_depth)}, expected 0 at rest`)
   }
+  const arena = body.cuda_resident_arena
+  if (!arena || typeof arena !== 'object' || Array.isArray(arena)) {
+    failures.push('/v1/health: cuda_resident_arena must be an object')
+  } else {
+    if (![0, 1, 2].includes(arena.capacity_models)) {
+      failures.push(`/v1/health: cuda_resident_arena.capacity_models=${JSON.stringify(arena.capacity_models)}, expected 0, 1, or 2`)
+    }
+    if (arena.resident_models !== 0) {
+      failures.push(`/v1/health: cuda_resident_arena.resident_models=${JSON.stringify(arena.resident_models)}, expected 0 at model-less boot`)
+    }
+    if (arena.active_models !== 0) {
+      failures.push(`/v1/health: cuda_resident_arena.active_models=${JSON.stringify(arena.active_models)}, expected 0 at model-less boot`)
+    }
+  }
   return failures
 }
 

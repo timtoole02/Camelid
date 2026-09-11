@@ -96,6 +96,20 @@ const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
+const CUDA_COOPERATIVE_PREFILL_ENV: &str = "CAMELID_CUDA_COOPERATIVE_PREFILL";
+const CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV: &str =
+    "CAMELID_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS";
+const DEFAULT_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS: usize = 256;
+const CUDA_BATCHED_PREFILL_ENV: &str = "CAMELID_CUDA_BATCHED_PREFILL";
+
+#[cfg(feature = "cuda")]
+fn cuda_scalar_prefill_step_tokens(configured: usize, batched_prefill: bool) -> usize {
+    if batched_prefill {
+        1
+    } else {
+        configured
+    }
+}
 // Speculative decoding is a default-off serving optimization (lossless greedy
 // speculation; see src/inference/speculative.rs). It makes no support claim.
 const SPEC_DECODE_ENV: &str = "CAMELID_SPEC_DECODE";
@@ -642,12 +656,6 @@ pub struct HealthResponse {
     /// True when the active runnable model has a resident Prism/Qwen3-VL
     /// projector and can accept OpenAI `image_url` chat content parts.
     pub vision_ready: bool,
-    /// Merged image tokens one attached image is charged by default, so a client
-    /// can budget its context window without guessing. `None` when the active
-    /// model cannot accept an image at all. This is the default ceiling only: a
-    /// request that sets `camelid_image_max_tokens` may legitimately cost more,
-    /// up to the hard bound this server enforces.
-    pub vision_token_allowance: Option<u32>,
     pub active_model_id: Option<String>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
@@ -695,6 +703,8 @@ pub struct HealthResponse {
     pub engine_queued_tasks: usize,
     pub engine_active_task_id: Option<u64>,
     pub engine_active_generated_tokens: u64,
+    pub engine_active_prefill_tokens: u64,
+    pub engine_active_prefill_tokens_total: u64,
     pub engine_active_elapsed_seconds: u64,
     pub engine_stalled_seconds: u64,
     /// Maximum streaming sessions retained by the engine's round-robin scheduler.
@@ -1696,6 +1706,8 @@ pub struct LlamaServerSlotCamelid {
     pub engine_queue_depth: usize,
     pub queued_tasks: usize,
     pub active_generated_tokens: u64,
+    pub active_prefill_tokens: u64,
+    pub prefill_tokens_total: u64,
     pub active_elapsed_seconds: u64,
     pub stalled_seconds: u64,
     pub unsupported: Vec<&'static str>,
@@ -3605,6 +3617,8 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         crate::inference::deterministic_mode_enabled(),
     );
     let slot = state.engine.slot_snapshot();
+    let (engine_active_prefill_tokens, engine_active_prefill_tokens_total) =
+        state.engine.cooperative_prefill_progress();
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3617,7 +3631,6 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         max_prompt_tokens,
         max_generation_tokens,
         vision_ready,
-        vision_token_allowance: vision_ready.then_some(DEFAULT_MAX_IMAGE_TOKENS),
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
         execution_plan,
@@ -3639,6 +3652,8 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
         engine_active_generated_tokens: slot.completed_units,
+        engine_active_prefill_tokens,
+        engine_active_prefill_tokens_total,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
@@ -3727,6 +3742,8 @@ async fn purge_kv_cache(State(state): State<AppState>) -> Json<PurgeKvCacheRespo
 /// live. The process is alive and serving, so `ok` remains true.
 fn busy_health_response(state: &AppState) -> HealthResponse {
     let slot = state.engine.slot_snapshot();
+    let (engine_active_prefill_tokens, engine_active_prefill_tokens_total) =
+        state.engine.cooperative_prefill_progress();
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3739,9 +3756,6 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         max_prompt_tokens: state.server_limits.max_prompt_tokens,
         max_generation_tokens: state.server_limits.max_generation_tokens,
         vision_ready: false,
-        // The busy snapshot cannot read the runnable registry, so it cannot know
-        // whether vision is ready — reporting an allowance here would be a guess.
-        vision_token_allowance: None,
         active_model_id: None,
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
@@ -3762,6 +3776,8 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
         engine_active_generated_tokens: slot.completed_units,
+        engine_active_prefill_tokens,
+        engine_active_prefill_tokens_total,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
         continuous_batch_slots: state.engine.continuous_batch_slots(),
@@ -4665,21 +4681,31 @@ async fn llama_server_slots(
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
     let generation_ready = model.is_some_and(loaded_model_generation_ready);
     let slot = state.engine.slot_snapshot();
+    let cooperative_slots = state.engine.cooperative_slot_snapshots();
 
     let total_slots = state.engine.total_slots();
     let busy_slots = state.engine.busy_slots();
+    let exclusive_active = busy_slots == total_slots
+        && cooperative_slots
+            .iter()
+            .all(|slot| slot.active_task_id.is_none());
 
     // Refuse only when there is genuinely no room: with cooperative streaming a
     // second stream is admissible while the first is mid-generation.
     if query.fail_on_no_slot.as_deref() == Some("1")
         && (!generation_ready || busy_slots >= total_slots)
     {
-        return api_error(
+        let mut response = api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_available_slot",
             "no generation-ready Camelid slot is available".to_string(),
             Some("fail_on_no_slot"),
         );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            "1".parse().expect("static header"),
+        );
+        return response;
     }
 
     let n_ctx = model
@@ -4693,24 +4719,25 @@ async fn llama_server_slots(
     } else {
         "idle_generation_ready"
     };
-    let id_task = slot
-        .active_task_id
-        .map(|id| id.min(i32::MAX as u64) as i32)
-        .unwrap_or(-1);
-
-    // One entry per admissible slot, so this array's length is `total_slots` on
-    // `/props` and the denominator `fail_on_no_slot` arbitrates against. The
-    // engine tracks WHICH slots are busy but keeps a single set of progress
-    // atomics for whichever job is stepping, so `id_task` and the progress
-    // fields are engine-wide values repeated on the busy entries rather than
-    // per-slot truth — declared as `per_slot_task_identity` /
-    // `per_slot_progress` in `unsupported` rather than quietly implied.
-    let slots: Vec<LlamaServerSlotResponse> = (0..total_slots)
-        .map(|index| {
-            let busy = index < busy_slots;
+    // One entry per admissible slot, backed by the engine's stable per-job
+    // slot assignment. An exclusive job still saturates every slot and uses
+    // the legacy aggregate task identity because it has no cooperative slot.
+    let slots: Vec<LlamaServerSlotResponse> = cooperative_slots
+        .into_iter()
+        .map(|cooperative_slot| {
+            let busy = cooperative_slot.active_task_id.is_some() || exclusive_active;
+            let active_task_id = cooperative_slot.active_task_id.or({
+                if exclusive_active {
+                    slot.active_task_id
+                } else {
+                    None
+                }
+            });
             LlamaServerSlotResponse {
-                id: index.try_into().unwrap_or(u32::MAX),
-                id_task: if busy { id_task } else { -1 },
+                id: cooperative_slot.id.try_into().unwrap_or(u32::MAX),
+                id_task: active_task_id
+                    .map(|id| id.min(i32::MAX as u64) as i32)
+                    .unwrap_or(-1),
                 n_ctx,
                 speculative: false,
                 is_processing: busy,
@@ -4749,17 +4776,42 @@ async fn llama_server_slots(
                     },
                     engine_queue_depth: state.engine.depth(),
                     queued_tasks: slot.queued_tasks,
-                    active_generated_tokens: if busy { slot.completed_units } else { 0 },
-                    active_elapsed_seconds: if busy { slot.active_elapsed_seconds } else { 0 },
-                    stalled_seconds: if busy { slot.stalled_seconds } else { 0 },
+                    active_generated_tokens: if cooperative_slot.active_task_id.is_some() {
+                        cooperative_slot.completed_units
+                    } else if exclusive_active {
+                        slot.completed_units
+                    } else {
+                        0
+                    },
+                    active_prefill_tokens: if cooperative_slot.active_task_id.is_some() {
+                        cooperative_slot.prefill_completed_units
+                    } else {
+                        0
+                    },
+                    prefill_tokens_total: if cooperative_slot.active_task_id.is_some() {
+                        cooperative_slot.prefill_total_units
+                    } else {
+                        0
+                    },
+                    active_elapsed_seconds: if cooperative_slot.active_task_id.is_some() {
+                        cooperative_slot.active_elapsed_seconds
+                    } else if exclusive_active {
+                        slot.active_elapsed_seconds
+                    } else {
+                        0
+                    },
+                    stalled_seconds: if cooperative_slot.active_task_id.is_some() {
+                        cooperative_slot.stalled_seconds
+                    } else if exclusive_active {
+                        slot.stalled_seconds
+                    } else {
+                        0
+                    },
                     unsupported: vec![
                         "post_slots",
                         "slot_cache_save_restore_erase",
                         "prompt_cache_metadata",
                         "cancellation_metadata",
-                        "continuous_batching_metrics",
-                        "per_slot_task_identity",
-                        "per_slot_progress",
                     ],
                 },
             }
@@ -14389,16 +14441,6 @@ async fn load_runnable_serve_runtime(
 const PRISM_IMAGE_PAD: &str = "<|image_pad|>";
 const MAX_PRISM_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Merged image-token floor a chat request is charged when it does not set
-/// `camelid_image_min_tokens`.
-const DEFAULT_MIN_IMAGE_TOKENS: u32 = 8;
-/// Merged image-token ceiling a chat request is charged when it does not set
-/// `camelid_image_max_tokens`. `/v1/health` advertises this as
-/// `vision_token_allowance` so a client can budget context without guessing.
-const DEFAULT_MAX_IMAGE_TOKENS: u32 = 128;
-/// Hard bound on either override, whatever the request asks for.
-const IMAGE_TOKEN_HARD_CEILING: u32 = 1024;
-
 enum RunnablePreparedPrompt {
     Text(Vec<u32>),
     Vision {
@@ -14557,7 +14599,7 @@ fn prepare_runnable_prompt(
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "vision_projector_not_ready",
-            "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
+            "the language model is loaded, but no Prism mmproj GGUF was found; place a *mmproj*.gguf beside the model or set CAMELID_MMPROJ before loading it"
                 .to_string(),
             Some("model"),
         ));
@@ -14602,13 +14644,10 @@ fn prepare_runnable_prompt(
                 None,
             )
         })?;
-    let min_image_tokens = image_min_tokens
-        .unwrap_or(DEFAULT_MIN_IMAGE_TOKENS)
-        .clamp(1, IMAGE_TOKEN_HARD_CEILING) as usize;
+    let min_image_tokens = image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
     let max_image_tokens = image_max_tokens
-        .unwrap_or(DEFAULT_MAX_IMAGE_TOKENS)
-        .clamp(min_image_tokens as u32, IMAGE_TOKEN_HARD_CEILING)
-        as usize;
+        .unwrap_or(128)
+        .clamp(min_image_tokens as u32, 1024) as usize;
     Ok(RunnablePreparedPrompt::Vision {
         prefix,
         image_bytes: decode_prism_image_data_url(image_urls[0])?,
@@ -16706,7 +16745,6 @@ async fn unload_model(
             None,
         );
     }
-    let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
         req.id
     } else {
@@ -16718,6 +16756,26 @@ async fn unload_model(
     } else {
         state.active_model_id.read().await.clone()
     };
+
+    #[cfg(feature = "cuda")]
+    if let Some(id) = target_id.as_deref() {
+        let resident_key = state
+            .loaded_models
+            .read()
+            .await
+            .get(id)
+            .map(|model| model_resident_cache_key(&model.id, &model.lane.gguf_sha256));
+        if resident_key.is_some_and(crate::inference::resident_cuda_model_active) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                "resident CUDA model still has active sequences".to_string(),
+                None,
+            );
+        }
+    }
+
+    let _exclusive = state.model_file_lifecycle.write().await;
 
     if let Err(resp) = release_model(&state, target_id).await {
         return *resp;
@@ -16739,6 +16797,50 @@ async fn unload_model(
 /// The caller must already hold the model-transition lock and an exclusive
 /// `model_file_lifecycle` guard. `Err` carries a ready-to-return response.
 async fn release_model(state: &AppState, target: Option<String>) -> Result<(), Box<Response>> {
+    #[cfg(feature = "cuda")]
+    {
+        let release_all = target.is_none();
+        let resident_key = match target.as_deref() {
+            Some(id) => state
+                .loaded_models
+                .read()
+                .await
+                .get(id)
+                .map(|model| model_resident_cache_key(&model.id, &model.lane.gguf_sha256)),
+            None => None,
+        };
+        if resident_key.is_some_and(crate::inference::resident_cuda_model_active) {
+            return Err(Box::new(api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                "resident CUDA model still has active sequences".to_string(),
+                None,
+            )));
+        }
+        let release = state
+            .engine
+            .run_exclusive(move || {
+                if release_all {
+                    crate::inference::reset_resident_caches();
+                    Ok(())
+                } else if let Some(key) = resident_key {
+                    crate::inference::release_resident_cuda_model(key)
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(engine_post_error_response)?;
+        if let Err(message) = release {
+            return Err(Box::new(api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                message,
+                None,
+            )));
+        }
+    }
+
     if let Some(id) = target {
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
@@ -16784,12 +16886,15 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     // The reset mutates engine-owned GPU state, so it runs as an ENGINE JOB —
     // it can never race a decode. A failed post is surfaced, never skipped
     // silently (a skipped reset is the 20x-slowdown VRAM leak all over again).
-    if let Err(err) = state
-        .engine
-        .run_exclusive(crate::inference::reset_resident_caches)
-        .await
+    #[cfg(not(feature = "cuda"))]
     {
-        return Err(engine_post_error_response(err));
+        if let Err(err) = state
+            .engine
+            .run_exclusive(crate::inference::reset_resident_caches)
+            .await
+        {
+            return Err(engine_post_error_response(err));
+        }
     }
     Ok(())
 }
@@ -17570,12 +17675,6 @@ async fn llama_server_apply_template(
             )
         }
     };
-    // Ahead of validate_chat_messages: an audio-only or video-only message
-    // renders to empty content, so the generic empty-content refusal would
-    // otherwise answer first and hide which part type was actually rejected.
-    if let Some(response) = reject_unsupported_multimodal_content(&messages) {
-        return response;
-    }
     if let Err(response) = validate_chat_messages(&messages) {
         return *response;
     }
@@ -17584,49 +17683,6 @@ async fn llama_server_apply_template(
         Ok(model) => model,
         Err(response) => return response,
     };
-    // An image_url part renders to a Qwen vision marker unconditionally (see the
-    // ChatMessage Deserialize impl), so without this ladder every non-vision row
-    // answers 200 with `<|vision_start|>` sitting in the returned prompt. Refuse
-    // on the same three rungs, codes and wording the chat lane uses, so a client
-    // cannot tell the two routes apart. Architecture alone is not the predicate:
-    // the text-only qwen35 rows share it with the two Prism vision rows and are
-    // only separated by projector readiness.
-    let image_count: usize = messages
-        .iter()
-        .map(|message| message.image_urls.len())
-        .sum();
-    if image_count > 0 {
-        if image_count != 1 {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "unsupported_image_count",
-                "Prism chat currently accepts exactly one image per request".to_string(),
-                Some("messages"),
-            );
-        }
-        if model.gguf.architecture() != Some("qwen35") {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "vision_model_required",
-                "image_url content requires a Prism/Qwen3.5 vision model".to_string(),
-                Some("model"),
-            );
-        }
-        let vision_ready = match resolve_runnable_runtime(&state, &None).await {
-            Ok(Some((_, runtime))) => runtime.vision_ready(),
-            Ok(None) => false,
-            Err(response) => return response,
-        };
-        if !vision_ready {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "vision_projector_not_ready",
-                "the language model is loaded, but no Prism image projector is ready: either no *mmproj*.gguf was found beside the model (set CAMELID_MMPROJ before loading it), or this build has no Metal or CUDA lane to decode with image embeddings"
-                    .to_string(),
-                Some("model"),
-            );
-        }
-    }
     let tokenizer = match model.tokenizer_runtime.clone() {
         Some(tokenizer) => tokenizer,
         None => match Tokenizer::from_gguf(&model.gguf) {
@@ -20184,11 +20240,23 @@ fn enforce_context_budget(
     Ok(())
 }
 
-pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
+pub(super) fn model_resident_cache_key(model_id: &str, gguf_sha256: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     model_id.hash(&mut hasher);
+    gguf_sha256.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+#[test]
+fn phase8_resident_cache_key_is_stable_and_artifact_sensitive() {
+    let artifact_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let artifact_b = "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let first = model_resident_cache_key("model-a", artifact_a);
+    assert_eq!(first, model_resident_cache_key("model-a", artifact_a));
+    assert_ne!(first, model_resident_cache_key("model-a", artifact_b));
+    assert_ne!(first, model_resident_cache_key("model-b", artifact_a));
 }
 
 #[cfg(test)]
@@ -20890,7 +20958,7 @@ async fn prepare_generation(
     // Pin the GPU resident-decode engine cache to the model identity (not the
     // per-load weights Arc pointer), so every request for this model reuses the
     // uploaded weights instead of rebuilding the engine each time.
-    let resident_cache_key = model_resident_cache_key(&model.id);
+    let resident_cache_key = model_resident_cache_key(&model.id, &model.lane.gguf_sha256);
     session.set_resident_cache_key(resident_cache_key);
     timings.session_create = session_create_started.elapsed().as_millis();
 
@@ -23513,6 +23581,9 @@ fn stream_first_content_accounting_json(
 /// SSE layer needs to reproduce the pre-inversion byte stream (chunk shapes
 /// unchanged; only timing VALUES may differ).
 enum StreamDecodeEvent {
+    /// The engine accepted this request into an active slot. Queue-wait timeout
+    /// ownership can now hand off to the job, which reports generated progress.
+    Started,
     /// A non-empty text delta (already stop-sequence-truncated and diffed
     /// against previously streamed text).
     Delta(String),
@@ -23710,6 +23781,9 @@ fn run_stream_decode_job(
         }
     };
     let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    if !send(StreamDecodeEvent::Started) {
+        return;
+    }
     let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
     if collect_q8_schedule {
         reset_q8_schedule_telemetry();
@@ -23982,13 +24056,85 @@ struct CooperativeStreamDecodeJob {
     forward_timings: LlamaForwardTimings,
     sample: u128,
     finished: bool,
+    #[cfg(feature = "cuda")]
+    cuda_prefill: Option<CooperativeCudaPrefill>,
     #[cfg(test)]
     initial_step_delay: Option<Duration>,
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CooperativeCudaPrefill {
+    total_tokens: usize,
+    tokens_done: usize,
+    chunk_tokens: usize,
+    elapsed_micros: u128,
+    started: bool,
+    finalized: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl CooperativeCudaPrefill {
+    fn from_env(prompt_tokens: usize, diagnostics: bool) -> Option<Self> {
+        let enabled = matches!(
+            env::var(CUDA_COOPERATIVE_PREFILL_ENV).ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        let total_tokens = prompt_tokens.saturating_sub(1);
+        let chunk_tokens = env::var(CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS);
+        let batched = matches!(
+            env::var(CUDA_BATCHED_PREFILL_ENV).ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        ) && crate::inference::resident_cuda_batched_prefill_active();
+        (enabled && !diagnostics && total_tokens >= 2 && (total_tokens > chunk_tokens || batched))
+            .then_some(Self {
+                total_tokens,
+                tokens_done: 0,
+                chunk_tokens,
+                elapsed_micros: 0,
+                started: false,
+                finalized: false,
+            })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_true_batch2_scalar_fallback_safe(
+    error: &crate::inference::CudaTrueBatch2ContractError,
+) -> bool {
+    matches!(
+        error,
+        crate::inference::CudaTrueBatch2ContractError::Disabled
+            | crate::inference::CudaTrueBatch2ContractError::DuplicateSequence(_)
+            | crate::inference::CudaTrueBatch2ContractError::IncompatibleRows
+            | crate::inference::CudaTrueBatch2ContractError::MissingLease(_)
+            | crate::inference::CudaTrueBatch2ContractError::CancelledBeforeDispatch(_)
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_true_paged_batch_scalar_fallback_safe(
+    error: &crate::inference::CudaTruePagedBatchContractError,
+) -> bool {
+    matches!(
+        error,
+        crate::inference::CudaTruePagedBatchContractError::Disabled
+            | crate::inference::CudaTruePagedBatchContractError::InvalidBatchSize(_)
+            | crate::inference::CudaTruePagedBatchContractError::DuplicateSequence(_)
+            | crate::inference::CudaTruePagedBatchContractError::IncompatibleRows
+            | crate::inference::CudaTruePagedBatchContractError::MissingLease(_)
+            | crate::inference::CudaTruePagedBatchContractError::CancelledBeforeDispatch(_)
+    )
+}
+
 impl CooperativeStreamDecodeJob {
+    #[cfg(test)]
     fn new(
-        mut prepared: PreparedGeneration,
+        prepared: PreparedGeneration,
         events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
     ) -> Option<Self> {
         let request_timeout = match generation_timeout_duration() {
@@ -23999,6 +24145,18 @@ impl CooperativeStreamDecodeJob {
                 return None;
             }
         };
+        Self::new_at(prepared, events, Instant::now(), request_timeout)
+    }
+
+    fn new_at(
+        mut prepared: PreparedGeneration,
+        events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+        generation_started: Instant,
+        request_timeout: Duration,
+    ) -> Option<Self> {
+        if events.blocking_send(StreamDecodeEvent::Started).is_err() {
+            return None;
+        }
         let collect_q8_schedule =
             stream_timing_diagnostics_enabled() && q8_schedule_telemetry_enabled();
         if collect_q8_schedule {
@@ -24008,7 +24166,6 @@ impl CooperativeStreamDecodeJob {
             .telemetry
             .take()
             .map(telemetry::RequestGuard::begin);
-        let generation_started = Instant::now();
         let mut input = prepared.token_ids.clone();
         let mut history = prepared.token_ids.clone();
         let mut generated = Vec::new();
@@ -24044,6 +24201,9 @@ impl CooperativeStreamDecodeJob {
         {
             return None;
         }
+        #[cfg(feature = "cuda")]
+        let cuda_prefill =
+            CooperativeCudaPrefill::from_env(input.len(), prepared.collect_dense_diagnostics);
         Some(Self {
             prepared,
             events,
@@ -24063,6 +24223,8 @@ impl CooperativeStreamDecodeJob {
             forward_timings: LlamaForwardTimings::default(),
             sample,
             finished: false,
+            #[cfg(feature = "cuda")]
+            cuda_prefill,
             #[cfg(test)]
             initial_step_delay: generation_step_test_sleep_duration(),
         })
@@ -24146,143 +24308,47 @@ impl CooperativeStreamDecodeJob {
         engine::StepOutcome::Complete
     }
 
-    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
-        #[cfg(test)]
-        let _decode_probe = decode_probe::enter();
-        // Preserve the exclusive stream job's test contract: its synthetic initial
-        // delay is observed as live decode work, not as untracked job construction.
-        #[cfg(test)]
-        if let Some(duration) = self.initial_step_delay.take() {
-            std::thread::sleep(duration);
-        }
-        if self.finished {
-            return engine::StepOutcome::Complete;
-        }
-        // Preserve the fast single-request pipeline when this is the only active stream.
-        // With contention, consume any already-prepared current graph but do not enqueue
-        // another session-local future graph ahead of the next round-robin participant.
-        self.prepared
-            .session
-            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
-        if let Some(guard) = &self.telemetry_guard {
-            guard.activate();
-        }
-        if self.prepared.cancel.token.is_cancelled() || self.events.is_closed() {
-            self.finished = true;
-            return engine::StepOutcome::Complete;
-        }
-        if self.finish_reason != "length"
-            || self.generated.len() >= self.prepared.max_tokens as usize
+    fn consume_step(&mut self, step: LlamaGenerationStep) -> engine::StepOutcome {
+        if self.generated.is_empty()
+            && !self.prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
         {
-            return self.finish_clean();
+            store_prompt_prefix_cache(&mut self.prepared, &step);
         }
-        if self
-            .request_timeout
-            .checked_sub(self.generation_started.elapsed())
-            .is_none()
-        {
-            // Same reasoning as the exclusive job: release the hold-back before the
-            // client sees the timeout frame, or those bytes are lost.
-            let pending = stop_hold_back_flush(
-                &self.prepared.tokenizer,
-                &self.generated,
-                &self.streamed_text,
-                &self.prepared.stop_sequences,
-            );
-            if !pending.is_empty() {
-                self.streamed_text.push_str(&pending);
-                self.send(StreamDecodeEvent::Delta(pending));
+        if self.generated.is_empty() {
+            let mut prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+            #[cfg(feature = "cuda")]
+            if let Some(prefill) = self.cuda_prefill.filter(|prefill| prefill.finalized) {
+                prompt_evaluation.prompt_token_count = self.prepared.token_ids.len();
+                prompt_evaluation.prefill_token_count = prefill.total_tokens;
+                prompt_evaluation.prefill.forward_total += micros_to_ms(prefill.elapsed_micros);
             }
-            self.send(StreamDecodeEvent::TimedOut {
-                timeout: self.request_timeout,
-                elapsed: self.generation_started.elapsed(),
-                generated_tokens: self.generated.len(),
-            });
-            self.finished = true;
-            return engine::StepOutcome::Complete;
+            self.prepared.timings.prompt_evaluation = prompt_evaluation;
         }
-
-        let generated_index = self.generated.len();
-        let collect_dense_for_step =
-            collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
-        let mut sampling = self.prepared.sampling.clone();
-        if let Some(seed) = sampling.seed {
-            sampling.seed = Some(seed.wrapping_add(self.generated.len() as u64));
-        }
-        let sampler = if sampling == SamplingConfig::default() {
-            LlamaSampler::Greedy
-        } else {
-            LlamaSampler::Sampling(sampling)
-        };
-        // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; the delta below is a text diff of the entire decoded
-        // output, so the client simply receives one larger delta.
-        let spec_eligible = !collect_dense_for_step
-            && self.prepared.logprobs_top_n.is_none()
-            && self.prepared.constraint.is_none()
-            && !self.top_logits.is_empty();
-        let spec_round = match run_speculative_round(
-            &mut self.prepared,
-            &sampler,
-            &self.input,
-            spec_eligible,
-            &mut self.generated,
-            &mut self.history,
-            &mut self.finish_reason,
-            &mut self.forward_timings,
+        self.forward_timings.add_assign(&step.timings);
+        self.sample += step.sample;
+        if let Err(response) = consume_generation_step(
+            &self.prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut self.generated,
+                history: &mut self.history,
+                top_logits: &mut self.top_logits,
+                output_projection: &mut self.output_projection,
+                dense: &mut self.dense,
+                finish_reason: &mut self.finish_reason,
+            },
         ) {
-            Ok(round) => round,
-            Err(response) => return self.fail(&response),
-        };
-        if matches!(spec_round, SpeculativeRound::Declined) {
-            let greedy_fast = self.input.len() == 1
-                && matches!(sampler, LlamaSampler::Greedy)
-                && !collect_dense_for_step
-                && !self.top_logits.is_empty();
-            let step = match run_stream_step(
-                &mut self.prepared.session,
-                StreamStepRequest {
-                    greedy_fast,
-                    input: self.input.clone(),
-                    sampler,
-                    history: self.history.clone(),
-                    collect_dense_diagnostics: collect_dense_for_step,
-                },
-            ) {
-                Ok(step) => step,
-                Err(response) => return self.fail(&response),
-            };
-            if self.generated.is_empty()
-                && !self.prepared.collect_dense_diagnostics
-                && step.diagnostics.is_none()
-            {
-                store_prompt_prefix_cache(&mut self.prepared, &step);
-            }
-            if self.generated.is_empty() {
-                self.prepared.timings.prompt_evaluation =
-                    prompt_evaluation_timings_from_step(&step);
-            }
-            self.forward_timings.add_assign(&step.timings);
-            self.sample += step.sample;
-            if let Err(response) = consume_generation_step(
-                &self.prepared,
-                step,
-                GenerationStepAccumulator {
-                    generated: &mut self.generated,
-                    history: &mut self.history,
-                    top_logits: &mut self.top_logits,
-                    output_projection: &mut self.output_projection,
-                    dense: &mut self.dense,
-                    finish_reason: &mut self.finish_reason,
-                },
-            ) {
-                return self.fail(&response);
-            }
-            self.prepared
-                .engine_progress
-                .record_progress(self.generated.len());
+            return self.fail(&response);
         }
+        self.prepared
+            .engine_progress
+            .record_progress(self.generated.len());
 
+        self.emit_step()
+    }
+
+    fn emit_step(&mut self) -> engine::StepOutcome {
         let text = match self.prepared.tokenizer.decode(&self.generated, true) {
             Ok(text) => text,
             Err(err) => {
@@ -24322,23 +24388,991 @@ impl CooperativeStreamDecodeJob {
             engine::StepOutcome::Continue
         }
     }
+
+    fn next_sampler(&self) -> LlamaSampler {
+        let mut sampling = self.prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(self.generated.len() as u64));
+        }
+        if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn step_cuda_prefill(&mut self) -> Option<engine::StepOutcome> {
+        let state = self.cuda_prefill?;
+        if state.finalized {
+            return None;
+        }
+        let step_tokens = cuda_scalar_prefill_step_tokens(
+            state.chunk_tokens,
+            crate::inference::resident_cuda_batched_prefill_active(),
+        );
+        let end = (state.tokens_done + step_tokens).min(state.total_tokens);
+        let chunk = self.input[state.tokens_done..end].to_vec();
+        let outcome = match self.prepared.session.try_resident_prefill_cuda_chunk(
+            &chunk,
+            state.tokens_done,
+            state.total_tokens,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_prefill_failed",
+                    error.to_string(),
+                    None,
+                );
+                return Some(self.fail(&response));
+            }
+        };
+        match outcome {
+            crate::inference::CudaResidentPrefillChunkOutcome::Unsupported => {
+                debug_assert_eq!(state.tokens_done, 0, "continuations fail instead");
+                self.cuda_prefill = None;
+                None
+            }
+            crate::inference::CudaResidentPrefillChunkOutcome::Advanced {
+                end_position,
+                elapsed_micros,
+                finalized,
+            } => {
+                if !state.started {
+                    telemetry::emit(telemetry::Event::PrefillStarted {
+                        prefill_tokens: state.total_tokens,
+                        path: "cuda_resident_cooperative",
+                        layers_total: self.prepared.session.weights.layers.len(),
+                    });
+                }
+                let state = self.cuda_prefill.as_mut().expect("prefill state retained");
+                state.started = true;
+                state.tokens_done = end_position;
+                state.elapsed_micros = state.elapsed_micros.saturating_add(elapsed_micros);
+                state.finalized = finalized;
+                self.forward_timings.total =
+                    self.forward_timings.total.saturating_add(elapsed_micros);
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: end_position,
+                    tokens_total: state.total_tokens,
+                });
+                if finalized {
+                    self.input.clear();
+                    self.input.push(
+                        *self
+                            .prepared
+                            .token_ids
+                            .last()
+                            .expect("cooperative prefill prompt is non-empty"),
+                    );
+                }
+                Some(engine::StepOutcome::Continue)
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn batch_identity(&self) -> Option<(u64, engine::CooperativeBatchKey)> {
+        let generated_index = self.generated.len();
+        let ready = !self.finished
+            && self.finish_reason == "length"
+            && generated_index < self.prepared.max_tokens as usize
+            && self.input.len() == 1
+            && !self.history.is_empty()
+            && !self.top_logits.is_empty()
+            && self.prepared.logprobs_top_n.is_none()
+            && self.prepared.constraint.is_none()
+            && self.prepared.logit_diagnostic_token_ids.is_empty()
+            && self.prepared.speculative.is_none()
+            && !self.collect_q8_schedule
+            && !collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index)
+            && !self.prepared.cancel.token.is_cancelled()
+            && !self.events.is_closed()
+            && self.generation_started.elapsed() < self.request_timeout;
+        if !ready {
+            return None;
+        }
+        let (sequence_id, group, instance) = self.prepared.session.cuda_true_batch_identity()?;
+        Some((
+            sequence_id,
+            engine::CooperativeBatchKey::new(group, instance),
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn group_identity(&self) -> Option<(u64, engine::CooperativeBatchKey)> {
+        if self.cuda_prefill.is_some_and(|prefill| !prefill.finalized)
+            && !self.prepared.cancel.token.is_cancelled()
+            && !self.events.is_closed()
+            && self.generation_started.elapsed() < self.request_timeout
+        {
+            let (sequence_id, group, instance) =
+                self.prepared.session.cuda_true_paged_prefill_identity()?;
+            return Some((
+                sequence_id,
+                engine::CooperativeBatchKey::prefill(group, instance),
+            ));
+        }
+        self.batch_identity()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn consume_batch_row(
+        &mut self,
+        row: crate::inference::CudaTrueBatch2RowResult,
+    ) -> engine::StepOutcome {
+        match row.outcome {
+            crate::inference::CudaTrueBatch2RowOutcome::Generated { next_token_id }
+            | crate::inference::CudaTrueBatch2RowOutcome::Stopped { next_token_id } => {
+                let step =
+                    match gpu_sampled_generation_step(next_token_id, row.shared_forward_micros) {
+                        Ok(step) => step,
+                        Err(err) => {
+                            let response = api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "generation_step_failed",
+                                err.to_string(),
+                                None,
+                            );
+                            return self.fail(&response);
+                        }
+                    };
+                self.consume_step(step)
+            }
+            crate::inference::CudaTrueBatch2RowOutcome::SamplingFailed { message } => {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_step_failed",
+                    message,
+                    None,
+                );
+                self.fail(&response)
+            }
+            crate::inference::CudaTrueBatch2RowOutcome::CancelledAfterDispatch => {
+                if !self.events.is_closed()
+                    && self.generation_started.elapsed() >= self.request_timeout
+                {
+                    self.send(StreamDecodeEvent::TimedOut {
+                        timeout: self.request_timeout,
+                        elapsed: self.generation_started.elapsed(),
+                        generated_tokens: self.generated.len(),
+                    });
+                }
+                self.finished = true;
+                engine::StepOutcome::Complete
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn step_pair(
+        &mut self,
+        other: &mut Self,
+        context: engine::CooperativeStepContext,
+    ) -> Option<[engine::StepOutcome; 2]> {
+        let (sequence_id, key) = self.batch_identity()?;
+        let (other_sequence_id, other_key) = other.batch_identity()?;
+        if context.active_slots < 2 || key != other_key || sequence_id == other_sequence_id {
+            return None;
+        }
+
+        self.prepared
+            .session
+            .set_resident_encode_ahead_enabled(false);
+        other
+            .prepared
+            .session
+            .set_resident_encode_ahead_enabled(false);
+        if let Some(guard) = &self.telemetry_guard {
+            guard.activate();
+        }
+        if let Some(guard) = &other.telemetry_guard {
+            guard.activate();
+        }
+
+        let input_token_id = self.input[0];
+        let other_input_token_id = other.input[0];
+        let history = self.history.clone();
+        let other_history = other.history.clone();
+        let sampler = self.next_sampler();
+        let other_sampler = other.next_sampler();
+        let stop_token_ids = self
+            .prepared
+            .tokenizer
+            .special
+            .eog
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let other_stop_token_ids = other
+            .prepared
+            .tokenizer
+            .special
+            .eog
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        let cancel = self.prepared.cancel.token.clone();
+        let events = self.events.clone();
+        let generation_started = self.generation_started;
+        let request_timeout = self.request_timeout;
+        let cancelled = move || {
+            cancel.is_cancelled()
+                || events.is_closed()
+                || generation_started.elapsed() >= request_timeout
+        };
+        let other_cancel = other.prepared.cancel.token.clone();
+        let other_events = other.events.clone();
+        let other_generation_started = other.generation_started;
+        let other_request_timeout = other.request_timeout;
+        let other_cancelled = move || {
+            other_cancel.is_cancelled()
+                || other_events.is_closed()
+                || other_generation_started.elapsed() >= other_request_timeout
+        };
+
+        let execution = crate::inference::execute_cuda_true_batch2(
+            [&mut self.prepared.session, &mut other.prepared.session],
+            [
+                crate::inference::CudaTrueBatch2Request {
+                    sequence_id,
+                    input_token_id,
+                    token_history: &history,
+                    sampler,
+                    allowed_tokens: None,
+                    cancelled: Some(&cancelled),
+                    stop_token_ids: &stop_token_ids,
+                },
+                crate::inference::CudaTrueBatch2Request {
+                    sequence_id: other_sequence_id,
+                    input_token_id: other_input_token_id,
+                    token_history: &other_history,
+                    sampler: other_sampler,
+                    allowed_tokens: None,
+                    cancelled: Some(&other_cancelled),
+                    stop_token_ids: &other_stop_token_ids,
+                },
+            ],
+        );
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if cuda_true_batch2_scalar_fallback_safe(&error) => {
+                self.prepared
+                    .metrics
+                    .record_cuda_true_batch2_preflight_fallback();
+                return None;
+            }
+            Err(error) => {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_step_failed",
+                    error.to_string(),
+                    None,
+                );
+                return Some([self.fail(&response), other.fail(&response)]);
+            }
+        };
+
+        if execution.execution_mode != crate::cuda_resident::CudaBatchExecutionMode::TrueBatch {
+            let response = api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_step_failed",
+                "CUDA batch-2 executor returned a non-batched execution mode".to_string(),
+                None,
+            );
+            return Some([self.fail(&response), other.fail(&response)]);
+        }
+        self.prepared.metrics.record_cuda_true_batch2(
+            execution.shared_projection_launches,
+            execution.batch_elapsed_micros,
+        );
+
+        let left = execution
+            .rows
+            .iter()
+            .find(|row| row.sequence_id == sequence_id)
+            .cloned();
+        let right = execution
+            .rows
+            .iter()
+            .find(|row| row.sequence_id == other_sequence_id)
+            .cloned();
+        let (Some(left), Some(right)) = (left, right) else {
+            let response = api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_step_failed",
+                "CUDA true batch-2 returned an invalid row association".to_string(),
+                None,
+            );
+            return Some([self.fail(&response), other.fail(&response)]);
+        };
+        Some([self.consume_batch_row(left), other.consume_batch_row(right)])
+    }
+
+    #[cfg(feature = "cuda")]
+    fn step_paged_group(
+        jobs: &mut [&mut Self],
+        context: engine::CooperativeStepContext,
+    ) -> Option<Vec<engine::StepOutcome>> {
+        if jobs
+            .iter()
+            .all(|job| job.cuda_prefill.is_some_and(|prefill| !prefill.finalized))
+        {
+            return Self::step_paged_prefill_group(jobs, context);
+        }
+        if !crate::inference::resident_cuda_true_paged_batch_active()
+            || !(2..=crate::cuda_resident::MAX_VERIFY_K).contains(&jobs.len())
+            || context.active_slots < jobs.len()
+        {
+            return None;
+        }
+        let identities = jobs
+            .iter()
+            .map(|job| job.batch_identity())
+            .collect::<Option<Vec<_>>>()?;
+        let key = identities[0].1;
+        let mut unique_ids = std::collections::HashSet::with_capacity(jobs.len());
+        if identities
+            .iter()
+            .any(|(sequence_id, candidate)| *candidate != key || !unique_ids.insert(*sequence_id))
+        {
+            return None;
+        }
+        for job in &mut *jobs {
+            job.prepared
+                .session
+                .set_resident_encode_ahead_enabled(false);
+            if let Some(guard) = &job.telemetry_guard {
+                guard.activate();
+            }
+        }
+
+        let input_token_ids = jobs.iter().map(|job| job.input[0]).collect::<Vec<_>>();
+        let histories = jobs
+            .iter()
+            .map(|job| job.history.clone())
+            .collect::<Vec<_>>();
+        let samplers = jobs
+            .iter()
+            .map(|job| job.next_sampler())
+            .collect::<Vec<_>>();
+        let stop_token_ids = jobs
+            .iter()
+            .map(|job| {
+                job.prepared
+                    .tokenizer
+                    .special
+                    .eog
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let cancellation_checks = jobs
+            .iter()
+            .map(|job| {
+                let cancel = job.prepared.cancel.token.clone();
+                let events = job.events.clone();
+                let generation_started = job.generation_started;
+                let request_timeout = job.request_timeout;
+                Box::new(move || {
+                    cancel.is_cancelled()
+                        || events.is_closed()
+                        || generation_started.elapsed() >= request_timeout
+                }) as Box<dyn Fn() -> bool>
+            })
+            .collect::<Vec<_>>();
+        let requests = (0..jobs.len())
+            .map(|row| crate::inference::CudaTrueBatch2Request {
+                sequence_id: identities[row].0,
+                input_token_id: input_token_ids[row],
+                token_history: &histories[row],
+                sampler: samplers[row].clone(),
+                allowed_tokens: None,
+                cancelled: Some(cancellation_checks[row].as_ref()),
+                stop_token_ids: &stop_token_ids[row],
+            })
+            .collect::<Vec<_>>();
+        let execution = {
+            let mut sessions = jobs
+                .iter_mut()
+                .map(|job| &mut job.prepared.session)
+                .collect::<Vec<_>>();
+            crate::inference::execute_cuda_true_paged_batch(&mut sessions, &requests)
+        };
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if cuda_true_paged_batch_scalar_fallback_safe(&error) => {
+                jobs[0]
+                    .prepared
+                    .metrics
+                    .record_cuda_true_batch_preflight_fallback();
+                return None;
+            }
+            Err(error) => {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_step_failed",
+                    error.to_string(),
+                    None,
+                );
+                return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+            }
+        };
+        if execution.execution_mode != crate::cuda_resident::CudaBatchExecutionMode::TrueBatch
+            || execution.batch_size != jobs.len()
+        {
+            let response = api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_step_failed",
+                "CUDA paged batch executor returned an invalid execution mode or size".to_string(),
+                None,
+            );
+            return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+        }
+        jobs[0].prepared.metrics.record_cuda_true_batch(
+            execution.batch_size,
+            execution.shared_projection_launches,
+            execution.batch_elapsed_micros,
+        );
+
+        let mut rows = execution
+            .rows
+            .into_iter()
+            .map(|row| (row.sequence_id, row))
+            .collect::<std::collections::HashMap<_, _>>();
+        let ordered = identities
+            .iter()
+            .map(|(sequence_id, _)| rows.remove(sequence_id))
+            .collect::<Option<Vec<_>>>();
+        let Some(ordered) = ordered.filter(|_| rows.is_empty()) else {
+            let response = api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_step_failed",
+                "CUDA true paged batch returned an invalid row association".to_string(),
+                None,
+            );
+            return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+        };
+        Some(
+            jobs.iter_mut()
+                .zip(ordered)
+                .map(|(job, row)| job.consume_batch_row(row))
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn step_paged_prefill_group(
+        jobs: &mut [&mut Self],
+        context: engine::CooperativeStepContext,
+    ) -> Option<Vec<engine::StepOutcome>> {
+        if !crate::inference::resident_cuda_batched_prefill_active()
+            || !(2..=crate::cuda_resident::MAX_VERIFY_K).contains(&jobs.len())
+            || context.active_slots < jobs.len()
+        {
+            return None;
+        }
+        let identities = jobs
+            .iter()
+            .map(|job| job.prepared.session.cuda_true_paged_prefill_identity())
+            .collect::<Option<Vec<_>>>()?;
+        let group = (identities[0].1, identities[0].2);
+        let mut unique_ids = std::collections::HashSet::with_capacity(jobs.len());
+        if identities
+            .iter()
+            .any(|identity| (identity.1, identity.2) != group || !unique_ids.insert(identity.0))
+        {
+            return None;
+        }
+
+        for job in &mut *jobs {
+            if job.prepared.cancel.token.is_cancelled()
+                || job.events.is_closed()
+                || job.generation_started.elapsed() >= job.request_timeout
+            {
+                return None;
+            }
+            let state = job.cuda_prefill?;
+            if state.finalized || state.total_tokens < 2 || state.tokens_done >= state.total_tokens
+            {
+                return None;
+            }
+        }
+
+        let unseeded = jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, job)| {
+                (job.cuda_prefill
+                    .expect("prefill state was validated")
+                    .tokens_done
+                    == 0)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if let Some((&seed_index, siblings)) = unseeded.split_first() {
+            let state = jobs[seed_index]
+                .cuda_prefill
+                .expect("prefill state was validated");
+            let token = jobs[seed_index].input[0];
+            let outcome = match jobs[seed_index]
+                .prepared
+                .session
+                .try_resident_prefill_cuda_chunk(&[token], 0, state.total_tokens)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let response = api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_prefill_failed",
+                        error.to_string(),
+                        None,
+                    );
+                    return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+                }
+            };
+            let crate::inference::CudaResidentPrefillChunkOutcome::Advanced {
+                end_position: 1,
+                elapsed_micros,
+                finalized: false,
+            } = outcome
+            else {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_prefill_failed",
+                    "CUDA batched prefill seed returned an invalid outcome".to_string(),
+                    None,
+                );
+                return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+            };
+            {
+                let job = &mut jobs[seed_index];
+                telemetry::emit(telemetry::Event::PrefillStarted {
+                    prefill_tokens: state.total_tokens,
+                    path: "cuda_resident_batched",
+                    layers_total: job.prepared.session.weights.layers.len(),
+                });
+                let state = job.cuda_prefill.as_mut().expect("prefill state retained");
+                state.started = true;
+                state.tokens_done = 1;
+                state.elapsed_micros = state.elapsed_micros.saturating_add(elapsed_micros);
+                job.forward_timings.total =
+                    job.forward_timings.total.saturating_add(elapsed_micros);
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: 1,
+                    tokens_total: state.total_tokens,
+                });
+            }
+            for sibling_index in siblings {
+                let acquired = jobs[*sibling_index]
+                    .prepared
+                    .session
+                    .acquire_resident_paged_prefill_sequence_cuda();
+                match acquired {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let response = api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_prefill_failed",
+                            "CUDA batched prefill sibling could not acquire a paged sequence"
+                                .to_string(),
+                            None,
+                        );
+                        return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+                    }
+                    Err(error) => {
+                        let response = api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_prefill_failed",
+                            error.to_string(),
+                            None,
+                        );
+                        return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+                    }
+                }
+                let job = &mut jobs[*sibling_index];
+                let state = job.cuda_prefill.as_mut().expect("prefill state retained");
+                state.started = true;
+                telemetry::emit(telemetry::Event::PrefillStarted {
+                    prefill_tokens: state.total_tokens,
+                    path: "cuda_resident_batched",
+                    layers_total: job.prepared.session.weights.layers.len(),
+                });
+            }
+        }
+
+        let rounds = jobs
+            .iter()
+            .map(|job| {
+                let state = job.cuda_prefill.expect("prefill state retained");
+                state.total_tokens - state.tokens_done
+            })
+            .min()?
+            .min(crate::runtime_config::cuda_batched_prefill_round_tokens());
+        let starts = jobs
+            .iter()
+            .map(|job| {
+                job.cuda_prefill
+                    .expect("prefill state retained")
+                    .tokens_done
+            })
+            .collect::<Vec<_>>();
+        let mut completed_rounds = 0usize;
+        let mut shared_micros = 0u128;
+        for offset in 0..rounds {
+            if jobs.iter().any(|job| {
+                job.prepared.cancel.token.is_cancelled()
+                    || job.events.is_closed()
+                    || job.generation_started.elapsed() >= job.request_timeout
+            }) {
+                break;
+            }
+            let positions = starts
+                .iter()
+                .map(|start| start + offset)
+                .collect::<Vec<_>>();
+            let tokens = jobs
+                .iter()
+                .zip(&positions)
+                .map(|(job, position)| job.input[*position])
+                .collect::<Vec<_>>();
+            let execution = {
+                let mut sessions = jobs
+                    .iter_mut()
+                    .map(|job| &mut job.prepared.session)
+                    .collect::<Vec<_>>();
+                crate::inference::execute_cuda_true_paged_prefill_step(
+                    &mut sessions,
+                    &tokens,
+                    &positions,
+                )
+            };
+            let execution = match execution {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let response = api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_prefill_failed",
+                        error.to_string(),
+                        None,
+                    );
+                    return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+                }
+            };
+            jobs[0].prepared.metrics.record_cuda_batched_prefill(
+                execution.batch_size,
+                execution.shared_projection_launches,
+                execution.batch_elapsed_micros,
+            );
+            shared_micros = shared_micros.saturating_add(execution.batch_elapsed_micros);
+            completed_rounds += 1;
+        }
+
+        for job in &mut *jobs {
+            let state = job.cuda_prefill.as_mut().expect("prefill state retained");
+            state.tokens_done += completed_rounds;
+            state.elapsed_micros = state.elapsed_micros.saturating_add(shared_micros);
+            job.forward_timings.total = job.forward_timings.total.saturating_add(shared_micros);
+            telemetry::emit(telemetry::Event::PrefillProgress {
+                tokens_done: state.tokens_done,
+                tokens_total: state.total_tokens,
+            });
+        }
+
+        for job in &mut *jobs {
+            let state = job.cuda_prefill.expect("prefill state retained");
+            if state.tokens_done != state.total_tokens {
+                continue;
+            }
+            if let Err(error) = job
+                .prepared
+                .session
+                .finalize_resident_paged_prefill_cuda(state.total_tokens)
+            {
+                let response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_prefill_failed",
+                    error.to_string(),
+                    None,
+                );
+                return Some(jobs.iter_mut().map(|job| job.fail(&response)).collect());
+            }
+            let state = job.cuda_prefill.as_mut().expect("prefill state retained");
+            state.finalized = true;
+            job.input.clear();
+            job.input.push(
+                *job.prepared
+                    .token_ids
+                    .last()
+                    .expect("cooperative prefill prompt is non-empty"),
+            );
+        }
+        Some(vec![engine::StepOutcome::Continue; jobs.len()])
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
+        // Preserve the exclusive stream job's test contract: its synthetic initial
+        // delay is observed as live decode work, not as untracked job construction.
+        #[cfg(test)]
+        if let Some(duration) = self.initial_step_delay.take() {
+            std::thread::sleep(duration);
+        }
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        // Preserve the fast single-request pipeline when this is the only active stream.
+        // With contention, consume any already-prepared current graph but do not enqueue
+        // another session-local future graph ahead of the next round-robin participant.
+        self.prepared
+            .session
+            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
+        if let Some(guard) = &self.telemetry_guard {
+            guard.activate();
+        }
+        if self.prepared.cancel.token.is_cancelled() || self.events.is_closed() {
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            return self.finish_clean();
+        }
+        if self
+            .request_timeout
+            .checked_sub(self.generation_started.elapsed())
+            .is_none()
+        {
+            let pending = stop_hold_back_flush(
+                &self.prepared.tokenizer,
+                &self.generated,
+                &self.streamed_text,
+                &self.prepared.stop_sequences,
+            );
+            if !pending.is_empty() {
+                self.streamed_text.push_str(&pending);
+                self.send(StreamDecodeEvent::Delta(pending));
+            }
+            self.send(StreamDecodeEvent::TimedOut {
+                timeout: self.request_timeout,
+                elapsed: self.generation_started.elapsed(),
+                generated_tokens: self.generated.len(),
+            });
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+
+        #[cfg(feature = "cuda")]
+        if let Some(outcome) = self.step_cuda_prefill() {
+            return outcome;
+        }
+
+        let generated_index = self.generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
+        let sampler = self.next_sampler();
+        let spec_eligible = !collect_dense_for_step
+            && self.prepared.logprobs_top_n.is_none()
+            && self.prepared.constraint.is_none()
+            && !self.top_logits.is_empty();
+        let spec_round = match run_speculative_round(
+            &mut self.prepared,
+            &sampler,
+            &self.input,
+            spec_eligible,
+            &mut self.generated,
+            &mut self.history,
+            &mut self.finish_reason,
+            &mut self.forward_timings,
+        ) {
+            Ok(round) => round,
+            Err(response) => return self.fail(&response),
+        };
+        if !matches!(spec_round, SpeculativeRound::Declined) {
+            return self.emit_step();
+        }
+        let greedy_fast = self.input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !self.top_logits.is_empty();
+        let step = match run_stream_step(
+            &mut self.prepared.session,
+            StreamStepRequest {
+                greedy_fast,
+                input: self.input.clone(),
+                sampler,
+                history: self.history.clone(),
+                collect_dense_diagnostics: collect_dense_for_step,
+            },
+        ) {
+            Ok(step) => step,
+            Err(response) => return self.fail(&response),
+        };
+        self.consume_step(step)
+    }
 }
 
-fn cooperative_stream_decode_task(
-    prepared: PreparedGeneration,
-    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
-) -> impl FnMut(engine::CooperativeStepContext) -> engine::StepOutcome + Send + 'static {
-    let mut pending = Some((prepared, events));
-    let mut job: Option<CooperativeStreamDecodeJob> = None;
-    move |context| {
-        if job.is_none() {
-            let (prepared, events) = pending.take().expect("cooperative job initializes once");
-            let Some(initialized) = CooperativeStreamDecodeJob::new(prepared, events) else {
-                return engine::StepOutcome::Complete;
-            };
-            job = Some(initialized);
+struct CooperativeStreamDecodeTask {
+    pending: Option<(
+        PreparedGeneration,
+        tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+        Instant,
+        Duration,
+    )>,
+    job: Option<CooperativeStreamDecodeJob>,
+}
+
+impl CooperativeStreamDecodeTask {
+    fn new(
+        prepared: PreparedGeneration,
+        events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+        generation_started: Instant,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            pending: Some((prepared, events, generation_started, request_timeout)),
+            job: None,
         }
-        job.as_mut().expect("initialized").step(context)
+    }
+
+    fn ensure_initialized(&mut self) {
+        if self.job.is_none() {
+            if let Some((prepared, events, generation_started, request_timeout)) =
+                self.pending.take()
+            {
+                self.job = CooperativeStreamDecodeJob::new_at(
+                    prepared,
+                    events,
+                    generation_started,
+                    request_timeout,
+                );
+            }
+        }
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        self.ensure_initialized();
+        self.job
+            .as_mut()
+            .map_or(engine::StepOutcome::Complete, |job| job.step(context))
+    }
+}
+
+impl engine::BatchableCooperativeJob for CooperativeStreamDecodeTask {
+    fn compatibility_key(&mut self) -> Option<engine::CooperativeBatchKey> {
+        #[cfg(feature = "cuda")]
+        {
+            self.ensure_initialized();
+            self.job.as_ref()?.group_identity().map(|(_, key)| key)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        self.step(context)
+    }
+
+    fn step_pair(
+        &mut self,
+        other: &mut dyn engine::BatchableCooperativeJob,
+        context: engine::CooperativeStepContext,
+    ) -> Option<[engine::StepOutcome; 2]> {
+        #[cfg(feature = "cuda")]
+        {
+            let other = other.as_any_mut().downcast_mut::<Self>()?;
+            self.job.as_mut()?.step_pair(other.job.as_mut()?, context)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (other, context);
+            None
+        }
+    }
+
+    fn step_group(
+        &mut self,
+        others: &mut [&mut dyn engine::BatchableCooperativeJob],
+        context: engine::CooperativeStepContext,
+    ) -> Option<Vec<engine::StepOutcome>> {
+        #[cfg(feature = "cuda")]
+        {
+            if !crate::inference::resident_cuda_true_paged_batch_active() {
+                if others.len() != 1 {
+                    return None;
+                }
+                let other = others[0].as_any_mut().downcast_mut::<Self>()?;
+                return self
+                    .job
+                    .as_mut()?
+                    .step_pair(other.job.as_mut()?, context)
+                    .map(Vec::from);
+            }
+            let mut jobs = Vec::with_capacity(others.len() + 1);
+            jobs.push(self.job.as_mut()?);
+            for other in &mut *others {
+                let other = other.as_any_mut().downcast_mut::<Self>()?;
+                jobs.push(other.job.as_mut()?);
+            }
+            CooperativeStreamDecodeJob::step_paged_group(&mut jobs, context)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (others, context);
+            None
+        }
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn completed_units(&self) -> Option<u64> {
+        self.job
+            .as_ref()
+            .map(|job| job.generated.len().try_into().unwrap_or(u64::MAX))
+    }
+
+    fn prefill_progress(&self) -> Option<(u64, u64)> {
+        #[cfg(feature = "cuda")]
+        {
+            let job = self.job.as_ref()?;
+            if !job.generated.is_empty() {
+                return None;
+            }
+            job.cuda_prefill.map(|prefill| {
+                (
+                    prefill.tokens_done.try_into().unwrap_or(u64::MAX),
+                    prefill.total_tokens.try_into().unwrap_or(u64::MAX),
+                )
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn is_prefill_pending(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.job
+                .as_ref()
+                .and_then(|job| job.cuda_prefill)
+                .is_some_and(|prefill| !prefill.finalized)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
     }
 }
 
@@ -24349,6 +25383,11 @@ fn stream_completion(
     include_usage: bool,
     stream_tool_calls: Option<tool_envelope::ToolParameterNames>,
 ) -> Response {
+    let generation_started = Instant::now();
+    let request_timeout = match generation_timeout_duration() {
+        Ok(timeout) => timeout,
+        Err(response) => return *response,
+    };
     // Streaming keeps whatever speculation `prepare_generation` admitted, and
     // with it that call's resident-path decision. Forcing both off here meant a
     // spec-enabled server never speculated for streaming clients — i.e. never
@@ -24389,11 +25428,18 @@ fn stream_completion(
     // resident engine (and its on-GPU KV cache) is a PROCESS-GLOBAL slot keyed
     // by model id — two sessions of the same model would share one KV cache and
     // interleave each other's history. Keep those runs run-to-completion.
-    let task = if state.engine.continuous_batch_slots() > 1
-        && !crate::inference::resident_decode_cuda_active()
-    {
-        let job = cooperative_stream_decode_task(prepared, events_tx);
-        engine::EngineTask::Cooperative(Box::new(job))
+    let cuda_multi_sequence = crate::inference::resident_cuda_multi_sequence_active();
+    if cuda_multi_sequence && !prepared.session.supports_cuda_multi_sequence_kv() {
+        prepared.session.set_resident_paths_disabled(true);
+    }
+    let task = if state.engine.total_slots() > 1 {
+        let job = CooperativeStreamDecodeTask::new(
+            prepared,
+            events_tx,
+            generation_started,
+            request_timeout,
+        );
+        engine::EngineTask::BatchableCooperative(Box::new(job))
     } else {
         engine::EngineTask::Exclusive(Box::new(move || {
             run_stream_decode_job(prepared, events_tx);
@@ -24409,6 +25455,11 @@ fn stream_completion(
         // detached from the engine's serialization.
         let _cancel_on_drop = CancelOnDrop(cancel_token);
         let stream_started = Instant::now();
+        let mut request_deadline = generation_started
+            .checked_add(request_timeout)
+            .map(tokio::time::Instant::from_std)
+            .map(tokio::time::sleep_until)
+            .map(Box::pin);
         let mut stream_event_timings = StreamEventTimings {
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
@@ -24444,8 +25495,31 @@ fn stream_completion(
         }
         stream_event_timings.generate_start = Some(stream_started.elapsed().as_millis());
 
-        while let Some(event) = events_rx.recv().await {
+        loop {
+            let event = if let Some(deadline) = request_deadline.as_mut() {
+                tokio::select! {
+                    _ = deadline.as_mut() => {
+                        _cancel_on_drop.0.cancel();
+                        yield generation_timeout_stream_event(
+                            request_timeout,
+                            generation_started.elapsed(),
+                            0,
+                        );
+                        yield Ok(Event::default().data("[DONE]"));
+                        return;
+                    }
+                    event = events_rx.recv() => event,
+                }
+            } else {
+                events_rx.recv().await
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
+                StreamDecodeEvent::Started => {
+                    request_deadline = None;
+                }
                 StreamDecodeEvent::Delta(delta) => {
                     if stream_event_timings.first_content_yield.is_none() {
                         stream_event_timings.first_content_yield =
@@ -27238,6 +28312,84 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cooperative_cuda_prefill_policy_is_default_off_and_chunk_bounded() {
+        let _env_guard = crate::test_support::env_lock();
+        env::remove_var(CUDA_COOPERATIVE_PREFILL_ENV);
+        env::remove_var(CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV);
+        assert_eq!(CooperativeCudaPrefill::from_env(96, false), None);
+
+        env::set_var(CUDA_COOPERATIVE_PREFILL_ENV, "1");
+        assert_eq!(
+            CooperativeCudaPrefill::from_env(257, false),
+            None,
+            "256 prefill tokens fit one chunk and must retain the monolithic path"
+        );
+        let state = CooperativeCudaPrefill::from_env(258, false).expect("two chunks required");
+        assert_eq!(state.total_tokens, 257);
+        assert_eq!(
+            state.chunk_tokens,
+            DEFAULT_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS
+        );
+        assert!(!state.started);
+        assert!(!state.finalized);
+        assert_eq!(
+            CooperativeCudaPrefill::from_env(300, true),
+            None,
+            "dense diagnostics retain their unchanged monolithic path"
+        );
+
+        env::set_var(CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV, "17");
+        assert_eq!(
+            CooperativeCudaPrefill::from_env(36, false)
+                .expect("35 tokens need three chunks")
+                .chunk_tokens,
+            17
+        );
+        for invalid in ["0", "not-a-number"] {
+            env::set_var(CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV, invalid);
+            assert_eq!(
+                CooperativeCudaPrefill::from_env(300, false)
+                    .expect("default chunk policy")
+                    .chunk_tokens,
+                DEFAULT_CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS
+            );
+        }
+
+        env::remove_var(CUDA_COOPERATIVE_PREFILL_CHUNK_TOKENS_ENV);
+        env::remove_var(CUDA_COOPERATIVE_PREFILL_ENV);
+    }
+
+    #[test]
+    fn phase7_batched_prefill_solo_work_yields_after_one_token() {
+        assert_eq!(cuda_scalar_prefill_step_tokens(256, false), 256);
+        assert_eq!(cuda_scalar_prefill_step_tokens(256, true), 1);
+        assert_eq!(cuda_scalar_prefill_step_tokens(16, true), 1);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_true_batch2_scalar_fallback_is_limited_to_pre_dispatch_refusals() {
+        use crate::inference::CudaTrueBatch2ContractError as Error;
+
+        for error in [
+            Error::Disabled,
+            Error::DuplicateSequence(1),
+            Error::IncompatibleRows,
+            Error::MissingLease(2),
+            Error::CancelledBeforeDispatch(3),
+        ] {
+            assert!(cuda_true_batch2_scalar_fallback_safe(&error), "{error}");
+        }
+        for error in [
+            Error::EngineUnavailable,
+            Error::Backend("runtime".to_string()),
+        ] {
+            assert!(!cuda_true_batch2_scalar_fallback_safe(&error), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn runtime_memory_reports_empty_state_and_purge_is_idempotent() {
         let state = AppState::default();
@@ -27250,6 +28402,44 @@ mod tests {
         let Json(purged) = purge_kv_cache(State(state)).await;
         assert_eq!(purged.purged_entries, 0);
         assert_eq!(purged.released_bytes_estimate, 0);
+    }
+
+    #[tokio::test]
+    async fn phase9_read_only_surfaces_expose_cuda_resident_arena() {
+        let state = AppState::default();
+        let health = serde_json::to_value(busy_health_response(&state)).unwrap();
+        let props = llama_server_props(
+            State(state.clone()),
+            Query(LlamaServerReadOnlyQuery {
+                unsupported_fields: HashMap::new(),
+            }),
+        )
+        .await;
+        let props: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(props.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let slots = llama_server_slots(
+            State(state),
+            Query(LlamaServerSlotsQuery {
+                fail_on_no_slot: None,
+                unsupported_fields: HashMap::new(),
+            }),
+        )
+        .await;
+        let slots: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(slots.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = &health["cuda_resident_arena"];
+        assert_eq!(&props["camelid"]["cuda_resident_arena"], expected);
+        for slot in slots.as_array().expect("slots response is an array") {
+            assert_eq!(&slot["camelid"]["cuda_resident_arena"], expected);
+        }
     }
 
     #[test]
@@ -27657,6 +28847,83 @@ mod tests {
         drain_decode_probe().await;
         std::env::remove_var(GENERATION_TIMEOUT_ENV);
         assert_no_orphan_overlap(observed, "P0-T2 generation timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn phase7_stream_deadline_cancels_a_request_while_it_is_still_queued() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "1");
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "100");
+        let state = AppState::default();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        state
+            .engine
+            .post(engine::EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking engine owner starts");
+
+        let prepared = orphan_test_prepared("queued-timeout.gguf");
+        let cancel = prepared.cancel.token.clone();
+        let response = stream_completion(&state, prepared, true, false, None);
+        let started = Instant::now();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("queued SSE deadline must fire")
+        .expect("read queued timeout response");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("generation_timeout"), "{body}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            cancel.is_cancelled(),
+            "timed-out queued work must be cancelled"
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.engine.depth() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled queued job did not drain"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[tokio::test]
+    async fn phase7_no_available_slot_refusal_includes_retry_after() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        let response = llama_server_slots(
+            State(AppState::default()),
+            Query(LlamaServerSlotsQuery {
+                fail_on_no_slot: Some("1".to_string()),
+                unsupported_fields: HashMap::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     /// P0-T1 — client disconnect mid non-streaming request: hyper drops the
@@ -28854,8 +30121,8 @@ mod tests {
             .iter()
             .map(|item| (item.project, item))
             .collect();
-        assert_eq!(projects.len(), 7);
-        for project in [2u32, 3, 4, 5, 6, 7, 8] {
+        assert_eq!(projects.len(), 8);
+        for project in [2u32, 3, 4, 5, 6, 7, 8, 9] {
             let item = projects
                 .get(&project)
                 .unwrap_or_else(|| panic!("project {project} missing"));
@@ -28879,6 +30146,14 @@ mod tests {
         assert!(
             projects[&8].default_enabled,
             "production server guardrails are active by default"
+        );
+        assert_eq!(
+            projects[&9].id, "cuda-continuous-batching-residency",
+            "project 9 must remain separate from model support rows"
+        );
+        assert!(
+            !projects[&9].default_enabled,
+            "CUDA batching and two-model residency remain explicit opt-ins"
         );
     }
 

@@ -141,6 +141,35 @@
         "api::metrics::tests::exposition_is_prometheus_text_and_has_no_model_or_secret_labels"
       ],
       "safety_contract": "Loopback stays frictionless. Non-loopback binds require authentication unless an explicit unsafe override is set; CORS is exact-origin only, secrets are redacted, TLS inputs are paired, and request/token/download ceilings are enforced."
+    },
+    {
+      "id": "cuda-continuous-batching-residency",
+      "project": 9,
+      "status": "implemented_explicit_opt_in_exact_envelope",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_CUDA_SEQUENCE_SLOTS=1|2|4|8",
+        "CAMELID_CUDA_PAGED_KV=1",
+        "CAMELID_CUDA_TRUE_BATCH=1",
+        "CAMELID_CUDA_BATCHED_PREFILL=1",
+        "CAMELID_CUDA_BATCHED_PREFILL_ROUND_TOKENS=1|4|16",
+        "CAMELID_CUDA_RESIDENT_MODELS=1|2",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT"
+      ],
+      "dependencies": [
+        "runtime-capability-registry",
+        "unified-kv-sequence-pool",
+        "continuous-batch-scheduler"
+      ],
+      "evidence": [
+        "inference::cuda_resident_arena::tests::phase8_active_models_are_never_evicted_and_full_active_arena_is_unchanged",
+        "inference::cuda_resident_arena::tests::phase8_idle_lru_is_deterministic_and_reuse_refreshes_recency",
+        "inference::tests::phase7_real_model_batch8_decode_product_gate",
+        "api::tests::runtime_memory_reports_empty_state_and_purge_is_idempotent",
+        "frontend/scripts/arena-residency-browser-smoke.mjs",
+        "qa/evidence-bundles/f1-phase9-rollout/manifest.json"
+      ],
+      "safety_contract": "One engine thread remains the sole resident-GPU mutation owner. Sequence leases isolate paged KV; failed reservations are mutation-free; active models are never evicted; idle eviction is deterministic LRU; model identity binds model id plus exact GGUF SHA-256; per-model unload rechecks activity before registry mutation. Defaults retain one CUDA sequence and one resident main model unless the documented flags explicitly promote the validated envelope."
     }
   ]
 }

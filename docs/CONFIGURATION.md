@@ -49,6 +49,15 @@ target/release/camelid serve --model /path/to/model.gguf
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
 
+### CUDA continuous batching and model residency
+
+CUDA multi-sequence batching and two-main-model residency are explicit opt-ins. Defaults remain
+one CUDA sequence and one resident main model. The accepted values, dependency gates,
+observability fields, exact validated hardware/model envelope, and rollback commands are in
+[`CUDA_CONTINUOUS_BATCHING.md`](CUDA_CONTINUOUS_BATCHING.md). Do not infer broader model or
+hardware support from these runtime controls; [`COMPATIBILITY.md`](../COMPATIBILITY.md) remains
+the support ledger.
+
 ### Prompt-prefix cache: partial hits on the Metal lane
 
 A partial prompt-prefix-cache hit resumes a cached session at a non-zero KV position, and

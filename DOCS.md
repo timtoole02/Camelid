@@ -32,6 +32,7 @@ Read these first:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution and validation guidance
 - [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) — shortest safe local contributor path
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — current toolchain, env-var, and path guidance
+- [`docs/CUDA_CONTINUOUS_BATCHING.md`](docs/CUDA_CONTINUOUS_BATCHING.md) — explicit-opt-in CUDA sequence batching, two-model residency, observability, and rollback
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change class
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices

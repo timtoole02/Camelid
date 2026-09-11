@@ -673,6 +673,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       // ceiling. A server that sends it stays authoritative either way.
       vision_token_allowance: Number(health?.vision_token_allowance) || null,
       q8_runtime: health?.q8_runtime || null,
+      cuda_resident_arena: health?.cuda_resident_arena || null,
       // Required for lane-scoped support truth. All Gemma 4 serve variants use
       // backend="gemma4-runtime"; this discriminator plus projected Ghost
       // component/marker health identifies the supported Windows CUDA lane.

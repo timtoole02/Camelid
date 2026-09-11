@@ -340,6 +340,7 @@ assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System vie
 assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'the curl example must use the loaded backend model id for alias-selected rows')
 assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
 assert.match(dashboardHookSource, /\.\.\.executionRuntimeFields\(health\)/, 'dashboard runtime state should use the tested health execution-field mapper')
+assert.match(dashboardHookSource, /cuda_resident_arena:\s*health\?\.cuda_resident_arena \|\| null/, 'dashboard runtime must project CUDA arena health without inventing state for older backends')
 assert.match(systemViewSource, /describeExecutionPlan\(runtime\)/, 'System execution copy should come only from the health-derived runtime snapshot')
 assert.doesNotMatch(systemViewSource, /GPU acceleration remains future work|local CPU generation path today/, 'System must not retain static backend execution claims')
 assert.match(executionPlanSource, /CUDA_BACKENDS\.has\(selectedBackend\)[\s\S]*METAL_BACKENDS\.has\(selectedBackend\)/, 'execution-plan presenter should classify only explicitly known CUDA and Metal backends')

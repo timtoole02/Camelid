@@ -13,6 +13,9 @@ export function RuntimeMemoryPanel({ apiBase }) {
   const { memory, loading, purging, error, notice, refresh, purge, clearNotice } = useRuntimeMemory(apiBase)
   const modelCount = memory?.models?.length || 0
   const cacheEntries = Number(memory?.kv_cache_entries || 0)
+  const residentArena = memory?.cuda_resident_arena
+  const residentCount = Number(residentArena?.resident_models || 0)
+  const activeResidentCount = Number(residentArena?.active_models || 0)
 
   return (
     <section className="cxv-card cxv-panel a-memory">
@@ -64,6 +67,11 @@ export function RuntimeMemoryPanel({ apiBase }) {
           <strong>{memoryValue(memory?.kv_cache_bytes, loading)}</strong>
           <small>{cacheEntries} of {memory?.kv_cache_capacity || 0} retained entries</small>
         </div>
+        <div className="cxv-stat">
+          <span>CUDA residency</span>
+          <strong>{residentArena ? `${residentCount} / ${residentArena.capacity_models}` : '—'}</strong>
+          <small>{residentArena ? `${activeResidentCount} active · ${residentArena.evictions || 0} evictions` : 'not reported by this backend'}</small>
+        </div>
       </div>
 
       <div className="a-memory__models">
@@ -77,6 +85,8 @@ export function RuntimeMemoryPanel({ apiBase }) {
               <IconMemory size={16} />
               <strong title={model.id}>{model.id}</strong>
               {model.active ? <span className="cxv-tag cxv-tag--ready">Active</span> : null}
+              {model.cuda_resident ? <span className="cxv-tag cxv-tag--accent">GPU resident</span> : null}
+              {model.cuda_active ? <span className="cxv-tag cxv-tag--warn">GPU busy</span> : null}
             </div>
             <div className="a-memory__model-metrics">
               <span><small>Weights</small><strong>{formatBytes(model.weight_bytes_estimate)}</strong></span>

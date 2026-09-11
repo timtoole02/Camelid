@@ -11,6 +11,8 @@ pub const ENGINE_QUEUE_DEPTH_ENV: &str = "CAMELID_QUEUE_DEPTH";
 pub const NGRAM_INDEX_MAX_ENTRIES_ENV: &str = "CAMELID_NGRAM_INDEX_MAX_ENTRIES";
 pub const KV_POOL_BUDGET_BYTES_ENV: &str = "CAMELID_KV_POOL_BUDGET_BYTES";
 pub const CONTINUOUS_BATCH_SLOTS_ENV: &str = "CAMELID_CONTINUOUS_BATCH_SLOTS";
+pub const CUDA_SEQUENCE_SLOTS_ENV: &str = "CAMELID_CUDA_SEQUENCE_SLOTS";
+pub const CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV: &str = "CAMELID_CUDA_BATCHED_PREFILL_ROUND_TOKENS";
 pub const KQUANT_PREFILL_OWNER_ENV: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
 pub const MOE_EXPERT_STORAGE_ENV: &str = "CAMELID_MOE_EXPERT_STORAGE";
 pub const MIXTRAL_LONG_GENERATION_ENV: &str = "CAMELID_MIXTRAL_LONG_GENERATION";
@@ -100,6 +102,30 @@ pub fn continuous_batch_slots() -> usize {
     RuntimeConfig::from_env().continuous_batch_slots
 }
 
+pub fn cuda_sequence_slots_override() -> Option<usize> {
+    env::var(CUDA_SEQUENCE_SLOTS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| matches!(value, 1 | 2 | 4 | 8))
+}
+
+pub fn cuda_sequence_capacity(legacy_two_slots: bool, paged_kv: bool) -> usize {
+    let requested = cuda_sequence_slots_override().unwrap_or(if legacy_two_slots { 2 } else { 1 });
+    if requested > 2 && !paged_kv {
+        1
+    } else {
+        requested
+    }
+}
+
+pub fn cuda_batched_prefill_round_tokens() -> usize {
+    env::var(CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| matches!(value, 1 | 4 | 16))
+        .unwrap_or(16)
+}
+
 pub fn kquant_prefill_owner_enabled() -> bool {
     RuntimeConfig::from_env().kquant_prefill_owner
 }
@@ -181,6 +207,66 @@ fn kquant_prefill_owner_default() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase7_cuda_sequence_slots_accept_only_promoted_capacities() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var(CUDA_SEQUENCE_SLOTS_ENV);
+        assert_eq!(cuda_sequence_slots_override(), None);
+
+        for capacity in [1usize, 2, 4, 8] {
+            env::set_var(CUDA_SEQUENCE_SLOTS_ENV, capacity.to_string());
+            assert_eq!(cuda_sequence_slots_override(), Some(capacity));
+        }
+        for invalid in ["0", "3", "5", "9", "256", "not-a-number", ""] {
+            env::set_var(CUDA_SEQUENCE_SLOTS_ENV, invalid);
+            assert_eq!(
+                cuda_sequence_slots_override(),
+                None,
+                "{invalid:?} must fail closed"
+            );
+        }
+        env::remove_var(CUDA_SEQUENCE_SLOTS_ENV);
+    }
+
+    #[test]
+    fn phase7_cuda_sequence_capacity_preserves_legacy_and_requires_paging_above_two() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var(CUDA_SEQUENCE_SLOTS_ENV);
+        assert_eq!(cuda_sequence_capacity(false, false), 1);
+        assert_eq!(cuda_sequence_capacity(true, false), 2);
+
+        env::set_var(CUDA_SEQUENCE_SLOTS_ENV, "1");
+        assert_eq!(cuda_sequence_capacity(true, true), 1);
+        env::set_var(CUDA_SEQUENCE_SLOTS_ENV, "2");
+        assert_eq!(cuda_sequence_capacity(false, false), 2);
+        env::set_var(CUDA_SEQUENCE_SLOTS_ENV, "4");
+        assert_eq!(cuda_sequence_capacity(false, false), 1);
+        assert_eq!(cuda_sequence_capacity(false, true), 4);
+        env::set_var(CUDA_SEQUENCE_SLOTS_ENV, "8");
+        assert_eq!(cuda_sequence_capacity(false, true), 8);
+
+        env::set_var(CUDA_SEQUENCE_SLOTS_ENV, "invalid");
+        assert_eq!(cuda_sequence_capacity(true, true), 2);
+        assert_eq!(cuda_sequence_capacity(false, true), 1);
+        env::remove_var(CUDA_SEQUENCE_SLOTS_ENV);
+    }
+
+    #[test]
+    fn phase7_batched_prefill_quantum_accepts_only_preregistered_values() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var(CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV);
+        assert_eq!(cuda_batched_prefill_round_tokens(), 16);
+        for candidate in [1usize, 4, 16] {
+            env::set_var(CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV, candidate.to_string());
+            assert_eq!(cuda_batched_prefill_round_tokens(), candidate);
+        }
+        for invalid in ["0", "2", "8", "17", "invalid"] {
+            env::set_var(CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV, invalid);
+            assert_eq!(cuda_batched_prefill_round_tokens(), 16);
+        }
+        env::remove_var(CUDA_BATCHED_PREFILL_ROUND_TOKENS_ENV);
+    }
 
     #[test]
     fn invalid_and_out_of_range_values_fail_closed() {

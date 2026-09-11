@@ -66,6 +66,7 @@ export async function loadLocalModelForChat({
   readActiveFilename = null,
   model = null,
   force = false,
+  preserveLoadedModels = false,
 } = {}) {
   const base = String(apiBase || '').replace(/\/$/, '')
   /* A models-relative path, NOT the engine's absolute models_dir joined with '/'.
@@ -125,7 +126,7 @@ export async function loadLocalModelForChat({
       body: JSON.stringify({
         id: requestModelId,
         path,
-        replace: !embeddingModel,
+        replace: !embeddingModel && !preserveLoadedModels,
         set_active: !embeddingModel,
         // Omitted rather than sent as false: the default request stays the shape
         // every existing server already accepts.
