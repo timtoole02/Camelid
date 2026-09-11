@@ -1668,8 +1668,8 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
             }
         }
         match &side.weights_check {
-            Some(WeightsCheck::Enforced { expected }) => say!(
-                "   every run was bound to GGUF file sha256 {expected}, and the engine served them"
+            Some(WeightsCheck::Unconfirmed { expected }) => say!(
+                "   every run was bound to GGUF file sha256 {expected} and served; the engine did not confirm it checked, so this shows nothing about its weights"
             ),
             Some(WeightsCheck::Refused { expected, detail }) => say!(
                 "   REFUSED a run bound to GGUF file sha256 {expected}: its loaded file is other bytes ({detail})"

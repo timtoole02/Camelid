@@ -223,6 +223,36 @@ each restored and verified by SHA-256; every named check failed (receipt:
 | D44 | a buffered answer to a stream is re-placed on any 503 | `an_untyped_refusal_of_a_stream_is_relayed_once_not_re_placed` |
 | D45 | the mixed-mode model-less rule applied in every mode | `a_camelid_only_fabric_decides_exactly_as_before` |
 
+Review follow-up: the spec rows the P5 pass left unrun, and the guards this review added (R1–R3).
+Run on the M4 node against this branch's tree, one edit per row — except D14, whose behaviour needs
+both the queue-full code check and the trust gate removed, so it carries two. Every named check
+failed, every file was restored and verified by SHA-256 (9 files, all pristine at the end):
+
+| # | Sabotage | Caught by |
+|---|---|---|
+| D14 | re-place any 5xx, from any engine (the queue-full code check and the `typed_backpressure` gate both removed) | `a_foreign_node_s_untyped_503_is_relayed_once_and_names_its_engine`, `a_refusal_that_is_not_backpressure_is_relayed_untouched` |
+| D16 | `serves()` matches installed models without checking `loads_on_demand` | `an_installed_model_on_an_engine_whose_loading_is_unprobed_is_not_matched` |
+| D17 | the probe reads a failed `/api/ps` as an empty list (`unwrap_or_default`) | `a_node_whose_running_models_cannot_be_read_still_serves` |
+| D19 | `node_detail` `placeable` uses `is_placeable()` rather than `is_placeable_under(mixed)` | `health_under_mixed_mode_reports_the_mode_the_nodes_it_accepts_and_their_consequences` |
+| D22 | count unadmitted ready nodes as unobserved again | `a_model_only_an_unplaced_engine_holds_is_refused_as_settled_and_names_it` |
+| D23a | `forward_error` omits `x-camelid-fabric-engine` | `every_answer_through_a_mixed_proxy_names_its_engine`, `a_failure_through_a_camelid_only_proxy_carries_its_node_and_engine_and_nothing_else` |
+| D23b | the buffered path looks the engine up in `fabric.specs()` by label after the failure | `a_failure_names_the_engine_that_was_sent_the_request_even_if_the_file_changed` |
+| D24 | `COLD_LOAD_COST` set to 0 | `a_resident_holder_outranks_a_cold_one_at_equal_load` |
+| D25 | `tag()` omits `x-camelid-fabric-model-identity` | `an_answer_resting_on_a_declared_alias_says_so_and_one_that_does_not_does_not` |
+| D26 | `placement_blocker_keys()` reversed | `each_blocker_key_names_the_capability_that_produced_its_string` |
+| D27 | `held_by_unplaced` dropped from the `ModelUnavailable` Display | `a_model_only_an_unplaced_engine_holds_is_refused_as_settled_and_names_it` |
+| D31 | `route_error` uses Display regardless of `disclose` | `an_exposed_listener_refuses_without_naming_engine_versions` |
+| D32 | `tag()` always emits `x-camelid-fabric-model` | `a_camelid_only_proxy_serves_a_tool_calling_request_exactly_as_before`, `a_camelid_only_answer_carries_no_new_header` |
+| D34 | `x-camelid-fabric-residency-observed: resident` sent for `Unknown` | `residency_is_reported_as_observed_and_absent_when_unknown` |
+| D35 | model-less requests admit every ready node under mixed mode | `a_request_naming_no_model_is_placed_only_where_the_model_it_will_get_is_known` |
+| D36 | `server.rs` `model()` calls the free `route()`, which never sees the aliases | `an_aliased_model_is_retrievable_and_listed_exactly_when_it_would_be_placed` |
+| D37 | the `foreign_additions` call removed from the node-set reload | `a_foreign_node_added_under_mixed_mode_is_announced`, `a_foreign_node_added_while_mixed_is_announced_in_health` |
+| D38 | the Camelid `rerank_route` detail says rerank is supported | `a_route_existing_is_not_the_model_supporting_it` |
+| D38b | Ollama credited with a rerank route | `a_rerank_request_never_lands_on_an_engine_without_the_route` |
+| R1 | `shared_weights_digest` lets an unconfirmed binding vouch again | `a_served_binding_vouches_for_nothing_when_its_side_published_no_digest`, `a_node_that_served_a_binding_but_published_no_digest_is_not_verified_by_it` |
+| R2 | `engine_and_version` says "version not published" for every node without a version | `a_node_that_was_not_reached_has_an_unknown_version_not_an_unpublished_one`, `health_calls_an_unreached_nodes_version_unknown_never_unpublished` |
+| R3 | the unplaced holders are not filtered by what the request needs | `a_holder_the_flag_would_still_refuse_is_never_offered_the_flag` |
+
 **Any new guard in P4/P5/P7 needs the same treatment.**
 
 ### 5.3 Receipts — against real software, not stubs

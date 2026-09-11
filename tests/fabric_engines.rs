@@ -1186,7 +1186,8 @@ fn a_camelid_side_is_never_bound_to_a_digest_another_engine_published() {
 }
 
 /// C4. Two Camelid nodes each publish the digest of the file they loaded, so
-/// each is bound to the other's on every run and the engines check it.
+/// each is bound to the other's on every run. Served, that binding is
+/// recorded as unconfirmed; the two published digests are what verify.
 #[test]
 fn a_camelid_side_is_bound_to_another_camelid_nodes_loaded_file_digest() {
     use camelid::fabric::{ModelIdentity, SamplingPlan, WeightsCheck};
@@ -1204,7 +1205,7 @@ fn a_camelid_side_is_bound_to_another_camelid_nodes_loaded_file_digest() {
     for (side, node) in [(&comparison.left, &win), (&comparison.right, &mac)] {
         assert_eq!(
             side.weights_check,
-            Some(WeightsCheck::Enforced {
+            Some(WeightsCheck::Unconfirmed {
                 expected: GGUF_SHA256.to_string()
             }),
             "{}",
@@ -1220,6 +1221,45 @@ fn a_camelid_side_is_bound_to_another_camelid_nodes_loaded_file_digest() {
             );
         }
     }
+}
+
+/// C4. A Camelid build from before the binding ignores it and serves
+/// whatever it loaded, and this stub does exactly that. When such a node's
+/// own listing could not be read, the digest it was bound to must not vouch
+/// for it: identity stays resting on the name.
+#[test]
+fn a_node_that_served_a_binding_but_published_no_digest_is_not_verified_by_it() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan, WeightsCheck, WeightsDigest};
+
+    let new = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let old = StubEngine::start(camelid_answering(None));
+    let fabric = Fabric::new(vec![new.spec("new", "camelid"), old.spec("old", "camelid")])
+        .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("new", "old", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+
+    assert!(matches!(
+        comparison.right.weights_digest,
+        WeightsDigest::Unavailable { .. }
+    ));
+    assert_eq!(
+        comparison.right.weights_check,
+        Some(WeightsCheck::Unconfirmed {
+            expected: GGUF_SHA256.to_string()
+        })
+    );
+    let runs = run_bodies(&old, "q");
+    assert!(!runs.is_empty());
+    assert!(runs
+        .iter()
+        .all(|body| body["camelid_expected_gguf_sha256"] == GGUF_SHA256));
+    assert_eq!(comparison.model_identity, ModelIdentity::SameId);
+    assert_eq!(
+        camelid::fabric::shared_weights_digest(&comparison.left, &comparison.right),
+        None
+    );
 }
 
 /// C2. Every run of a side after its first follows one short unrelated

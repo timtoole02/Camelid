@@ -895,6 +895,68 @@ pub(crate) fn route_reserved_with_estimates(
     )
 }
 
+/// The refusal for a request whose model only ready nodes this fabric does
+/// not place on hold, or `None` when no such node holds it.
+///
+/// The flag is named only when it would help. A holder that could not do
+/// what the request needs would refuse it again under the flag, and pointing
+/// an operator at a standing grant for that is advice that cannot work; the
+/// refusal is then the one the flag would give, naming what each holder
+/// lacks.
+fn refused_for_unplaced_holders<'a>(
+    snapshots: &[NodeSnapshot],
+    admitted_nodes: &[&NodeSnapshot],
+    request: &RouteRequest<'a>,
+    model: &'a str,
+    serving: Vec<String>,
+    unobserved: usize,
+) -> Option<RouteError> {
+    let holders: Vec<&NodeSnapshot> = snapshots
+        .iter()
+        .filter(|s| s.status.is_ready() && !admitted(s, request))
+        .filter(|s| serves(s, local_id(request, s.label(), model).0).is_some())
+        .collect();
+    if holders.is_empty() {
+        return None;
+    }
+    let mut would_take_it: Vec<String> = holders
+        .iter()
+        .filter(|s| meets(&s.capabilities(), request.requires).is_ok())
+        .map(|s| s.label().to_string())
+        .collect();
+    if !would_take_it.is_empty() {
+        would_take_it.sort();
+        return Some(RouteError::ModelUnavailable {
+            model: model.to_string(),
+            serving,
+            unobserved,
+            held_by_unplaced: would_take_it,
+        });
+    }
+    let requirement = holders
+        .iter()
+        .find_map(|s| meets(&s.capabilities(), request.requires).err())
+        .unwrap_or("tool_calls");
+    let mut unmet: Vec<(String, String)> = holders
+        .iter()
+        .map(|s| (s.label().to_string(), s.engine_and_version()))
+        .collect();
+    unmet.sort();
+    let mut capable_elsewhere: Vec<String> = admitted_nodes
+        .iter()
+        .filter(|s| meets(&s.capabilities(), request.requires).is_ok())
+        .map(|s| s.label().to_string())
+        .collect();
+    capable_elsewhere.sort();
+    Some(RouteError::RequirementUnmet {
+        requirement,
+        model: Some(model.to_string()),
+        unmet,
+        capable_elsewhere,
+        unobserved,
+    })
+}
+
 fn route_reserved_with_estimates_at(
     snapshots: &[NodeSnapshot],
     request: &RouteRequest<'_>,
@@ -917,20 +979,16 @@ fn route_reserved_with_estimates_at(
         // the operator's flag, and "no node can serve" would say nothing
         // about which node holds it or why it was not used.
         if let Some(model) = request.model {
-            let mut held_by_unplaced: Vec<String> = snapshots
-                .iter()
-                .filter(|s| s.status.is_ready())
-                .filter(|s| serves(s, local_id(request, s.label(), model).0).is_some())
-                .map(|s| s.label().to_string())
-                .collect();
-            if !held_by_unplaced.is_empty() {
-                held_by_unplaced.sort();
-                return Err(RouteError::ModelUnavailable {
-                    model: model.to_string(),
-                    serving: Vec::new(),
-                    unobserved: snapshots.iter().filter(|s| !s.status.is_ready()).count(),
-                    held_by_unplaced,
-                });
+            let unobserved = snapshots.iter().filter(|s| !s.status.is_ready()).count();
+            if let Some(refusal) = refused_for_unplaced_holders(
+                snapshots,
+                &admitted_nodes,
+                request,
+                model,
+                Vec::new(),
+                unobserved,
+            ) {
+                return Err(refusal);
             }
         }
         let unreachable = snapshots
@@ -978,18 +1036,21 @@ fn route_reserved_with_estimates_at(
                     .collect();
                 serving.sort();
                 serving.dedup();
-                let mut held_by_unplaced: Vec<String> = snapshots
-                    .iter()
-                    .filter(|s| s.status.is_ready() && !admitted(s, request))
-                    .filter(|s| serves(s, local_id(request, s.label(), model).0).is_some())
-                    .map(|s| s.label().to_string())
-                    .collect();
-                held_by_unplaced.sort();
-                return Err(RouteError::ModelUnavailable {
-                    model: model.to_string(),
-                    serving,
+                return Err(match refused_for_unplaced_holders(
+                    snapshots,
+                    &admitted_nodes,
+                    request,
+                    model,
+                    serving.clone(),
                     unobserved,
-                    held_by_unplaced,
+                ) {
+                    Some(refusal) => refusal,
+                    None => RouteError::ModelUnavailable {
+                        model: model.to_string(),
+                        serving,
+                        unobserved,
+                        held_by_unplaced: Vec::new(),
+                    },
                 });
             }
             matched
@@ -2656,6 +2717,61 @@ mod tests {
             public.contains("no ready node is serving model `x`"),
             "{public}"
         );
+    }
+
+    /// The flag is named only where it would help. A holder that could not
+    /// take the request under the flag either — tools, on an engine nobody
+    /// measured — would refuse it again, so sending an operator to widen
+    /// trust for it is advice that cannot work. The refusal is the one the
+    /// flag would give.
+    #[test]
+    fn a_holder_the_flag_would_still_refuse_is_never_offered_the_flag() {
+        for nodes in [
+            vec![
+                ready("a-camelid", Some("a"), 0),
+                foreign("b-ollama", NodeEngine::Ollama, "x"),
+            ],
+            vec![foreign("b-ollama", NodeEngine::Ollama, "x")],
+        ] {
+            let asking = RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("x"))
+                .requiring(tools());
+            let refused = route(&nodes, &asking).expect_err("no measured holder");
+            let message = refused.to_string();
+            assert!(!message.contains(MIXED_ENGINES_FLAG), "{message}");
+            assert!(message.contains("b-ollama"), "{message}");
+            assert!(
+                matches!(
+                    refused,
+                    RouteError::RequirementUnmet {
+                        requirement: "tool_calls",
+                        unobserved: 0,
+                        ..
+                    }
+                ),
+                "{refused:?}"
+            );
+
+            let mixed = route(&nodes, &asking.with_mixed_engines(MIXED)).expect_err("unmeasured");
+            assert!(
+                matches!(
+                    mixed,
+                    RouteError::RequirementUnmet {
+                        requirement: "tool_calls",
+                        ..
+                    }
+                ),
+                "the flag gives the same refusal: {mixed:?}"
+            );
+
+            // Without tools the flag would help, and it is still named.
+            let plain = route(
+                &nodes,
+                &RouteRequest::new(RouteMode::Throughput).with_model(Some("x")),
+            )
+            .expect_err("placed only under the flag");
+            assert!(plain.to_string().contains(MIXED_ENGINES_FLAG), "{plain}");
+        }
     }
 
     #[test]

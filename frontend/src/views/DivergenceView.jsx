@@ -226,9 +226,10 @@ function Weights({ side }) {
         {!digest.kind && digest.reported && <Unknown why="The proxy sent a weights-digest kind this build does not recognise." />}
         {!digest.reported && <Unknown why="This proxy predates weights digests, so it read none.">weights digest not reported</Unknown>}
       </p>
-      {check?.kind === 'enforced' && (
-        <p className="divergence-side__runtime" data-testid={`${testid}-check`} data-check="enforced">
-          Every run was bound to sha256 <code>{check.expected}</code>, and the engine served them.
+      {check?.kind === 'unconfirmed' && (
+        <p className="divergence-side__runtime" data-testid={`${testid}-check`} data-check="unconfirmed">
+          Every run was bound to sha256 <code>{check.expected}</code> and served. The engine did not
+          confirm it checked, so this shows nothing about its weights.
         </p>
       )}
       {check?.kind === 'refused' && (

@@ -32,6 +32,16 @@ function boolOrNull(value) {
   return typeof value === 'boolean' ? value : null
 }
 
+/* The spelling a long flag takes. The flag is quoted into a command an
+   operator is invited to paste, and the proxy address is free text, so
+   anything else a proxy sends in its place is never shown. */
+const FLAG_SYNTAX = /^--[a-z][a-z0-9-]*$/
+
+function flagOrNull(value) {
+  const flag = stringOrNull(value)
+  return flag && FLAG_SYNTAX.test(flag) ? flag : null
+}
+
 /** What kind of process answered, decided on fields only one of them has.
    The proxy carries `service` and no `engine`; the engine carries `engine` and
    no `service`. `fabric serve` shaped its payload that way deliberately so a
@@ -215,7 +225,7 @@ export function describePlacement(raw) {
     : null
   return {
     mixedEngines: MIXED_ENGINE_MODES.includes(placement.mixed_engines) ? placement.mixed_engines : null,
-    flag: stringOrNull(placement.flag),
+    flag: flagOrNull(placement.flag),
     unreportedLoadCost: numberOrNull(placement.unreported_load_cost),
     coldLoadCost: numberOrNull(placement.cold_load_cost),
     maxForwardAttempts: numberOrNull(placement.max_forward_attempts),
@@ -246,6 +256,9 @@ export function mixedModeAcceptance(nodes) {
         label: node.label,
         engine: node.engine,
         version: node.version,
+        // A missing version means "not published" only for a node that
+        // answered; the page needs the state to tell the two apart.
+        state: node.state,
         detail: capability ? capability.detail : null,
         provenance: capability ? capability.provenance : null,
       })
@@ -270,6 +283,7 @@ export function requirementLimits(nodes) {
         label: node.label,
         engine: node.engine,
         version: node.version,
+        state: node.state,
         consequence: limit.consequence,
       })
     }
@@ -282,9 +296,9 @@ export function requirementLimits(nodes) {
    quotes a spelling the running build would refuse; null when it published
    none. The operator's other flags are theirs to keep, which the ellipsis
    stands for: the proxy does not publish its command line, because it may
-   carry a key. */
+   carry a key. Null too for anything that is not a plain long flag. */
 export function routingCommand(placement, target) {
-  const flag = placement ? stringOrNull(placement.flag) : null
+  const flag = placement ? flagOrNull(placement.flag) : null
   if (!flag) return null
   return target === 'mixed' ? `camelid fabric serve … ${flag}` : 'camelid fabric serve …'
 }

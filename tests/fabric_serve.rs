@@ -4325,6 +4325,28 @@ async fn a_camelid_only_proxy_serves_a_tool_calling_request_exactly_as_before() 
     );
 }
 
+/// A failure through a default proxy names the node and the engine it was
+/// sent to, and nothing else: the engine is the one header a failure gained
+/// with mixed placement, in every mode, and none of the mixed-mode headers
+/// ride on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_through_a_camelid_only_proxy_carries_its_node_and_engine_and_nothing_else() {
+    let node = StubNode::start(StubConfig {
+        hangs_up_on_completion: true,
+        ..StubConfig::ready("m", 0)
+    });
+    let addr = start_proxy(fabric_of(vec![node.spec("only")]), RouteMode::Throughput).await;
+
+    let (status, _, headers) = post_chat(addr, &serde_json::json!({ "model": "m" }), &[]).await;
+    assert_eq!(status, 502);
+    assert_eq!(
+        fabric_headers(&headers),
+        ["x-camelid-fabric-engine", "x-camelid-fabric-node"]
+    );
+    assert_eq!(header(&headers, "x-camelid-fabric-engine"), Some("camelid"));
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("only"));
+}
+
 /// I14 on the wire: an answer that rests on a declaration says so, and one
 /// that does not carries nothing extra.
 #[tokio::test(flavor = "multi_thread")]
@@ -4443,6 +4465,46 @@ async fn completion_time_invalidates_a_foreign_node_whose_503_only_looks_typed()
         Some("LeastLoaded"),
         "an untrusted refusal must return the class to cold fallback"
     );
+}
+
+/// A node the proxy could not reach was never asked its version. Health
+/// must say that version is unknown, not that the engine publishes none: the
+/// same engine, reached, answers `/api/version`.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_calls_an_unreached_nodes_version_unknown_never_unpublished() {
+    let serving = StubNode::start(StubConfig::ready("m", 0));
+    let closed = closed_port_spec("b-ollama").await;
+    let unreached = camelid::fabric::parse_node_spec(&format!(
+        "b-ollama=ollama://{}:{}",
+        closed.host, closed.port
+    ))
+    .expect("parses");
+    let addr = start_proxy_mixed(
+        fabric_of(vec![serving.spec("a-camelid"), unreached]),
+        RouteMode::Throughput,
+    )
+    .await;
+
+    let (_, health) = get_json(addr, "/v1/health").await;
+    let node = health["node_detail"]
+        .as_array()
+        .expect("detail")
+        .iter()
+        .find(|node| node["spec"]["label"] == "b-ollama")
+        .expect("b-ollama listed");
+    assert_eq!(node["status"]["state"], "unreachable");
+    let tools = node["requirement_limits"]
+        .as_array()
+        .expect("limits")
+        .iter()
+        .find(|limit| limit["key"] == "tool_calls")
+        .and_then(|limit| limit["consequence"].as_str())
+        .expect("a tools limit");
+    assert!(
+        tools.contains("ollama, version unknown (not reached)"),
+        "{tools}"
+    );
+    assert!(!tools.contains("not published"), "{tools}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

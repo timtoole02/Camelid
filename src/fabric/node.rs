@@ -355,14 +355,20 @@ impl NodeSnapshot {
 
     /// The engine and the version it reported, in the form a measurement is
     /// keyed on, for messages that have to say which build they are about.
+    ///
+    /// "Not published" only for a node that answered without one. A node
+    /// that did not answer as ready was never asked, so its version is
+    /// unknown; calling it unpublished would be a claim about an engine that
+    /// may well publish one.
     pub fn engine_and_version(&self) -> String {
-        match self
-            .status
-            .ready()
-            .and_then(|ready| ready.version.as_deref())
-        {
-            Some(version) => format!("{} {version}", self.spec.engine),
-            None => format!("{}, version not published", self.spec.engine),
+        let engine = self.spec.engine;
+        match &self.status {
+            NodeStatus::Ready(ready) => match ready.version.as_deref() {
+                Some(version) => format!("{engine} {version}"),
+                None => format!("{engine}, version not published"),
+            },
+            NodeStatus::NotReady { .. } => format!("{engine}, version unknown (not ready)"),
+            NodeStatus::Unreachable { .. } => format!("{engine}, version unknown (not reached)"),
         }
     }
 
@@ -668,6 +674,57 @@ mod tests {
             unknown, empty,
             "unknown and none-resident must not collapse"
         );
+    }
+
+    /// A version is "not published" only when a node answered without one.
+    /// A node that did not answer was never asked, and saying its engine
+    /// publishes none would be inventing a fact about the engine.
+    #[test]
+    fn a_node_that_was_not_reached_has_an_unknown_version_not_an_unpublished_one() {
+        let spec = || NodeSpec {
+            label: "b-ollama".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 11434,
+            engine: NodeEngine::Ollama,
+        };
+        let ready = |version: Option<&str>| NodeSnapshot {
+            spec: spec(),
+            status: NodeStatus::Ready(NodeReady {
+                engine: NodeEngine::Ollama,
+                active_model_id: None,
+                models: vec!["m".to_string()],
+                resident_models: None,
+                backend: None,
+                version: version.map(str::to_string),
+                load: None,
+            }),
+            latency: None,
+        };
+        let down = NodeSnapshot {
+            spec: spec(),
+            status: NodeStatus::Unreachable {
+                reason: "connection refused".to_string(),
+            },
+            latency: None,
+        };
+        let loading = NodeSnapshot {
+            spec: spec(),
+            status: NodeStatus::NotReady {
+                reason: "loading".to_string(),
+            },
+            latency: None,
+        };
+
+        assert_eq!(ready(Some("0.33.2")).engine_and_version(), "ollama 0.33.2");
+        assert_eq!(
+            ready(None).engine_and_version(),
+            "ollama, version not published"
+        );
+        for (snapshot, why) in [(down, "not reached"), (loading, "not ready")] {
+            let said = snapshot.engine_and_version();
+            assert!(!said.contains("not published"), "{said}");
+            assert_eq!(said, format!("ollama, version unknown ({why})"));
+        }
     }
 
     #[test]

@@ -18,13 +18,20 @@ import {
    written here would describe this page's build rather than the proxy's.
    The choice lives in component state only; nothing is stored. */
 
+/* Only a node that answered can have published no version. One that did not
+   answer was never asked, so its version is unknown. */
+function versionText(node) {
+  if (node.version) return ` ${node.version}`
+  return node.state === 'ready' ? ', version not published' : ', version unknown'
+}
+
 function NodeLine({ node }) {
   return (
     <li className="fabric-routing__node" data-node-label={node.label || ''}>
       <span className="fabric-routing__node-label">{node.label || 'unlabelled node'}</span>
       <span className="fabric-routing__node-engine">
         {node.engine || 'engine not stated'}
-        {node.version ? ` ${node.version}` : ', version not published'}
+        {versionText(node)}
       </span>
       {node.detail && <span className="fabric-routing__node-detail">{node.detail}</span>}
       {node.provenance && (

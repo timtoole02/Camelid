@@ -472,7 +472,7 @@ What changes under the flag, and what does not:
 | Rerank | `/v1/rerank` and `/v1/reranking` go only to a node whose API has the route (`rerank_route`); the same 400 with `param: route` otherwise. The route existing is not the loaded model supporting it. |
 | A refusal from a foreign node | **Relayed once, never re-placed.** Only an engine that declares a typed queue-full refusal (`typed_backpressure`) has a `503 engine_queue_full` handed to a sibling; any other answer — an untyped 5xx, or a foreign node's 503 carrying that same code — cannot be told from a real failure, may already be generating, and is returned to the client as it came. A node that was never reached is re-placed whatever its engine. |
 | Which node holds a model | A node holds a model it has loaded, or one it has installed where its engine declares that naming it loads it (`loads_on_demand`: Ollama yes, LM Studio not published, so not matched). A holder that must load it first — or whose listing did not say — is charged `cold_load_cost` (4) on top of its load, a stated guess and not a measurement; cold-load latency has not been measured here. |
-| A request naming no model | Placed only where the model it will get is known (a node with exactly one active model), and that id is written into `model`. Otherwise **400** `model_required`. Without the flag it is placed exactly as before and nothing is written. |
+| A request naming no model | Placed only where the model it will get is known (a node with exactly one active model), and that id is written into `model`. Otherwise **400** `model_required`, or `503` while any node could not be consulted. Without the flag it is placed exactly as before and nothing is written. |
 | Aliases | One matching rule in both modes: the proxy sends each node the id its `alias` line names. Read once at startup. |
 
 Every answer carries `x-camelid-fabric-node`, `-engine`, `-reason` and `-attempts` as before, and a
@@ -481,8 +481,9 @@ say something new: `x-camelid-fabric-model` (the id sent) under the flag or when
 it; `x-camelid-fabric-model-identity: asserted_by_operator` only when an alias changed it; and
 `x-camelid-fabric-residency-observed: resident|not_resident` under the flag, only when the node's own
 listing said — an observation up to the observation age (500 ms) old, which an engine that unloads on
-its own timer can make stale. A proxy without the flag and without aliases answers with exactly the
-headers it always did.
+its own timer can make stale. A proxy without the flag and without aliases adds none of those three:
+a success carries the node, engine, reason and attempts, and a `502`/`499` or a node-attributed
+`400` the node and the engine it was sent to.
 
 `GET /v1/models` and `GET /v1/models/{id}` follow the mode: a model is listed and retrievable exactly
 when a request naming it would be placed, and an id that exists only through an alias carries
@@ -563,7 +564,7 @@ Every comparison carries, per side and for the whole run:
 | `advertised_template` | The chat template the engine publishes for the model (see the table above). Never evidence of what it applied. |
 | `rendered_prompt` | The prompt the engine built from exactly the messages the comparison sent, where it can render without generating (Camelid only). `captured` with its `source` and `text`, or `unavailable` with a `reason`. |
 | `weights_digest` | The SHA-256 of the weights the side serves: `published` with its `digest` and `source`, or `unavailable` with a `reason`. |
-| `weights_check` | Whether the side's engine checked its own loaded bytes against the other side's digest: `enforced`, `refused`, or `null` when it was not asked. |
+| `weights_check` | What happened when the side's runs were bound to the other side's digest: `refused` (the engine checked and its loaded bytes are other bytes), `unconfirmed` (every run was served, which a build that ignores the binding also does, so it shows nothing), or `null` when it was not bound. |
 | `plan.history_perturbed` | Whether each side was sent an unrelated request between its runs (below). |
 | `uncontrolled` / `uncontrolled_detail` | What the comparison did not control. `uncontrolled` is the bare list of names, as before; `uncontrolled_detail` carries a `{name, reason}` for each, in the same order, because the gaps are of different kinds — a seed is a parameter an engine may lack, model identity is a check nobody ran. |
 
@@ -586,15 +587,18 @@ Ollama's is the copy it stored. So equal digests show the same file on both side
 engines publishing different digests show only two files — not that the tensors in them differ.
 
 Both sides are read before either generates. When **both** sides are Camelid nodes, each side's runs
-are sent `camelid_expected_gguf_sha256` set to the other's published digest, so the engine itself
-checks its loaded bytes on every run. If it refuses (`model_artifact_mismatch`), its weights are
-other bytes and the comparison says so — `different_models` — rather than failing. A Camelid side is
+are sent `camelid_expected_gguf_sha256` set to the other's published digest, so an engine that has
+the check tests its loaded bytes on every run. If it refuses (`model_artifact_mismatch`), its
+weights are other bytes and the comparison says so — `different_models` — rather than failing. If
+it serves, nothing is shown: a Camelid build from before the binding existed ignores the field and
+serves whatever it loaded, so a served run is recorded as `unconfirmed` and never stands in for a
+digest the side did not publish. A Camelid side is
 never sent an Ollama blob digest to enforce: that is the digest of the copy Ollama stored, which a
 Camelid node loaded from the original GGUF can never match (below).
 
 | Evidence | Result |
 |---|---|
-| Both sides published, or enforced, one digest | `model_identity: verified_by_digest`, the digest shown, nothing about identity uncontrolled |
+| Both sides published one digest | `model_identity: verified_by_digest`, the digest shown, nothing about identity uncontrolled |
 | One engine kind published two digests that differ (two Camelid nodes, say), or a Camelid node refused the other's | `different_models`, naming each side's GGUF file digest. Different files are shown; different tensors are not, so the headline says the sides are *not shown to serve the same model* |
 | Two different engines published digests that differ | **Not** `different_models`. The comparison proceeds exactly as it would with no digests: `same_id`; `asserted_by_operator` when the operator paired the ids (`--left-model`/`--right-model`, an `alias` line); or, when the ids differ and nobody asserted, `different_models` naming the two ids. `model identity` is listed as uncontrolled, and its reason names both digests and says a file digest cannot show whether the tensors differ |
 | Anything else | `same_id` or `asserted_by_operator` as before, with the reason naming the side that published no digest |
@@ -603,7 +607,7 @@ Measured with `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `432f310a…`) on mini2,
 temperature 0, seed 42, three runs a side:
 
 - The same Camelid server under two labels published `432f310a…` on both sides, each side's runs
-  were bound to the other's and enforced, and the comparison reported `verified_by_digest` and
+  were bound to the other's and served, and the comparison reported `verified_by_digest` and
   `identical` (`Hi!` on every run).
 - Against Ollama 0.33.2 with a model made by `ollama create` from that same file, the digests do not
   match: Ollama stored a re-serialized copy — the same size, metadata keys reordered, sha256

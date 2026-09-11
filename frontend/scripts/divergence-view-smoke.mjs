@@ -149,16 +149,16 @@ const SAME_TEMPLATE = {
 }
 
 /* The same GGUF file on both sides: each published its digest, and the left
-   side's engine also enforced the digest it was bound to. (A real proxy binds
-   a Camelid side only to another Camelid node's digest; the page renders any
-   enforced check the same way.) */
+   side's runs were also bound to the digest and served, which confirms
+   nothing. (A real proxy binds a Camelid side only to another Camelid node's
+   digest; the page renders any served binding the same way.) */
 const WEIGHTS = '432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3'
 const VERIFIED = {
   ...DIVERGENT,
   left: {
     ...DIVERGENT.left,
     weights_digest: { kind: 'published', digest: WEIGHTS, source: 'GET /v1/models gguf_sha256' },
-    weights_check: { kind: 'enforced', expected: WEIGHTS },
+    weights_check: { kind: 'unconfirmed', expected: WEIGHTS },
   },
   right: {
     ...DIVERGENT.right,
@@ -673,9 +673,15 @@ try {
     }))
     assert.equal(weights.kind, 'published')
     assert.match(weights.text, new RegExp(`GGUF file sha256 ${WEIGHTS} via GET /v1/models gguf_sha256`))
-    assert.equal(await page.$eval('[data-testid="weights-win-check"]', (el) => el.getAttribute('data-check')), 'enforced')
+    const bound = await page.$eval('[data-testid="weights-win-check"]', (el) => ({
+      kind: el.getAttribute('data-check'),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(bound.kind, 'unconfirmed')
+    assert.match(bound.text, /did not confirm it checked, so this shows nothing about its weights/)
+    assert.doesNotMatch(bound.text, /enforced|verified/i)
     assert.equal(await page.$('[data-testid="weights-studio-check"]'), null, 'an engine never asked to check shows no check')
-    check('each side shows the weights digest it published, and the one its engine enforced')
+    check('each side shows the weights digest it published, and a served binding as confirming nothing')
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()
   }

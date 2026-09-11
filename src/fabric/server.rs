@@ -1626,8 +1626,9 @@ async fn stream_completion(
 /// the residency the node's own listing reported, under mixed placement and
 /// only when it reported one. That last one is an observation, at most the
 /// proxy's observation age (500 ms by default) older than the send, and an
-/// engine that unloads on its own timer can make it stale. A default proxy
-/// answers with exactly the headers it always did.
+/// engine that unloads on its own timer can make it stale. Without the flag
+/// and without an alias, none of the three is sent. Failures are tagged by
+/// [`forward_error`], not here.
 fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize, mixed: MixedEngines) {
     insert(headers, "x-camelid-fabric-node", &decision.label);
     // Always sent, in every routing mode, so a client never has to know which
@@ -1782,6 +1783,10 @@ fn route_error(error: RouteError, disclose: bool) -> Response {
 /// A request that did not complete, naming the node and — when it was sent
 /// anywhere — the engine it was sent to, taken from the placement so a node
 /// file re-declared mid-request cannot change which engine the answer names.
+///
+/// In every routing mode, the default one included: before mixed placement a
+/// failure carried the node alone, and a failure that does not name its
+/// engine is one a client cannot attribute (I2).
 fn forward_error(error: ForwardError, engine: Option<NodeEngine>) -> Response {
     let message = error.to_string();
     // The node was reachable but refused unsupported input: that is the

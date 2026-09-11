@@ -330,9 +330,11 @@ impl WeightsDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WeightsCheck {
-    /// Every run carried `expected` and was served: the engine compared its
-    /// own loaded bytes against it and they matched.
-    Enforced { expected: String },
+    /// Every run carried `expected` and was served, which confirms nothing: a
+    /// Camelid build from before the binding existed ignores the field and
+    /// serves whatever it loaded, and its answer does not say which happened.
+    /// So this vouches for no digest. Only a refusal is evidence.
+    Unconfirmed { expected: String },
     /// The engine refused a run bound to `expected` because its loaded bytes
     /// are something else. That is the answer to the question, not a failure.
     Refused { expected: String, detail: String },
@@ -450,29 +452,26 @@ pub enum ModelIdentity {
     /// verified, and never inferred — it travels with the receipt so a reader
     /// knows the comparison rests on someone's word.
     AssertedByOperator,
-    /// Both sides are shown to serve weights with one SHA-256: each published
-    /// it, or its engine checked its own loaded bytes against it and served.
-    /// Whatever the ids were, and whatever an operator said, this is the one
-    /// basis that is not a name.
+    /// Both sides published weights with one SHA-256. Whatever the ids were,
+    /// and whatever an operator said, this is the one basis that is not a
+    /// name.
     VerifiedByDigest,
 }
 
 /// The one weights digest both sides are shown to serve, if there is one.
 ///
-/// A side vouches for a digest by publishing it or by having its engine
-/// enforce it. A refusal anywhere, or two different published digests, means
-/// there is no such digest; so does a side that vouched for nothing. No such
-/// digest is not the same as different weights: see [`weights_disagree`].
+/// A side vouches for a digest only by publishing it. A binding it was sent
+/// and served does not count ([`WeightsCheck::Unconfirmed`]): an engine that
+/// ignores the binding serves too, so counting it let one side's digest
+/// vouch for a side that published none. A refusal anywhere, or two
+/// different published digests, means there is no such digest; so does a
+/// side that published none. No such digest is not the same as different
+/// weights: see [`weights_disagree`].
 pub fn shared_weights_digest<'a>(left: &'a Side, right: &'a Side) -> Option<&'a str> {
     if weights_disagree(left, right) {
         return None;
     }
-    let vouched = |side: &'a Side| -> Option<&'a str> {
-        side.weights_digest.digest().or(match &side.weights_check {
-            Some(WeightsCheck::Enforced { expected }) => Some(expected.as_str()),
-            _ => None,
-        })
-    };
+    let vouched = |side: &'a Side| -> Option<&'a str> { side.weights_digest.digest() };
     match (vouched(left), vouched(right)) {
         (Some(l), Some(r)) if same_digest(l, r) => Some(l),
         _ => None,
@@ -1227,28 +1226,55 @@ mod tests {
         assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
     }
 
-    /// C4. A side whose engine checked its own bytes against the other's
-    /// published digest and served has vouched for that digest as surely as
-    /// publishing it.
+    /// C4. A side that published no digest and served runs bound to the
+    /// other's has shown nothing: a Camelid build from before the binding
+    /// ignores it and serves another file. So the other side's digest never
+    /// vouches for it, and identity rests on the names.
     #[test]
-    fn an_enforced_weights_check_vouches_for_the_digest_it_enforced() {
+    fn a_served_binding_vouches_for_nothing_when_its_side_published_no_digest() {
+        let unconfirmed = || {
+            checked(
+                side("old", NodeEngine::Camelid, "m", &["7", "7"]),
+                WeightsCheck::Unconfirmed {
+                    expected: WEIGHTS_A.to_string(),
+                },
+            )
+        };
+        for identity in [ModelIdentity::SameId, ModelIdentity::AssertedByOperator] {
+            let comparison = conclude(
+                "q",
+                SamplingPlan::default(),
+                publishing(
+                    side("new", NodeEngine::Camelid, "m", &["12", "12"]),
+                    WEIGHTS_A,
+                ),
+                unconfirmed(),
+                identity,
+            );
+            assert_eq!(comparison.model_identity, identity);
+            assert_eq!(
+                shared_weights_digest(&comparison.left, &comparison.right),
+                None
+            );
+        }
+
+        // Published on both sides, the digests verify, and the binding is
+        // still recorded as what it was.
         let comparison = conclude(
             "q",
             SamplingPlan::default(),
-            checked(
-                side("win", NodeEngine::Camelid, "m", &["12", "12"]),
-                WeightsCheck::Enforced {
-                    expected: WEIGHTS_A.to_string(),
-                },
-            ),
             publishing(
-                side("studio", NodeEngine::Ollama, "m", &["12", "12"]),
+                side("new", NodeEngine::Camelid, "m", &["12", "12"]),
                 WEIGHTS_A,
             ),
+            publishing(unconfirmed(), WEIGHTS_A),
             ModelIdentity::SameId,
         );
         assert_eq!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
-        assert_eq!(comparison.verdict, Verdict::Identical);
+        assert!(matches!(
+            comparison.right.weights_check,
+            Some(WeightsCheck::Unconfirmed { .. })
+        ));
     }
 
     fn advertising(mut side: Side, template: &str) -> Side {

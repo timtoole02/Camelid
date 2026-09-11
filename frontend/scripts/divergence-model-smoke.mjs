@@ -406,7 +406,7 @@ const published = (source) => ({ kind: 'published', digest: DIGEST, source })
 check('an identity the proxy verified by digest is stated with the digest it rests on', () => {
   const comparison = describeComparison(body({
     model_identity: 'verified_by_digest',
-    left: side({ weights_digest: published('GET /v1/models gguf_sha256'), weights_check: { kind: 'enforced', expected: DIGEST } }),
+    left: side({ weights_digest: published('GET /v1/models gguf_sha256'), weights_check: { kind: 'unconfirmed', expected: DIGEST } }),
     right: side({ label: 'studio', weights_digest: published('POST /api/show modelfile FROM blob') }),
   }))
   const statement = identityStatement(comparison)
@@ -415,8 +415,19 @@ check('an identity the proxy verified by digest is stated with the digest it res
   assert.doesNotMatch(statement.text, /asserted|not verified/i)
   assert.deepEqual(
     [comparison.left.weightsDigest.kind, comparison.left.weightsDigest.digest, comparison.left.weightsCheck.kind],
-    ['published', DIGEST, 'enforced'],
+    ['published', DIGEST, 'unconfirmed'],
   )
+
+  // A binding a side was sent and served is never quoted as the digest it
+  // rests on, and an older proxy's `enforced` is not read as a check at all.
+  const bound = describeComparison(body({
+    model_identity: 'verified_by_digest',
+    left: side({ weights_digest: { kind: 'unavailable', reason: 'x' }, weights_check: { kind: 'unconfirmed', expected: DIGEST } }),
+    right: side({ label: 'studio', weights_digest: { kind: 'unavailable', reason: 'y' } }),
+  }))
+  assert.doesNotMatch(identityStatement(bound).text, new RegExp(DIGEST))
+  const older = describeComparison(body({ left: side({ weights_check: { kind: 'enforced', expected: DIGEST } }) }))
+  assert.equal(older.left.weightsCheck.kind, null)
 })
 
 check('this build never concludes identity from two digests the proxy did not call verified', () => {

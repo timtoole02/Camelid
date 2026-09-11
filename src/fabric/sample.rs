@@ -152,7 +152,8 @@ pub(crate) fn prepare(
 /// `bind_to` is the other side's [`Prepared::loaded_file_digest`]. An engine
 /// that can check its own loaded bytes against a digest is asked to on every
 /// run; one that refuses has answered the identity question, and the side
-/// records that rather than failing.
+/// records that rather than failing. One that serves has not: an engine that
+/// ignores the binding serves as well, so that is recorded as unconfirmed.
 pub(crate) fn measure(
     request: &SideRequest<'_>,
     prepared: Prepared,
@@ -167,7 +168,7 @@ pub(crate) fn measure(
     let engine = ready.engine;
     // Only our own engine takes a digest to enforce.
     let bind_to = bind_to.filter(|_| engine == NodeEngine::Camelid);
-    let mut weights_check = bind_to.map(|expected| WeightsCheck::Enforced {
+    let mut weights_check = bind_to.map(|expected| WeightsCheck::Unconfirmed {
         expected: expected.to_string(),
     });
     let runs = request.plan.repetitions.clamp(1, MAX_COMPARE_REPETITIONS);
