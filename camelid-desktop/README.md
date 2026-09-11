@@ -53,8 +53,10 @@ has been observed live.
 
 **Keep engine running when window closes**, a check item in the tray menu, is off by default.
 With it on, closing the main window hides it, the engine keeps serving, and the tray states
-what the engine is doing. The first such close shows a one-time notice saying so and where
-Quit is. The setting is stored in `desktop-lifetime.json` in the app-data directory
+what the engine is doing. The first such close raises a one-time notice on the still-visible
+window, saying so and where Quit is; the window hides once that notice is acknowledged, and
+only then is it recorded as shown. The setting is stored in `desktop-lifetime.json` in the
+app-data directory
 (`~/Library/Application Support/app.camelid.desktop/` on macOS,
 `%APPDATA%\app.camelid.desktop\` on Windows). A missing, unreadable or unknown-version file
 means off. If saving fails, the check mark stays where it was and the menu shows

@@ -319,6 +319,190 @@ fn every_quit_path_reaches_the_engine_shutdown() {
     );
 }
 
+/// The index of the first non-blank line after `from`.
+fn next_nonblank(lines: &[&str], from: usize) -> Option<usize> {
+    lines[from + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .map(|offset| from + 1 + offset)
+}
+
+/// The lines of the callback the notice dialog is answered with: from its `.show(` line to
+/// the line that closes the call at the same indentation.
+fn notice_callback_span(main: &str) -> (usize, usize) {
+    let lines: Vec<&str> = main.lines().collect();
+    let opened: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(".show(move |"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        opened.len(),
+        1,
+        "expected exactly one dialog callback in main.rs, found {opened:?}"
+    );
+    let start = opened[0];
+    let indent = lines[start].len() - lines[start].trim_start().len();
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| {
+            line.trim_start().starts_with('}') && line.len() - line.trim_start().len() == indent
+        })
+        .map(|(index, _)| index)
+        .expect("the dialog callback is never closed");
+    (start, end)
+}
+
+/// The source with comments and all whitespace removed, and the line each byte came from, so
+/// a needle matches whatever rustfmt did with the line breaks while a comment can still name
+/// what the code must not do.
+fn stripped_code(source: &str) -> (String, Vec<usize>) {
+    let mut code = String::new();
+    let mut line_of_byte = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        for ch in line
+            .split("//")
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+        {
+            for _ in 0..ch.len_utf8() {
+                line_of_byte.push(number);
+            }
+            code.push(ch);
+        }
+    }
+    (code, line_of_byte)
+}
+
+/// Source-level, and the reason the ordering exists at all. Measured twice on macOS 26 with
+/// the bundle built from this branch: a background close hid the window and then raised an
+/// unparented dialog, which the OS displayed nowhere (no app window onscreen for 6 s after
+/// the close, and none after reopening). The user was told nothing while the preference
+/// recorded that they had been. The live receipt is the behavioural closure.
+#[test]
+fn the_background_notice_is_raised_on_the_visible_window_before_it_hides() {
+    let main = production_source("camelid-desktop/src/main.rs");
+    let lines: Vec<&str> = main.lines().collect();
+    let (callback, callback_end) = notice_callback_span(&main);
+
+    // The order is decided by the pure policy, where it is unit-tested.
+    assert!(
+        main.contains("lifetime::background_close("),
+        "a background close no longer asks the policy which order to use"
+    );
+    assert!(
+        line_then(
+            &main,
+            "BackgroundClose::NoticeThenHide =>",
+            "show_background_notice("
+        ),
+        "the first background close no longer raises the notice"
+    );
+
+    // Without a parent the OS has no window to attach the dialog to.
+    let built = lines
+        .iter()
+        .position(|line| line.contains("lifetime::background_notice("))
+        .expect("the notice text is built in main.rs");
+    assert!(
+        lines[built..callback]
+            .iter()
+            .any(|line| line.contains(".parent(")),
+        "the background notice is raised without a parent window"
+    );
+    assert!(
+        fn_body(&main, "fn show_background_notice(")
+            .iter()
+            .any(|line| line.contains("notice_raised.swap(true")),
+        "two quick closes could stack two notices"
+    );
+
+    // One place hides the main window, and both of its callers are past the notice: the arm
+    // for a notice already answered, and the callback of one being answered now.
+    let hides: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(".hide()") && !line.contains("spotlight"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        hides.len(),
+        1,
+        "the main window is hidden from more than one place: {hides:?}"
+    );
+    assert!(
+        fn_body(&main, "fn hide_to_background(")
+            .iter()
+            .any(|line| line.contains(".hide()")),
+        "the main window is hidden outside hide_to_background"
+    );
+
+    let hide_now = lines
+        .iter()
+        .position(|line| line.contains("BackgroundClose::HideNow =>"))
+        .expect("the arm for a notice that was already answered");
+    let (mut from_arm, mut from_callback) = (0, 0);
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("hide_to_background(") || line.contains("fn hide_to_background(") {
+            continue;
+        }
+        if index == hide_now || next_nonblank(&lines, hide_now) == Some(index) {
+            from_arm += 1;
+        } else if (callback..=callback_end).contains(&index) {
+            from_callback += 1;
+        } else {
+            panic!(
+                "camelid-desktop/src/main.rs:{}: the window is hidden outside the notice's \
+                 callback, so a first background close hides it before anything is shown: {line}",
+                index + 1
+            );
+        }
+    }
+    assert_eq!(
+        (from_arm, from_callback),
+        (1, 1),
+        "the window must hide once for an answered notice and once when one is answered"
+    );
+}
+
+/// Source-level. `notice_shown` is the claim that this user has been told the engine keeps
+/// running with the window closed, and it is written once, for ever. Recorded anywhere but
+/// the dialog's callback it claims a notice that may never have been displayed — which is
+/// what shipped: the flag was saved immediately after a dialog call that showed nothing.
+#[test]
+fn notice_shown_is_recorded_only_from_the_notice_callback() {
+    let main = production_source("camelid-desktop/src/main.rs");
+    let (callback, callback_end) = notice_callback_span(&main);
+    let (code, line_of_byte) = stripped_code(&main);
+    let mut recorded = 0;
+    for needle in [
+        "notice_shown:true",
+        ".notice_shown.store(true",
+        ".notice_shown.swap(true",
+        ".notice_shown.fetch_or(true",
+    ] {
+        for (offset, _) in code.match_indices(needle) {
+            let line = line_of_byte[offset];
+            assert!(
+                (callback..=callback_end).contains(&line),
+                "camelid-desktop/src/main.rs:{}: notice_shown is recorded outside the notice's \
+                 callback ({needle}), so it would claim a notice nobody answered",
+                line + 1
+            );
+            recorded += 1;
+        }
+    }
+    assert_eq!(
+        recorded, 2,
+        "the callback must both set notice_shown in memory and save it as true"
+    );
+}
+
 /// Both macOS upgrade paths quit the app with the same Apple Event logout sends, then wait
 /// for the desktop AND the sidecar to be gone. A hard kill would skip the engine shutdown,
 /// and dropping the sidecar wait would replace the bundle under a running engine.

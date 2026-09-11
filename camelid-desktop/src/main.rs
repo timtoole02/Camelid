@@ -25,14 +25,14 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, Wry};
+use tauri::{AppHandle, Emitter, Manager, State, Window, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use engine::{EngineHost, StartOutcome};
 use lifetime::{
-    CloseAction, Containment, EngineSnapshot, EngineStatus, LifetimePreference, MenuAction,
-    MenuEntryKind, Platform, PointerButton, PointerState, ProbeHistory, StatusStore,
+    BackgroundClose, CloseAction, Containment, EngineSnapshot, EngineStatus, LifetimePreference,
+    MenuAction, MenuEntryKind, Platform, PointerButton, PointerState, ProbeHistory, StatusStore,
     TrayClickAction, TrayInputs, TrayPointerEvent, TrayPresence, TrayView,
 };
 use ui_storage::UiStorageState;
@@ -42,11 +42,15 @@ const MAIN_WINDOW: &str = "main";
 const SPOTLIGHT_WINDOW: &str = "spotlight";
 const TRAY_ID: &str = "camelid";
 
-/// What the close handler, the tray and the supervisor share. `keep_running` is the only
-/// input the close handler reads, and it changes only after the preference file is saved.
+/// What the close handler, the tray and the supervisor share. `keep_running` decides what a
+/// close does, and it changes only after the preference file is saved.
 struct Lifetime {
     keep_running: AtomicBool,
+    /// The one-time background notice has been acknowledged, in this run or an earlier one.
     notice_shown: AtomicBool,
+    /// A notice has been asked for in this run. Set before the dialog is raised, so two quick
+    /// closes cannot stack two of them; `notice_shown` follows only once one is answered.
+    notice_raised: AtomicBool,
     pref_error: Mutex<Option<String>>,
     /// Serialises preference writes, so a toggle and the notice never interleave.
     pref_write: Mutex<()>,
@@ -62,6 +66,7 @@ impl Default for Lifetime {
         Self {
             keep_running: AtomicBool::new(false),
             notice_shown: AtomicBool::new(false),
+            notice_raised: AtomicBool::new(false),
             pref_error: Mutex::new(None),
             pref_write: Mutex::new(()),
             tray: Mutex::new(TrayPresence::Missing(
@@ -375,9 +380,7 @@ fn main() {
                 match decide_close(app) {
                     CloseAction::HideKeepEngine => {
                         api.prevent_close();
-                        let _ = window.hide();
-                        sync_background_activity(app, false);
-                        show_background_notice_once(app);
+                        close_to_background(app, window);
                     }
                     CloseAction::QuitApp => app.exit(0),
                 }
@@ -516,29 +519,73 @@ fn toggle_keep_running(app: &AppHandle) {
     refresh_tray(app, true);
 }
 
-/// Once per user: a hidden window with a running engine is easy to mistake for a quit,
-/// and Windows hides new notification-area icons by default.
-fn show_background_notice_once(app: &AppHandle) {
+/// A close that keeps the engine running. Measured on macOS 26 before this ordering existed:
+/// the window hid first and the unparented notice was never displayed at all, while the
+/// preference recorded that it had been — so the user was told nothing and would not be told
+/// again. The first such close therefore raises the notice on the window that is still on
+/// screen, and hides only once it has been answered.
+fn close_to_background(app: &AppHandle, window: &Window) {
+    let notice_shown = app.state::<Lifetime>().notice_shown.load(Ordering::SeqCst);
+    match lifetime::background_close(notice_shown) {
+        BackgroundClose::NoticeThenHide => show_background_notice(app, window),
+        BackgroundClose::HideNow => hide_to_background(app, window),
+    }
+}
+
+fn hide_to_background(app: &AppHandle, window: &Window) {
+    let _ = window.hide();
+    sync_background_activity(app, false);
+}
+
+/// Once per user: a hidden window with a running engine is easy to mistake for a quit, and
+/// Windows hides new notification-area icons by default. Parented to the main window, so the
+/// OS has something to attach it to — a sheet on macOS, owner-modal on Windows — which is
+/// also what stops another close arriving while it is up.
+fn show_background_notice(app: &AppHandle, window: &Window) {
     let state = app.state::<Lifetime>();
-    if state.notice_shown.swap(true, Ordering::SeqCst) {
+    // Two quick closes must not stack two notices. The window is deliberately left on screen
+    // here rather than hidden: the notice already in flight hides it when it is answered,
+    // and if one never appeared, the close visibly does nothing instead of backgrounding an
+    // engine the user was never told about.
+    if state.notice_raised.swap(true, Ordering::SeqCst) {
         return;
     }
     let status = lock(&state.observed).store.status().clone();
     let (title, body) = lifetime::background_notice(Platform::current(), &status);
+    let handle = app.clone();
+    let window = window.clone();
     app.dialog()
         .message(body)
         .title(title)
         .kind(MessageDialogKind::Info)
-        .show(|_| {});
-    let _serialised = lock(&state.pref_write);
-    let preference = LifetimePreference {
-        keep_engine_running_when_window_closes: state.keep_running.load(Ordering::SeqCst),
-        notice_shown: true,
-        ..LifetimePreference::default()
-    };
-    if let Err(err) = save_lifetime_preference(app, &preference) {
-        eprintln!("[desktop] lifetime: could not record that the notice was shown: {err}");
-    }
+        .parent(&window)
+        .show(move |_| {
+            {
+                // Written here and nowhere else: the flag claims the user has been told, so
+                // it is recorded after they answered, not because a dialog was requested.
+                let state = handle.state::<Lifetime>();
+                let _serialised = lock(&state.pref_write);
+                state.notice_shown.store(true, Ordering::SeqCst);
+                let preference = LifetimePreference {
+                    keep_engine_running_when_window_closes: state
+                        .keep_running
+                        .load(Ordering::SeqCst),
+                    notice_shown: true,
+                    ..LifetimePreference::default()
+                };
+                if let Err(err) = save_lifetime_preference(&handle, &preference) {
+                    eprintln!(
+                        "[desktop] lifetime: could not record that the notice was shown: {err}"
+                    );
+                }
+            }
+            // The tray can turn background mode off while the notice is up; hiding then would
+            // leave a windowless app that the preference says should have quit.
+            match decide_close(&handle) {
+                CloseAction::HideKeepEngine => hide_to_background(&handle, &window),
+                CloseAction::QuitApp => handle.exit(0),
+            }
+        });
 }
 
 fn show_main_window(app: &AppHandle) {

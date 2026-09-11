@@ -150,8 +150,12 @@ Stated here so nobody has to discover it by reading code:
    measurement of the engine. Wiring it in would violate I5.
 4. **One ablation (D5) is unguarded offline** and is declared so by the harness rather than counted.
    It is closed by a live receipt instead.
-5. **P7 has no live receipt for the new build yet.** The only live receipt is the regression on the
-   installed 0.7.3. The macOS GUI walk-through (close quits, background close hides, reopen, Quit,
+5. **P7's live receipts are still owed, with one exception.** The background close has now been
+   driven twice on macOS 26 with the bundle built from this branch: it hid the window and left the
+   engine serving, correctly, but no notice was displayed at any point (CoreGraphics window list:
+   every app window `onscreen=0` for 6 s after the close, and none after reopening) while
+   `desktop-lifetime.json` recorded `notice_shown: true`. That is the defect A26/A27 now guard. The
+   fix itself is unobserved, and the rest of the macOS GUI walk-through (close quits, reopen, Quit,
    crash) is a checklist for the next session, not a result.
 6. **P7 on Windows is unverified at every level.** The `cfg(windows)` code has been reviewed and
    rustfmt'ed but never compiled: the job object's error handling, `launch_contained`'s
@@ -194,9 +198,9 @@ cargo test --test fabric_engines                 # 15
 cargo test --bin camelid                         # 67 (includes serve_optional_desktop_flags_default_off)
 cargo test --test serve_stdin_close              # 2
 cargo clippy -p camelid-desktop --all-targets -- -D warnings   # 0
-cargo test -p camelid-desktop --all-targets      # macOS: 46 unit + 10 installer_hooks + 12 lifetime_guards
+cargo test -p camelid-desktop --all-targets      # macOS: 48 unit + 10 installer_hooks + 14 lifetime_guards
                                                  # Windows: NOT YET RUN on any runner; expected
-                                                 # 49 unit (+ verbatim-path x2, job object) + 10 + 12
+                                                 # 51 unit (+ verbatim-path x2, job object) + 10 + 14
 
 cd frontend
 npm run build
@@ -305,6 +309,11 @@ ablates the production sites (A5b, A5s, A5m, A14) and keeps the helper rows as A
 A10 and A10b (`serve --exit-when-stdin-closes`) were not re-run: `src/main.rs` is unchanged
 since they were caught at `8737c504`.
 
+A26, A26p and A27 are new, and ran on the background-notice fix at the head of this branch.
+They guard the one thing the first macOS GUI walk-through actually caught: the notice was
+raised *after* the window hid, and unparented, so nothing was displayed while the preference
+recorded that it had been (see "What is NOT claimed" 5).
+
 | # | Sabotage | Caught by |
 |---|---|---|
 | P7-A1 | preference defaults to keeping the engine | `lifetime_preference_defaults_to_closing_the_engine_with_the_window` |
@@ -342,6 +351,9 @@ since they were caught at `8737c504`.
 | P7-A23 | `EngineHost::supervisor_tick` returns the snapshot taken before its probe | `a_supervisor_tick_reports_an_exit_that_happened_during_its_probe` |
 | P7-A24 | compile and register the single-instance plugin on macOS (manifest section and `#[cfg(windows)]`) | `single_instance_plugin_is_windows_only` (*source*) |
 | P7-A25 | the tray's Restart item reroutes to the lifetime toggle | `every_tray_menu_action_reaches_its_handler` (*source*) |
+| P7-A26 | hide the window before the notice is raised | `the_background_notice_is_raised_on_the_visible_window_before_it_hides` (*source*) |
+| P7-A26p | raise the notice with no parent window | `the_background_notice_is_raised_on_the_visible_window_before_it_hides` (*source*) |
+| P7-A27 | record `notice_shown` before the dialog is answered | `notice_shown_is_recorded_only_from_the_notice_callback` (*source*) |
 
 Declared **unguarded offline**, each closed only by a receipt that is not taken yet:
 

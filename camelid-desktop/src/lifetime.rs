@@ -238,6 +238,27 @@ pub fn close_action(
     }
 }
 
+/// The order of the two things a background close does: raise the one-time notice, and hide
+/// the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundClose {
+    /// Notice first, hide only once it has been answered. A notice raised after the hide has
+    /// no window left to appear on: on macOS nothing was displayed at all, so the close was
+    /// indistinguishable from a quit while the engine kept serving.
+    NoticeThenHide,
+    HideNow,
+}
+
+/// `notice_shown` is true only once a notice has actually been acknowledged, so a run that
+/// ended while one was on screen still owes it.
+pub fn background_close(notice_shown: bool) -> BackgroundClose {
+    if notice_shown {
+        BackgroundClose::HideNow
+    } else {
+        BackgroundClose::NoticeThenHide
+    }
+}
+
 /// App Nap is held off only while the engine is kept running behind a hidden window, so
 /// the default mode's App Nap behaviour is unchanged.
 pub fn wants_background_activity(keep_running: bool, main_visible: bool) -> bool {
@@ -1468,6 +1489,16 @@ mod tests {
         assert!(!wants_background_activity(true, true));
         assert!(!wants_background_activity(false, false));
         assert!(!wants_background_activity(false, true));
+    }
+
+    #[test]
+    fn the_first_background_close_raises_the_notice_before_the_window_hides() {
+        assert_eq!(background_close(false), BackgroundClose::NoticeThenHide);
+    }
+
+    #[test]
+    fn a_background_close_hides_at_once_once_the_notice_was_acknowledged() {
+        assert_eq!(background_close(true), BackgroundClose::HideNow);
     }
 
     #[test]
