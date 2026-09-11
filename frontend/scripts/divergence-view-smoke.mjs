@@ -52,7 +52,7 @@ const ECHO_REQUESTED = '<echo the requested id>'
 const DIVERGENT = {
   prompt: 'What is 7 plus 5?',
   prompt_sha256: 'f00dcafe',
-  plan: { temperature: 0, seed: 0, max_tokens: 64, repetitions: 2 },
+  plan: { temperature: 0, seed: 0, max_tokens: 64, repetitions: 2, history_perturbed: true },
   left: {
     label: 'win', engine: 'camelid', engine_version: 'v0.6.1-267', model: 'llama-3.2-1b',
     applied_sampling: { temperature: 'sent', seed: 'sent' },
@@ -249,6 +249,7 @@ function comparisonFor(fixture, request) {
   if (proxy.legacy) {
     delete body.uncontrolled
     for (const line of body.diff.lines || []) delete line.eol
+    delete body.plan.history_perturbed
     // An older proxy sent the advertised capture as `template`, and no render.
     for (const side of [body.left, body.right]) {
       side.template = side.advertised_template
@@ -599,6 +600,13 @@ try {
     assert.equal(proxy.lastRequest.body.max_tokens, 200)
     check('the token cap is sent, and the result says how much of each answer was compared')
 
+    assert.equal(
+      await page.$eval('[data-testid="divergence-history"]', (el) => el.getAttribute('data-perturbed')),
+      'true',
+    )
+    assert.match(await textOf(page, '.divergence__plan'), /between runs one unrelated request/)
+    check('the plan says an unrelated request was sent between runs')
+
     assert.deepEqual(errors, [], 'no page errors')
     check('the divergence view raises no page error')
     await page.close()
@@ -916,6 +924,11 @@ try {
       'an unreported list is unknown, never "nothing uncontrolled"',
     )
     assert.equal(await page.$$eval('[data-eol-marker]', (els) => els.length), 0, 'no eol, rendered as before')
+    assert.equal(
+      await page.$eval('[data-testid="divergence-history"]', (el) => el.getAttribute('data-perturbed')),
+      'null',
+      'a proxy that never said whether it perturbed history is unknown, not "nothing"',
+    )
     assert.equal(
       await page.$eval('[data-testid="rendered-win"]', (el) => el.getAttribute('data-rendered-kind')),
       'not_reported',

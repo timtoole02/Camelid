@@ -893,6 +893,15 @@ fn chat_bodies(node: &StubEngine) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The chat requests that were runs of the comparison's own prompt, leaving
+/// out the unrelated requests sent between them.
+fn run_bodies(node: &StubEngine, prompt: &str) -> Vec<serde_json::Value> {
+    chat_bodies(node)
+        .into_iter()
+        .filter(|body| body["messages"][0]["content"] == prompt)
+        .collect()
+}
+
 /// C4. Both engines publish the digest of the weights they serve, and it is
 /// the same digest: identity is verified, the Camelid side is bound to the
 /// Ollama side's digest on every run, and nothing about identity is left
@@ -937,7 +946,7 @@ fn the_same_gguf_on_two_engines_is_verified_by_digest() {
             expected: GGUF_SHA256.to_string()
         })
     );
-    let chats = chat_bodies(&camelid);
+    let chats = run_bodies(&camelid, "q");
     assert!(!chats.is_empty());
     for body in &chats {
         assert_eq!(
@@ -988,7 +997,7 @@ fn a_manifest_digest_is_never_read_as_a_weights_digest() {
         .uncontrolled
         .contains(&"model identity".to_string()));
     assert_eq!(comparison.left.weights_check, None);
-    for body in chat_bodies(&camelid) {
+    for body in run_bodies(&camelid, "q") {
         assert!(
             body.get("camelid_expected_gguf_sha256").is_none(),
             "nothing to bind to, so nothing is sent: {body}"
@@ -1041,6 +1050,104 @@ fn a_camelid_refusal_of_the_other_sides_weights_is_different_models_not_a_failur
     assert_eq!(
         chat_bodies(&refusing).len(),
         1,
-        "the first refusal ends that side"
+        "the first refusal ends that side, before anything is sent between runs"
+    );
+}
+
+/// C2. Every run of a side after its first follows one short unrelated
+/// request, generating one token, so a history-dependent answer cannot pass as
+/// stable by repeating itself back to back. Turning it off sends nothing
+/// between runs, and the result says request history was not controlled.
+#[test]
+fn each_run_after_the_first_follows_a_short_unrelated_request() {
+    use camelid::fabric::{SamplingPlan, HISTORY_PERTURBATION, REQUEST_HISTORY};
+
+    let camelid = StubEngine::start(camelid_answering(None));
+    let studio = StubEngine::start(ollama_showing(MANIFEST_DIGEST, "m:latest"));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+    let three = SamplingPlan {
+        repetitions: 3,
+        ..SamplingPlan::default()
+    };
+
+    let comparison = fabric
+        .compare_model("win", "studio", "m", "q", three.clone())
+        .expect("both sides answered");
+    assert!(comparison.plan.history_perturbed);
+
+    let asked: Vec<(String, u64)> = chat_bodies(&camelid)
+        .iter()
+        .map(|body| {
+            (
+                body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                body["max_tokens"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    let perturbation = (HISTORY_PERTURBATION.to_string(), 1);
+    let run = ("q".to_string(), 64);
+    assert_eq!(
+        asked,
+        [
+            run.clone(),
+            perturbation.clone(),
+            run.clone(),
+            perturbation,
+            run
+        ],
+        "one unrelated one-token request before every run after the first"
+    );
+    let studio_prompts: Vec<String> = studio
+        .received()
+        .into_iter()
+        .filter(|request| request.path == "/api/chat")
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).expect("a JSON body")
+                ["messages"][0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        studio_prompts,
+        ["q", HISTORY_PERTURBATION, "q", HISTORY_PERTURBATION, "q"],
+        "every engine gets the same treatment"
+    );
+    assert_eq!(
+        comparison.left.samples.len(),
+        3,
+        "the perturbations are never samples"
+    );
+
+    let opted_out = fabric
+        .compare_model(
+            "win",
+            "studio",
+            "m",
+            "q",
+            SamplingPlan {
+                history_perturbed: false,
+                ..three
+            },
+        )
+        .expect("both sides answered");
+    assert!(!opted_out.plan.history_perturbed);
+    let reason = opted_out
+        .uncontrolled_detail
+        .iter()
+        .find(|item| item.name == REQUEST_HISTORY)
+        .map(|item| item.reason.clone())
+        .expect("an opted-out comparison lists request history");
+    assert!(
+        reason.contains("nothing was sent between a side's runs"),
+        "{reason}"
     );
 }

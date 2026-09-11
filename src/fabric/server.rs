@@ -840,6 +840,12 @@ struct CompareRequest {
     seed: Option<u64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// Send each side one short unrelated request between its runs, so an
+    /// answer that depends on the engine's request history shows as
+    /// instability. On unless a caller turns it off, and then the answer lists
+    /// request history as uncontrolled.
+    #[serde(default)]
+    perturb_history: Option<bool>,
 }
 
 /// Ask two named nodes the same question and report what differed.
@@ -892,6 +898,7 @@ async fn compare(
             .repetitions
             .unwrap_or(2)
             .clamp(1, fabric::MAX_COMPARE_REPETITIONS),
+        history_perturbed: request.perturb_history.unwrap_or(true),
     };
 
     // Every run is a generation, which is what `forward_timeout` budgets. The

@@ -208,6 +208,9 @@ export function describeComparison(body) {
       seed: numberOrNull(plan.seed),
       maxTokens: numberOrNull(plan.max_tokens),
       repetitions: numberOrNull(plan.repetitions),
+      // Whether each side was sent an unrelated request between its runs. An
+      // older proxy never did and never said, which is unknown, not "no".
+      historyPerturbed: typeof plan.history_perturbed === 'boolean' ? plan.history_perturbed : null,
     },
     verdict: {
       kind: oneOf(KNOWN_VERDICTS, verdict.kind),

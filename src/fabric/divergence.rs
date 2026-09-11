@@ -102,7 +102,25 @@ pub struct SamplingPlan {
     /// How many times each side is run. One is permitted, and is why
     /// [`Stability::Unmeasured`] exists.
     pub repetitions: usize,
+    /// Whether each side was sent [`HISTORY_PERTURBATION`] before every run
+    /// after its first. True only when that actually happened, so one run, or
+    /// an operator's opt-out, records false.
+    pub history_perturbed: bool,
 }
+
+/// The request sent to a side between two of its runs, generating at most
+/// [`HISTORY_PERTURBATION_MAX_TOKENS`] token, and never compared.
+///
+/// Why it exists, measured on Ollama 0.33.2 with one unchanged GGUF at
+/// temperature 0 and a fixed seed: the same request answered one way on a
+/// fresh server and another way after other requests, then kept repeating
+/// whichever it had settled on. Run back to back, a side like that agrees with
+/// itself, and a comparison reported a confident divergence that was really
+/// the engine's own history. Putting an unrelated request between runs gives
+/// each run a different history from the one before it, so a history-dependent
+/// answer shows up as instability instead.
+pub const HISTORY_PERTURBATION: &str = "Reply with the single word: ok.";
+pub const HISTORY_PERTURBATION_MAX_TOKENS: u32 = 1;
 
 impl Default for SamplingPlan {
     fn default() -> Self {
@@ -113,6 +131,7 @@ impl Default for SamplingPlan {
             seed: Some(0),
             max_tokens: 64,
             repetitions: 2,
+            history_perturbed: true,
         }
     }
 }
@@ -121,9 +140,11 @@ impl SamplingPlan {
     /// This plan with its repetitions inside what a comparison will run, so
     /// the plan a receipt records is the plan that ran. Zero reads as one: a
     /// side is always asked at least once, and recording zero beside one
-    /// sample would misstate the receipt.
+    /// sample would misstate the receipt. A single run has nothing to perturb
+    /// between, so it records no perturbation.
     pub fn bounded(mut self) -> Self {
         self.repetitions = self.repetitions.clamp(1, MAX_COMPARE_REPETITIONS);
+        self.history_perturbed &= self.repetitions > 1;
         self
     }
 }
@@ -661,6 +682,12 @@ pub fn conclude(
             reason,
         });
     }
+    if let Some(reason) = request_history_reason(&plan, &left, &right) {
+        uncontrolled_detail.push(Uncontrolled {
+            name: REQUEST_HISTORY.to_string(),
+            reason,
+        });
+    }
     let uncontrolled = uncontrolled_detail
         .iter()
         .map(|item| item.name.clone())
@@ -678,6 +705,54 @@ pub fn conclude(
         uncontrolled,
         uncontrolled_detail,
     }
+}
+
+/// The name request history is listed under when it is not controlled.
+pub const REQUEST_HISTORY: &str = "request history (prompt cache)";
+
+/// Why request history is uncontrolled, if it is.
+///
+/// It is unless both engines are shown, on their exact versions, to answer
+/// the same whatever they served before — the capability matrix says who is —
+/// and each side's runs were separated by the perturbation. The perturbation
+/// only exposes a dependence; it never controls it, so it is disclosed either
+/// way.
+fn request_history_reason(plan: &SamplingPlan, left: &Side, right: &Side) -> Option<String> {
+    let unattested: Vec<String> = [left, right]
+        .into_iter()
+        .filter_map(|side| {
+            let neutral = side
+                .engine
+                .capabilities(side.engine_version.as_deref())
+                .history_neutral;
+            (neutral.supported != Some(true)).then(|| {
+                format!(
+                    "{} ({} {}, {}: {})",
+                    side.label,
+                    side.engine,
+                    side.engine_version.as_deref().unwrap_or("version unknown"),
+                    neutral.provenance.as_str(),
+                    neutral.detail
+                )
+            })
+        })
+        .collect();
+    if unattested.is_empty() && plan.history_perturbed {
+        return None;
+    }
+    let between_runs = if plan.history_perturbed {
+        "each side was sent a short unrelated request before every run after its first, so an answer that depends on what the engine served before shows as instability; that exposes the dependence, it does not remove it"
+    } else {
+        "nothing was sent between a side's runs, so an answer that depends on what the engine served before can repeat itself and read as stable"
+    };
+    Some(if unattested.is_empty() {
+        between_runs.to_string()
+    } else {
+        format!(
+            "nothing shows an answer here is independent of the requests an engine served before it — {}; {between_runs}",
+            unattested.join("; ")
+        )
+    })
 }
 
 /// Which sides published no weights digest, and why, as a clause to append
@@ -1359,7 +1434,10 @@ mod tests {
         // Seed, because LM Studio takes none. Model identity, because an
         // equal id on two engines is two names agreeing rather than one set of
         // weights (pinned on its own below). Nothing else is invented.
-        assert_eq!(comparison.uncontrolled, ["seed", "model identity"]);
+        assert_eq!(
+            comparison.uncontrolled,
+            ["seed", "model identity", REQUEST_HISTORY]
+        );
         assert_eq!(
             comparison.verdict,
             Verdict::Divergent,
@@ -1457,7 +1535,7 @@ mod tests {
             side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
             ModelIdentity::SameId,
         );
-        assert_eq!(comparison.uncontrolled, ["model identity"]);
+        assert_eq!(comparison.uncontrolled, ["model identity", REQUEST_HISTORY]);
         assert_eq!(
             comparison.verdict,
             Verdict::Divergent,
@@ -1489,7 +1567,10 @@ mod tests {
             ModelIdentity::AssertedByOperator,
         );
 
-        assert_eq!(comparison.uncontrolled, ["seed", "model identity"]);
+        assert_eq!(
+            comparison.uncontrolled,
+            ["seed", "model identity", REQUEST_HISTORY]
+        );
         let names: Vec<&str> = comparison
             .uncontrolled_detail
             .iter()
@@ -1540,9 +1621,11 @@ mod tests {
             side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
             ModelIdentity::SameId,
         );
-        let [only] = comparison.uncontrolled_detail.as_slice() else {
-            panic!("{:?}", comparison.uncontrolled_detail);
-        };
+        let only = comparison
+            .uncontrolled_detail
+            .iter()
+            .find(|item| item.name == "model identity")
+            .unwrap_or_else(|| panic!("{:?}", comparison.uncontrolled_detail));
         assert_eq!(only.name, "model identity");
         assert!(
             only.reason.contains("both sides were asked for `m`")
@@ -1567,10 +1650,92 @@ mod tests {
             side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
             ModelIdentity::SameId,
         );
+        assert_eq!(
+            comparison.uncontrolled,
+            [REQUEST_HISTORY],
+            "no identity caveat; request history is the only thing listed"
+        );
+    }
+
+    /// C2. By default each side is sent an unrelated request between its runs,
+    /// and the plan records it only when it happened.
+    #[test]
+    fn the_default_plan_perturbs_history_between_runs() {
+        assert!(SamplingPlan::default().history_perturbed);
+        assert!(SamplingPlan::default().bounded().history_perturbed);
+        let once = SamplingPlan {
+            repetitions: 1,
+            ..SamplingPlan::default()
+        };
         assert!(
-            comparison.uncontrolled.is_empty(),
-            "{:?}",
-            comparison.uncontrolled
+            !once.bounded().history_perturbed,
+            "one run has nothing between it and another to perturb"
+        );
+        let opted_out = SamplingPlan {
+            history_perturbed: false,
+            ..SamplingPlan::default()
+        };
+        assert!(!opted_out.bounded().history_perturbed);
+        assert_eq!(HISTORY_PERTURBATION_MAX_TOKENS, 1);
+    }
+
+    /// C2. Request history is listed as uncontrolled while no engine is shown
+    /// to answer independently of it, with each side's evidence as the
+    /// capability matrix has it, and what was done between runs.
+    #[test]
+    fn request_history_is_uncontrolled_while_no_engine_is_shown_neutral() {
+        let mut studio = side("studio", NodeEngine::Ollama, "m", &["7", "7"]);
+        studio.engine_version = Some("0.33.2".to_string());
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            studio,
+            ModelIdentity::SameId,
+        );
+        let reason = comparison
+            .uncontrolled_detail
+            .iter()
+            .find(|item| item.name == REQUEST_HISTORY)
+            .map(|item| item.reason.as_str())
+            .expect("request history is uncontrolled");
+        assert!(
+            reason.contains("win (camelid version unknown, not_probed:"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("studio (ollama 0.33.2, measured:"),
+            "{reason}"
+        );
+        assert!(reason.contains("short unrelated request"), "{reason}");
+        assert_eq!(
+            comparison.verdict,
+            Verdict::Divergent,
+            "disclosed, not a reason to withhold a verdict both sides earned"
+        );
+    }
+
+    #[test]
+    fn an_opted_out_perturbation_says_nothing_was_sent_between_runs() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan {
+                history_perturbed: false,
+                ..SamplingPlan::default()
+            },
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("mac", NodeEngine::Camelid, "m", &["12", "12"]),
+            ModelIdentity::SameId,
+        );
+        let [only] = comparison.uncontrolled_detail.as_slice() else {
+            panic!("{:?}", comparison.uncontrolled_detail);
+        };
+        assert_eq!(only.name, REQUEST_HISTORY);
+        assert!(
+            only.reason
+                .contains("nothing was sent between a side's runs"),
+            "{}",
+            only.reason
         );
     }
 

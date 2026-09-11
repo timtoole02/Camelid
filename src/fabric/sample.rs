@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use super::camelid;
 use super::divergence::{
     stability_of, AppliedSampling, Ask, RenderedPrompt, Sample, SamplingPlan, Side,
-    TemplateEvidence, WeightsCheck, WeightsDigest, MAX_COMPARE_REPETITIONS,
+    TemplateEvidence, WeightsCheck, WeightsDigest, HISTORY_PERTURBATION,
+    HISTORY_PERTURBATION_MAX_TOKENS, MAX_COMPARE_REPETITIONS,
 };
 use super::engine::NodeEngine;
 use super::lmstudio;
@@ -173,7 +174,13 @@ pub(crate) fn measure(
         max_tokens: request.plan.max_tokens,
     };
 
-    for _ in 0..runs {
+    for run in 0..runs {
+        if run > 0 && request.plan.history_perturbed {
+            perturb_history(request, engine, transport).map_err(|detail| SampleError::Failed {
+                label: label.clone(),
+                detail: format!("the request sent between runs failed: {detail}"),
+            })?;
+        }
         let started = Instant::now();
         let answer = match engine {
             NodeEngine::Camelid => match camelid::complete(
@@ -231,6 +238,41 @@ pub(crate) fn measure(
         weights_digest,
         weights_check,
     })
+}
+
+/// Send [`HISTORY_PERTURBATION`] to a side, so its next run follows a
+/// different request than its last one did. Its answer is never compared.
+///
+/// Not bound to a weights digest: it asks nothing about the weights, and a
+/// refusal here would read as a failure of the comparison.
+fn perturb_history(
+    request: &SideRequest<'_>,
+    engine: NodeEngine,
+    transport: &NodeTransport,
+) -> Result<(), String> {
+    let ask = Ask {
+        model: request.model,
+        prompt: HISTORY_PERTURBATION,
+        temperature: request.plan.temperature,
+        seed: request.plan.seed,
+        max_tokens: HISTORY_PERTURBATION_MAX_TOKENS,
+    };
+    let timeout = request.generation_timeout;
+    match engine {
+        NodeEngine::Camelid => {
+            camelid::complete(request.spec, &ask, None, request.bearer, timeout, transport)
+                .map(drop)
+                .map_err(|error| match error {
+                    camelid::AskError::OtherWeights(detail) | camelid::AskError::Failed(detail) => {
+                        detail
+                    }
+                })
+        }
+        NodeEngine::Ollama => ollama::complete(request.spec, &ask, timeout, transport).map(drop),
+        NodeEngine::LmStudio => {
+            lmstudio::complete(request.spec, &ask, timeout, transport).map(drop)
+        }
+    }
 }
 
 /// The digest of the weights this side serves, where its engine publishes one.

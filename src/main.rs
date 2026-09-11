@@ -1577,14 +1577,19 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
     say!("{headline}");
     say!("prompt sha256 {}", comparison.prompt_sha256);
     say!(
-        "temperature {} · seed {} · max_tokens {} · {} run(s) each",
+        "temperature {} · seed {} · max_tokens {} · {} run(s) each · {}",
         comparison.plan.temperature,
         comparison
             .plan
             .seed
             .map_or_else(|| "none".to_string(), |seed| seed.to_string()),
         comparison.plan.max_tokens,
-        comparison.plan.repetitions
+        comparison.plan.repetitions,
+        if comparison.plan.history_perturbed {
+            "an unrelated request sent between runs"
+        } else {
+            "nothing sent between runs"
+        }
     );
     if !comparison.uncontrolled_detail.is_empty() {
         say!("NOT CONTROLLED:");
@@ -1989,6 +1994,15 @@ enum FabricAction {
         /// as uncontrolled either way.
         #[arg(long)]
         seed: Option<u64>,
+        /// Do not send each side a short unrelated request between its runs.
+        ///
+        /// By default one is sent (one token, never compared) before every run
+        /// after a side's first, so an engine whose answer depends on the
+        /// requests it served before shows as unstable rather than as a stable
+        /// answer that differs. With this flag the runs follow each other
+        /// directly, and the result lists request history as uncontrolled.
+        #[arg(long)]
+        no_history_perturbation: bool,
         #[arg(long, default_value_t = 64)]
         max_tokens: u32,
         #[arg(long, value_name = "TOKEN")]
@@ -2345,7 +2359,7 @@ mod fabric_command_tests {
             )),
             "{rendered}"
         );
-        assert!(!rendered.contains("NOT CONTROLLED"), "{rendered}");
+        assert!(!rendered.contains("  - model identity:"), "{rendered}");
         assert!(!rendered.contains("NOT VERIFIED"), "{rendered}");
     }
 
@@ -5103,6 +5117,7 @@ async fn main() -> anyhow::Result<()> {
                 transport,
                 timeout_s,
                 json,
+                no_history_perturbation,
             } => {
                 let declared = camelid::fabric::parse_model_aliases(&model_alias)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -5119,6 +5134,7 @@ async fn main() -> anyhow::Result<()> {
                     seed,
                     max_tokens,
                     repetitions: repeat,
+                    history_perturbed: !no_history_perturbation,
                 };
                 // An explicit per-side id wins over anything declared, because
                 // it is the more specific statement of the same claim.

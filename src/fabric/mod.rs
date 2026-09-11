@@ -58,7 +58,8 @@ pub use divergence::{
     check_temperature, conclude, sha256_hex, shared_weights_digest, AppliedSampling, Comparison,
     Honoured, ModelIdentity, RenderedPrompt, Sample, SamplingPlan, Side, Stability,
     TemplateEvidence, TextMatch, Uncontrolled, Verdict, WeightsCheck, WeightsDigest,
-    MAX_COMPARE_REPETITIONS, MAX_COMPARE_TEMPERATURE,
+    HISTORY_PERTURBATION, HISTORY_PERTURBATION_MAX_TOKENS, MAX_COMPARE_REPETITIONS,
+    MAX_COMPARE_TEMPERATURE, REQUEST_HISTORY,
 };
 pub use engine::NodeEngine;
 pub use forward::{

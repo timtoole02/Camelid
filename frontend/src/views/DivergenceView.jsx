@@ -518,6 +518,14 @@ export default function DivergenceView() {
             {comparison.plan.seed === null ? 'none' : comparison.plan.seed}
             {' · runs each '}
             {comparison.plan.repetitions ?? <Unknown why="Not reported." />}
+            {' · between runs '}
+            <span data-testid="divergence-history" data-perturbed={String(comparison.plan.historyPerturbed)}>
+              {comparison.plan.historyPerturbed === true && 'one unrelated request'}
+              {comparison.plan.historyPerturbed === false && 'nothing'}
+              {comparison.plan.historyPerturbed === null && (
+                <Unknown why="This proxy did not say whether it sent anything between runs." />
+              )}
+            </span>
             {' · prompt sha256 '}
             <code>{comparison.promptSha256 || '-'}</code>
           </p>

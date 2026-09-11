@@ -518,6 +518,12 @@ check('a line ending is carried per line, so a terminator-only difference can be
   assert.equal(lines[4].eolUnrecognised, true, 'an eol this build does not know is unknown, not LF')
 })
 
+check('whether history was perturbed between runs is read as sent, and unknown when not sent', () => {
+  assert.equal(describeComparison(body({ plan: { ...body().plan, history_perturbed: true } })).plan.historyPerturbed, true)
+  assert.equal(describeComparison(body({ plan: { ...body().plan, history_perturbed: false } })).plan.historyPerturbed, false)
+  assert.equal(describeComparison(body()).plan.historyPerturbed, null, 'an older proxy never said, which is not "no"')
+})
+
 check('the token cap is stated, and a clamped request says what was applied', () => {
   assert.match(tokenCapStatement(describeComparison(body())), /capped at 64 tokens, so this compares at most the first 64 tokens/)
   const clamped = tokenCapStatement(describeComparison(body({ plan: { temperature: 0, seed: 0, max_tokens: 1024, repetitions: 2 } })), 5000)

@@ -104,17 +104,24 @@ pub struct Capabilities {
     pub warm_prefix: Capability,
     pub tool_calls: Capability,
     pub embeddings: Capability,
+    /// Answers a request the same way whatever requests it served before —
+    /// that a prompt cache, a reused KV prefix or a slot left over from an
+    /// earlier request never changes the bytes. A comparison's
+    /// back-to-back self-consistency check cannot see an engine that fails
+    /// this: it repeats itself run after run from the same history.
+    pub history_neutral: Capability,
 }
 
 impl Capabilities {
     /// Name/answer pairs in a fixed order, for rendering.
-    pub fn entries(&self) -> [(&'static str, Capability); 5] {
+    pub fn entries(&self) -> [(&'static str, Capability); 6] {
         [
             ("load_reporting", self.load_reporting),
             ("typed_backpressure", self.typed_backpressure),
             ("warm_prefix", self.warm_prefix),
             ("tool_calls", self.tool_calls),
             ("embeddings", self.embeddings),
+            ("history_neutral", self.history_neutral),
         ]
     }
 
@@ -179,6 +186,33 @@ fn tool_calls_for(engine: NodeEngine, version: Option<&str>) -> Capability {
     }
 }
 
+/// Request-history measurements. Exact version match only, like the table
+/// above. Only a `false` is recorded from a single counterexample: one request
+/// answered two ways is proof of dependence, while no number of agreeing runs
+/// proves independence, so a `true` needs more than this table can hold.
+const HISTORY_MEASUREMENTS: &[Measurement] = &[Measurement {
+    engine: NodeEngine::Ollama,
+    version: "0.33.2",
+    supported: false,
+    detail: "measured on this exact version: the same temperature-0, seed-42 request on an unchanged Llama-3.2-1B-Instruct Q8_0 answered two different ways depending on the requests served before it",
+}];
+
+fn history_neutral_for(engine: NodeEngine, version: Option<&str>) -> Capability {
+    if let Some(version) = version {
+        for measurement in HISTORY_MEASUREMENTS {
+            if measurement.engine == engine && measurement.version == version {
+                return Capability::measured(measurement.supported, measurement.detail);
+            }
+        }
+    }
+    // Our own engine included. It keeps prompt caches, and nothing here has
+    // shown a cache hit and a cold prefill produce the same bytes on every
+    // lane, so it is not declared neutral on its own say-so either.
+    Capability::not_probed(
+        "no measurement here shows this engine and version answers the same whatever requests it served before",
+    )
+}
+
 /// What an engine can be asked, given the version it reported.
 ///
 /// `version` is `Option` because not every engine publishes one over HTTP:
@@ -201,6 +235,7 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
             ),
             tool_calls: tool_calls_for(engine, version),
             embeddings: Capability::declared(true, "`/v1/embeddings` is served by the engine"),
+            history_neutral: history_neutral_for(engine, version),
         },
         NodeEngine::Ollama => Capabilities {
             load_reporting: Capability::declared(
@@ -217,6 +252,7 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
             ),
             tool_calls: tool_calls_for(engine, version),
             embeddings: Capability::declared(true, "`/api/embed` is documented"),
+            history_neutral: history_neutral_for(engine, version),
         },
         NodeEngine::LmStudio => Capabilities {
             load_reporting: Capability::declared(
@@ -233,6 +269,7 @@ pub fn capabilities_of(engine: NodeEngine, version: Option<&str>) -> Capabilitie
             ),
             tool_calls: tool_calls_for(engine, version),
             embeddings: Capability::declared(true, "`/api/v0/embeddings` is documented"),
+            history_neutral: history_neutral_for(engine, version),
         },
     }
 }
@@ -382,6 +419,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// C2. Neutrality across request history is never declared, for any
+    /// engine, ours included: back-to-back agreement cannot show it, and the
+    /// one measurement recorded is a counterexample on one exact version.
+    #[test]
+    fn history_neutrality_is_never_declared_and_only_measured_on_its_exact_version() {
+        for engine in [
+            NodeEngine::Camelid,
+            NodeEngine::Ollama,
+            NodeEngine::LmStudio,
+        ] {
+            for version in [None, Some("0.33.1"), Some("0.33.3"), Some("v0.7.3-1")] {
+                let history = capabilities_of(engine, version).history_neutral;
+                assert_eq!(
+                    history.provenance,
+                    Provenance::NotProbed,
+                    "{engine} {version:?} must not be credited with neutrality"
+                );
+                assert_eq!(history.supported, None);
+            }
+        }
+        let measured = capabilities_of(NodeEngine::Ollama, Some("0.33.2")).history_neutral;
+        assert_eq!(measured.provenance, Provenance::Measured);
+        assert_eq!(measured.supported, Some(false));
+        assert_eq!(
+            capabilities_of(NodeEngine::Camelid, Some("0.33.2"))
+                .history_neutral
+                .provenance,
+            Provenance::NotProbed,
+            "a measurement belongs to the engine it was taken on"
+        );
     }
 
     #[test]
