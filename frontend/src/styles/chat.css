@@ -1386,6 +1386,91 @@
 }
 
 
+/* ---- Math (KaTeX) ---------------------------------------------------------
+   Renders lazily, so a formula has a visible pre-render state: its TeX
+   source. Style that fallback so it reads as "not typeset yet", never as
+   broken output. */
+.cx-math { font-size: 1.02em; }
+.cx-math--display {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: var(--space-3) 0;
+  padding: var(--space-2) 0;
+  text-align: center;
+}
+/* Pre-render and load-failure states: monospace signals "this is source". */
+.cx-math__source {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+.cx-math--unrendered .cx-math__source { text-decoration: underline dotted var(--color-border-soft); }
+/* The host is empty until KaTeX fills it; an empty inline box must not add
+   width, or every un-typeset formula gains a stray gap. */
+.cx-math__host:empty { display: none; }
+
+/* ---- Diagrams (Mermaid) --------------------------------------------------
+   Renders lazily, like math: the diagram's own source is the pre-render
+   state, and a diagram that never parses stays an ordinary code card. */
+.cx-mermaid {
+  margin: var(--space-3) 0;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+.cx-mermaid__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--color-border-soft);
+  font-size: var(--text-2xs);
+}
+.cx-mermaid__label {
+  flex: 1;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+.cx-mermaid__bar button {
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  padding: 2px var(--space-1);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.cx-mermaid__bar button:hover { background: var(--color-surface-hover); color: var(--color-text); }
+/* A wide diagram scrolls inside its own box; the message column never does. */
+.cx-mermaid__canvas {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-3);
+  overflow-x: auto;
+}
+.cx-mermaid__canvas svg { max-width: 100%; height: auto; }
+.cx-mermaid__svg:empty { display: none; }
+.cx-mermaid__pending {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-faint);
+  white-space: pre-wrap;
+  text-align: left;
+}
+.cx-mermaid__source {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+  background: var(--color-surface-hover);
+  font-size: var(--text-xs);
+  overflow-x: auto;
+}
+
 /* ---- Regenerated-reply siblings -----------------------------------------
    Sits at the head of the actions row. Kept quiet: on a reply with one
    version it is not rendered at all, so this must never make an ordinary
