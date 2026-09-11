@@ -1,9 +1,7 @@
 import { Fragment, createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { copyText } from './clipboard.js'
 import { displayMathOnlyLine, splitMathSegments } from './mathSegments.js'
 import { MathSpan } from '../components/chat/render/MathSpan.jsx'
-import { MermaidDiagram } from '../components/chat/render/MermaidDiagram.jsx'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
@@ -25,11 +23,16 @@ export const normalizeCodeLanguage = (value) => {
    would otherwise make that indistinguishable from success, letting a caller show
    a "Copied" confirmation for a copy that never happened. Callers that ignore the
    result behave exactly as before. */
-/* Re-exported so the many existing `from '../../lib/markdown'` call sites keep
-   working; the implementation moved to lib/clipboard.js because components
-   rendered BY this module now need it too, and importing it back from here
-   would be a cycle. */
-export { copyText }
+export const copyText = async (text) => {
+  try {
+    if (!navigator.clipboard?.writeText) return false
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // Clipboard access can be denied even in a secure context; rendering still works.
+    return false
+  }
+}
 
 /* Only http(s)/mailto links render as anchors; any other scheme (javascript:,
    data:, file:) stays plain text — model output never picks the protocol. */
@@ -487,31 +490,18 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
   )
 }
 
-const isMermaidLanguage = (language) => String(language || '').trim().toLowerCase() === 'mermaid'
-
 const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
   const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
   const stillGenerating = Boolean(incomplete && streaming)
-  const card = (
+  blocks.push(
     <CodeBlockCard
       key={`code-${blocks.length}`}
       language={language}
       code={trimmedCode}
       keyPrefix={keyPrefix}
       stillGenerating={stillGenerating}
-    />
+    />,
   )
-  /* A mermaid fence draws only once it is CLOSED. Handing Mermaid a half-typed
-     diagram on every frame would flash parse failures through the whole
-     stream, so until the fence closes this stays the ordinary code card --
-     which is also what it falls back to if the diagram never parses. */
-  if (isMermaidLanguage(language) && trimmedCode && !incomplete) {
-    blocks.push(
-      <MermaidDiagram key={`mermaid-${blocks.length}`} source={trimmedCode} fallback={card} />,
-    )
-    return
-  }
-  blocks.push(card)
 }
 
 export const hasOpenCodeFence = (content) => {

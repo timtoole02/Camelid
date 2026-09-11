@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-/* Math + diagram rendering smoke.
+/* Math rendering smoke.
  *
  * The delimiter scanner is where this feature lives or dies: model output is
  * full of dollar signs that are not math, and four different delimiter styles
  * that are. Most of this file is the NOT-math half.
  *
- * The renderers themselves are asserted only at the level a static render can
- * see (KaTeX and Mermaid both do their work in an effect, which
- * renderToStaticMarkup does not run) -- that the TeX source and the diagram
- * source survive as the pre-render fallback, which is what the reader sees if
- * the lazy chunk never arrives. The browser smoke covers actual rendering.
+ * KaTeX itself is asserted only at the level a static render can see (it does
+ * its work in an effect, which renderToStaticMarkup does not run) -- that the
+ * TeX source survives as the pre-render fallback, which is what the reader
+ * sees if the lazy chunk never arrives. The browser smoke covers actual
+ * typesetting.
  */
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
@@ -101,29 +101,12 @@ try {
   assert.doesNotMatch(currencyProse, /cx-math/, 'currency in rendered prose stays prose')
   assert.match(currencyProse, /costs \$40 and the 27B costs \$90/, 'and reads exactly as written')
 
-  /* ---- mermaid fences ---------------------------------------------------- */
-  const diagram = render('```mermaid\ngraph TD;\n  A-->B;\n```')
-  assert.match(diagram, /class="cx-mermaid"/, 'a closed mermaid fence becomes a diagram figure')
-  assert.match(diagram, /graph TD/, 'the diagram source survives as the pre-render fallback')
-  assert.match(diagram, /Copy diagram source/, 'the source stays copyable')
-
-  const openDiagram = render('```mermaid\ngraph TD;\n  A-->B;', true)
-  assert.doesNotMatch(
-    openDiagram,
-    /class="cx-mermaid"/,
-    'an OPEN mermaid fence stays a code card — handing Mermaid a half-typed diagram flashes parse errors through the stream',
-  )
-  assert.match(openDiagram, /message-code-card-title/, 'and renders as the ordinary code card meanwhile')
-
-  const ordinaryCode = render('```python\nx = 1\n```')
-  assert.doesNotMatch(ordinaryCode, /cx-mermaid/, 'a non-mermaid fence is unaffected')
-  assert.match(ordinaryCode, /message-code-card-title[^>]*>PYTHON</, 'and still labels its language')
-
   /* Math inside a code fence is code, not math. */
   const mathInFence = render('```tex\n$$x=1$$\n```')
   assert.doesNotMatch(mathInFence, /cx-math/, 'a formula inside a code fence stays code')
+  assert.match(mathInFence, /message-code-card-title[^>]*>TEX</, 'and the fence still renders as a labelled code card')
 
-  console.log('math + diagram smoke passed')
+  console.log('math smoke passed')
 } finally {
   await server.close()
 }

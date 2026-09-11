@@ -486,19 +486,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:markdown
 
-      # Math and diagram rendering. The pure half is mostly the NOT-math half:
-      # model output is full of dollar signs that are currency, and a renderer
-      # that typesets them turns a sentence into a garbled formula.
-      - name: Frontend math + diagram smoke
+      # Math rendering. The pure half is mostly the NOT-math half: model output
+      # is full of dollar signs that are currency, and a renderer that typesets
+      # them turns a sentence into a garbled formula.
+      - name: Frontend math smoke
         if: ${{ !cancelled() }}
-        run: npm run smoke:math-diagram
+        run: npm run smoke:math
 
-      # KaTeX and Mermaid both work in an effect, so only a real browser can
-      # show they render at all. This gate also holds the regression guard for
-      # writing into a React-owned node, which unmounts the entire app.
-      - name: Frontend math + diagram browser smoke
+      # KaTeX works in an effect, so only a real browser can show it typesets
+      # at all. This gate also holds the regression guard for writing into a
+      # React-owned node, which unmounts the entire app.
+      - name: Frontend math browser smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: npm run smoke:math-diagram-browser
+        run: npm run smoke:math-browser
       # Continuing a reply that stopped on the response budget. Pure half:
       # which replies may be continued, how the resumed text rejoins the kept
       # text (mid-word resumes, restated sentences), and cumulative usage.

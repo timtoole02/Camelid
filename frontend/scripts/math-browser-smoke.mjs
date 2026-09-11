@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-/* Browser-level acceptance for math and diagram rendering.
+/* Browser-level acceptance for math rendering.
  *
  * Requires `npm run build` first. Serves the compiled app from an ephemeral
  * loopback server and aborts every cross-origin request, so a green run
- * proves the lazy chunks resolve from the LOCAL server -- which is the only
- * place they can come from once the app is embedded in the engine binary.
+ * proves the lazy chunk and its fonts resolve from the LOCAL server -- which
+ * is the only place they can come from once the app is embedded in the
+ * engine binary.
  *
- * Both renderers do their work in an effect, so static rendering can only see
- * the fallback. This is the gate that proves the real thing:
+ * KaTeX does its work in an effect, so static rendering can only see the
+ * fallback. This is the gate that proves the real thing:
  *   - KaTeX actually typesets, and the lazy chunk actually arrives
- *   - Mermaid actually draws an SVG
- *   - a malformed diagram falls back to the code card instead of a blank box
  *   - currency in a real rendered reply is still currency
+ *   - a formula that re-renders on every streamed frame does not unmount the app
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -27,14 +27,10 @@ const ledgerPath = resolve(scriptDir, '../../ledger/camelid-ledger.json')
 const MODEL_FILENAME = 'Qwen3-0.6B-Q8_0.gguf'
 
 const MATH_PROMPT = 'Show me Euler'
-const DIAGRAM_PROMPT = 'Draw the pipeline'
-const BROKEN_DIAGRAM_PROMPT = 'Draw something broken'
 const PRICE_PROMPT = 'What do the tiers cost'
 const STREAMED_MATH_PROMPT = 'Stream me a formula'
 
 const MATH_ANSWER = 'Inline $e^{i\\pi} + 1 = 0$ and a block:\n\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$'
-const DIAGRAM_ANSWER = '```mermaid\ngraph TD;\n  Prompt-->Prefill;\n  Prefill-->Decode;\n```'
-const BROKEN_DIAGRAM_ANSWER = '```mermaid\nthis is definitely not a diagram {{{\n```'
 const PRICE_ANSWER = 'The 8B costs $40 and the 27B costs $90 per month.'
 
 const MIME = {
@@ -131,8 +127,8 @@ const server = createServer(async (req, res) => {
         ok: true,
         engine: 'camelid',
         api_surface: 'full',
-        version: 'math-diagram-browser-smoke',
-        build: 'math-diagram-browser-smoke',
+        version: 'math-browser-smoke',
+        build: 'math-browser-smoke',
         backend: 'llama',
         model_family: 'qwen3',
         loaded_now: true,
@@ -183,8 +179,6 @@ const server = createServer(async (req, res) => {
       const body = await readJsonBody(req)
       const lastUser = [...(body?.messages || [])].reverse().find((m) => m?.role === 'user')
       const text = typeof lastUser?.content === 'string' ? lastUser.content : ''
-      if (text === DIAGRAM_PROMPT) return sendChatCompletion(res, DIAGRAM_ANSWER)
-      if (text === BROKEN_DIAGRAM_PROMPT) return sendChatCompletion(res, BROKEN_DIAGRAM_ANSWER)
       if (text === PRICE_PROMPT) return sendChatCompletion(res, PRICE_ANSWER)
       if (text === STREAMED_MATH_PROMPT) return sendChatCompletionStreamed(res, MATH_ANSWER)
       return sendChatCompletion(res, MATH_ANSWER)
@@ -204,7 +198,7 @@ const server = createServer(async (req, res) => {
 await new Promise((done) => server.listen(0, '127.0.0.1', done))
 const origin = `http://127.0.0.1:${server.address().port}`
 
-const browser = await launchBrowser({ purpose: 'the math and diagram browser smoke', headless: 'new' })
+const browser = await launchBrowser({ purpose: 'the math browser smoke', headless: 'new' })
 const page = await browser.newPage()
 await page.setViewport({ width: 1280, height: 900, deviceScaleFactor: 1 })
 page.on('pageerror', (error) => pageErrors.push(String(error)))
@@ -294,54 +288,7 @@ try {
     'KaTeX fonts resolve locally — a formula must not depend on a CDN',
   )
 
-  /* ---- 2. Mermaid actually draws --------------------------------------- */
-  await newChat()
-  await sendPrompt(DIAGRAM_PROMPT)
-  await page.waitForFunction(() => (
-    document.querySelector('.cx-mermaid[data-mermaid-state="ready"] svg') !== null
-  ), { timeout: 30000 })
-  const diagramState = await page.evaluate(() => {
-    const figure = document.querySelector('.cx-mermaid')
-    const svg = figure?.querySelector('svg')
-    return {
-      state: figure?.getAttribute('data-mermaid-state'),
-      hasSvg: Boolean(svg),
-      // Proves it drew THIS diagram rather than an empty canvas.
-      labels: svg ? svg.textContent : '',
-      hasScript: Boolean(svg?.querySelector('script')),
-      sourceHidden: !figure?.querySelector('.cx-mermaid__source'),
-    }
-  })
-  assert.equal(diagramState.state, 'ready', 'the diagram reached the ready state')
-  assert.equal(diagramState.hasSvg, true, 'Mermaid produced an SVG')
-  assert.match(diagramState.labels, /Prefill/, 'the SVG contains this diagram’s own node labels')
-  assert.equal(diagramState.hasScript, false, 'the generated SVG carries no script element')
-  assert.equal(diagramState.sourceHidden, true, 'the source panel starts collapsed')
-
-  await page.click('.cx-mermaid__bar button')
-  await page.waitForSelector('.cx-mermaid__source', { timeout: 10000 })
-  const revealed = await page.$eval('.cx-mermaid__source', (node) => node.textContent)
-  assert.match(revealed, /graph TD/, 'the diagram source can be revealed')
-
-  /* ---- 3. a malformed diagram degrades to the code card ----------------- */
-  await newChat()
-  await sendPrompt(BROKEN_DIAGRAM_PROMPT)
-  await page.waitForFunction(() => (
-    document.querySelector('main[data-view="chat"] .message-code-card') !== null
-  ), { timeout: 30000 })
-  const brokenState = await page.evaluate(() => ({
-    figures: document.querySelectorAll('.cx-mermaid').length,
-    codeCards: document.querySelectorAll('main[data-view="chat"] .message-code-card').length,
-    text: document.querySelector('main[data-view="chat"] .message-code-card')?.textContent || '',
-    // Mermaid appends an error node to <body> on a parse failure.
-    strayErrorNodes: document.querySelectorAll('body > svg[id^="dcx-mermaid"], body > div[id^="dcx-mermaid"]').length,
-  }))
-  assert.equal(brokenState.figures, 0, 'an unparseable diagram leaves no empty diagram box')
-  assert.equal(brokenState.codeCards, 1, 'it falls back to the ordinary code card')
-  assert.match(brokenState.text, /not a diagram/, 'and the reader still gets the text of it')
-  assert.equal(brokenState.strayErrorNodes, 0, 'Mermaid’s failure node is cleaned up, not left on the page')
-
-  /* ---- 4. currency in a real rendered reply is still currency ----------- */
+  /* ---- 2. currency in a real rendered reply is still currency ----------- */
   await newChat()
   await sendPrompt(PRICE_PROMPT)
   await page.waitForFunction((answer) => (
@@ -354,8 +301,7 @@ try {
   assert.equal(priceState.mathSpans, 0, 'two prices in a sentence must not be typeset as a formula')
   assert.match(priceState.text, /costs \$40 and the 27B costs \$90/, 'the sentence reads exactly as written')
 
-
-  /* ---- 5. a formula whose TeX changes on every frame -------------------- */
+  /* ---- 3. a formula whose TeX changes on every frame -------------------- */
   /* This is the regression guard for the defect the first run of this smoke
      found: KaTeX writing into a React-owned node. It only reproduces when a
      formula RE-renders, which is every frame of a streamed reply. The
@@ -384,7 +330,7 @@ try {
   assert.deepEqual(pageErrors, [], 'the page must not raise errors')
   assert.deepEqual(externalRequests, [], 'nothing may be fetched off-origin — no CDN dependency')
 
-  console.log('math + diagram browser smoke passed')
+  console.log('math browser smoke passed')
 } finally {
   await browser.close()
   await new Promise((done) => server.close(done))

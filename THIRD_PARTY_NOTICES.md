@@ -81,13 +81,12 @@ ecosystem); this records its promotion to a direct, load-bearing dependency.
 
 The WebUI is compiled to static assets and embedded in the engine binary by `rust-embed`, so every runtime npm dependency below is **redistributed inside every Camelid release**, not merely used at build time. That is what puts them in this file rather than leaving them to the lockfile.
 
-KaTeX and Mermaid are loaded on demand rather than in the main bundle, but on-demand loading is a size decision, not a distribution one: the chunks and font files still ship in the binary.
+KaTeX is loaded on demand rather than in the main bundle, but on-demand loading is a size decision, not a distribution one: its chunk and font files still ship in the binary.
 
 | Dependency | License | Used for |
 | --- | --- | --- |
 | [React](https://github.com/facebook/react) / React DOM | MIT | the WebUI itself |
 | [KaTeX](https://github.com/KaTeX/KaTeX) | MIT | typesetting TeX in assistant replies (JS plus its bundled fonts) |
-| [Mermaid](https://github.com/mermaid-js/mermaid) | MIT | drawing ` ```mermaid ` diagram fences |
 | [Inter](https://github.com/rsms/inter), [Space Grotesk](https://github.com/floriankarsten/space-grotesk), [IBM Plex Mono](https://github.com/IBM/plex) (via Fontsource) | OFL-1.1 | the WebUI's typefaces |
 
 The OFL-1.1 fonts are redistributed unmodified under their reserved names, which that licence permits; Camelid does not sell the fonts on their own.
