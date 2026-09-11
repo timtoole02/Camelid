@@ -545,3 +545,192 @@
 
   .fabric-header__endpoint { flex-basis: 100%; }
 }
+
+/* ---- routing (Screen E) ----
+   What this proxy places on, and the command that would change it. Only the
+   proxy's own sentences appear here, so the layout's job is to keep each one
+   next to the nodes it is about. */
+
+.fabric-routing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  min-width: 0;
+}
+
+.fabric-routing h2 {
+  font-size: var(--text-md);
+  margin: 0;
+}
+
+.fabric-routing h3 {
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-2);
+}
+
+.fabric-routing__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.fabric-routing__choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+}
+
+.fabric-routing__option {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.fabric-routing__option input:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.fabric-routing__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: var(--color-overlay);
+}
+
+.fabric-routing__dialog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(44rem, 100%);
+  max-height: 88vh;
+  overflow-y: auto;
+  padding: var(--space-5);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-3);
+  min-width: 0;
+}
+
+.fabric-routing__dialog h3 {
+  font-size: var(--text-lg);
+  margin: 0;
+}
+
+.fabric-routing__accept {
+  padding: var(--space-3);
+  border: 1px solid var(--color-evidence-border);
+  border-radius: var(--radius-md);
+  background: var(--color-evidence-soft);
+  min-width: 0;
+}
+
+.fabric-routing__blocker {
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__consequence {
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-2);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__nodes,
+.fabric-routing__limits,
+.fabric-routing__consequences,
+.fabric-routing__adds ul,
+.fabric-routing__added ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  min-width: 0;
+}
+
+.fabric-routing__node {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.fabric-routing__node-label {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__node-engine {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__node-detail {
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__node-how {
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.fabric-routing__limits li,
+.fabric-routing__consequences li {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__adds code,
+.fabric-routing__added li {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.fabric-routing__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.fabric-routing__command {
+  min-width: 0;
+}
+
+.fabric-row__engine-note--accepting {
+  font-style: normal;
+  color: var(--color-warning);
+}
+
+.fabric-detail__accepting {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fabric-detail__blocker {
+  font-weight: 600;
+}

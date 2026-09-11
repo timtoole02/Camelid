@@ -29,8 +29,10 @@ function EngineCell({ node }) {
     return <Unknown why="This entry arrived without a declared engine." />
   }
   // `placeable` is the proxy's answer, not ours: a healthy node can still be
-  // one this fabric does not route to.
+  // one this fabric does not route to. And one it does route to can still be
+  // one it cannot fully see, when the proxy was told to accept that.
   const routed = node.placeable
+  const accepting = node.placementBlockers ? node.placementBlockers.length : 0
   return (
     <span className="fabric-row__engine">
       <span className="fabric-row__engine-name">{node.engine}</span>
@@ -40,6 +42,14 @@ function EngineCell({ node }) {
           title="This fabric reads this node but does not send work to it."
         >
           not routed to
+        </span>
+      )}
+      {routed === true && accepting > 0 && (
+        <span
+          className="fabric-row__engine-note fabric-row__engine-note--accepting"
+          title="This proxy sends work here and accepts what it cannot see about this engine. Open the node for the list."
+        >
+          routed to · accepting {accepting} {accepting === 1 ? 'limit' : 'limits'}
         </span>
       )}
     </span>

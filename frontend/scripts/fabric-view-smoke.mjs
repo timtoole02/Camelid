@@ -148,7 +148,87 @@ const SUMMARY = {
   build: 'v0.6.1-267-gabc1234',
 }
 
+/* Screen E fixtures. Every sentence about what the proxy does is a nonsense
+   token here, so a page that authored its own sentence instead of rendering
+   the proxy's would fail on the token, not pass on a plausible paragraph. */
+const A_CAMELID = {
+  ...READY_NODE,
+  spec: { ...READY_NODE.spec, label: 'a-camelid' },
+  placement_blockers: [],
+  placement_blocker_detail: [],
+  requirement_limits: [],
+}
+const OLLAMA_BLOCKERS = [
+  { key: 'load_reporting', blocker: 'publishes no load to rank on', consequence: 'zz-ranked-as-carrying-two' },
+  { key: 'typed_backpressure', blocker: 'a full queue is indistinguishable from a failure', consequence: 'zz-handed-back-once' },
+  { key: 'warm_prefix', blocker: 'cannot attest a warm prefix, so affinity would be a guess', consequence: 'zz-pinned-is-refused' },
+]
+function bOllama(placeable) {
+  return {
+    spec: { label: 'b-ollama', host: '127.0.0.1', port: 11434, engine: 'ollama' },
+    status: {
+      state: 'ready',
+      engine: 'ollama',
+      active_model_id: 'llama1b-q8:latest',
+      models: ['llama1b-q8:latest', 'only-on-ollama:latest'],
+      resident_models: ['llama1b-q8:latest'],
+      backend: null,
+      version: '0.33.2',
+    },
+    latency_ms: 5,
+    placeable,
+    capabilities: {
+      load_reporting: { supported: false, provenance: 'declared', detail: 'zz-no-depth-endpoint' },
+      typed_backpressure: { supported: false, provenance: 'declared', detail: 'zz-no-typed-refusal' },
+      warm_prefix: { supported: false, provenance: 'declared', detail: 'zz-ps-is-not-prefix' },
+      tool_calls: { supported: null, provenance: 'not_probed', detail: 'zz-tools-unchecked' },
+    },
+    placement_blockers: OLLAMA_BLOCKERS.map((entry) => entry.blocker),
+    placement_blocker_detail: OLLAMA_BLOCKERS,
+    requirement_limits: [
+      { key: 'tool_calls', consequence: 'zz-tools-never-here' },
+      { key: 'rerank_route', consequence: 'zz-rerank-never-here' },
+    ],
+  }
+}
+function placementOf(mode, extra = {}) {
+  return {
+    mixed_engines: mode,
+    flag: '--allow-mixed-engines',
+    unreported_load_cost: 2,
+    cold_load_cost: 4,
+    max_forward_attempts: 2,
+    models_if_mixed: mode === 'refused' ? ['only-on-ollama:latest'] : [],
+    covers_nodes_added_later: true,
+    consequences: [{ key: 'standing_grant', text: 'zz-standing-grant-sentence' }],
+    foreign_nodes_added_since_start: [],
+    ...extra,
+  }
+}
+
+function routingBody(nodes, placement) {
+  const ready = nodes.filter((node) => node.status.state === 'ready').length
+  return {
+    ...SUMMARY,
+    ready: true,
+    nodes: { total: nodes.length, ready, not_ready: 0, unreachable: 0 },
+    models: ['Llama 3.2 1B Instruct'],
+    node_detail: nodes,
+    placement,
+  }
+}
+
 function proxyBody() {
+  if (proxy.mode === 'routing-refused') return routingBody([A_CAMELID, bOllama(false)], placementOf('refused'))
+  if (proxy.mode === 'routing-camelid-only') {
+    return routingBody([A_CAMELID], placementOf('refused', { models_if_mixed: [] }))
+  }
+  if (proxy.mode === 'routing-allowed') {
+    return routingBody(
+      [A_CAMELID, bOllama(true)],
+      placementOf('allowed', { foreign_nodes_added_since_start: [{ label: 'c-ollama2', engine: 'ollama' }] }),
+    )
+  }
   if (proxy.mode === 'withheld') return { ...SUMMARY, ready: true }
   if (proxy.mode === 'empty') return { ...SUMMARY, ready: false, nodes: { total: 0, ready: 0, not_ready: 0, unreachable: 0 }, models: [], node_detail: [] }
   if (proxy.mode === 'engine') return { ok: true, engine: 'camelid', generation_ready: true, version: '0.6.1', build: 'v0.6.1' }
@@ -209,6 +289,23 @@ async function openCluster({ endpoint, viewport = { width: 1280, height: 900 } }
   await page.evaluateOnNewDocument((value) => {
     window.localStorage.clear()
     window.localStorage.setItem('camelid.fabricEndpoint', value)
+    // Every request the page makes, however it makes it, so a check can say
+    // what the page asked for rather than what one server happened to see.
+    window.__requests = []
+    const record = (method, url) => {
+      window.__requests.push({ method: String(method || 'GET').toUpperCase(), url: new URL(String(url), window.location.href).href })
+    }
+    const originalFetch = window.fetch
+    window.fetch = function recordedFetch(input, init) {
+      const url = typeof input === 'string' || input instanceof URL ? input : input.url
+      record((init && init.method) || (input && input.method), url)
+      return originalFetch.apply(this, arguments)
+    }
+    const originalOpen = window.XMLHttpRequest.prototype.open
+    window.XMLHttpRequest.prototype.open = function recordedOpen(method, url) {
+      record(method, url)
+      return originalOpen.apply(this, arguments)
+    }
   }, endpoint)
   const errors = []
   page.on('pageerror', (error) => errors.push(String(error)))
@@ -546,6 +643,170 @@ try {
     assert.match(body, /Something answered at/)
     assert.doesNotMatch(body, /No fabric proxy answered/, 'something did answer, and saying otherwise sends the operator to the wrong fix')
     check('an opaque follow-up tells an origin refusal apart from a dead address')
+
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+  resetProxy()
+
+  /* ---- 10. Screen E: the routing mode, and the command that would change it ---- */
+  const routingButtons = (page) => page.$$eval(
+    '[data-testid="fabric-routing"] button, [data-testid="fabric-routing"] [role="button"]',
+    (els) => els.map((el) => (el.getAttribute('aria-label') || el.textContent).replace(/\s+/g, ' ').trim()),
+  )
+  const storageOf = (page) => page.evaluate(() => ({
+    local: Object.keys(window.localStorage).sort(),
+    session: Object.keys(window.sessionStorage).sort(),
+  }))
+
+  proxy.mode = 'routing-refused'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"][data-mode="refused"]', { timeout: 10000 })
+    const storedBefore = await storageOf(page)
+    await page.evaluate(() => { window.__requests.length = 0 })
+    const seenButtons = new Set(await routingButtons(page))
+
+    assert.equal(await textOf(page, '[data-testid="fabric-routing-live"]'), 'Camelid engines only')
+    assert.equal(await page.$eval('input[name="fabric-routing"][value="camelid_only"]', (el) => el.checked), true)
+    assert.equal(await page.$eval('input[name="fabric-routing"][value="mixed"]', (el) => el.checked), false)
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false)
+    check("Screen E defaults to Camelid-only and shows the proxy's live mode")
+
+    await page.click('input[name="fabric-routing"][value="mixed"]')
+    await page.waitForSelector('[data-testid="fabric-routing-confirm"][role="dialog"]', { timeout: 5000 })
+    for (const name of await routingButtons(page)) seenButtons.add(name)
+    const dialog = await page.$eval('[data-testid="fabric-routing-confirm"]', (el) => ({
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+      keys: [...el.querySelectorAll('section[data-blocker-key]')].map((section) => ({
+        key: section.getAttribute('data-blocker-key'),
+        text: section.textContent.replace(/\s+/g, ' ').trim(),
+        nodes: [...section.querySelectorAll('[data-node-label]')].map((node) => node.getAttribute('data-node-label')),
+      })),
+      limits: el.querySelector('[data-testid="fabric-routing-limits"]')?.textContent.replace(/\s+/g, ' ').trim() || '',
+      consequences: el.querySelector('[data-testid="fabric-routing-consequences"]')?.textContent.trim() || '',
+      adds: el.querySelector('[data-testid="fabric-routing-adds"]')?.textContent.replace(/\s+/g, ' ').trim() || '',
+    }))
+    assert.deepEqual(dialog.keys.map((section) => section.key), OLLAMA_BLOCKERS.map((entry) => entry.key))
+    for (const [index, entry] of OLLAMA_BLOCKERS.entries()) {
+      assert.match(dialog.keys[index].text, new RegExp(entry.consequence), `the proxy's own words for ${entry.key}`)
+      assert.ok(dialog.keys[index].text.includes(entry.blocker), `the proxy's blocker for ${entry.key}`)
+      assert.deepEqual(dialog.keys[index].nodes, ['b-ollama'], 'a Camelid node has nothing to accept')
+      assert.match(dialog.keys[index].text, /0\.33\.2/, 'the version the node reported')
+    }
+    assert.match(dialog.keys[0].text, /zz-no-depth-endpoint/, "the node's own capability detail")
+    assert.match(dialog.limits, /zz-tools-never-here/)
+    assert.match(dialog.limits, /zz-rerank-never-here/)
+    assert.equal(dialog.consequences, 'zz-standing-grant-sentence')
+    assert.match(dialog.adds, /This would start serving:\s*only-on-ollama:latest/)
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false, 'no command before the confirmation')
+    check("choosing mixed shows what it accepts, in the proxy's words, before any command")
+
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid="fabric-routing-confirm"]'), { timeout: 5000 })
+    assert.equal(await page.$eval('input[name="fabric-routing"][value="camelid_only"]', (el) => el.checked), true)
+    await page.waitForFunction(
+      () => document.activeElement?.matches('input[name="fabric-routing"][value="mixed"]'),
+      { timeout: 5000 },
+    )
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false)
+    check('Escape cancels the confirmation, keeps Camelid-only, and returns focus to the choice')
+
+    await page.click('input[name="fabric-routing"][value="mixed"]')
+    await page.waitForSelector('[data-testid="fabric-routing-confirm"]', { timeout: 5000 })
+    const [showCommand] = await page.$$('xpath/.//button[normalize-space(.)="Show the command"]')
+    await showCommand.click()
+    await page.waitForSelector('[data-testid="fabric-routing-command"]', { timeout: 5000 })
+    for (const name of await routingButtons(page)) seenButtons.add(name)
+    const command = await page.$eval('[data-testid="fabric-routing-command"]', (el) => ({
+      code: el.querySelector('code')?.textContent.trim(),
+      text: el.textContent.replace(/\s+/g, ' ').trim(),
+    }))
+    assert.equal(command.code, 'camelid fabric serve … --allow-mixed-engines')
+    assert.match(command.text, /This page cannot change a running proxy\./)
+    check('the command appears only after the confirmation, spelled with the flag the proxy published')
+
+    // Let one poll land while the command is shown, so the check below covers
+    // the page's steady state and not only the clicks.
+    await new Promise((done) => setTimeout(done, 5600))
+    const requests = await page.evaluate(() => window.__requests.slice())
+    const proxyOrigin = `http://${proxyEndpoint}`
+    const toProxy = requests.filter((request) => request.url.startsWith(proxyOrigin))
+    assert.ok(toProxy.length > 0, 'the proxy was read during the flow')
+    for (const request of toProxy) {
+      assert.equal(request.method, 'GET', `${request.method} ${request.url}`)
+      assert.equal(new URL(request.url).pathname, '/v1/health', request.url)
+    }
+    for (const request of requests) {
+      assert.equal(request.method, 'GET', `the page wrote to ${request.url}`)
+    }
+    assert.deepEqual([...seenButtons].sort(), ['Cancel', 'Copy', 'Show the command'])
+    const source = readFileSync(resolve(scriptDir, '../src/components/fabric/RoutingMode.jsx'), 'utf8')
+    assert.doesNotMatch(source, /retr(y|ied)|relay|affinit|sticky|measured|queue/i, 'the component authors no claim about proxy behaviour')
+    check('the routing screen never tries to change the proxy')
+
+    assert.deepEqual(await storageOf(page), storedBefore)
+    check('no routing choice is written to browser storage')
+
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- 11. nothing to accept: the confirmation is derived, not a paragraph ---- */
+  proxy.mode = 'routing-camelid-only'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"][data-mode="refused"]', { timeout: 10000 })
+    await page.click('input[name="fabric-routing"][value="mixed"]')
+    await page.waitForSelector('[data-testid="fabric-routing-confirm"]', { timeout: 5000 })
+    assert.ok(await present(page, '[data-testid="fabric-routing-nothing"]'))
+    assert.equal(await present(page, '[data-testid="fabric-routing-confirm"] section[data-blocker-key]'), false)
+    assert.equal(await present(page, '[data-testid="fabric-routing-adds"]'), false)
+    check('with no node to accept anything about, the confirmation says the flag would change nothing')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- 12. a proxy that did not say ---- */
+  for (const mode of ['withheld', 'nodes']) {
+    proxy.mode = mode
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"]', { timeout: 10000 })
+    assert.equal(await page.$eval('[data-testid="fabric-routing"]', (el) => el.getAttribute('data-mode')), 'unknown', mode)
+    assert.equal(await present(page, '[data-testid="fabric-routing-choice"]'), false, mode)
+    assert.equal(await present(page, '[data-testid="fabric-routing-command"]'), false, mode)
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+  check('a proxy that withholds detail, or predates the field, offers no mixed-mode command')
+
+  /* ---- 13. a proxy already placing on other engines ---- */
+  proxy.mode = 'routing-allowed'
+  {
+    const { page, errors } = await openCluster({ endpoint: proxyEndpoint })
+    await page.waitForSelector('[data-testid="fabric-routing"][data-mode="allowed"]', { timeout: 10000 })
+    assert.equal(await textOf(page, '[data-testid="fabric-routing-live"]'), 'Also placing on other engines')
+    const accepting = await page.$eval('[data-testid="fabric-routing-accepting"]', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    assert.match(accepting, /What this proxy is accepting now/)
+    for (const entry of OLLAMA_BLOCKERS) assert.ok(accepting.includes(entry.consequence), entry.key)
+    const added = await page.$eval('[data-testid="fabric-routing-added-later"]', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    assert.match(added, /c-ollama2 \(ollama\)/)
+    assert.equal(
+      await page.$eval('[data-testid="fabric-routing-command"] code', (el) => el.textContent.trim()),
+      'camelid fabric serve …',
+      'the way back names no flag',
+    )
+
+    const row = await page.$eval('.fabric-row[data-node-label="b-ollama"]', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    assert.doesNotMatch(row, /not routed to/)
+    assert.match(row, /routed to · accepting 3 limits/)
+    await page.click('.fabric-row[data-node-label="b-ollama"] .fabric-row__open')
+    await page.waitForSelector('[data-testid="fabric-detail-accepting"]', { timeout: 5000 })
+    const drawer = await page.$eval('[data-testid="fabric-detail-accepting"]', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    for (const entry of OLLAMA_BLOCKERS) assert.ok(drawer.includes(entry.consequence), entry.key)
+    const loaded = await page.$eval('.fabric-detail', (el) => el.textContent.replace(/\s+/g, ' ').trim())
+    assert.match(loaded, /Loaded models\s*llama1b-q8:latest/)
+    check('under mixed mode a foreign node is routed to and still shows what is accepted')
 
     assert.deepEqual(errors, [], 'no page errors')
     await page.close()

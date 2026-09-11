@@ -20,9 +20,14 @@ import {
   corsCommand,
   crossOriginDiagnosis,
   describeFabric,
+  describePlacement,
   fabricPosture,
   fabricProblemMessage,
+  mixedModeAcceptance,
   modelPlacements,
+  provenanceLabel,
+  requirementLimits,
+  routingCommand,
 } from '../src/lib/fabricModel.js'
 import {
   clearCachedFabricNodes,
@@ -361,6 +366,115 @@ check('a withheld fabric that says it is serving is not called degraded', () => 
   // Counts are unknown there, so "ready < total" cannot be evaluated and must
   // not be guessed.
   assert.equal(fabricPosture(describeFabric(answered(fabricBody()))), 'ready')
+})
+
+/* ---- routing: every word about the proxy's behaviour is the proxy's ----
+   Screen E renders what these return. The rule under test is that nothing
+   here authors a claim: a missing field is unknown, and every sentence is one
+   the fixture put there, even when it is a nonsense token. */
+
+check('the routing mode is read from the proxy, and absent is unknown, never Camelid-only', () => {
+  assert.equal(describePlacement(undefined).mixedEngines, null)
+  assert.equal(describePlacement(null).flag, null)
+  assert.equal(describePlacement({ mixed_engines: 'refused' }).mixedEngines, 'refused')
+  assert.equal(describePlacement({ mixed_engines: 'allowed' }).mixedEngines, 'allowed')
+  assert.equal(describePlacement({ mixed_engines: 'sometimes' }).mixedEngines, null, 'a mode this build does not know is unknown')
+  assert.equal(routingCommand(describePlacement({ mixed_engines: 'refused' }), 'mixed'), null, 'no published flag, no command')
+  const withheld = describeFabric(answered(fabricBody()))
+  assert.equal(withheld.placement.mixedEngines, null, 'a proxy that withholds detail did not say how it routes')
+  const older = describeFabric(answered(fabricBody({ nodes: [READY_NODE] })))
+  assert.equal(older.placement.mixedEngines, null, 'a proxy that predates the field did not say either')
+  assert.equal(older.nodes[0].placementBlockerDetail, null)
+  assert.equal(older.nodes[0].requirementLimits, null)
+})
+
+check("a node's loaded models are unknown when the proxy did not say, and empty only when it said so", () => {
+  const [unsaid] = describeFabric(answered(fabricBody({ nodes: [READY_NODE] }))).nodes
+  assert.equal(unsaid.residentModels, null)
+  const none = { ...READY_NODE, status: { ...READY_NODE.status, resident_models: [] } }
+  assert.deepEqual(describeFabric(answered(fabricBody({ nodes: [none] }))).nodes[0].residentModels, [])
+  const gone = { ...NOT_READY_NODE, status: { ...NOT_READY_NODE.status, resident_models: ['x'] } }
+  assert.equal(describeFabric(answered(fabricBody({ nodes: [gone] }))).nodes[0].residentModels, null)
+})
+
+check("what mixed mode accepts is the proxy's own words", () => {
+  const first = {
+    spec: { label: 'n1', host: 'h', port: 1, engine: 'zz-engine' },
+    status: { state: 'ready', engine: 'zz-engine', version: 'zz-9', models: ['m'] },
+    placeable: false,
+    capabilities: { 'zz-key-1': { supported: false, provenance: 'declared', detail: 'zz-detail-1' } },
+    placement_blockers: ['zz-blocker-1', 'zz-blocker-2'],
+    placement_blocker_detail: [
+      { key: 'zz-key-1', blocker: 'zz-blocker-1', consequence: 'zz-consequence-1' },
+      { key: 'zz-key-2', blocker: 'zz-blocker-2', consequence: 'zz-consequence-2' },
+    ],
+  }
+  const second = {
+    ...first,
+    spec: { ...first.spec, label: 'n2' },
+    placement_blocker_detail: [{ key: 'zz-key-1', blocker: 'zz-blocker-1', consequence: 'zz-consequence-1' }],
+  }
+  const nodes = describeFabric(answered(fabricBody({ nodes: [first, second] }))).nodes
+  const groups = mixedModeAcceptance(nodes)
+  assert.deepEqual(groups.map((group) => [group.key, group.blocker, group.consequence]), [
+    ['zz-key-1', 'zz-blocker-1', 'zz-consequence-1'],
+    ['zz-key-2', 'zz-blocker-2', 'zz-consequence-2'],
+  ])
+  assert.deepEqual(groups[0].nodes.map((node) => node.label), ['n1', 'n2'])
+  assert.equal(groups[0].nodes[0].detail, 'zz-detail-1', "the node's own capability detail travels with it")
+  assert.equal(groups[0].nodes[0].provenance, 'declared')
+  assert.equal(groups[0].nodes[0].version, 'zz-9')
+  assert.equal(groups[1].nodes[0].detail, null, 'no capability entry for that key, no invented detail')
+
+  // A backend this build has never heard of, with one reason only, is one
+  // section: the grouping is on what the proxy said, not on an engine name.
+  const fourth = {
+    spec: { label: 'x', host: 'h', port: 2, engine: 'zz-fourth-engine' },
+    status: { state: 'ready', engine: 'zz-fourth-engine', models: ['m'] },
+    placeable: true,
+    placement_blockers: ['cannot attest a warm prefix'],
+    placement_blocker_detail: [{ key: 'warm_prefix', blocker: 'cannot attest a warm prefix', consequence: 'zz-pinned' }],
+  }
+  const lone = mixedModeAcceptance(describeFabric(answered(fabricBody({ nodes: [fourth] }))).nodes)
+  assert.equal(lone.length, 1)
+  assert.equal(lone[0].consequence, 'zz-pinned')
+  assert.deepEqual(mixedModeAcceptance(describeFabric(answered(fabricBody({ nodes: [READY_NODE] }))).nodes), [])
+
+  const partial = { ...first, placement_blocker_detail: [{ key: 'zz-key-1', blocker: 'zz-blocker-1' }] }
+  assert.deepEqual(
+    describeFabric(answered(fabricBody({ nodes: [partial] }))).nodes[0].placementBlockerDetail,
+    [],
+    'an entry missing its consequence is dropped, never rendered half-said',
+  )
+})
+
+check("tool limits come from the proxy's requirement_limits, not the engine name", () => {
+  const foreignWithout = {
+    spec: { label: 'studio', host: 's', port: 11434, engine: 'ollama' },
+    status: { state: 'ready', engine: 'ollama', models: ['m'] },
+    requirement_limits: [{ key: 'rerank_route', consequence: 'zz-no-route' }],
+  }
+  const oursWith = {
+    ...READY_NODE,
+    spec: { ...READY_NODE.spec, engine: 'camelid' },
+    requirement_limits: [{ key: 'tool_calls', consequence: 'zz-tools-never' }],
+  }
+  const groups = requirementLimits(describeFabric(answered(fabricBody({ nodes: [foreignWithout, oursWith] }))).nodes)
+  const tools = groups.find((group) => group.key === 'tool_calls')
+  assert.deepEqual(tools.nodes.map((node) => [node.label, node.consequence]), [['win', 'zz-tools-never']])
+  const rerank = groups.find((group) => group.key === 'rerank_route')
+  assert.deepEqual(rerank.nodes.map((node) => node.label), ['studio'])
+})
+
+check('the command uses the flag the proxy published', () => {
+  const placement = describePlacement({ mixed_engines: 'refused', flag: '--zz-flag' })
+  const mixed = routingCommand(placement, 'mixed')
+  assert.equal(mixed.split('--zz-flag').length - 1, 1, mixed)
+  assert.ok(!routingCommand(placement, 'camelid_only').includes('--zz-flag'))
+  assert.ok(!mixed.includes('allow-mixed-engines'), 'no spelling of its own')
+  assert.equal(provenanceLabel('not_probed'), 'not checked')
+  assert.equal(provenanceLabel('zz-way'), 'zz-way', 'an unknown provenance is shown as sent')
+  assert.equal(provenanceLabel(null), null)
 })
 
 /* ---- endpoint handling ---- */

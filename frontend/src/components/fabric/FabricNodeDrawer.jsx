@@ -128,6 +128,22 @@ export function FabricNodeDrawer({ node, checkedAt, onClose }) {
                 : '.'}
             </p>
           )}
+          {node.placeable === true && node.placementBlockers && node.placementBlockers.length > 0 && (
+            <div className="fabric-detail__note" data-testid="fabric-detail-accepting">
+              This proxy sends work here, accepting what it was told to accept:
+              <ul className="fabric-detail__accepting">
+                {node.placementBlockerDetail && node.placementBlockerDetail.length > 0
+                  ? node.placementBlockerDetail.map((entry) => (
+                    <li key={entry.key} data-blocker-key={entry.key}>
+                      <span className="fabric-detail__blocker">it {entry.blocker}</span>
+                      {' — '}
+                      {entry.consequence}
+                    </li>
+                  ))
+                  : node.placementBlockers.map((blocker) => <li key={blocker}>it {blocker}</li>)}
+              </ul>
+            </div>
+          )}
         </Row>
 
         {node.state !== 'ready' && (
@@ -142,6 +158,16 @@ export function FabricNodeDrawer({ node, checkedAt, onClose }) {
           {node.state !== 'ready'
             ? <Unknown why="Only a ready node reports which model it is serving." />
             : (node.activeModelId || <span className="fabric-row__muted">no model loaded</span>)}
+        </Row>
+
+        <Row label="Loaded models">
+          {node.state !== 'ready'
+            ? <Unknown why="Only a ready node reports what it has loaded." />
+            : node.residentModels === null
+              ? <Unknown why="This node's own listing did not say which models are loaded." />
+              : (node.residentModels.length === 0
+                ? <span className="fabric-row__muted">none loaded</span>
+                : node.residentModels.join(', '))}
         </Row>
 
         <Row label="Execution backend">

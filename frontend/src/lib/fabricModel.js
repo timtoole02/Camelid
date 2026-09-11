@@ -48,6 +48,19 @@ export function classifyHealthBody(body) {
 /** Provenance values the proxy can attach to a capability answer. */
 export const PROVENANCE = ['measured', 'declared', 'not_probed']
 
+const PROVENANCE_LABELS = {
+  measured: 'measured here',
+  declared: 'from the API',
+  not_probed: 'not checked',
+}
+
+/** How the proxy came by a capability answer, in the operator's words. An
+   unrecognised value is shown as sent rather than dressed as a known one. */
+export function provenanceLabel(provenance) {
+  if (typeof provenance !== 'string' || provenance.length === 0) return null
+  return PROVENANCE_LABELS[provenance] || provenance
+}
+
 /* An answer plus how the proxy came by it. `supported` is null exactly when the
    provenance is `not_probed`, and the two must stay distinguishable: an
    unmeasured backend is not a broken one. */
@@ -66,6 +79,33 @@ function describeCapabilities(raw) {
     })
     .filter(Boolean)
   return entries.length > 0 ? entries : null
+}
+
+function stringList(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : null
+}
+
+/* What the proxy says accepting a node would mean, blocker by blocker. Null
+   when the proxy sent no such field, which is an older proxy, not a node with
+   nothing to accept. */
+function describeBlockerDetail(raw) {
+  if (!Array.isArray(raw)) return null
+  return raw
+    .filter(isPlainObject)
+    .map((entry) => ({
+      key: stringOrNull(entry.key),
+      blocker: stringOrNull(entry.blocker),
+      consequence: stringOrNull(entry.consequence),
+    }))
+    .filter((entry) => entry.key && entry.blocker && entry.consequence)
+}
+
+function describeRequirementLimits(raw) {
+  if (!Array.isArray(raw)) return null
+  return raw
+    .filter(isPlainObject)
+    .map((entry) => ({ key: stringOrNull(entry.key), consequence: stringOrNull(entry.consequence) }))
+    .filter((entry) => entry.key && entry.consequence)
 }
 
 function describeNode(entry) {
@@ -92,6 +132,8 @@ function describeNode(entry) {
     placementBlockers: Array.isArray(entry?.placement_blockers)
       ? entry.placement_blockers.filter((blocker) => typeof blocker === 'string')
       : null,
+    placementBlockerDetail: describeBlockerDetail(entry?.placement_blocker_detail),
+    requirementLimits: describeRequirementLimits(entry?.requirement_limits),
     state,
     // Only the failing states carry a reason; a ready node has nothing to explain.
     reason: state === 'ready' ? null : stringOrNull(status.reason),
@@ -99,6 +141,9 @@ function describeNode(entry) {
     models: state === 'ready' && Array.isArray(status.models)
       ? status.models.filter((model) => typeof model === 'string')
       : null,
+    // What the node's own listing says is loaded. Null when it did not say,
+    // which is not "nothing loaded": the proxy prices the two differently.
+    residentModels: state === 'ready' ? stringList(status.resident_models) : null,
     backend: state === 'ready' ? stringOrNull(status.backend) : null,
     version: state === 'ready' ? stringOrNull(status.version) : null,
     inFlight: state === 'ready' ? numberOrNull(status.in_flight) : null,
@@ -146,6 +191,102 @@ const UNKNOWN_FABRIC = {
   models: null,
   nodes: null,
   placements: null,
+  placement: null,
+}
+
+const MIXED_ENGINE_MODES = ['refused', 'allowed']
+
+/** How the proxy says it places work. Every field is null unless the proxy
+   sent it in the shape this build understands: a proxy that did not say is
+   not a Camelid-only one, and must never be offered a command as if it were. */
+export function describePlacement(raw) {
+  const placement = isPlainObject(raw) ? raw : {}
+  const consequences = Array.isArray(placement.consequences)
+    ? placement.consequences
+      .filter(isPlainObject)
+      .map((entry) => ({ key: stringOrNull(entry.key), text: stringOrNull(entry.text) }))
+      .filter((entry) => entry.key && entry.text)
+    : null
+  const added = Array.isArray(placement.foreign_nodes_added_since_start)
+    ? placement.foreign_nodes_added_since_start
+      .filter(isPlainObject)
+      .map((entry) => ({ label: stringOrNull(entry.label), engine: stringOrNull(entry.engine) }))
+      .filter((entry) => entry.label)
+    : null
+  return {
+    mixedEngines: MIXED_ENGINE_MODES.includes(placement.mixed_engines) ? placement.mixed_engines : null,
+    flag: stringOrNull(placement.flag),
+    unreportedLoadCost: numberOrNull(placement.unreported_load_cost),
+    coldLoadCost: numberOrNull(placement.cold_load_cost),
+    maxForwardAttempts: numberOrNull(placement.max_forward_attempts),
+    modelsIfMixed: stringList(placement.models_if_mixed),
+    coversNodesAddedLater: boolOrNull(placement.covers_nodes_added_later),
+    consequences,
+    foreignAddedSinceStart: added,
+  }
+}
+
+/** What placing on other engines accepts, grouped by the reason, in the
+   proxy's own words. Each group carries the proxy's blocker and consequence
+   verbatim and the nodes it applies to, with that capability's own detail and
+   provenance. Grouped on the key the proxy sent, never on an engine name, so a
+   backend this page has never heard of is described the same way. */
+export function mixedModeAcceptance(nodes) {
+  if (!Array.isArray(nodes)) return []
+  const groups = []
+  for (const node of nodes) {
+    for (const entry of node?.placementBlockerDetail || []) {
+      let group = groups.find((existing) => existing.key === entry.key)
+      if (!group) {
+        group = { key: entry.key, blocker: entry.blocker, consequence: entry.consequence, nodes: [] }
+        groups.push(group)
+      }
+      const capability = (node.capabilities || []).find((candidate) => candidate.name === entry.key) || null
+      group.nodes.push({
+        label: node.label,
+        engine: node.engine,
+        version: node.version,
+        detail: capability ? capability.detail : null,
+        provenance: capability ? capability.provenance : null,
+      })
+    }
+  }
+  return groups
+}
+
+/** Requests the proxy says it never sends to a node, grouped by kind, with
+   the proxy's own sentence for each node. */
+export function requirementLimits(nodes) {
+  if (!Array.isArray(nodes)) return []
+  const groups = []
+  for (const node of nodes) {
+    for (const limit of node?.requirementLimits || []) {
+      let group = groups.find((existing) => existing.key === limit.key)
+      if (!group) {
+        group = { key: limit.key, nodes: [] }
+        groups.push(group)
+      }
+      group.nodes.push({
+        label: node.label,
+        engine: node.engine,
+        version: node.version,
+        consequence: limit.consequence,
+      })
+    }
+  }
+  return groups
+}
+
+/** The command that starts a proxy in `target` mode: `mixed` or
+   `camelid_only`. Spelled with the flag the proxy published, so a page never
+   quotes a spelling the running build would refuse; null when it published
+   none. The operator's other flags are theirs to keep, which the ellipsis
+   stands for: the proxy does not publish its command line, because it may
+   carry a key. */
+export function routingCommand(placement, target) {
+  const flag = placement ? stringOrNull(placement.flag) : null
+  if (!flag) return null
+  return target === 'mixed' ? `camelid fabric serve … ${flag}` : 'camelid fabric serve …'
 }
 
 /**
@@ -213,6 +354,7 @@ export function describeFabric(probe) {
     models,
     nodes,
     placements: nodes ? modelPlacements(nodes, models) : null,
+    placement: describePlacement(body.placement),
   }
 }
 

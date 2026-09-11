@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useFabric } from '../hooks/useFabric'
 import { FabricNodeTable } from '../components/fabric/FabricNodeTable'
 import { FabricNodeDrawer } from '../components/fabric/FabricNodeDrawer'
+import { RoutingMode } from '../components/fabric/RoutingMode'
 import { CopyableCommand } from '../components/fabric/CopyableCommand'
 import { CorsHint } from '../components/fabric/CorsHint'
 import { Unknown } from '../components/fabric/Unknown'
@@ -165,6 +166,8 @@ export default function ClusterView() {
         </div>
       )}
 
+      {fabric?.detail === 'withheld' && <RoutingMode fabric={fabric} />}
+
       {fabric?.detail === 'disclosed' && (
         <>
           <section className="fabric-counts" data-testid="fabric-counts">
@@ -200,6 +203,8 @@ export default function ClusterView() {
               <p className="fabric-note">No node is currently serving a model.</p>
             )}
           </section>
+
+          <RoutingMode fabric={fabric} />
         </>
       )}
 
