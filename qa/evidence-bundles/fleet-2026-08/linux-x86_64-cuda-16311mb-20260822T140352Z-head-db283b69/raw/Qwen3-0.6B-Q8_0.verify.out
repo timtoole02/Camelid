@@ -1,0 +1,2 @@
+NO PROFILE model=Qwen3-0.6B-Q8_0.gguf report_id=cc2f4f3b152bfdd5395032571aec0bef74a6d5f0ea4ca8c62c69e0b5a0d9fbfc output=./evidence-clean/linux-x86_64-cuda-16311mb-20260822T140352Z-head-db283b69/raw/Qwen3-0.6B-Q8_0.verify.json
+No built-in verification profile matches this exact GGUF. Camelid abstained.

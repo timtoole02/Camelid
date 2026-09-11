@@ -1,0 +1,5 @@
+model: layers=28 hidden=1024 ffn=3072 heads=16 kv_heads=8 head_dim=128 vocab=Some(151936) | KV reserved at context=4096
+[offload] 28 layers: 28 resident in VRAM, 0 offloaded to host (fits fully — no offload)
+[offload] budget (MiB): free 19849 = KV 896 + ends 157 + safety 256 + scratch 0 + resident-layers 446 (of total-layers 446)
+[offload] per-layer ~15 MiB | resident-weights budget 18540 MiB | fully resident
+[offload] layer map (V=VRAM, H=host): VVVVVVVVVVVVVVVVVVVVVVVVVVVV

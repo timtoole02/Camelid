@@ -1,0 +1,2 @@
+[hw] GPU: Apple A18 Pro | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 6 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 2.3 GiB free / 8.0 GiB total

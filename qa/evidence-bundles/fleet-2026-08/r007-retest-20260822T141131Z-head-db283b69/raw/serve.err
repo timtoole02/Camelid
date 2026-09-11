@@ -1,0 +1,12 @@
+[hw] GPU: none detected — CPU backend is the inference path
+[hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 0.0 GiB free / 0.0 GiB total
+
+  ðŸª Warming up the model (building the engine, one-time)â€¦
+[camelid] CAMELID_METAL_NOCOPY: loading Q8_0 weights as page-aligned wire pages (GPU reads them in place; requires the wire kernel stack)
+[camelid] CAMELID_METAL_NOCOPY: loading Q8_0 weights as page-aligned wire pages (GPU reads them in place; requires the wire kernel stack)
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:18437
+  OpenAI-style API:  http://127.0.0.1:18437/v1/chat/completions
+
+  Workspace CLI: ready

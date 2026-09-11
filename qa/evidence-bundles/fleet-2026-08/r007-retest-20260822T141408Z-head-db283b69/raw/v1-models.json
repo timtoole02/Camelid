@@ -1,0 +1,1 @@
+{"object":"list","data":[{"id":"Qwen3 1.7B Instruct","object":"model","created":0,"owned_by":"camelid","meta":{"n_vocab":151936,"n_ctx_train":40960,"n_embd":2048,"n_params":1720574976,"size":1834426016,"file_type":7}}]}

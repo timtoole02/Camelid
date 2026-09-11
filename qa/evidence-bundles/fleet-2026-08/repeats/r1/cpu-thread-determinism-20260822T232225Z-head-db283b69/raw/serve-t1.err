@@ -1,0 +1,13 @@
+[hw] GPU: NVIDIA GeForce RTX 5060 Ti (x1) | compute 12.0 | tensor-cores yes | VRAM 15.3 GiB free / 15.5 GiB total
+[hw] CPU: 32 logical cores | SIMD AVX2 (avx2=true avx512f=false fma=true neon=false) | RAM 61.3 GiB free / 62.7 GiB total
+[cuda] selected device 0 of 1: "NVIDIA GeForce RTX 5060 Ti" (compute capability 12.0) | VRAM 15684 MiB free / 15847 MiB total
+  Diagnostics log: [REDACTED]/.local/state/Camelid/logs/camelid.log
+
+  ðŸª Warming up the model (building the engine, one-time)â€¦
+[camelid] WARNING: CAMELID_LAZY_Q8_0_LINEAR is set; Q8_0 weights will stream from disk per token instead of residing in RAM (expect ~100x slower decode)
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:18435
+  OpenAI-style API:  http://127.0.0.1:18435/v1/chat/completions
+
+  Workspace CLI: ready
