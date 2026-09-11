@@ -329,9 +329,10 @@ impl Fabric {
     /// `left_model` and `right_model` may differ, which is an operator saying
     /// two differently-named ids are the same weights. Engines do not agree on
     /// naming, so that claim is recorded as unverified rather than inferred —
-    /// unless both engines publish a digest of the weights they serve, in
-    /// which case the digests decide and the claim is either verified or
-    /// shown to be about different weights.
+    /// unless both sides publish the same file digest, which verifies it, or
+    /// one engine kind publishes two that differ, or a Camelid node refuses
+    /// the other's, which shows different weights. Two engines publishing
+    /// different file digests settle nothing, and the claim stands as made.
     ///
     /// Each node is probed within [`Fabric::with_timeout`] and each generation
     /// within [`Fabric::with_generation_timeout`]. `plan` is bounded to what
@@ -382,16 +383,16 @@ impl Fabric {
             ..left_request
         };
 
-        // Both sides are read before either generates: each side's runs are
-        // bound to the weights digest the other published, so an engine that
-        // can check its own loaded bytes does, instead of this fabric trusting
-        // a listing.
+        // Both sides are read before either generates: a Camelid side's runs
+        // are bound to the other side's loaded-file digest, where the other
+        // side is a Camelid node too, so the engine checks its own loaded bytes
+        // instead of this fabric trusting a listing.
         let left_prepared =
             sample::prepare(&left_request, &self.transport).map_err(CompareError::Side)?;
         let right_prepared =
             sample::prepare(&right_request, &self.transport).map_err(CompareError::Side)?;
-        let left_bind = right_prepared.published_digest().map(str::to_string);
-        let right_bind = left_prepared.published_digest().map(str::to_string);
+        let left_bind = right_prepared.loaded_file_digest().map(str::to_string);
+        let right_bind = left_prepared.loaded_file_digest().map(str::to_string);
         let left_side = sample::measure(
             &left_request,
             left_prepared,

@@ -292,6 +292,10 @@ pub enum RenderedPrompt {
 /// carries a digest too, of a *manifest*, which changes with a template or a
 /// parameter while the weights stay put; reading it here would verify two
 /// different things as one.
+///
+/// It is a digest of a *file*, and which file depends on the engine: Camelid's
+/// is the GGUF it loaded, Ollama's the copy it stored, which is not always
+/// byte-for-byte the GGUF it was given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WeightsDigest {
@@ -432,10 +436,11 @@ impl Verdict {
 /// How the two sides came to be treated as the same model.
 ///
 /// Engines do not agree on how to name weights: Ollama suffixes `:latest`, LM
-/// Studio does not. Where both engines publish a digest of the weights they
-/// serve, the digests decide. Otherwise an exactly-equal id is the only thing
-/// this build will *conclude* on its own, and anything else has to be a human
-/// saying so out loud.
+/// Studio does not. Where both sides publish the same file digest, that
+/// decides. Otherwise an exactly-equal id is the only thing this build will
+/// *conclude* on its own, and anything else has to be a human saying so out
+/// loud — including when two engines publish different file digests, which
+/// shows two files and not whether their tensors differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelIdentity {
@@ -456,7 +461,8 @@ pub enum ModelIdentity {
 ///
 /// A side vouches for a digest by publishing it or by having its engine
 /// enforce it. A refusal anywhere, or two different published digests, means
-/// there is no such digest; so does a side that vouched for nothing.
+/// there is no such digest; so does a side that vouched for nothing. No such
+/// digest is not the same as different weights: see [`weights_disagree`].
 pub fn shared_weights_digest<'a>(left: &'a Side, right: &'a Side) -> Option<&'a str> {
     if weights_disagree(left, right) {
         return None;
@@ -479,16 +485,30 @@ fn same_digest(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
-/// Whether the weights evidence shows the two sides serve different bytes.
+/// Whether the weights evidence shows the two sides serve different weights.
+///
+/// A refusal always does: the engine compared its own loaded bytes. Two
+/// published digests that differ do only when one engine kind published both,
+/// so both are digests of the same kind of file. Across engines they are not:
+/// measured on Ollama 0.33.2, `ollama create` from a GGUF stores a
+/// re-serialized copy under another digest, so a Camelid node and an Ollama
+/// model made from the very same file never publish equal digests. Treating
+/// that as different weights refused the lane's main comparison outright and
+/// overrode the operator, who is the only one here who can say (I14).
 fn weights_disagree(left: &Side, right: &Side) -> bool {
     let refused = |side: &Side| matches!(side.weights_check, Some(WeightsCheck::Refused { .. }));
     if refused(left) || refused(right) {
         return true;
     }
-    matches!(
-        (left.weights_digest.digest(), right.weights_digest.digest()),
-        (Some(l), Some(r)) if !same_digest(l, r)
-    )
+    left.engine == right.engine && differing_published_digests(left, right).is_some()
+}
+
+/// The two digests, when both sides published one and they differ.
+fn differing_published_digests<'a>(left: &'a Side, right: &'a Side) -> Option<(&'a str, &'a str)> {
+    match (left.weights_digest.digest(), right.weights_digest.digest()) {
+        (Some(l), Some(r)) if !same_digest(l, r) => Some((l, r)),
+        _ => None,
+    }
 }
 
 /// A side's name for a different-files verdict, carrying the digest that
@@ -660,7 +680,7 @@ pub fn conclude(
             "the operator declared `{}` and `{}` to be the same weights, and nothing here checked it{}",
             left.model.as_deref().unwrap_or("-"),
             right.model.as_deref().unwrap_or("-"),
-            unpublished_digests(&left, &right),
+            digest_evidence(&left, &right),
         )),
         ModelIdentity::SameId
             if left.engine != right.engine
@@ -671,7 +691,7 @@ pub fn conclude(
                 left.model.as_deref().unwrap_or("-"),
                 left.engine,
                 right.engine,
-                unpublished_digests(&left, &right),
+                digest_evidence(&left, &right),
             ))
         }
         ModelIdentity::SameId | ModelIdentity::VerifiedByDigest => None,
@@ -755,6 +775,30 @@ fn request_history_reason(plan: &SamplingPlan, left: &Side, right: &Side) -> Opt
     })
 }
 
+/// What the weights digests said about an identity that rests on a name, as
+/// a clause to append to its reason.
+///
+/// Two published digests that differ are named in full: the reader sees two
+/// different files, and is told why that settles nothing. Otherwise the
+/// clause names the sides that published none, since that is the check that
+/// could have settled it.
+fn digest_evidence(left: &Side, right: &Side) -> String {
+    if let Some((l, r)) = differing_published_digests(left, right) {
+        let source = |side: &Side| match &side.weights_digest {
+            WeightsDigest::Published { source, .. } => source.clone(),
+            WeightsDigest::Unavailable { .. } => "-".to_string(),
+        };
+        return format!(
+            "; {} publishes GGUF file sha256 {l} (via {}) and {} publishes GGUF file sha256 {r} (via {}): two different files, and a file digest cannot show whether the tensors in them differ, because an engine may store a re-serialized copy of the GGUF it was given (Ollama 0.33.2 does on `ollama create`)",
+            left.label,
+            source(left),
+            right.label,
+            source(right),
+        );
+    }
+    unpublished_digests(left, right)
+}
+
 /// Which sides published no weights digest, and why, as a clause to append
 /// to an identity reason: that is the check that could have settled it.
 fn unpublished_digests(left: &Side, right: &Side) -> String {
@@ -811,8 +855,10 @@ fn verdict_for(left: &Side, right: &Side, model_identity: ModelIdentity) -> Verd
             right: served(right),
         };
     }
-    // Next, the bytes: two published digests that differ, or an engine that
-    // refused the other side's, are different weights however alike the ids.
+    // Next, the bytes: an engine that refused the other side's digest, or two
+    // digests one engine kind published that differ, are different weights
+    // however alike the ids. Digests that differ across engines fall through
+    // to the names, exactly as if none had been published.
     if weights_disagree(left, right) {
         return Verdict::DifferentModels {
             left: named_by_weights(left),
@@ -958,32 +1004,157 @@ mod tests {
         );
     }
 
-    /// C4. Published digests that differ are different weights, however alike
-    /// the ids, and never a divergence between engines.
+    /// C4. Two digests one engine kind published are digests of the same kind
+    /// of file, so digests that differ are different weights however alike
+    /// the ids and whatever an operator said; never a divergence between
+    /// engines.
     #[test]
-    fn published_weights_digests_that_differ_are_different_models_never_verified() {
+    fn published_digests_that_differ_on_one_engine_are_different_models_even_when_asserted() {
+        for (right_id, identity) in [
+            ("m", ModelIdentity::SameId),
+            ("m-copy", ModelIdentity::AssertedByOperator),
+        ] {
+            let comparison = conclude(
+                "q",
+                SamplingPlan::default(),
+                publishing(
+                    side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+                    WEIGHTS_A,
+                ),
+                publishing(
+                    side("mac", NodeEngine::Camelid, right_id, &["7", "7"]),
+                    WEIGHTS_B,
+                ),
+                identity,
+            );
+            assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+            match &comparison.verdict {
+                Verdict::DifferentModels { left, right } => {
+                    assert!(left.contains("432f310a77f4"), "{left}");
+                    assert!(right.contains("36330585f362"), "{right}");
+                }
+                other => panic!("{identity:?}: different weights are different models: {other:?}"),
+            }
+            assert!(matches!(comparison.diff, Diff::Declined { .. }));
+        }
+    }
+
+    fn identity_reason(comparison: &Comparison) -> &str {
+        comparison
+            .uncontrolled_detail
+            .iter()
+            .find(|item| item.name == "model identity")
+            .map(|item| item.reason.as_str())
+            .unwrap_or_else(|| panic!("model identity is uncontrolled: {comparison:?}"))
+    }
+
+    /// C4. Different file digests from two different engines show two files,
+    /// not different tensors: measured, Ollama 0.33.2 stores a re-serialized
+    /// copy of a GGUF it creates a model from. So the comparison runs on the
+    /// operator's word, exactly as it would with no digests, and the identity
+    /// reason names both files and says why they settle nothing.
+    #[test]
+    fn different_file_digests_on_two_engines_leave_the_operators_assertion_standing() {
+        const HI: &str = "Hi. How can I assist you today?";
         let comparison = conclude(
-            "q",
+            "Say hi.",
             SamplingPlan::default(),
             publishing(
-                side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+                side("camelid", NodeEngine::Camelid, "llama-1b", &["Hi!", "Hi!"]),
                 WEIGHTS_A,
             ),
             publishing(
-                side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
+                side(
+                    "ollama",
+                    NodeEngine::Ollama,
+                    "llama32-1b-q8-r1:latest",
+                    &[HI, HI],
+                ),
+                WEIGHTS_B,
+            ),
+            ModelIdentity::AssertedByOperator,
+        );
+        assert_eq!(comparison.verdict, Verdict::Divergent);
+        assert_eq!(comparison.model_identity, ModelIdentity::AssertedByOperator);
+        assert!(
+            matches!(comparison.diff, Diff::Lines { .. }),
+            "{:?}",
+            comparison.diff
+        );
+        assert_eq!(
+            shared_weights_digest(&comparison.left, &comparison.right),
+            None
+        );
+        let reason = identity_reason(&comparison);
+        for needle in [
+            "the operator declared `llama-1b` and `llama32-1b-q8-r1:latest`",
+            &format!("camelid publishes GGUF file sha256 {WEIGHTS_A} (via test)"),
+            &format!("ollama publishes GGUF file sha256 {WEIGHTS_B} (via test)"),
+            "a file digest cannot show whether the tensors in them differ",
+        ] {
+            assert!(reason.contains(needle), "{needle:?} in {reason}");
+        }
+
+        // An equal id on the two engines is no different: it rests on the
+        // name, and the two files are disclosed.
+        let same_id = conclude(
+            "Say hi.",
+            SamplingPlan::default(),
+            publishing(
+                side("camelid", NodeEngine::Camelid, "m", &["Hi!", "Hi!"]),
+                WEIGHTS_A,
+            ),
+            publishing(
+                side("ollama", NodeEngine::Ollama, "m", &[HI, HI]),
                 WEIGHTS_B,
             ),
             ModelIdentity::SameId,
         );
-        assert_ne!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
-        match &comparison.verdict {
-            Verdict::DifferentModels { left, right } => {
-                assert!(left.contains("432f310a77f4"), "{left}");
-                assert!(right.contains("36330585f362"), "{right}");
+        assert_eq!(same_id.verdict, Verdict::Divergent);
+        assert_eq!(same_id.model_identity, ModelIdentity::SameId);
+        let reason = identity_reason(&same_id);
+        assert!(
+            reason.contains(WEIGHTS_A) && reason.contains(WEIGHTS_B),
+            "{reason}"
+        );
+    }
+
+    /// C4. With nobody asserting, differing ids on two engines are refused as
+    /// different models exactly as before digests existed: two different file
+    /// digests neither rescue the comparison nor reword the refusal.
+    #[test]
+    fn different_file_digests_on_two_engines_refuse_unasserted_ids_as_before() {
+        let camelid = side("camelid", NodeEngine::Camelid, "llama-1b", &["Hi!", "Hi!"]);
+        let ollama = side(
+            "ollama",
+            NodeEngine::Ollama,
+            "llama32:latest",
+            &["Hi.", "Hi."],
+        );
+        let without = conclude(
+            "q",
+            SamplingPlan::default(),
+            camelid.clone(),
+            ollama.clone(),
+            ModelIdentity::SameId,
+        );
+        let with = conclude(
+            "q",
+            SamplingPlan::default(),
+            publishing(camelid, WEIGHTS_A),
+            publishing(ollama, WEIGHTS_B),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(
+            with.verdict,
+            Verdict::DifferentModels {
+                left: "llama-1b".to_string(),
+                right: "llama32:latest".to_string(),
             }
-            other => panic!("different weights are different models: {other:?}"),
-        }
-        assert!(matches!(comparison.diff, Diff::Declined { .. }));
+        );
+        assert_eq!(with.verdict, without.verdict);
+        assert_eq!(with.model_identity, without.model_identity);
+        assert_eq!(with.uncontrolled, without.uncontrolled);
     }
 
     /// C4. A digest only one side published verifies nothing: identity rests

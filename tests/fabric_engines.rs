@@ -902,13 +902,13 @@ fn run_bodies(node: &StubEngine, prompt: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// C4. Both engines publish the digest of the weights they serve, and it is
-/// the same digest: identity is verified, the Camelid side is bound to the
-/// Ollama side's digest on every run, and nothing about identity is left
-/// resting on a name.
+/// C4. Both engines publish the digest of the file they serve, and it is the
+/// same digest: identity is verified, and nothing about identity is left
+/// resting on a name. The Camelid side is not bound to an Ollama blob digest;
+/// the equal published digests are the evidence.
 #[test]
 fn the_same_gguf_on_two_engines_is_verified_by_digest() {
-    use camelid::fabric::{ModelIdentity, SamplingPlan, Verdict, WeightsCheck, WeightsDigest};
+    use camelid::fabric::{ModelIdentity, SamplingPlan, Verdict, WeightsDigest};
 
     let camelid = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
     let studio = StubEngine::start(ollama_showing(
@@ -940,20 +940,7 @@ fn the_same_gguf_on_two_engines_is_verified_by_digest() {
         &comparison.right.weights_digest,
         WeightsDigest::Published { source, .. } if source.contains("/api/show")
     ));
-    assert_eq!(
-        comparison.left.weights_check,
-        Some(WeightsCheck::Enforced {
-            expected: GGUF_SHA256.to_string()
-        })
-    );
-    let chats = run_bodies(&camelid, "q");
-    assert!(!chats.is_empty());
-    for body in &chats {
-        assert_eq!(
-            body["camelid_expected_gguf_sha256"], GGUF_SHA256,
-            "every run is bound to the other side's digest: {body}"
-        );
-    }
+    assert_eq!(comparison.left.weights_check, None);
     assert!(
         !comparison
             .uncontrolled
@@ -1005,9 +992,9 @@ fn a_manifest_digest_is_never_read_as_a_weights_digest() {
     }
 }
 
-/// C4. A Camelid node that refuses the other side's digest has said its
-/// loaded GGUF file is other bytes. The comparison reports different models;
-/// it does not fail.
+/// C4. A Camelid node that refuses the other Camelid node's loaded-file
+/// digest has said its own loaded GGUF file is other bytes. The comparison
+/// reports different models; it does not fail.
 #[test]
 fn a_camelid_refusal_of_the_other_sides_weights_is_different_models_not_a_failure() {
     use camelid::fabric::{SamplingPlan, Verdict, WeightsCheck};
@@ -1023,18 +1010,15 @@ fn a_camelid_refusal_of_the_other_sides_weights_is_different_models_not_a_failur
         ]),
         HashMap::from([("/v1/chat/completions", 409)]),
     );
-    let studio = StubEngine::start(ollama_showing(
-        MANIFEST_DIGEST,
-        &format!("/x/blobs/sha256-{OTHER_GGUF_SHA256}"),
-    ));
+    let mac = StubEngine::start(camelid_answering(Some(camelid_listing(OTHER_GGUF_SHA256))));
     let fabric = Fabric::new(vec![
         refusing.spec("win", "camelid"),
-        studio.spec("studio", "ollama"),
+        mac.spec("mac", "camelid"),
     ])
     .with_timeout(PROBE_TIMEOUT);
 
     let comparison = fabric
-        .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+        .compare_model("win", "mac", "m", "q", SamplingPlan::default())
         .expect("a refusal of the other side's weights is an answer, not a failure");
 
     assert!(matches!(
@@ -1052,6 +1036,166 @@ fn a_camelid_refusal_of_the_other_sides_weights_is_different_models_not_a_failur
         1,
         "the first refusal ends that side, before anything is sent between runs"
     );
+}
+
+/// An Ollama holding `name`, whose modelfile names the blob `blob`, and which
+/// answers `content` under that name.
+fn ollama_serving(name: &str, blob: &str, content: &str) -> Bodies {
+    let mut bodies = ollama_bodies(&[name], &[name]);
+    bodies.insert(
+        "/api/show",
+        serde_json::json!({
+            "template": "{{ .Prompt }}",
+            "modelfile": format!("# FROM {name}\n\nFROM /srv/ollama/models/blobs/sha256-{blob}\n"),
+        })
+        .to_string(),
+    );
+    bodies.insert(
+        "/api/chat",
+        serde_json::json!({
+            "model": name,
+            "message": { "role": "assistant", "content": content },
+            "done": true,
+        })
+        .to_string(),
+    );
+    bodies
+}
+
+/// C4, measured on mini2: a Camelid node and an Ollama model created from the
+/// very same GGUF publish different file digests, because Ollama 0.33.2 stores
+/// a re-serialized copy. That shows two files, not different weights, so the
+/// comparison the operator paired runs on their word and names both files.
+#[test]
+fn a_camelid_node_and_an_ollama_model_with_different_file_digests_compare_on_the_operators_word() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan, Verdict, WeightsDigest};
+    const OLLAMA_ID: &str = "llama32-1b-q8-r1:latest";
+
+    let camelid = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let studio = StubEngine::start(ollama_serving(
+        OLLAMA_ID,
+        OTHER_GGUF_SHA256,
+        "Hi. How can I assist you today?",
+    ));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        studio.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare(
+            "win",
+            "studio",
+            "m",
+            OLLAMA_ID,
+            "q",
+            SamplingPlan::default(),
+        )
+        .expect("both sides answered");
+
+    assert_eq!(comparison.model_identity, ModelIdentity::AssertedByOperator);
+    assert_eq!(comparison.verdict, Verdict::Divergent);
+    assert_eq!(comparison.left.weights_digest.digest(), Some(GGUF_SHA256));
+    assert!(matches!(
+        &comparison.right.weights_digest,
+        WeightsDigest::Published { digest, source }
+            if digest == OTHER_GGUF_SHA256 && source.contains("/api/show")
+    ));
+    let identity = comparison
+        .uncontrolled_detail
+        .iter()
+        .find(|item| item.name == "model identity")
+        .expect("identity rests on the operator's word");
+    for needle in [
+        GGUF_SHA256,
+        OTHER_GGUF_SHA256,
+        "a file digest cannot show whether the tensors in them differ",
+    ] {
+        assert!(
+            identity.reason.contains(needle),
+            "{needle:?} in {}",
+            identity.reason
+        );
+    }
+}
+
+/// C4. A Camelid side is bound only to a digest another Camelid node
+/// published of the file it loaded. An Ollama blob digest is never sent for
+/// it to enforce: not when it differs, where the node would refuse bytes it
+/// was never going to match, and not when it is equal, where the two
+/// published digests already verify.
+#[test]
+fn a_camelid_side_is_never_bound_to_a_digest_another_engine_published() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan};
+
+    for (blob, identity) in [
+        (OTHER_GGUF_SHA256, ModelIdentity::SameId),
+        (GGUF_SHA256, ModelIdentity::VerifiedByDigest),
+    ] {
+        let camelid = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+        let studio = StubEngine::start(ollama_showing(
+            MANIFEST_DIGEST,
+            &format!("/x/blobs/sha256-{blob}"),
+        ));
+        let fabric = Fabric::new(vec![
+            camelid.spec("win", "camelid"),
+            studio.spec("studio", "ollama"),
+        ])
+        .with_timeout(PROBE_TIMEOUT);
+
+        let comparison = fabric
+            .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+            .expect("both sides answered");
+
+        assert_eq!(comparison.model_identity, identity, "blob {blob}");
+        assert_eq!(comparison.left.weights_check, None, "blob {blob}");
+        let runs = run_bodies(&camelid, "q");
+        assert!(!runs.is_empty());
+        for body in runs {
+            assert!(
+                body.get("camelid_expected_gguf_sha256").is_none(),
+                "blob {blob}: an Ollama blob digest is not the file this node loaded: {body}"
+            );
+        }
+    }
+}
+
+/// C4. Two Camelid nodes each publish the digest of the file they loaded, so
+/// each is bound to the other's on every run and the engines check it.
+#[test]
+fn a_camelid_side_is_bound_to_another_camelid_nodes_loaded_file_digest() {
+    use camelid::fabric::{ModelIdentity, SamplingPlan, WeightsCheck};
+
+    let win = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let mac = StubEngine::start(camelid_answering(Some(camelid_listing(GGUF_SHA256))));
+    let fabric = Fabric::new(vec![win.spec("win", "camelid"), mac.spec("mac", "camelid")])
+        .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("win", "mac", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+
+    assert_eq!(comparison.model_identity, ModelIdentity::VerifiedByDigest);
+    for (side, node) in [(&comparison.left, &win), (&comparison.right, &mac)] {
+        assert_eq!(
+            side.weights_check,
+            Some(WeightsCheck::Enforced {
+                expected: GGUF_SHA256.to_string()
+            }),
+            "{}",
+            side.label
+        );
+        let runs = run_bodies(node, "q");
+        assert!(!runs.is_empty());
+        for body in runs {
+            assert_eq!(
+                body["camelid_expected_gguf_sha256"], GGUF_SHA256,
+                "{}: every run is bound to the other node's digest: {body}",
+                side.label
+            );
+        }
+    }
 }
 
 /// C2. Every run of a side after its first follows one short unrelated

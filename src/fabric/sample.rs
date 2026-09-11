@@ -92,8 +92,16 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn published_digest(&self) -> Option<&str> {
-        self.weights_digest.digest()
+    /// The digest of the exact file this side's engine loaded, which is what
+    /// another Camelid node can be asked to enforce. Only Camelid publishes
+    /// one. Ollama's is of the copy it stored, and a Camelid node loaded from
+    /// the original GGUF would refuse it: measured, `ollama create` on 0.33.2
+    /// re-serializes the file under another digest, so binding to it turned
+    /// every such comparison into "different models".
+    pub(crate) fn loaded_file_digest(&self) -> Option<&str> {
+        self.weights_digest
+            .digest()
+            .filter(|_| self.ready.engine == NodeEngine::Camelid)
     }
 }
 
@@ -141,10 +149,10 @@ pub(crate) fn prepare(
 /// template the engine advertises and the prompt it renders, where the engine
 /// exposes either.
 ///
-/// `bind_to` is the weights digest the other side published. An engine that
-/// can check its own loaded bytes against a digest is asked to on every run;
-/// one that refuses has answered the identity question, and the side records
-/// that rather than failing.
+/// `bind_to` is the other side's [`Prepared::loaded_file_digest`]. An engine
+/// that can check its own loaded bytes against a digest is asked to on every
+/// run; one that refuses has answered the identity question, and the side
+/// records that rather than failing.
 pub(crate) fn measure(
     request: &SideRequest<'_>,
     prepared: Prepared,
