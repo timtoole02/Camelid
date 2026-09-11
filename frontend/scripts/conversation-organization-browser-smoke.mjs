@@ -181,8 +181,24 @@ try {
   /* ---- tag it, and filter by that tag ---------------------------------- */
   await openMenuFor(OLDEST)
   await page.waitForSelector('.rail-menu__tag-input', { timeout: 10000 })
-  await page.type('.rail-menu__tag-input', 'CUDA')
-  await page.keyboard.press('Enter')
+  /* Set the value and fire Enter in ONE evaluate.
+     page.type() followed by keyboard.press() spans two round trips, and the
+     menu is portalled: if React re-commits it in between, the typed value goes
+     with the replaced input and Enter then lands on an empty box, whose
+     handler returns silently. That raced about half the time. Doing both
+     against the same element reference removes the window while still going
+     through the real onKeyDown path -- React's synthetic handler is delegated
+     at the root, so a bubbling native keydown reaches it. */
+  const tagSubmitted = await page.evaluate(() => {
+    const input = document.querySelector('.rail-menu__tag-input')
+    if (!input) return false
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+    setter.call(input, 'CUDA')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    return true
+  })
+  assert.equal(tagSubmitted, true, 'the tag box is reachable in the open menu')
   await page.waitForFunction(() => (
     [...document.querySelectorAll('.rail-convo__tag')].some((n) => n.textContent === 'cuda')
   ), { timeout: 10000 })
