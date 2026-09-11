@@ -83,7 +83,16 @@ These came out of real defects. Each one has caught a bug at least once.
 - **I9** We do not claim answer parity across engines. We measure divergence and display it.
 - **I10** No throughput or latency claim without a fresh paired receipt on the exact head.
 - **I11** Existing fail-closed transport rules are never loosened to reach a foreign backend.
-- **I12** Placement never inspects or rewrites a request body beyond the `model` field.
+- **I12** Placement reads exactly these parts of a request body and nothing else:
+  - `model`, which it may write, and only `model`: to the id the chosen node uses under an
+    operator-declared alias, or, under --allow-mixed-engines, to the chosen node's single active
+    model when the request named none;
+  - whether a top-level `tools` or `functions` key is present, never its contents;
+  - in completion-time mode only, `stream`, `max_tokens`/`max_completion_tokens`, and the
+    power-of-two bucket of the encoded body size.
+
+  Message and tool content can influence placement only through that size bucket. The readers are
+  `placement_requirements` and `service_class`.
 
 Two more added by this work:
 

@@ -442,6 +442,67 @@ nothing ready refuses exactly as it would without the flag — retryably, never 
 **Camelid** node: it is a Camelid API key, and a foreign engine that takes work under this flag
 never receives it, on any path.
 
+#### On the proxy
+
+`fabric serve --allow-mixed-engines` turns the same thing on for the resident proxy. It is a
+startup flag and nothing else: there is **no environment variable** — unlike
+`--allow-unauthenticated-remote` and `--allow-cleartext-remote`, because a variable left in a
+service definition would place on unmeasured engines with nothing on the command line to show it —
+and no route or node-file line that changes it while the proxy runs. Restart to change it; a stop
+drains the requests in flight. At startup the proxy prints one of:
+
+```
+placement: Camelid engines only
+placement: ALSO placing on other engines (--allow-mixed-engines)
+  b-ollama (ollama 0.33.2): accepted without asking: publishes no load to rank on; ... requests carrying tools are never placed here: ...
+  note: nodes of other engines added to the nodes file later are accepted too, and are announced here.
+aliases in force (read at startup; edit and restart to change): llama-1b -> a-camelid:..., b-ollama:llama1b-q8:latest
+```
+
+**The flag is a standing grant.** With `--nodes-file` it covers nodes of other engines added to the
+file later, which are placed on as soon as they are read. Each such addition is announced: a `WARN`
+log line and a line on stderr naming the node, its engine and what is accepted about it, and an
+entry under `placement.foreign_nodes_added_since_start` in `/v1/health`.
+
+What changes under the flag, and what does not:
+
+| | |
+|---|---|
+| Requests carrying tools | Read from the body at the one point every placed request passes, whoever built the request: a top-level `tools` or `functions` key, present at all (`tools: []` included, failing closed). Only a node whose tool calls are `supported: true` takes one — a foreign engine only after that exact version is measured. When every node holding the model lacks it: **400** `invalid_request_error`, `code: capability_unavailable`, `param: tools`, naming the nodes; `503` while any node could not be consulted. A tool-result follow-up carrying `role: "tool"` messages but no `tools` key is not detected, because seeing it would mean reading the messages. |
+| Rerank | `/v1/rerank` and `/v1/reranking` go only to a node whose API has the route (`rerank_route`); the same 400 with `param: route` otherwise. The route existing is not the loaded model supporting it. |
+| A refusal from a foreign node | **Relayed once, never re-placed.** Only an engine that declares a typed queue-full refusal (`typed_backpressure`) has a `503 engine_queue_full` handed to a sibling; any other answer — an untyped 5xx, or a foreign node's 503 carrying that same code — cannot be told from a real failure, may already be generating, and is returned to the client as it came. A node that was never reached is re-placed whatever its engine. |
+| Which node holds a model | A node holds a model it has loaded, or one it has installed where its engine declares that naming it loads it (`loads_on_demand`: Ollama yes, LM Studio not published, so not matched). A holder that must load it first — or whose listing did not say — is charged `cold_load_cost` (4) on top of its load, a stated guess and not a measurement; cold-load latency has not been measured here. |
+| A request naming no model | Placed only where the model it will get is known (a node with exactly one active model), and that id is written into `model`. Otherwise **400** `model_required`. Without the flag it is placed exactly as before and nothing is written. |
+| Aliases | One matching rule in both modes: the proxy sends each node the id its `alias` line names. Read once at startup. |
+
+Every answer carries `x-camelid-fabric-node`, `-engine`, `-reason` and `-attempts` as before, and a
+`502`/`499` carries the node and the engine it was sent to. Three headers are added only where they
+say something new: `x-camelid-fabric-model` (the id sent) under the flag or when an alias changed
+it; `x-camelid-fabric-model-identity: asserted_by_operator` only when an alias changed it; and
+`x-camelid-fabric-residency-observed: resident|not_resident` under the flag, only when the node's own
+listing said — an observation up to the observation age (500 ms) old, which an engine that unloads on
+its own timer can make stale. A proxy without the flag and without aliases answers with exactly the
+headers it always did.
+
+`GET /v1/models` and `GET /v1/models/{id}` follow the mode: a model is listed and retrievable exactly
+when a request naming it would be placed, and an id that exists only through an alias carries
+`"x_camelid_identity": "asserted_by_operator"`. Without the flag, a model only a foreign node holds is
+refused as `404 model_not_found` naming that node and the flag — settled, not retryable, because the
+node answered; off-box the node is not named.
+
+On a loopback listener `/v1/health` adds a `placement` object — `mixed_engines`
+(`refused`|`allowed`), `flag`, `unreported_load_cost`, `cold_load_cost`, `max_forward_attempts`,
+`models_if_mixed`, `covers_nodes_added_later`, `consequences` (the standing-grant sentence) and
+`foreign_nodes_added_since_start` — and, per node, `placement_blocker_detail` (each blocker with what
+accepting it means) and `requirement_limits` (requests never sent there). Every sentence is the
+build's own; the web UI's Cluster view renders them verbatim under *Routing*, with the command to
+restart in the other mode rather than a button, because a page cannot restart a proxy. An off-box
+listener still answers only `{ok, service, version, build, ready}`, and its refusals name no node and
+no engine version.
+
+`fabric route --with-tools` shows where a request carrying tools would go, and `fabric route --json`
+and `fabric run --json` report `engine`, `model`, `model_identity` and `residency`.
+
 Every eligibility rule above is written against **capabilities, not engine names**, so a backend
 added later is a new row rather than a new argument — and placement still contains no engine name
 anywhere.
