@@ -1,4 +1,7 @@
-import { createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Fragment, createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+
+import { displayMathOnlyLine, splitMathSegments } from './mathSegments.js'
+import { MathSpan } from '../components/chat/render/MathSpan.jsx'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
@@ -98,8 +101,21 @@ const renderInlineMarkdown = (text, keyPrefix) => {
       }
       return <span key={key}>{label} ({href})</span>
     }
-    return <span key={key}>{part}</span>
+    return <span key={key}>{renderMathInText(part, key)}</span>
   })
+}
+
+/* Math is applied ONLY to the parts the inline splitter left as plain text.
+   Running it earlier would mathify a $ inside `inline code`, a link target or
+   a bold run; running it here means those all still win. */
+const renderMathInText = (value, keyPrefix) => {
+  const segments = splitMathSegments(value)
+  if (segments.length === 1 && segments[0].type === 'text') return value
+  return segments.map((segment, index) => (
+    segment.type === 'math'
+      ? <MathSpan key={`${keyPrefix}-m${index}`} tex={segment.value} display={segment.display} />
+      : <Fragment key={`${keyPrefix}-m${index}`}>{segment.value}</Fragment>
+  ))
 }
 
 /* ---- Tables: header + |---| separator + body rows, cells get inline markdown ---- */
@@ -273,6 +289,17 @@ const renderMarkdownText = (text, keyPrefix) => {
       flushParagraph()
       flushList()
       blocks.push(<hr key={`${keyPrefix}-hr-${blocks.length}`} />)
+      return
+    }
+    /* A line that is nothing but one display formula becomes its own centred
+       block rather than a paragraph that happens to contain a formula. */
+    const displayMath = displayMathOnlyLine(line)
+    if (displayMath) {
+      flushParagraph()
+      flushList()
+      blocks.push(
+        <MathSpan key={`${keyPrefix}-math-${blocks.length}`} tex={displayMath} display />,
+      )
       return
     }
     const heading = line.match(/^(#{1,6})\s+(.+)$/)

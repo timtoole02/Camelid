@@ -1386,6 +1386,30 @@
 }
 
 
+/* ---- Math (KaTeX) ---------------------------------------------------------
+   Renders lazily, so a formula has a visible pre-render state: its TeX
+   source. Style that fallback so it reads as "not typeset yet", never as
+   broken output. */
+.cx-math { font-size: 1.02em; }
+.cx-math--display {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: var(--space-3) 0;
+  padding: var(--space-2) 0;
+  text-align: center;
+}
+/* Pre-render and load-failure states: monospace signals "this is source". */
+.cx-math__source {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+.cx-math--unrendered .cx-math__source { text-decoration: underline dotted var(--color-border-soft); }
+/* The host is empty until KaTeX fills it; an empty inline box must not add
+   width, or every un-typeset formula gains a stray gap. */
+.cx-math__host:empty { display: none; }
+
 /* ---- Regenerated-reply siblings -----------------------------------------
    Sits at the head of the actions row. Kept quiet: on a reply with one
    version it is not rendered at all, so this must never make an ordinary

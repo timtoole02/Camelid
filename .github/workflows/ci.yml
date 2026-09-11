@@ -479,6 +479,26 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:streaming
 
+      # The markdown renderer's own gate. It shipped with the renderer but was
+      # never wired here, so tables, link-scheme sanitization, the no-raw-HTML
+      # invariant and per-language highlighting were all ungated.
+      - name: Frontend markdown smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:markdown
+
+      # Math rendering. The pure half is mostly the NOT-math half: model output
+      # is full of dollar signs that are currency, and a renderer that typesets
+      # them turns a sentence into a garbled formula.
+      - name: Frontend math smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:math
+
+      # KaTeX works in an effect, so only a real browser can show it typesets
+      # at all. This gate also holds the regression guard for writing into a
+      # React-owned node, which unmounts the entire app.
+      - name: Frontend math browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:math-browser
       # Continuing a reply that stopped on the response budget. Pure half:
       # which replies may be continued, how the resumed text rejoins the kept
       # text (mid-word resumes, restated sentences), and cumulative usage.
