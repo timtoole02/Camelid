@@ -432,9 +432,10 @@ export default function DivergenceView() {
             <input type="checkbox" checked={asserted} onChange={(event) => setAsserted(event.target.checked)} />
             <span>
               These are two different ids — <code>{left.model}</code> and <code>{right.model}</code>.
-              Engines name weights differently. Where both engines publish a digest of the weights
-              they serve, the result checks it; otherwise nothing here can verify they match. Tick to
-              declare they are the same weights; the result records that you asserted it.
+              Engines name weights differently. If both sides publish the same GGUF file digest, the
+              result shows that; two engines publishing different digests only shows two files (Ollama
+              stores its own copy of a GGUF it imports), so otherwise nothing here can verify they
+              match. Tick to declare they are the same weights; the result records that you asserted it.
             </span>
           </label>
         )}

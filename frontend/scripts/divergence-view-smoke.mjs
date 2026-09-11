@@ -148,8 +148,10 @@ const SAME_TEMPLATE = {
   },
 }
 
-/* The same GGUF on both engines: each side published its weights digest,
-   and the Camelid side was bound to the other's. */
+/* The same GGUF file on both sides: each published its digest, and the left
+   side's engine also enforced the digest it was bound to. (A real proxy binds
+   a Camelid side only to another Camelid node's digest; the page renders any
+   enforced check the same way.) */
 const WEIGHTS = '432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3'
 const VERIFIED = {
   ...DIVERGENT,

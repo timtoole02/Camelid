@@ -310,8 +310,10 @@ export function identityStatement(comparison) {
     case 'same_id':
       return {
         kind: 'same_id',
+        // Not "no digest was available": two engines can each publish one and
+        // still settle nothing, because their digests are of different files.
         text: `Both sides were asked for the same id${leftId ? `, ${leftId}` : ''}. The id is all that was `
-          + 'compared: a weights digest was not available from both sides to check.',
+          + 'compared: no weights digest settled whether these are the same weights.',
       }
     case 'verified_by_digest': {
       const digest = verifiedDigest(comparison)
@@ -450,8 +452,9 @@ export function modelLooksAbsent(choices, model) {
 }
 
 /* Whether running this comparison means asserting two names are the same
- * weights. Engines do not agree on naming and none publishes a comparable
- * digest, so this is a claim only a person can make. */
+ * weights. Engines do not agree on naming, and a file digest is only
+ * comparable between engines when it is equal, so this is a claim only a
+ * person can make. */
 export function needsIdentityAssertion(leftModel, rightModel) {
   return Boolean(leftModel) && Boolean(rightModel) && leftModel !== rightModel
 }

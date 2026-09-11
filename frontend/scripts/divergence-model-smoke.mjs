@@ -430,6 +430,25 @@ check('this build never concludes identity from two digests the proxy did not ca
   assert.equal(identityStatement(comparison).kind, 'same_id')
 })
 
+check('a same-id result never says no digest was available when both sides published one', () => {
+  // Two engines publishing different file digests is a same-id result too:
+  // Ollama stores a re-serialized copy of a GGUF it imports, so the digests
+  // settle nothing. The statement must not claim they were missing.
+  const comparison = describeComparison(body({
+    model_identity: 'same_id',
+    left: side({ weights_digest: published('GET /v1/models gguf_sha256') }),
+    right: side({
+      label: 'studio',
+      engine: 'ollama',
+      weights_digest: { kind: 'published', digest: 'a2fa82e5'.padEnd(64, '0'), source: 'POST /api/show modelfile FROM blob' },
+    }),
+  }))
+  const statement = identityStatement(comparison)
+  assert.equal(statement.kind, 'same_id')
+  assert.doesNotMatch(statement.text, /not available/)
+  assert.match(statement.text, /no weights digest settled/)
+})
+
 check('a refused weights check and an unreported digest are each their own fact', () => {
   const refused = describeComparison(body({
     left: side({
