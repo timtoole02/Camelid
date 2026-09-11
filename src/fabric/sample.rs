@@ -17,7 +17,7 @@ use super::engine::NodeEngine;
 use super::lmstudio;
 use super::node::{NodeSpec, NodeStatus};
 use super::ollama;
-use super::probe::probe_node;
+use super::probe::probe_node_with_transport;
 use super::transport::NodeTransport;
 
 /// Why one side of a comparison could not be measured at all.
@@ -69,7 +69,14 @@ pub(crate) struct SideRequest<'a> {
     pub(crate) prompt: &'a str,
     pub(crate) plan: &'a SamplingPlan,
     pub(crate) bearer: Option<&'a str>,
-    pub(crate) timeout: Duration,
+    /// For what a node answers without generating: its status and its
+    /// template.
+    pub(crate) probe_timeout: Duration,
+    /// For each generation, which can legitimately take minutes. Held apart
+    /// from the probe budget because a resident proxy's is two seconds, and a
+    /// node that needed longer than a health read to generate was reported as
+    /// having failed.
+    pub(crate) generation_timeout: Duration,
 }
 
 /// Probe the node, check it holds the model, run the prompt `plan.repetitions`
@@ -79,7 +86,15 @@ pub(crate) fn measure(
     transport: &NodeTransport,
 ) -> Result<Side, SampleError> {
     let label = request.spec.label.clone();
-    let snapshot = probe_node(request.spec, request.bearer, request.timeout);
+    // Through the configured transport, like every other read of a node. The
+    // default one allows cleartext to loopback only, so a node `fabric status`
+    // reached under the operator's flags was refused here under the same ones.
+    let snapshot = probe_node_with_transport(
+        request.spec,
+        request.bearer,
+        request.probe_timeout,
+        transport,
+    );
     let ready = match snapshot.status {
         NodeStatus::Ready(ready) => ready,
         NodeStatus::NotReady { reason } | NodeStatus::Unreachable { reason } => {
@@ -116,12 +131,14 @@ pub(crate) fn measure(
                 request.spec,
                 &ask,
                 request.bearer,
-                request.timeout,
+                request.generation_timeout,
                 transport,
             ),
-            NodeEngine::Ollama => ollama::complete(request.spec, &ask, request.timeout, transport),
+            NodeEngine::Ollama => {
+                ollama::complete(request.spec, &ask, request.generation_timeout, transport)
+            }
             NodeEngine::LmStudio => {
-                lmstudio::complete(request.spec, &ask, request.timeout, transport).map(
+                lmstudio::complete(request.spec, &ask, request.generation_timeout, transport).map(
                     |completion| {
                         runtime_note = completion.runtime;
                         completion.text
@@ -159,11 +176,21 @@ fn capture_template(
     let (source, captured) = match engine {
         NodeEngine::Camelid => (
             "GET /props",
-            camelid::template(request.spec, request.bearer, request.timeout, transport),
+            camelid::template(
+                request.spec,
+                request.bearer,
+                request.probe_timeout,
+                transport,
+            ),
         ),
         NodeEngine::Ollama => (
             "POST /api/show",
-            ollama::template(request.spec, request.model, request.timeout, transport),
+            ollama::template(
+                request.spec,
+                request.model,
+                request.probe_timeout,
+                transport,
+            ),
         ),
         // Its documented API has no endpoint that returns a prompt template.
         // Saying so is the honest answer; an empty string would read as "no

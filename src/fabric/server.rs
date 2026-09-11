@@ -891,7 +891,14 @@ async fn compare(
             .clamp(1, MAX_COMPARE_REPETITIONS),
     };
 
-    let fabric_handle = Arc::clone(&state.fabric);
+    // Every run is a generation, which is what `forward_timeout` budgets. The
+    // fabric's own timeout is the probe budget, and under it a node that took
+    // longer than a health read to generate was reported as having failed.
+    let fabric_handle = state
+        .fabric
+        .as_ref()
+        .clone()
+        .with_generation_timeout(state.config.forward_timeout);
     // Same reason as `health`: this is blocking socket I/O, and a long one.
     let outcome = tokio::task::spawn_blocking(move || {
         // An explicit per-side id wins; otherwise the operator's declared

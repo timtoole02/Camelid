@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use camelid::fabric::{
     forward, parse_node_spec, route, Cancel, DispatchError, Fabric, ForwardError, NodeSpec,
-    RouteError, RouteMode, RouteReason, RouteRequest,
+    RouteError, RouteMode, RouteReason, RouteRequest, SamplingPlan, Verdict,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -640,6 +640,31 @@ fn a_fabric_observes_and_dispatches_through_one_ca_pinned_tls_policy() {
     assert!(seen
         .iter()
         .all(|request| { request.header("authorization") == Some("Bearer s3cret") }));
+}
+
+/// `fabric compare` reads a node the way every other subcommand does. It used
+/// to probe with the default transport — cleartext, to loopback only — so a
+/// node `fabric status` reached under the operator's flags was refused by
+/// `fabric compare` under the very same ones. A TLS-only node cannot be read
+/// in cleartext at all, so this fails unless the configured transport is used.
+#[test]
+fn a_comparison_reaches_its_nodes_through_the_configured_transport() {
+    let node = TlsStubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![node.spec("left"), node.spec("right")])
+        .with_node_transport(Some(&node.ca_path), false)
+        .expect("the CA bundle resolves");
+
+    let comparison = fabric
+        .compare_model("left", "right", "model-alpha", "q", SamplingPlan::default())
+        .expect("both sides are reached through the configured TLS transport");
+
+    assert_eq!(comparison.verdict, Verdict::Identical);
+    assert!(
+        node.received()
+            .iter()
+            .any(|request| request.path == "/v1/health"),
+        "the probe itself went over TLS"
+    );
 }
 
 #[test]

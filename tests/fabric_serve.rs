@@ -3932,3 +3932,40 @@ async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         "a stopped proxy must not still be taking work"
     );
 }
+
+/// Every run in a comparison is a generation, and generation is what the
+/// forward budget is for. Given the probe budget instead, a node that needed
+/// longer than a health read was reported as having failed — measured live as
+/// a 400 "request exceeded its deadline" two seconds in, while the CLI
+/// comparing the same nodes succeeded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_waits_for_a_generation_on_the_forward_budget_not_the_probe_budget() {
+    let node = StubNode::start(StubConfig::slow("model-alpha", Duration::from_millis(900)));
+    let probe_budget = Duration::from_millis(300);
+    let fabric =
+        Fabric::new(vec![node.spec("left"), node.spec("right")]).with_timeout(probe_budget);
+    // Forwarded within FORWARD_TIMEOUT, which is far longer than either.
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, body, _) = post_to(
+        addr,
+        "/v1/fabric/compare",
+        &serde_json::json!({
+            "left": "left", "right": "right", "model": "model-alpha",
+            "prompt": "q", "repetitions": 1,
+        }),
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    for side in ["left", "right"] {
+        let samples = body[side]["samples"].as_array().expect("samples");
+        assert_eq!(samples.len(), 1, "{body}");
+        let took = samples[0]["elapsed_ms"].as_u64().expect("elapsed");
+        assert!(
+            took >= probe_budget.as_millis() as u64,
+            "the generation really did outlast the probe budget: {took} ms"
+        );
+    }
+}

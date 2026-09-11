@@ -1873,6 +1873,7 @@ enum FabricAction {
         #[command(flatten)]
         transport: NodeTransportArgs,
         /// Budget for each generation, which can legitimately take minutes.
+        /// Also bounds each node's status probe.
         #[arg(long, default_value_t = 300)]
         timeout_s: u64,
         /// Print the whole comparison as JSON, in the shape the evidence
@@ -4702,7 +4703,8 @@ async fn main() -> anyhow::Result<()> {
                 let mut fabric =
                     configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
                         .with_bearer(fabric_bearer(bearer).as_deref())
-                        .with_timeout(std::time::Duration::from_secs(timeout_s));
+                        .with_timeout(std::time::Duration::from_secs(timeout_s))
+                        .with_generation_timeout(std::time::Duration::from_secs(timeout_s));
                 if !declared.is_empty() {
                     fabric = fabric.with_model_aliases(declared);
                 }

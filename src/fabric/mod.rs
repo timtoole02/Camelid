@@ -133,6 +133,9 @@ pub struct Fabric {
     /// against different fabrics.
     nodes: NodeSet,
     timeout: Duration,
+    /// Budget for each generation a comparison runs; see
+    /// [`Fabric::with_generation_timeout`].
+    generation_timeout: Duration,
     bearer: Option<String>,
     transport: NodeTransport,
     /// What each node calls a model, where an operator has said so.
@@ -172,6 +175,7 @@ impl std::fmt::Debug for Fabric {
         f.debug_struct("Fabric")
             .field("nodes", &self.nodes)
             .field("timeout", &self.timeout)
+            .field("generation_timeout", &self.generation_timeout)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
             .field("transport", &self.transport)
             .field("max_observation_age", &self.max_observation_age)
@@ -206,6 +210,7 @@ impl Fabric {
         Self {
             nodes,
             timeout: DEFAULT_PROBE_TIMEOUT,
+            generation_timeout: DEFAULT_FORWARD_TIMEOUT,
             bearer: None,
             transport: NodeTransport::default(),
             aliases: Arc::new(ModelAliases::default()),
@@ -219,6 +224,17 @@ impl Fabric {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Bound each generation [`Fabric::compare`] runs.
+    ///
+    /// Apart from [`Fabric::with_timeout`] because the two budget different
+    /// things: a probe is a health read and should fail fast, while a
+    /// generation can legitimately take minutes. Defaults to
+    /// [`DEFAULT_FORWARD_TIMEOUT`].
+    pub fn with_generation_timeout(mut self, timeout: Duration) -> Self {
+        self.generation_timeout = timeout;
         self
     }
 
@@ -348,7 +364,8 @@ impl Fabric {
                     prompt,
                     plan: &plan,
                     bearer,
-                    timeout: self.timeout,
+                    probe_timeout: self.timeout,
+                    generation_timeout: self.generation_timeout,
                 },
                 &self.transport,
             )
