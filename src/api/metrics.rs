@@ -35,6 +35,22 @@ struct MetricsInner {
     prompt_cache_misses: AtomicU64,
     weight_cache_hits: AtomicU64,
     weight_cache_misses: AtomicU64,
+    cuda_true_batch2_forwards: AtomicU64,
+    cuda_true_batch2_rows: AtomicU64,
+    cuda_true_batch2_shared_projection_launches: AtomicU64,
+    cuda_true_batch2_duration_micros: AtomicU64,
+    cuda_true_batch2_preflight_fallbacks: AtomicU64,
+    cuda_true_batch_forwards: AtomicU64,
+    cuda_true_batch_rows: AtomicU64,
+    cuda_true_batch_shared_projection_launches: AtomicU64,
+    cuda_true_batch_duration_micros: AtomicU64,
+    cuda_true_batch_preflight_fallbacks: AtomicU64,
+    cuda_true_batch_size_forwards: [AtomicU64; 9],
+    cuda_batched_prefill_forwards: AtomicU64,
+    cuda_batched_prefill_rows: AtomicU64,
+    cuda_batched_prefill_shared_projection_launches: AtomicU64,
+    cuda_batched_prefill_duration_micros: AtomicU64,
+    cuda_batched_prefill_size_forwards: [AtomicU64; 9],
 }
 
 impl ServerMetrics {
@@ -84,6 +100,103 @@ impl ServerMetrics {
         self.inner
             .generation_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cuda_true_batch2(
+        &self,
+        shared_projection_launches: usize,
+        duration_micros: u128,
+    ) {
+        self.record_cuda_true_batch(2, shared_projection_launches, duration_micros);
+    }
+
+    pub(crate) fn record_cuda_true_batch(
+        &self,
+        batch_size: usize,
+        shared_projection_launches: usize,
+        duration_micros: u128,
+    ) {
+        debug_assert!((2..=8).contains(&batch_size));
+        self.inner
+            .cuda_true_batch_forwards
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .cuda_true_batch_rows
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
+        self.inner
+            .cuda_true_batch_shared_projection_launches
+            .fetch_add(
+                shared_projection_launches.try_into().unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        self.inner
+            .cuda_true_batch_duration_micros
+            .fetch_add(saturating_u128_to_u64(duration_micros), Ordering::Relaxed);
+        if let Some(counter) = self.inner.cuda_true_batch_size_forwards.get(batch_size) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if batch_size != 2 {
+            return;
+        }
+        self.inner
+            .cuda_true_batch2_forwards
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .cuda_true_batch2_rows
+            .fetch_add(2, Ordering::Relaxed);
+        self.inner
+            .cuda_true_batch2_shared_projection_launches
+            .fetch_add(
+                shared_projection_launches.try_into().unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        self.inner
+            .cuda_true_batch2_duration_micros
+            .fetch_add(saturating_u128_to_u64(duration_micros), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cuda_true_batch2_preflight_fallback(&self) {
+        self.record_cuda_true_batch_preflight_fallback();
+        self.inner
+            .cuda_true_batch2_preflight_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cuda_true_batch_preflight_fallback(&self) {
+        self.inner
+            .cuda_true_batch_preflight_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cuda_batched_prefill(
+        &self,
+        batch_size: usize,
+        shared_projection_launches: usize,
+        duration_micros: u128,
+    ) {
+        debug_assert!((2..=8).contains(&batch_size));
+        self.inner
+            .cuda_batched_prefill_forwards
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .cuda_batched_prefill_rows
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
+        self.inner
+            .cuda_batched_prefill_shared_projection_launches
+            .fetch_add(
+                shared_projection_launches.try_into().unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        self.inner
+            .cuda_batched_prefill_duration_micros
+            .fetch_add(saturating_u128_to_u64(duration_micros), Ordering::Relaxed);
+        if let Some(counter) = self
+            .inner
+            .cuda_batched_prefill_size_forwards
+            .get(batch_size)
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn render(&self, state: &AppState) -> String {
@@ -172,8 +285,173 @@ impl ServerMetrics {
                 "Completed generations that loaded weights.",
                 load(&self.inner.weight_cache_misses),
             ),
+            (
+                "camelid_cuda_true_batch2_forwards_total",
+                "Successful CUDA forwards that jointly served two independent rows.",
+                load(&self.inner.cuda_true_batch2_forwards),
+            ),
+            (
+                "camelid_cuda_true_batch2_rows_total",
+                "Independent rows served by successful CUDA true batch-2 forwards.",
+                load(&self.inner.cuda_true_batch2_rows),
+            ),
+            (
+                "camelid_cuda_true_batch2_shared_projection_launches_total",
+                "Shared projection launches issued by successful CUDA true batch-2 forwards.",
+                load(&self.inner.cuda_true_batch2_shared_projection_launches),
+            ),
+            (
+                "camelid_cuda_true_batch2_preflight_fallbacks_total",
+                "Candidate CUDA batch-2 pairs refused before shared dispatch and run scalar.",
+                load(&self.inner.cuda_true_batch2_preflight_fallbacks),
+            ),
         ] {
             metric_counter(&mut out, name, help, value);
+        }
+        metric_counter(
+            &mut out,
+            "camelid_cuda_true_batch2_duration_seconds_sum",
+            "Cumulative shared-forward wall time for successful CUDA true batch-2 dispatches.",
+            micros_seconds(load(&self.inner.cuda_true_batch2_duration_micros)),
+        );
+        for (name, help, value) in [
+            (
+                "camelid_cuda_true_batch_forwards_total",
+                "Successful CUDA forwards that jointly served two to eight independent rows.",
+                load(&self.inner.cuda_true_batch_forwards),
+            ),
+            (
+                "camelid_cuda_true_batch_rows_total",
+                "Independent rows served by successful CUDA true-batch forwards.",
+                load(&self.inner.cuda_true_batch_rows),
+            ),
+            (
+                "camelid_cuda_true_batch_shared_projection_launches_total",
+                "Shared projection launches issued by successful CUDA true-batch forwards.",
+                load(&self.inner.cuda_true_batch_shared_projection_launches),
+            ),
+            (
+                "camelid_cuda_true_batch_preflight_fallbacks_total",
+                "Candidate CUDA groups refused before shared dispatch and run scalar.",
+                load(&self.inner.cuda_true_batch_preflight_fallbacks),
+            ),
+        ] {
+            metric_counter(&mut out, name, help, value);
+        }
+        metric_counter(
+            &mut out,
+            "camelid_cuda_true_batch_duration_seconds_sum",
+            "Cumulative shared-forward wall time for successful CUDA true-batch dispatches.",
+            micros_seconds(load(&self.inner.cuda_true_batch_duration_micros)),
+        );
+        for batch_size in 2..=8 {
+            metric_counter(
+                &mut out,
+                &format!("camelid_cuda_true_batch_size_{batch_size}_forwards_total"),
+                "Successful CUDA true-batch forwards at this exact row count.",
+                load(&self.inner.cuda_true_batch_size_forwards[batch_size]),
+            );
+        }
+        for (name, help, value) in [
+            (
+                "camelid_cuda_batched_prefill_forwards_total",
+                "Successful CUDA prefill forwards shared by independent sequences.",
+                load(&self.inner.cuda_batched_prefill_forwards),
+            ),
+            (
+                "camelid_cuda_batched_prefill_rows_total",
+                "Independent prompt rows served by shared CUDA prefill forwards.",
+                load(&self.inner.cuda_batched_prefill_rows),
+            ),
+            (
+                "camelid_cuda_batched_prefill_shared_projection_launches_total",
+                "Shared projection launches issued by cross-request CUDA prefill.",
+                load(&self.inner.cuda_batched_prefill_shared_projection_launches),
+            ),
+        ] {
+            metric_counter(&mut out, name, help, value);
+        }
+        metric_counter(
+            &mut out,
+            "camelid_cuda_batched_prefill_duration_seconds_sum",
+            "Cumulative shared-forward wall time for cross-request CUDA prefill.",
+            micros_seconds(load(&self.inner.cuda_batched_prefill_duration_micros)),
+        );
+        for batch_size in 2..=8 {
+            metric_counter(
+                &mut out,
+                &format!("camelid_cuda_batched_prefill_size_{batch_size}_forwards_total"),
+                "Successful cross-request CUDA prefill forwards at this exact row count.",
+                load(&self.inner.cuda_batched_prefill_size_forwards[batch_size]),
+            );
+        }
+        metric_counter(
+            &mut out,
+            "camelid_cuda_paged_kv_allocation_failures_total",
+            "Paged CUDA KV reservations refused atomically for insufficient capacity.",
+            crate::inference::cuda_paged_kv::allocation_failures_total(),
+        );
+        metric_counter(
+            &mut out,
+            "camelid_cuda_paged_kv_reclaimed_pages_total",
+            "Paged CUDA KV pages reclaimed from completed, cancelled, or aborted sequences.",
+            crate::inference::cuda_paged_kv::reclaimed_pages_total(),
+        );
+        let paged =
+            crate::inference::active_resident_cuda_status().and_then(|status| status.paged_kv);
+        for (name, help, value) in [
+            (
+                "camelid_cuda_paged_kv_capacity_pages",
+                "Logical page capacity of the active CUDA paged KV allocator.",
+                paged.map_or(0, |status| status.capacity_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_allocated_pages",
+                "Pages owned by active sequences in the CUDA paged KV allocator.",
+                paged.map_or(0, |status| status.allocated_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_free_pages",
+                "Unallocated logical pages in the active CUDA paged KV allocator.",
+                paged.map_or(0, |status| status.free_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_fragmented_pages",
+                "Vacant reusable page indices below the allocator metadata high-water mark.",
+                paged.map_or(0, |status| status.fragmented_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_shared_pages",
+                "Immutable CUDA paged KV pages referenced by more than one sequence.",
+                paged.map_or(0, |status| status.shared_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_high_watermark_pages",
+                "Maximum simultaneously allocated pages in the active CUDA paged KV allocator.",
+                paged.map_or(0, |status| status.high_watermark_pages as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_allocated_bytes",
+                "Logical bytes owned by active CUDA paged KV sequences.",
+                paged.map_or(0, |status| status.allocated_bytes as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_device_allocated_bytes",
+                "Physical device bytes held by active CUDA paged KV pages.",
+                paged.map_or(0, |status| status.device_allocated_bytes as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_device_high_watermark_bytes",
+                "Maximum physical bytes held by the active CUDA paged KV page store.",
+                paged.map_or(0, |status| status.device_high_watermark_bytes as u64),
+            ),
+            (
+                "camelid_cuda_paged_kv_sequences",
+                "Sequences currently owning a CUDA paged KV page table.",
+                paged.map_or(0, |status| status.sequence_count as u64),
+            ),
+        ] {
+            metric_gauge(&mut out, name, help, value);
         }
 
         metric_gauge(
@@ -192,13 +470,26 @@ impl ServerMetrics {
             &mut out,
             "camelid_engine_active_slots",
             "Active single-owner engine slots.",
-            u64::from(slot.is_processing()),
+            state.engine.busy_slots() as u64,
         );
         metric_gauge(
             &mut out,
             "camelid_engine_active_generated_tokens",
             "Tokens completed by the active generation job.",
             slot.completed_units,
+        );
+        let (prefill_completed, prefill_total) = state.engine.cooperative_prefill_progress();
+        metric_gauge(
+            &mut out,
+            "camelid_engine_active_prefill_tokens",
+            "Prompt tokens completed by active cooperative prefill jobs.",
+            prefill_completed,
+        );
+        metric_gauge(
+            &mut out,
+            "camelid_engine_active_prefill_tokens_total",
+            "Total prompt tokens scheduled by active cooperative prefill jobs.",
+            prefill_total,
         );
         metric_gauge(
             &mut out,
@@ -357,10 +648,36 @@ mod tests {
         state
             .metrics
             .record_generation(12, 5, &GenerationTimings::default());
+        state.metrics.record_cuda_true_batch2(15, 1_250);
+        state.metrics.record_cuda_true_batch2_preflight_fallback();
+        state.metrics.record_cuda_true_batch(4, 29, 2_500);
+        state.metrics.record_cuda_true_batch_preflight_fallback();
+        state.metrics.record_cuda_batched_prefill(4, 28, 2_000);
         let text = state.metrics.render(&state);
         assert!(text.contains("# TYPE camelid_prompt_tokens_total counter"));
         assert!(text.contains("camelid_prompt_tokens_total 12"));
         assert!(text.contains("camelid_decode_tokens_total 5"));
+        assert!(text.contains("camelid_cuda_true_batch2_forwards_total 1"));
+        assert!(text.contains("camelid_cuda_true_batch2_rows_total 2"));
+        assert!(text.contains("camelid_cuda_true_batch2_shared_projection_launches_total 15"));
+        assert!(text.contains("camelid_cuda_true_batch2_preflight_fallbacks_total 1"));
+        assert!(text.contains("camelid_cuda_true_batch2_duration_seconds_sum 0.001250"));
+        assert!(text.contains("camelid_cuda_true_batch_forwards_total 2"));
+        assert!(text.contains("camelid_cuda_true_batch_rows_total 6"));
+        assert!(text.contains("camelid_cuda_true_batch_shared_projection_launches_total 44"));
+        assert!(text.contains("camelid_cuda_true_batch_preflight_fallbacks_total 2"));
+        assert!(text.contains("camelid_cuda_true_batch_duration_seconds_sum 0.003750"));
+        assert!(text.contains("camelid_cuda_true_batch_size_2_forwards_total 1"));
+        assert!(text.contains("camelid_cuda_true_batch_size_4_forwards_total 1"));
+        assert!(text.contains("camelid_cuda_batched_prefill_forwards_total 1"));
+        assert!(text.contains("camelid_cuda_batched_prefill_rows_total 4"));
+        assert!(text.contains("camelid_cuda_batched_prefill_shared_projection_launches_total 28"));
+        assert!(text.contains("camelid_cuda_batched_prefill_duration_seconds_sum 0.002000"));
+        assert!(text.contains("camelid_cuda_batched_prefill_size_4_forwards_total 1"));
+        assert!(text.contains("# TYPE camelid_cuda_paged_kv_allocation_failures_total counter"));
+        assert!(text.contains("# TYPE camelid_cuda_paged_kv_reclaimed_pages_total counter"));
+        assert!(text.contains("# TYPE camelid_cuda_paged_kv_fragmented_pages gauge"));
+        assert!(text.contains("# TYPE camelid_cuda_paged_kv_device_allocated_bytes gauge"));
         assert!(!text.contains('{'));
     }
 }

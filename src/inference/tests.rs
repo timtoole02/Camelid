@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::env_lock;
-use std::io::Write;
+use std::io::{Read, Write};
 
 fn assert_close(actual: f32, expected: f32) {
     assert!(
@@ -1763,6 +1763,2719 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
     };
     let session = LlamaInferenceSession::new(config, weights).unwrap();
     (session, temp_file)
+}
+
+fn phase1_model_identity() -> BatchModelIdentity {
+    BatchModelIdentity::from_sha256([0xA5; 32])
+}
+
+fn phase1_sampling_for(token_id: usize) -> LlamaSampler {
+    LlamaSampler::Sampling(SamplingConfig {
+        temperature: 1.0,
+        seed: Some(7),
+        logit_bias: vec![(token_id, 100.0)],
+        ..SamplingConfig::default()
+    })
+}
+
+fn phase1_row(
+    sequence_id: u64,
+    input_token_id: u32,
+    sampler: LlamaSampler,
+) -> (SerialBatchRow, tempfile::NamedTempFile) {
+    phase1_row_with_history(sequence_id, input_token_id, vec![input_token_id], sampler)
+}
+
+fn phase1_row_with_history(
+    sequence_id: u64,
+    input_token_id: u32,
+    token_history: Vec<u32>,
+    sampler: LlamaSampler,
+) -> (SerialBatchRow, tempfile::NamedTempFile) {
+    let (mut session, temp_file) = tiny_kv_budget_session(16);
+    session.set_resident_paths_disabled(true);
+    let compatibility = BatchCompatibilityKey::for_session(
+        phase1_model_identity(),
+        &session,
+        BatchOutputMode::GenerationStep,
+    );
+    (
+        SerialBatchRow::new(
+            BatchSequenceId::new(sequence_id),
+            compatibility,
+            0,
+            input_token_id,
+            token_history,
+            sampler,
+            None,
+            session,
+        ),
+        temp_file,
+    )
+}
+
+#[test]
+fn phase1_batch_size_one_matches_the_existing_serial_primitive() {
+    let (row, _temp_file) = phase1_row(11, 0, phase1_sampling_for(1));
+    let mut direct = row.session().clone();
+    let expected = direct
+        .generate_next_token_with_history_diagnostics(
+            &[0],
+            phase1_sampling_for(1),
+            &[0],
+            false,
+            None,
+        )
+        .unwrap();
+    let mut rows = [row];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+    let result = execution.results.get(&BatchSequenceId::new(11)).unwrap();
+
+    assert_eq!(result.execution_mode, BatchExecutionMode::Exclusive);
+    assert_eq!(execution.mode_counts.exclusive_rows, 1);
+    assert_eq!(execution.mode_counts.cooperative_serial_rows, 0);
+    assert_eq!(execution.mode_counts.true_batch_rows, 0);
+    assert_eq!(result.position_before, 0);
+    assert_eq!(result.position_after, 1);
+    assert_eq!(result.input_token_id, 0);
+    let BatchRowOutcome::Generated(actual) = &result.outcome else {
+        panic!("serial oracle failed: {:?}", result.outcome);
+    };
+    assert_eq!(actual.prompt_token_count, expected.prompt_token_count);
+    assert_eq!(actual.prefill_token_count, expected.prefill_token_count);
+    assert_eq!(actual.next_token_id, expected.next_token_id);
+    assert_eq!(actual.logits, expected.logits);
+    assert_eq!(actual.hidden_state, expected.hidden_state);
+    assert_eq!(actual.output_norm_state, expected.output_norm_state);
+    assert_eq!(actual.diagnostics, expected.diagnostics);
+    assert_eq!(rows[0].session(), &direct);
+}
+
+#[test]
+fn phase1_scatter_is_stable_when_input_order_changes() {
+    let (row_20, _temp_20) = phase1_row(20, 1, phase1_sampling_for(1));
+    let (row_10, _temp_10) = phase1_row(10, 0, phase1_sampling_for(0));
+    let mut rows = [row_20, row_10];
+    let reverse_execution = SerialBatchOracle::execute(&mut rows).unwrap();
+    let (row_10, _temp_10_again) = phase1_row(10, 0, phase1_sampling_for(0));
+    let (row_20, _temp_20_again) = phase1_row(20, 1, phase1_sampling_for(1));
+    let mut reversed_rows = [row_10, row_20];
+    let forward_execution = SerialBatchOracle::execute(&mut reversed_rows).unwrap();
+
+    let ids = reverse_execution
+        .results
+        .keys()
+        .map(|id| id.get())
+        .collect::<Vec<_>>();
+    let token_10 = match &reverse_execution.results[&BatchSequenceId::new(10)].outcome {
+        BatchRowOutcome::Generated(step) => step.next_token_id,
+        other => panic!("sequence 10 failed: {other:?}"),
+    };
+    let token_20 = match &reverse_execution.results[&BatchSequenceId::new(20)].outcome {
+        BatchRowOutcome::Generated(step) => step.next_token_id,
+        other => panic!("sequence 20 failed: {other:?}"),
+    };
+
+    assert_eq!(ids, vec![10, 20]);
+    assert_eq!(token_10, 0);
+    assert_eq!(token_20, 1);
+    for sequence_id in [BatchSequenceId::new(10), BatchSequenceId::new(20)] {
+        let BatchRowOutcome::Generated(reverse) = &reverse_execution.results[&sequence_id].outcome
+        else {
+            unreachable!()
+        };
+        let BatchRowOutcome::Generated(forward) = &forward_execution.results[&sequence_id].outcome
+        else {
+            unreachable!()
+        };
+        assert_eq!(reverse.next_token_id, forward.next_token_id);
+        assert_eq!(reverse.logits, forward.logits);
+        assert_eq!(reverse.hidden_state, forward.hidden_state);
+        assert_eq!(reverse.output_norm_state, forward.output_norm_state);
+    }
+    assert_eq!(reverse_execution.mode_counts.cooperative_serial_rows, 2);
+    assert_eq!(forward_execution.mode_counts.cooperative_serial_rows, 2);
+    assert!(reverse_execution
+        .results
+        .values()
+        .all(|result| result.execution_mode == BatchExecutionMode::CooperativeSerial));
+}
+
+#[test]
+fn phase1_token_histories_remain_bound_to_sequence_ids() {
+    let sampler = LlamaSampler::Sampling(SamplingConfig {
+        presence_penalty: 2.0,
+        ..SamplingConfig::default()
+    });
+    let (row_10, _temp_10) = phase1_row_with_history(10, 0, vec![0], sampler.clone());
+    let (row_20, _temp_20) = phase1_row_with_history(20, 0, vec![1], sampler.clone());
+    let mut direct_10 = row_10.session().clone();
+    let expected_10 = direct_10
+        .generate_next_token_with_history_diagnostics(&[0], sampler.clone(), &[0], false, None)
+        .unwrap();
+    let mut direct_20 = row_20.session().clone();
+    let expected_20 = direct_20
+        .generate_next_token_with_history_diagnostics(&[0], sampler, &[1], false, None)
+        .unwrap();
+    assert_ne!(expected_10.next_token_id, expected_20.next_token_id);
+    let mut rows = [row_20, row_10];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+    let BatchRowOutcome::Generated(actual_10) =
+        &execution.results[&BatchSequenceId::new(10)].outcome
+    else {
+        panic!("sequence 10 failed")
+    };
+    let BatchRowOutcome::Generated(actual_20) =
+        &execution.results[&BatchSequenceId::new(20)].outcome
+    else {
+        panic!("sequence 20 failed")
+    };
+
+    assert_eq!(actual_10.next_token_id, expected_10.next_token_id);
+    assert_eq!(actual_20.next_token_id, expected_20.next_token_id);
+}
+
+#[test]
+fn phase1_one_row_failure_does_not_mutate_or_stop_its_sibling() {
+    let (good, _good_temp) = phase1_row(1, 0, LlamaSampler::Greedy);
+    let (bad, _bad_temp) = phase1_row(2, 1, LlamaSampler::Greedy);
+    let bad = bad.with_expected_position(1);
+    let mut rows = [good, bad];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+
+    assert!(matches!(
+        execution.results[&BatchSequenceId::new(1)].outcome,
+        BatchRowOutcome::Generated(_)
+    ));
+    assert_eq!(
+        execution.results[&BatchSequenceId::new(2)].outcome,
+        BatchRowOutcome::Failed(BatchRowFailure::PositionMismatch {
+            expected: 1,
+            actual: 0,
+        })
+    );
+    assert_eq!(rows[0].session().kv_position(), 1);
+    assert_eq!(rows[1].session().kv_position(), 0);
+}
+
+#[test]
+fn phase1_generation_failure_does_not_stop_the_following_sibling() {
+    let (bad, _bad_temp) = phase1_row(1, 0, LlamaSampler::Greedy);
+    let bad = bad.with_allowed_tokens(vec![true]);
+    let (good, _good_temp) = phase1_row(2, 1, LlamaSampler::Greedy);
+    let mut rows = [bad, good];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+
+    let BatchRowOutcome::Failed(BatchRowFailure::GenerationFailed { message }) =
+        &execution.results[&BatchSequenceId::new(1)].outcome
+    else {
+        panic!("invalid mask did not fail")
+    };
+    assert!(message.contains("mask"), "{message}");
+    assert!(matches!(
+        execution.results[&BatchSequenceId::new(2)].outcome,
+        BatchRowOutcome::Generated(_)
+    ));
+    assert_eq!(rows[1].session().kv_position(), 1);
+}
+
+#[test]
+fn phase1_diagnostics_mode_returns_diagnostics() {
+    let (row, _temp_file) = phase1_row(9, 0, LlamaSampler::Greedy);
+    let diagnostics_key = BatchCompatibilityKey::for_session(
+        phase1_model_identity(),
+        row.session(),
+        BatchOutputMode::GenerationStepWithDiagnostics,
+    );
+    let mut rows = [row.with_compatibility(diagnostics_key)];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+    let BatchRowOutcome::Generated(step) = &execution.results[&BatchSequenceId::new(9)].outcome
+    else {
+        panic!("diagnostics row failed")
+    };
+
+    assert!(step.diagnostics.is_some());
+}
+
+#[test]
+fn phase1_output_mode_mismatch_is_refused_before_mutation() {
+    let (first, _first_temp) = phase1_row(1, 0, LlamaSampler::Greedy);
+    let (second, _second_temp) = phase1_row(2, 1, LlamaSampler::Greedy);
+    let diagnostics_key = BatchCompatibilityKey::for_session(
+        phase1_model_identity(),
+        second.session(),
+        BatchOutputMode::GenerationStepWithDiagnostics,
+    );
+    let mut rows = [first, second.with_compatibility(diagnostics_key)];
+
+    assert_eq!(
+        SerialBatchOracle::execute(&mut rows),
+        Err(BatchContractError::IncompatibleRow { sequence_id: 2 })
+    );
+    assert_eq!(rows[0].session().kv_position(), 0);
+    assert_eq!(rows[1].session().kv_position(), 0);
+}
+
+#[test]
+fn phase1_allowed_token_masks_are_row_local() {
+    let (first, _first_temp) = phase1_row(1, 0, LlamaSampler::Greedy);
+    let (second, _second_temp) = phase1_row(2, 1, LlamaSampler::Greedy);
+    let mut rows = [
+        first.with_allowed_tokens(vec![true, false]),
+        second.with_allowed_tokens(vec![false, true]),
+    ];
+
+    let execution = SerialBatchOracle::execute(&mut rows).unwrap();
+    let BatchRowOutcome::Generated(first) = &execution.results[&BatchSequenceId::new(1)].outcome
+    else {
+        panic!("first masked row failed")
+    };
+    let BatchRowOutcome::Generated(second) = &execution.results[&BatchSequenceId::new(2)].outcome
+    else {
+        panic!("second masked row failed")
+    };
+
+    assert_eq!(first.next_token_id, 0);
+    assert_eq!(second.next_token_id, 1);
+}
+
+#[test]
+fn phase1_incompatible_batch_is_refused_before_mutation() {
+    let (first, _first_temp) = phase1_row(1, 0, LlamaSampler::Greedy);
+    let (second, _second_temp) = phase1_row(2, 1, LlamaSampler::Greedy);
+    let incompatible = BatchCompatibilityKey::for_session(
+        BatchModelIdentity::from_sha256([0x5A; 32]),
+        second.session(),
+        BatchOutputMode::GenerationStep,
+    );
+    let second = second.with_compatibility(incompatible);
+    let mut rows = [first, second];
+
+    let error = SerialBatchOracle::execute(&mut rows).unwrap_err();
+
+    assert_eq!(
+        error,
+        BatchContractError::IncompatibleRow { sequence_id: 2 }
+    );
+    assert_eq!(rows[0].session().kv_position(), 0);
+    assert_eq!(rows[1].session().kv_position(), 0);
+}
+
+#[test]
+fn phase1_duplicate_sequence_ids_are_refused_before_mutation() {
+    let (first, _first_temp) = phase1_row(7, 0, LlamaSampler::Greedy);
+    let (second, _second_temp) = phase1_row(7, 1, LlamaSampler::Greedy);
+    let mut rows = [first, second];
+
+    let error = SerialBatchOracle::execute(&mut rows).unwrap_err();
+
+    assert_eq!(error, BatchContractError::DuplicateSequence(7));
+    assert_eq!(rows[0].session().kv_position(), 0);
+    assert_eq!(rows[1].session().kv_position(), 0);
+}
+
+#[test]
+fn phase1_session_geometry_mismatch_is_refused_before_mutation() {
+    let (mut row, _temp_file) = phase1_row(3, 0, LlamaSampler::Greedy);
+    row.session_mut().kv_cache.plan.max_sequence_length += 1;
+    let mut rows = [row];
+
+    let error = SerialBatchOracle::execute(&mut rows).unwrap_err();
+
+    assert_eq!(
+        error,
+        BatchContractError::SessionCompatibilityMismatch { sequence_id: 3 }
+    );
+    assert_eq!(rows[0].session().kv_position(), 0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn phase2_clone_renews_cuda_identity_while_take_for_step_preserves_it() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(16);
+    let original_id = session.cuda_sequence_id;
+
+    let cloned = session.clone();
+    assert_ne!(cloned.cuda_sequence_id, original_id);
+    assert!(cloned.cuda_sequence_lease.is_none());
+
+    let stepped = session.take_for_step();
+    assert_eq!(stepped.cuda_sequence_id, original_id);
+    assert!(stepped.cuda_sequence_lease.is_none());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn phase7_paged_vram_preflight_budgets_the_full_promoted_position_envelope() {
+    let all_sequences_bytes_per_position = 1_024u64;
+    assert_eq!(
+        resident_projected_kv_bytes(true, 8_192, all_sequences_bytes_per_position),
+        Some(512 * all_sequences_bytes_per_position)
+    );
+    assert_eq!(
+        resident_projected_kv_bytes(false, 8_192, all_sequences_bytes_per_position),
+        Some(8_192 * all_sequences_bytes_per_position)
+    );
+    assert_eq!(
+        resident_projected_kv_bytes(true, 256, all_sequences_bytes_per_position),
+        Some(256 * all_sequences_bytes_per_position)
+    );
+    assert_eq!(
+        resident_projected_kv_bytes(true, usize::MAX, u64::MAX),
+        None
+    );
+}
+
+#[cfg(feature = "cuda")]
+struct Phase3RealModel {
+    config: LlamaModelConfig,
+    weights: Arc<LlamaLoadedWeights>,
+    prompts: [Vec<u32>; 2],
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_real_model() -> Option<Phase3RealModel> {
+    const EXPECTED_SHA256: &str =
+        "3f87a880027e7b9ea8e0da9e4009584336f352af444a0e6e5c20721ac4c7ffd1";
+    let path = std::env::var_os("CAMELID_PHASE3_GGUF").map(std::path::PathBuf::from)?;
+    let mut file = std::fs::File::open(&path).expect("open Phase 3 GGUF");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).expect("hash Phase 3 GGUF");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(digest, EXPECTED_SHA256, "Phase 3 GGUF identity mismatch");
+
+    let gguf = crate::gguf::read_metadata(&path).expect("read Phase 3 GGUF metadata");
+    let config = LlamaModelConfig::from_gguf(&gguf).expect("Phase 3 model config");
+    let binding =
+        crate::model::LlamaTensorBinding::bind(&gguf, &config).expect("Phase 3 tensor binding");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+    let weights =
+        Arc::new(LlamaLoadedWeights::load(&store, &binding, None).expect("load Phase 3 weights"));
+    let tokenizer = crate::tokenizer::Tokenizer::from_gguf(&gguf).expect("Phase 3 tokenizer");
+    let prompt = |marker: &str, repeats: usize| {
+        tokenizer
+            .encode(
+                &format!(
+                    "F1-PHASE3-{marker} BEGIN\n{}\nContinue with a concise technical answer.",
+                    "Independent CUDA batch rows must retain their own complete history. "
+                        .repeat(repeats)
+                ),
+                true,
+                false,
+            )
+            .expect("encode Phase 3 prompt")
+    };
+    let prompts = [prompt("ROW-A", 24), prompt("ROW-B", 37)];
+    assert!(prompts[0].len() > 128 && prompts[1].len() > prompts[0].len());
+    Some(Phase3RealModel {
+        config,
+        weights,
+        prompts,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_build_batch2_engine(model: &Phase3RealModel) -> crate::cuda_resident::CudaResidentDecode {
+    let dims = DenseLlamaDims::from_config(&model.config).expect("Phase 3 dense dimensions");
+    let head_dim = dims.head_dim;
+    let rope_dim = model
+        .config
+        .rope_dimension_count
+        .map(|value| value as usize)
+        .unwrap_or(head_dim);
+    let tables = rope::resident_decode_rope_tables(
+        0,
+        head_dim,
+        &model.config,
+        model.weights.rope_freqs.as_ref(),
+    )
+    .expect("Phase 3 RoPE tables")
+    .expect("Phase 3 model supports resident RoPE");
+    build_resident_cuda_engine(
+        &model.weights,
+        0..dims.block_count,
+        dims.block_count,
+        model.config.attention_head_count as usize,
+        dims.attention_head_count_kv,
+        head_dim,
+        dims.embedding_length,
+        dims.feed_forward_length,
+        rope_dim,
+        8_192,
+        dims.vocab_size,
+        diagnostic_rms_norm_epsilon(model.config.rms_norm_epsilon).expect("Phase 3 RMS epsilon"),
+        tables.split_half_pairing,
+        false,
+        None,
+        2,
+        model.config.kv_quant,
+        false,
+    )
+    .expect("build Phase 3 resident engine")
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_seed_batch2_engine(
+    engine: &mut crate::cuda_resident::CudaResidentDecode,
+    model: &Phase3RealModel,
+) -> ([usize; 2], [u32; 2]) {
+    let dims = DenseLlamaDims::from_config(&model.config).expect("Phase 3 dense dimensions");
+    let head_dim = dims.head_dim;
+    let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale().unwrap());
+    let mut positions = [0usize; 2];
+    let mut inputs = [0u32; 2];
+    for row in 0..2 {
+        engine.clear_kv_slot(row).expect("clear Phase 3 KV bank");
+        let (input, prefix) = model.prompts[row]
+            .split_last()
+            .expect("non-empty Phase 3 prompt");
+        let embeddings = model
+            .weights
+            .token_embedding
+            .embedding_lookup(prefix, "phase3_real_model_prefill")
+            .expect("Phase 3 prompt embeddings");
+        let tables = rope::resident_prefill_rope_tables(
+            prefix.len(),
+            head_dim,
+            &model.config,
+            model.weights.rope_freqs.as_ref(),
+        )
+        .expect("Phase 3 prefill RoPE")
+        .expect("Phase 3 prefill is resident-eligible");
+        engine
+            .prefill_batched(
+                &embeddings.data,
+                &tables.cos,
+                &tables.sin,
+                prefix.len(),
+                scale,
+            )
+            .expect("Phase 3 resident prefill");
+        engine.set_filled(prefix.len());
+        positions[row] = prefix.len();
+        inputs[row] = *input;
+    }
+    (positions, inputs)
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index as u32)
+        .expect("non-empty Phase 3 logits")
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_resident_slot_paged_lifecycle_reconciles_metadata_and_device_pages() {
+    use crate::inference::cuda_paged_kv::{
+        CudaKvPageLayout, CudaKvPageStorage, CUDA_KV_PAGE_TOKENS,
+    };
+
+    let _env_guard = crate::test_support::env_lock();
+    let layout = CudaKvPageLayout {
+        layer_count: 2,
+        kv_head_count: 1,
+        head_dim: 32,
+        storage: CudaKvPageStorage::F16,
+    };
+    let engine = crate::cuda_resident::CudaResidentDecode::new_paged_with_kv_quant(
+        layout.layer_count,
+        2,
+        layout.kv_head_count,
+        layout.head_dim,
+        64,
+        128,
+        32,
+        128,
+        64,
+        1.0e-5,
+        false,
+        crate::model::KvCacheQuantization::F16,
+    )
+    .expect("build paged resident engine");
+    let key = 0xF106_0001_u64;
+    let sequence_id = cuda_sequence::CudaSequenceId::next();
+    let mut slot = ResidentCudaSlot {
+        key: key as usize,
+        engine,
+        sequence_slots: Some(cuda_sequence::FixedCudaSequenceSlots::new(2).unwrap()),
+        paged_kv: Some(ResidentCudaPagedKv::new(layout, 4).unwrap()),
+        range: 0..layout.layer_count,
+    };
+    let mut lease = None;
+    assert!(select_resident_cuda_sequence(&mut slot, sequence_id, &mut lease).unwrap());
+    let lease = lease.expect("fresh paged lease");
+    assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 1);
+    assert_eq!(slot.paged_kv.as_ref().unwrap().tables.len(), 1);
+
+    let append = slot
+        .prepare_paged_append(sequence_id, 2 * CUDA_KV_PAGE_TOKENS + 1)
+        .unwrap();
+    assert_eq!(append.allocated_pages.len(), 3);
+    slot.commit_paged_append(append).unwrap();
+    let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+    let device = slot.engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(metadata.allocated_pages, 3);
+    assert_eq!(metadata.allocated_bytes, 3 * layout.page_bytes().unwrap());
+    assert_eq!(device.resident_pages, 3);
+    assert_eq!(device.allocated_bytes, metadata.allocated_bytes);
+
+    let aborted = slot
+        .prepare_paged_append(sequence_id, CUDA_KV_PAGE_TOKENS)
+        .unwrap();
+    assert_eq!(aborted.allocated_pages.len(), 1);
+    assert_eq!(
+        slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+        4
+    );
+    slot.abort_paged_append(aborted).unwrap();
+    assert_eq!(
+        slot.paged_kv
+            .as_ref()
+            .unwrap()
+            .pool
+            .snapshot()
+            .allocated_pages,
+        3
+    );
+    assert_eq!(
+        slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+        3
+    );
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(slot);
+    release_resident_cuda_sequence(resident_cuda_cache(), lease);
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_ref()
+        .expect("successful release retains the engine");
+    let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+    let device = slot.engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 0);
+    assert!(slot.paged_kv.as_ref().unwrap().tables.is_empty());
+    assert_eq!(metadata.allocated_pages, 0);
+    assert_eq!(metadata.allocated_bytes, 0);
+    assert_eq!(metadata.high_watermark_pages, 4);
+    assert_eq!(metadata.total_allocations, 4);
+    assert_eq!(metadata.reclaimed_pages, 4);
+    assert_eq!(device.resident_pages, 0);
+    assert_eq!(device.allocated_bytes, 0);
+    assert_eq!(
+        device.high_watermark_bytes,
+        4 * layout.page_bytes().unwrap()
+    );
+    drop(guard);
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase7_four_paged_sequences_cancel_and_reuse_without_aliasing() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPageStorage};
+
+    let _env_guard = crate::test_support::env_lock();
+    let layout = CudaKvPageLayout {
+        layer_count: 2,
+        kv_head_count: 1,
+        head_dim: 32,
+        storage: CudaKvPageStorage::F16,
+    };
+    let engine = crate::cuda_resident::CudaResidentDecode::new_paged_with_kv_quant(
+        layout.layer_count,
+        2,
+        layout.kv_head_count,
+        layout.head_dim,
+        64,
+        128,
+        32,
+        128,
+        64,
+        1.0e-5,
+        false,
+        crate::model::KvCacheQuantization::F16,
+    )
+    .expect("build paged resident engine");
+    let mut slot = ResidentCudaSlot {
+        key: 0xF107_0001,
+        engine,
+        sequence_slots: Some(cuda_sequence::FixedCudaSequenceSlots::new(4).unwrap()),
+        paged_kv: Some(ResidentCudaPagedKv::new(layout, 8).unwrap()),
+        range: 0..layout.layer_count,
+    };
+    let mut sequences = Vec::new();
+    let mut leases = Vec::new();
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let sequence = cuda_sequence::CudaSequenceId::next();
+        let mut lease = None;
+        assert!(select_resident_cuda_sequence(&mut slot, sequence, &mut lease).unwrap());
+        let append = slot.prepare_paged_append(sequence, 17).unwrap();
+        slot.commit_paged_append(append).unwrap();
+        sequences.push(sequence);
+        leases.push(lease.unwrap());
+        pages.push(slot.paged_sequence_pages(sequence).unwrap());
+    }
+    let unique_pages = pages
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique_pages.len(), 8);
+    assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 4);
+    assert_eq!(slot.paged_kv.as_ref().unwrap().tables.len(), 4);
+    assert_eq!(
+        slot.paged_kv
+            .as_ref()
+            .unwrap()
+            .pool
+            .snapshot()
+            .allocated_pages,
+        8
+    );
+    assert_eq!(
+        slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+        8
+    );
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(slot);
+    let cancelled_lease = leases.remove(1);
+    let cancelled_pages = pages.remove(1);
+    sequences.remove(1);
+    release_resident_cuda_sequence(resident_cuda_cache(), cancelled_lease);
+
+    let replacement_lease = {
+        let mut guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.as_mut().expect("paged engine remains resident");
+        assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 3);
+        assert_eq!(slot.paged_kv.as_ref().unwrap().tables.len(), 3);
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            6
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            6
+        );
+        assert!(cancelled_pages.iter().all(|page| !slot
+            .paged_kv
+            .as_ref()
+            .unwrap()
+            .pool
+            .validate(*page)));
+        for (sequence, expected_pages) in sequences.iter().zip(&pages) {
+            assert_eq!(
+                slot.paged_sequence_pages(*sequence).unwrap(),
+                *expected_pages
+            );
+        }
+
+        let replacement = cuda_sequence::CudaSequenceId::next();
+        let mut lease = None;
+        assert!(select_resident_cuda_sequence(slot, replacement, &mut lease).unwrap());
+        let append = slot.prepare_paged_append(replacement, 17).unwrap();
+        slot.commit_paged_append(append).unwrap();
+        let replacement_pages = slot.paged_sequence_pages(replacement).unwrap();
+        assert_eq!(replacement_pages.len(), 2);
+        assert_eq!(
+            replacement_pages
+                .iter()
+                .map(|page| page.index())
+                .collect::<std::collections::BTreeSet<_>>(),
+            cancelled_pages
+                .iter()
+                .map(|page| page.index())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(replacement_pages
+            .iter()
+            .zip(cancelled_pages.iter().rev())
+            .all(|(replacement, cancelled)| replacement.generation() != cancelled.generation()));
+        lease.unwrap()
+    };
+
+    leases.push(replacement_lease);
+    for lease in leases {
+        release_resident_cuda_sequence(resident_cuda_cache(), lease);
+    }
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_ref()
+        .expect("released paged engine remains cached");
+    let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+    let device = slot.engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 0);
+    assert!(slot.paged_kv.as_ref().unwrap().tables.is_empty());
+    assert_eq!(metadata.allocated_pages, 0);
+    assert_eq!(metadata.allocated_bytes, 0);
+    assert_eq!(metadata.high_watermark_pages, 8);
+    assert_eq!(metadata.total_allocations, 10);
+    assert_eq!(metadata.reclaimed_pages, 10);
+    assert_eq!(device.resident_pages, 0);
+    assert_eq!(device.allocated_bytes, 0);
+    drop(guard);
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_paged_owner_one_page_short_is_atomic_and_churn_reconciles() {
+    use crate::inference::cuda_paged_kv::{
+        CudaKvPageLayout, CudaKvPageStorage, CUDA_KV_PAGE_TOKENS,
+    };
+
+    let _env_guard = crate::test_support::env_lock();
+    let layout = CudaKvPageLayout {
+        layer_count: 2,
+        kv_head_count: 1,
+        head_dim: 32,
+        storage: CudaKvPageStorage::F16,
+    };
+    let engine = crate::cuda_resident::CudaResidentDecode::new_paged_with_kv_quant(
+        layout.layer_count,
+        2,
+        layout.kv_head_count,
+        layout.head_dim,
+        64,
+        128,
+        32,
+        128,
+        64,
+        1.0e-5,
+        false,
+        crate::model::KvCacheQuantization::F16,
+    )
+    .unwrap();
+    let key = 0xF106_0003_u64;
+    let mut slot = ResidentCudaSlot {
+        key: key as usize,
+        engine,
+        sequence_slots: Some(cuda_sequence::FixedCudaSequenceSlots::new(1).unwrap()),
+        paged_kv: Some(ResidentCudaPagedKv::new(layout, 1).unwrap()),
+        range: 0..layout.layer_count,
+    };
+    let sequence_id = cuda_sequence::CudaSequenceId::next();
+    let mut lease = None;
+    assert!(select_resident_cuda_sequence(&mut slot, sequence_id, &mut lease).unwrap());
+    let error = match slot.prepare_paged_append(sequence_id, CUDA_KV_PAGE_TOKENS + 1) {
+        Ok(_) => panic!("one page short must refuse before any device allocation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("needs 1 pages but only 0 are free"));
+    let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+    let device = slot.engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(metadata.allocated_pages, 0);
+    assert_eq!(metadata.allocated_bytes, 0);
+    assert_eq!(metadata.allocation_failures, 1);
+    assert_eq!(device.resident_pages, 0);
+    assert_eq!(device.allocated_bytes, 0);
+
+    let kernel_error = slot
+        .prefill_paged_append(sequence_id, &[], &[], &[], 0, 1, 1.0)
+        .expect_err("invalid kernel inputs must roll back a prepared device page");
+    assert!(kernel_error
+        .to_string()
+        .contains("input slices are too short"));
+    assert_eq!(
+        slot.paged_kv
+            .as_ref()
+            .unwrap()
+            .pool
+            .snapshot()
+            .allocated_pages,
+        0
+    );
+    assert_eq!(
+        slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+        0
+    );
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(slot);
+    release_resident_cuda_sequence(resident_cuda_cache(), lease.unwrap());
+    let mut previous_handle: Option<cuda_paged_kv::CudaKvPageHandle> = None;
+    for _round in 0..1_024 {
+        let sequence_id = cuda_sequence::CudaSequenceId::next();
+        let lease = {
+            let mut guard = resident_cuda_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = guard.as_mut().unwrap();
+            let mut lease = None;
+            assert!(select_resident_cuda_sequence(slot, sequence_id, &mut lease).unwrap());
+            let append = slot
+                .prepare_paged_append(sequence_id, CUDA_KV_PAGE_TOKENS)
+                .unwrap();
+            let handle = append.allocated_pages[0];
+            if let Some(previous) = previous_handle {
+                assert_eq!(handle.index(), previous.index());
+                assert_ne!(handle.generation(), previous.generation());
+            }
+            previous_handle = Some(handle);
+            slot.commit_paged_append(append).unwrap();
+            lease.unwrap()
+        };
+        release_resident_cuda_sequence(resident_cuda_cache(), lease);
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.as_ref().unwrap();
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            0
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            0
+        );
+    }
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard.as_ref().unwrap();
+    let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+    let device = slot.engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(metadata.high_watermark_pages, 1);
+    assert_eq!(metadata.total_allocations, 1_026);
+    assert_eq!(metadata.reclaimed_pages, 1_026);
+    assert_eq!(metadata.allocation_failures, 1);
+    assert_eq!(metadata.allocated_bytes, 0);
+    assert_eq!(device.allocated_bytes, 0);
+    assert_eq!(device.high_watermark_bytes, layout.page_bytes().unwrap());
+    drop(guard);
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase6_production_paged_prefill_decode_matches_contiguous_and_reclaims() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 6 production paged gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::set_var("CAMELID_CUDA_TWO_SEQUENCE_KV", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+
+    let prompt = &model.prompts[0][..97];
+    let (last_token, prefix) = prompt.split_last().expect("non-empty Phase 6 prompt");
+    let cache_key = 0xF106_0002_u64;
+    let make_session = || {
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        session
+    };
+
+    let mut contiguous = make_session();
+    assert!(contiguous.try_resident_prefill_cuda(prefix).unwrap());
+    let contiguous_step = contiguous
+        .generate_next_token_with_history_diagnostics(
+            &[*last_token],
+            LlamaSampler::Greedy,
+            prompt,
+            false,
+            None,
+        )
+        .unwrap();
+    drop(contiguous);
+
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    let mut paged = make_session();
+    let mut base = 0usize;
+    for chunk_size in [13usize, 11, 16, 7, 19, 30] {
+        let end = (base + chunk_size).min(prefix.len());
+        if end == base {
+            break;
+        }
+        let outcome = paged
+            .try_resident_prefill_cuda_chunk(&prefix[base..end], base, prefix.len())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                end_position,
+                finalized,
+                ..
+            } if end_position == end && finalized == (end == prefix.len())
+        ));
+        base = end;
+    }
+    assert_eq!(base, prefix.len());
+    let paged_step = paged
+        .generate_next_token_with_history_diagnostics(
+            &[*last_token],
+            LlamaSampler::Greedy,
+            prompt,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(paged_step.logits, contiguous_step.logits);
+    assert_eq!(paged_step.next_token_id, contiguous_step.next_token_id);
+    assert_eq!(paged.kv_position(), prefix.len() + 1);
+    assert!(paged
+        .recover_cpu_kv_from_cuda_resident(paged.kv_position())
+        .unwrap());
+    assert!(paged.kv_cache.history_materialized(paged.kv_position()));
+
+    {
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard
+            .as_ref()
+            .expect("paged production engine remains cached");
+        let metadata = slot.paged_kv.as_ref().expect("paged owner").pool.snapshot();
+        let device = slot
+            .engine
+            .paged_kv_page_snapshot()
+            .expect("paged device store");
+        assert_eq!(metadata.allocated_pages, (prefix.len() + 1).div_ceil(16));
+        assert_eq!(device.resident_pages, metadata.allocated_pages);
+        assert_eq!(
+            slot.paged_sequence_len(paged.cuda_sequence_id).unwrap(),
+            paged.kv_position()
+        );
+    }
+    drop(paged);
+
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_ref()
+        .expect("released paged engine remains cached");
+    assert_eq!(
+        slot.paged_kv
+            .as_ref()
+            .unwrap()
+            .pool
+            .snapshot()
+            .allocated_pages,
+        0
+    );
+    assert_eq!(
+        slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+        0
+    );
+    assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 0);
+    drop(guard);
+
+    let mut cancelled = make_session();
+    cancelled
+        .try_resident_prefill_cuda_chunk(&prefix[..37], 0, prefix.len())
+        .unwrap();
+    {
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard
+            .as_ref()
+            .expect("partial paged prefill retains engine");
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            3
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            3
+        );
+    }
+    drop(cancelled);
+    {
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard
+            .as_ref()
+            .expect("cancelled paged engine remains cached");
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            0
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            0
+        );
+        assert_eq!(slot.sequence_slots.as_ref().unwrap().snapshot().occupied, 0);
+    }
+
+    let mut reused = make_session();
+    reused
+        .try_resident_prefill_cuda_chunk(&prefix[..17], 0, prefix.len())
+        .unwrap();
+    {
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.as_ref().expect("reused paged engine remains cached");
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            2
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            2
+        );
+    }
+    drop(reused);
+
+    let mut split_k = make_session();
+    assert_eq!(
+        split_k
+            .try_resident_prefill_cuda_chunk(
+                &prefix[..1],
+                0,
+                crate::cuda_resident::SPLITK_THRESHOLD + 1,
+            )
+            .unwrap(),
+        CudaResidentPrefillChunkOutcome::Unsupported,
+    );
+    assert!(split_k.cuda_sequence_lease.is_none());
+    {
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.as_ref().expect("split-K refusal retains idle engine");
+        assert_eq!(
+            slot.paged_kv
+                .as_ref()
+                .unwrap()
+                .pool
+                .snapshot()
+                .allocated_pages,
+            0
+        );
+        assert_eq!(
+            slot.engine.paged_kv_page_snapshot().unwrap().resident_pages,
+            0
+        );
+    }
+    drop(split_k);
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase7_four_production_paged_sessions_match_contiguous_and_reconcile() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 7 four-session gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "2");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+
+    let mut prompts = vec![
+        model.prompts[0].clone(),
+        model.prompts[1].clone(),
+        model.prompts[0].clone(),
+        model.prompts[1].clone(),
+    ];
+    let vocab = DenseLlamaDims::from_config(&model.config)
+        .expect("Phase 7 dense dimensions")
+        .vocab_size as u32;
+    for (row, prompt) in prompts.iter_mut().enumerate().skip(2) {
+        let index = 8 + row;
+        prompt[index] = (prompt[index] + row as u32 + 1) % vocab;
+    }
+    assert_eq!(
+        prompts
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4,
+        "the isolation gate requires four distinct prompts"
+    );
+    let cache_key = 0xF107_0002_u64;
+    let make_session = || {
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        session
+    };
+
+    let mut expected = Vec::with_capacity(4);
+    for prompt in &prompts {
+        let (input, prefix) = prompt.split_last().expect("non-empty Phase 7 prompt");
+        let mut session = make_session();
+        assert!(session.try_resident_prefill_cuda(prefix).unwrap());
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[*input],
+                LlamaSampler::Greedy,
+                prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        expected.push((step.logits, step.next_token_id));
+    }
+
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "4");
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    let mut sessions = Vec::with_capacity(4);
+    for prompt in &prompts {
+        let (_, prefix) = prompt.split_last().expect("non-empty Phase 7 prompt");
+        let mut session = make_session();
+        let outcome = session
+            .try_resident_prefill_cuda_chunk(prefix, 0, prefix.len())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                end_position,
+                finalized: true,
+                ..
+            } if end_position == prefix.len()
+        ));
+        sessions.push(session);
+    }
+    {
+        let status = resident_cuda_status(cache_key).expect("four-session paged status");
+        let paged = status.paged_kv.expect("paged status");
+        assert_eq!(status.kv_slot_capacity, 4);
+        assert_eq!(status.occupied_sequences, 4);
+        assert_eq!(paged.capacity_pages, 128);
+        assert_eq!(paged.sequence_count, 4);
+    }
+
+    for (row, ((session, prompt), (expected_logits, expected_token))) in
+        sessions.iter_mut().zip(&prompts).zip(&expected).enumerate()
+    {
+        let input = *prompt.last().expect("non-empty Phase 7 prompt");
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[input],
+                LlamaSampler::Greedy,
+                prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(step.logits, *expected_logits, "row {row} logits diverged");
+        assert_eq!(
+            step.next_token_id, *expected_token,
+            "row {row} token diverged"
+        );
+    }
+
+    drop(sessions);
+    let status = resident_cuda_status(cache_key).expect("released paged status");
+    let paged = status.paged_kv.expect("released paged metrics");
+    assert_eq!(status.occupied_sequences, 0);
+    assert_eq!(paged.sequence_count, 0);
+    assert_eq!(paged.allocated_pages, 0);
+    assert_eq!(paged.allocated_bytes, 0);
+    assert_eq!(paged.device_allocated_bytes, 0);
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase7_four_session_executor_is_transactional_and_scatters_by_stable_id() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 7 executor gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "4");
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    std::env::set_var("CAMELID_CUDA_TRUE_BATCH", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+
+    let prompts = [
+        model.prompts[0].clone(),
+        model.prompts[1].clone(),
+        model.prompts[0][..129].to_vec(),
+        model.prompts[1][..137].to_vec(),
+    ];
+    let cache_key = 0xF107_0003_u64;
+    let mut sessions = Vec::with_capacity(4);
+    let mut inputs = Vec::with_capacity(4);
+    for prompt in &prompts {
+        let (input, prefix) = prompt.split_last().expect("non-empty Phase 7 prompt");
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        let outcome = session
+            .try_resident_prefill_cuda_chunk(prefix, 0, prefix.len())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true,
+                ..
+            }
+        ));
+        sessions.push(session);
+        inputs.push(*input);
+    }
+    let positions = sessions
+        .iter()
+        .map(LlamaInferenceSession::kv_position)
+        .collect::<Vec<_>>();
+    let ids = [401u64, 402, 403, 404];
+    let vocab = DenseLlamaDims::from_config(&model.config)
+        .unwrap()
+        .vocab_size;
+    let masks = (0..4)
+        .map(|row| {
+            let mut mask = vec![false; vocab];
+            mask[row + 1] = true;
+            mask
+        })
+        .collect::<Vec<_>>();
+    let requests = (0..4)
+        .map(|row| CudaTrueBatch2Request {
+            sequence_id: ids[row],
+            input_token_id: inputs[row],
+            token_history: &prompts[row],
+            sampler: LlamaSampler::Greedy,
+            allowed_tokens: Some(&masks[row]),
+            cancelled: None,
+            stop_token_ids: &[],
+        })
+        .collect::<Vec<_>>();
+
+    let always_cancelled = || true;
+    let cancelled_requests = (0..4)
+        .map(|row| CudaTrueBatch2Request {
+            sequence_id: ids[row],
+            input_token_id: inputs[row],
+            token_history: &prompts[row],
+            sampler: LlamaSampler::Greedy,
+            allowed_tokens: Some(&masks[row]),
+            cancelled: (row == 2).then_some(&always_cancelled as &dyn Fn() -> bool),
+            stop_token_ids: &[],
+        })
+        .collect::<Vec<_>>();
+    let allocated_before_cancel = resident_cuda_status(cache_key)
+        .unwrap()
+        .paged_kv
+        .unwrap()
+        .allocated_pages;
+    {
+        let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+        assert_eq!(
+            execute_cuda_true_paged_batch(&mut session_refs, &cancelled_requests),
+            Err(CudaTruePagedBatchContractError::CancelledBeforeDispatch(
+                ids[2]
+            ))
+        );
+    }
+    assert_eq!(
+        sessions
+            .iter()
+            .map(LlamaInferenceSession::kv_position)
+            .collect::<Vec<_>>(),
+        positions
+    );
+    assert_eq!(
+        resident_cuda_status(cache_key)
+            .unwrap()
+            .paged_kv
+            .unwrap()
+            .allocated_pages,
+        allocated_before_cancel
+    );
+
+    let duplicate_requests = (0..4)
+        .map(|row| CudaTrueBatch2Request {
+            sequence_id: if row == 3 { ids[0] } else { ids[row] },
+            input_token_id: inputs[row],
+            token_history: &prompts[row],
+            sampler: LlamaSampler::Greedy,
+            allowed_tokens: Some(&masks[row]),
+            cancelled: None,
+            stop_token_ids: &[],
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+        assert_eq!(
+            execute_cuda_true_paged_batch(&mut session_refs, &duplicate_requests),
+            Err(CudaTruePagedBatchContractError::DuplicateSequence(ids[0]))
+        );
+    }
+    assert_eq!(
+        sessions
+            .iter()
+            .map(LlamaInferenceSession::kv_position)
+            .collect::<Vec<_>>(),
+        positions
+    );
+
+    let execution = {
+        let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+        execute_cuda_true_paged_batch(&mut session_refs, &requests).unwrap()
+    };
+    assert_eq!(execution.batch_size, 4);
+    assert_eq!(
+        execution.execution_mode,
+        crate::cuda_resident::CudaBatchExecutionMode::TrueBatch
+    );
+    assert_eq!(
+        execution.shared_projection_launches,
+        model.config.block_count as usize * 7 + 1
+    );
+    assert_eq!(
+        execution
+            .rows
+            .iter()
+            .map(|row| row.sequence_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    for row in 0..4 {
+        assert_eq!(execution.rows[row].position_before, positions[row]);
+        assert_eq!(execution.rows[row].position_after, positions[row] + 1);
+        assert_eq!(
+            execution.rows[row].outcome,
+            CudaTrueBatch2RowOutcome::Generated {
+                next_token_id: (row + 1) as u32,
+            }
+        );
+        assert_eq!(sessions[row].kv_position(), positions[row] + 1);
+    }
+
+    let cancellation_polls = std::sync::atomic::AtomicUsize::new(0);
+    let cancel_during_dispatch =
+        || cancellation_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+    let post_dispatch_requests = (0..4)
+        .map(|row| CudaTrueBatch2Request {
+            sequence_id: ids[row],
+            input_token_id: (row + 1) as u32,
+            token_history: &prompts[row],
+            sampler: LlamaSampler::Greedy,
+            allowed_tokens: Some(&masks[row]),
+            cancelled: (row == 0).then_some(&cancel_during_dispatch as &dyn Fn() -> bool),
+            stop_token_ids: &[],
+        })
+        .collect::<Vec<_>>();
+    let post_dispatch = {
+        let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+        execute_cuda_true_paged_batch(&mut session_refs, &post_dispatch_requests).unwrap()
+    };
+    assert_eq!(
+        cancellation_polls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        post_dispatch.rows[0].outcome,
+        CudaTrueBatch2RowOutcome::CancelledAfterDispatch
+    );
+    for row in 1..4 {
+        assert_eq!(
+            post_dispatch.rows[row].outcome,
+            CudaTrueBatch2RowOutcome::Generated {
+                next_token_id: (row + 1) as u32,
+            }
+        );
+    }
+    assert!(sessions
+        .iter()
+        .zip(&positions)
+        .all(|(session, position)| session.kv_position() == position + 2));
+    {
+        let status = resident_cuda_status(cache_key).unwrap();
+        assert_eq!(status.occupied_sequences, 4);
+        assert_eq!(status.paged_kv.unwrap().sequence_count, 4);
+    }
+    drop(sessions);
+    let status = resident_cuda_status(cache_key).unwrap();
+    let paged = status.paged_kv.unwrap();
+    assert_eq!(status.occupied_sequences, 0);
+    assert_eq!(paged.sequence_count, 0);
+    assert_eq!(paged.allocated_pages, 0);
+    assert_eq!(paged.device_allocated_bytes, 0);
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase7_batched_prefill_executor_matches_scalar_and_finalizes_every_row() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 7 batched prefill gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "4");
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    std::env::set_var("CAMELID_CUDA_TRUE_BATCH", "1");
+    std::env::set_var("CAMELID_CUDA_BATCHED_PREFILL", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    reset_resident_caches();
+
+    let prompts = [
+        model.prompts[0][..48].to_vec(),
+        model.prompts[1][..48].to_vec(),
+        model.prompts[0][8..56].to_vec(),
+        model.prompts[1][8..56].to_vec(),
+    ];
+    let cache_key = 0xF107_0004_u64;
+    let make_session = || {
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        session
+    };
+    let mut expected = Vec::with_capacity(4);
+    for prompt in &prompts {
+        let (input, prefix) = prompt.split_last().unwrap();
+        let mut session = make_session();
+        assert!(session.try_resident_prefill_cuda(prefix).unwrap());
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[*input],
+                LlamaSampler::Greedy,
+                prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        expected.push((step.logits, step.next_token_id));
+    }
+
+    let mut sessions = (0..4).map(|_| make_session()).collect::<Vec<_>>();
+    let prefixes = prompts
+        .iter()
+        .map(|prompt| &prompt[..prompt.len() - 1])
+        .collect::<Vec<_>>();
+    let total = prefixes[0].len();
+    for row in 0..4 {
+        let outcome = sessions[row]
+            .try_resident_prefill_cuda_chunk(&prefixes[row][..1], 0, total)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                end_position: 1,
+                finalized: false,
+                ..
+            }
+        ));
+    }
+    for position in 1..total {
+        let tokens = prefixes
+            .iter()
+            .map(|prefix| prefix[position])
+            .collect::<Vec<_>>();
+        let output = {
+            let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+            execute_cuda_true_paged_prefill_step(&mut session_refs, &tokens, &[position; 4])
+                .unwrap()
+        };
+        assert_eq!(output.batch_size, 4);
+        assert_eq!(
+            output.shared_projection_launches,
+            model.config.block_count as usize * 7
+        );
+        assert_eq!(
+            output.execution_mode,
+            crate::cuda_resident::CudaBatchExecutionMode::TrueBatch
+        );
+        assert!(sessions.iter().all(|session| session.kv_position() == 0));
+    }
+    for session in &mut sessions {
+        session.finalize_resident_paged_prefill_cuda(total).unwrap();
+        assert_eq!(session.kv_position(), total);
+        assert!(!session.cpu_kv_authoritative());
+    }
+    for row in 0..4 {
+        let input = *prompts[row].last().unwrap();
+        let step = sessions[row]
+            .generate_next_token_with_history_diagnostics(
+                &[input],
+                LlamaSampler::Greedy,
+                &prompts[row],
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            step.logits, expected[row].0,
+            "prefill row {row} logits diverged"
+        );
+        assert_eq!(
+            step.next_token_id, expected[row].1,
+            "prefill row {row} token diverged"
+        );
+        let position = sessions[row].kv_position();
+        assert!(sessions[row]
+            .recover_cpu_kv_from_cuda_resident(position)
+            .unwrap());
+        assert!(sessions[row].kv_cache.history_materialized(position));
+    }
+    drop(sessions);
+    let status = resident_cuda_status(cache_key).unwrap();
+    let paged = status.paged_kv.unwrap();
+    assert_eq!(status.occupied_sequences, 0);
+    assert_eq!(paged.sequence_count, 0);
+    assert_eq!(paged.allocated_pages, 0);
+    assert_eq!(paged.device_allocated_bytes, 0);
+
+    reset_resident_caches();
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_BATCHED_PREFILL");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV);
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum Phase7Batch4Arm {
+    Scalar,
+    TwoPairs,
+    Batch4,
+}
+
+#[cfg(feature = "cuda")]
+fn phase7_run_batch4_arm(
+    model: &Phase3RealModel,
+    arm: Phase7Batch4Arm,
+    steps: usize,
+) -> (std::time::Duration, [Vec<u32>; 4]) {
+    reset_resident_caches();
+    let prompts = [
+        model.prompts[0][..48].to_vec(),
+        model.prompts[1][..64].to_vec(),
+        model.prompts[0][..80].to_vec(),
+        model.prompts[1][..96].to_vec(),
+    ];
+    let cache_key = 0xF107_1000_u64;
+    let mut sessions = Vec::with_capacity(4);
+    let mut inputs = Vec::with_capacity(4);
+    for prompt in &prompts {
+        let (input, prefix) = prompt.split_last().unwrap();
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        let outcome = session
+            .try_resident_prefill_cuda_chunk(prefix, 0, prefix.len())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true,
+                ..
+            }
+        ));
+        sessions.push(session);
+        inputs.push(*input);
+    }
+    let mut histories = prompts.map(|prompt| prompt.to_vec());
+    let ids = [701u64, 702, 703, 704];
+    let mut generated: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::with_capacity(steps));
+    let started = std::time::Instant::now();
+    for _ in 0..steps {
+        let mut next = [0u32; 4];
+        match arm {
+            Phase7Batch4Arm::Scalar => {
+                for row in 0..4 {
+                    next[row] = sessions[row]
+                        .generate_next_token_with_history_diagnostics(
+                            &[inputs[row]],
+                            LlamaSampler::Greedy,
+                            &histories[row],
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                        .next_token_id;
+                }
+            }
+            Phase7Batch4Arm::TwoPairs => {
+                for start in [0usize, 2] {
+                    let requests = (start..start + 2)
+                        .map(|row| CudaTrueBatch2Request {
+                            sequence_id: ids[row],
+                            input_token_id: inputs[row],
+                            token_history: &histories[row],
+                            sampler: LlamaSampler::Greedy,
+                            allowed_tokens: None,
+                            cancelled: None,
+                            stop_token_ids: &[],
+                        })
+                        .collect::<Vec<_>>();
+                    let execution = {
+                        let mut session_refs =
+                            sessions[start..start + 2].iter_mut().collect::<Vec<_>>();
+                        execute_cuda_true_paged_batch(&mut session_refs, &requests).unwrap()
+                    };
+                    assert_eq!(execution.batch_size, 2);
+                    for result in execution.rows {
+                        let row = ids.iter().position(|id| *id == result.sequence_id).unwrap();
+                        next[row] = match result.outcome {
+                            CudaTrueBatch2RowOutcome::Generated { next_token_id }
+                            | CudaTrueBatch2RowOutcome::Stopped { next_token_id } => next_token_id,
+                            outcome => panic!("pair row {row} failed: {outcome:?}"),
+                        };
+                    }
+                }
+            }
+            Phase7Batch4Arm::Batch4 => {
+                let requests = (0..4)
+                    .map(|row| CudaTrueBatch2Request {
+                        sequence_id: ids[row],
+                        input_token_id: inputs[row],
+                        token_history: &histories[row],
+                        sampler: LlamaSampler::Greedy,
+                        allowed_tokens: None,
+                        cancelled: None,
+                        stop_token_ids: &[],
+                    })
+                    .collect::<Vec<_>>();
+                let execution = {
+                    let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+                    execute_cuda_true_paged_batch(&mut session_refs, &requests).unwrap()
+                };
+                assert_eq!(execution.batch_size, 4);
+                for result in execution.rows {
+                    let row = ids.iter().position(|id| *id == result.sequence_id).unwrap();
+                    next[row] = match result.outcome {
+                        CudaTrueBatch2RowOutcome::Generated { next_token_id }
+                        | CudaTrueBatch2RowOutcome::Stopped { next_token_id } => next_token_id,
+                        outcome => panic!("batch-4 row {row} failed: {outcome:?}"),
+                    };
+                }
+            }
+        }
+        for row in 0..4 {
+            inputs[row] = next[row];
+            histories[row].push(next[row]);
+            generated[row].push(next[row]);
+        }
+    }
+    let elapsed = started.elapsed();
+    drop(sessions);
+    reset_resident_caches();
+    (elapsed, generated)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase7_real_model_batch4_performance_gate() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 7 batch-4 performance gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "4");
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    std::env::set_var("CAMELID_CUDA_TRUE_BATCH", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    const STEPS: usize = 32;
+
+    let _ = phase7_run_batch4_arm(&model, Phase7Batch4Arm::Scalar, 4);
+    let _ = phase7_run_batch4_arm(&model, Phase7Batch4Arm::TwoPairs, 4);
+    let _ = phase7_run_batch4_arm(&model, Phase7Batch4Arm::Batch4, 4);
+    let order = [
+        Phase7Batch4Arm::Scalar,
+        Phase7Batch4Arm::TwoPairs,
+        Phase7Batch4Arm::Batch4,
+        Phase7Batch4Arm::Batch4,
+        Phase7Batch4Arm::TwoPairs,
+        Phase7Batch4Arm::Scalar,
+        Phase7Batch4Arm::TwoPairs,
+        Phase7Batch4Arm::Scalar,
+        Phase7Batch4Arm::Batch4,
+    ];
+    let mut scalar_ms = Vec::new();
+    let mut pair_ms = Vec::new();
+    let mut batch_ms = Vec::new();
+    let mut expected = None;
+    for arm in order {
+        let (elapsed, generated) = phase7_run_batch4_arm(&model, arm, STEPS);
+        if let Some(expected) = &expected {
+            assert_eq!(&generated, expected, "Phase 7 batch-4 arm changed tokens");
+        } else {
+            expected = Some(generated);
+        }
+        let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+        match arm {
+            Phase7Batch4Arm::Scalar => scalar_ms.push(elapsed_ms),
+            Phase7Batch4Arm::TwoPairs => pair_ms.push(elapsed_ms),
+            Phase7Batch4Arm::Batch4 => batch_ms.push(elapsed_ms),
+        }
+    }
+    scalar_ms.sort_by(f64::total_cmp);
+    pair_ms.sort_by(f64::total_cmp);
+    batch_ms.sort_by(f64::total_cmp);
+    let scalar_median = scalar_ms[1];
+    let pair_median = pair_ms[1];
+    let batch_median = batch_ms[1];
+    let speedup_over_pairs = pair_median / batch_median;
+    let aggregate_speedup = scalar_median / batch_median;
+    let per_row_step_ratio = 4.0 * batch_median / scalar_median;
+    eprintln!(
+        "PHASE7_REAL_BATCH4 scalar_ms={scalar_ms:?} pair_ms={pair_ms:?} batch_ms={batch_ms:?} \
+         speedup_over_pairs={speedup_over_pairs:.4} aggregate_speedup={aggregate_speedup:.4} \
+         per_row_step_ratio={per_row_step_ratio:.4}"
+    );
+    assert!(
+        speedup_over_pairs >= 1.10,
+        "batch-4 speedup over two batch-2 forwards {speedup_over_pairs:.4} is below 1.10"
+    );
+    assert!(
+        per_row_step_ratio <= 1.75,
+        "batch-4 per-row step ratio {per_row_step_ratio:.4} exceeds 1.75"
+    );
+
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV);
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum Phase7Batch8Arm {
+    Scalar,
+    Batch8,
+}
+
+#[cfg(feature = "cuda")]
+fn phase7_run_batch8_arm(
+    model: &Phase3RealModel,
+    arm: Phase7Batch8Arm,
+    steps: usize,
+) -> (std::time::Duration, [Vec<u32>; 8]) {
+    reset_resident_caches();
+    let prompts: [Vec<u32>; 8] = std::array::from_fn(|row| {
+        let source = &model.prompts[row % 2];
+        source[..40 + row * 8].to_vec()
+    });
+    let cache_key = 0xF107_2000_u64;
+    let mut sessions = Vec::with_capacity(8);
+    let mut inputs = Vec::with_capacity(8);
+    for prompt in &prompts {
+        let (input, prefix) = prompt.split_last().unwrap();
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        let outcome = session
+            .try_resident_prefill_cuda_chunk(prefix, 0, prefix.len())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true,
+                ..
+            }
+        ));
+        sessions.push(session);
+        inputs.push(*input);
+    }
+    let mut histories = prompts.map(|prompt| prompt.to_vec());
+    let ids = [801u64, 802, 803, 804, 805, 806, 807, 808];
+    let mut generated: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::with_capacity(steps));
+    let started = std::time::Instant::now();
+    for _ in 0..steps {
+        let mut next = [0u32; 8];
+        match arm {
+            Phase7Batch8Arm::Scalar => {
+                for row in 0..8 {
+                    next[row] = sessions[row]
+                        .generate_next_token_with_history_diagnostics(
+                            &[inputs[row]],
+                            LlamaSampler::Greedy,
+                            &histories[row],
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                        .next_token_id;
+                }
+            }
+            Phase7Batch8Arm::Batch8 => {
+                let requests = (0..8)
+                    .map(|row| CudaTrueBatch2Request {
+                        sequence_id: ids[row],
+                        input_token_id: inputs[row],
+                        token_history: &histories[row],
+                        sampler: LlamaSampler::Greedy,
+                        allowed_tokens: None,
+                        cancelled: None,
+                        stop_token_ids: &[],
+                    })
+                    .collect::<Vec<_>>();
+                let execution = {
+                    let mut session_refs = sessions.iter_mut().collect::<Vec<_>>();
+                    execute_cuda_true_paged_batch(&mut session_refs, &requests).unwrap()
+                };
+                assert_eq!(execution.batch_size, 8);
+                for result in execution.rows {
+                    let row = ids.iter().position(|id| *id == result.sequence_id).unwrap();
+                    next[row] = match result.outcome {
+                        CudaTrueBatch2RowOutcome::Generated { next_token_id }
+                        | CudaTrueBatch2RowOutcome::Stopped { next_token_id } => next_token_id,
+                        outcome => panic!("batch-8 row {row} failed: {outcome:?}"),
+                    };
+                }
+            }
+        }
+        for row in 0..8 {
+            inputs[row] = next[row];
+            histories[row].push(next[row]);
+            generated[row].push(next[row]);
+        }
+    }
+    let elapsed = started.elapsed();
+    drop(sessions);
+    reset_resident_caches();
+    (elapsed, generated)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase7_real_model_batch8_decode_product_gate() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 7 batch-8 decode gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::set_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV, "8");
+    std::env::set_var("CAMELID_CUDA_PAGED_KV", "1");
+    std::env::set_var("CAMELID_CUDA_TRUE_BATCH", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    const STEPS: usize = 32;
+
+    let _ = phase7_run_batch8_arm(&model, Phase7Batch8Arm::Scalar, 4);
+    let _ = phase7_run_batch8_arm(&model, Phase7Batch8Arm::Batch8, 4);
+    let order = [
+        Phase7Batch8Arm::Scalar,
+        Phase7Batch8Arm::Batch8,
+        Phase7Batch8Arm::Batch8,
+        Phase7Batch8Arm::Scalar,
+        Phase7Batch8Arm::Scalar,
+        Phase7Batch8Arm::Batch8,
+    ];
+    let mut scalar_ms = Vec::new();
+    let mut batch_ms = Vec::new();
+    let mut expected = None;
+    for arm in order {
+        let (elapsed, generated) = phase7_run_batch8_arm(&model, arm, STEPS);
+        if let Some(expected) = &expected {
+            assert_eq!(&generated, expected, "Phase 7 batch-8 arm changed tokens");
+        } else {
+            expected = Some(generated);
+        }
+        match arm {
+            Phase7Batch8Arm::Scalar => scalar_ms.push(elapsed.as_secs_f64() * 1_000.0),
+            Phase7Batch8Arm::Batch8 => batch_ms.push(elapsed.as_secs_f64() * 1_000.0),
+        }
+    }
+    scalar_ms.sort_by(f64::total_cmp);
+    batch_ms.sort_by(f64::total_cmp);
+    let scalar_median = scalar_ms[1];
+    let batch_median = batch_ms[1];
+    let aggregate_speedup = scalar_median / batch_median;
+    let batch_to_single_ratio = 8.0 * batch_median / scalar_median;
+    eprintln!(
+        "PHASE7_REAL_BATCH8 scalar_ms={scalar_ms:?} batch_ms={batch_ms:?} \
+         aggregate_speedup={aggregate_speedup:.4} batch_to_single_ratio={batch_to_single_ratio:.4}"
+    );
+    assert!(
+        batch_to_single_ratio < 2.0,
+        "batch-8 decode wall ratio {batch_to_single_ratio:.4} is not below 2.0 single-request equivalents"
+    );
+
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH");
+    std::env::remove_var("CAMELID_CUDA_PAGED_KV");
+    std::env::remove_var(crate::runtime_config::CUDA_SEQUENCE_SLOTS_ENV);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase5_resident_prefill_chunks_match_whole_and_release_every_boundary() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 5 chunk gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::set_var("CAMELID_CUDA_TWO_SEQUENCE_KV", "1");
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "1");
+    let prompt = &model.prompts[0][..97];
+    let (last_token, prefix) = prompt.split_last().expect("non-empty prompt");
+    assert_eq!(prefix.len(), 96);
+    let cache_key = 0xF105_0001_u64;
+    let make_session = || {
+        let mut session =
+            LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+        session.set_resident_cache_key(cache_key);
+        session
+    };
+
+    let mut whole = make_session();
+    assert!(whole.try_resident_prefill_cuda(prefix).unwrap());
+    assert_eq!(whole.kv_position(), prefix.len());
+    let whole_step = whole
+        .generate_next_token_with_history_diagnostics(
+            &[*last_token],
+            LlamaSampler::Greedy,
+            prompt,
+            false,
+            None,
+        )
+        .unwrap();
+    drop(whole);
+
+    let mut chunked = make_session();
+    let mut base = 0usize;
+    for chunk in prefix.chunks(32) {
+        let outcome = chunked
+            .try_resident_prefill_cuda_chunk(chunk, base, prefix.len())
+            .unwrap();
+        base += chunk.len();
+        assert_eq!(
+            outcome,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                end_position: base,
+                elapsed_micros: match outcome {
+                    CudaResidentPrefillChunkOutcome::Advanced { elapsed_micros, .. } =>
+                        elapsed_micros,
+                    CudaResidentPrefillChunkOutcome::Unsupported => unreachable!(),
+                },
+                finalized: base == prefix.len(),
+            }
+        );
+        assert_eq!(
+            chunked.kv_position(),
+            if base == prefix.len() { base } else { 0 },
+            "host cursor commits only after the final chunk",
+        );
+    }
+    let chunked_step = chunked
+        .generate_next_token_with_history_diagnostics(
+            &[*last_token],
+            LlamaSampler::Greedy,
+            prompt,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(chunked_step.logits, whole_step.logits);
+    assert_eq!(chunked_step.next_token_id, whole_step.next_token_id);
+    drop(chunked);
+
+    for boundary in [32usize, 64, 96] {
+        let mut cancelled = make_session();
+        let mut base = 0usize;
+        for chunk in prefix[..boundary].chunks(32) {
+            cancelled
+                .try_resident_prefill_cuda_chunk(chunk, base, prefix.len())
+                .unwrap();
+            base += chunk.len();
+        }
+        let slot_id = cancelled
+            .cuda_sequence_lease
+            .expect("partial prefill owns a lease")
+            .slot_id()
+            .index();
+        drop(cancelled);
+        let guard = resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resident = guard.as_ref().expect("resident engine remains cached");
+        assert_eq!(
+            resident
+                .sequence_slots
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .occupied,
+            0
+        );
+        assert_eq!(resident.engine.kv_slot_filled(slot_id), Some(0));
+    }
+
+    let mut interrupted = make_session();
+    interrupted
+        .try_resident_prefill_cuda_chunk(&prefix[..32], 0, prefix.len())
+        .unwrap();
+    let slot_id = interrupted
+        .cuda_sequence_lease
+        .expect("partial prefill owns a lease")
+        .slot_id()
+        .index();
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL", "0");
+    let error = interrupted
+        .try_resident_prefill_cuda_chunk(&prefix[32..64], 32, prefix.len())
+        .expect_err("a continuation must never fall back after partial mutation");
+    assert!(error
+        .to_string()
+        .contains("after partial KV mutation: resident CUDA prefill was disabled"));
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL");
+    drop(interrupted);
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let resident = guard.as_ref().expect("resident engine remains cached");
+    assert_eq!(
+        resident
+            .sequence_slots
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .occupied,
+        0
+    );
+    assert_eq!(resident.engine.kv_slot_filled(slot_id), Some(0));
+    drop(guard);
+
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    crate::cuda::release_async_pool();
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum Phase3Arm {
+    Serial,
+    Batch2,
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_run_arm(
+    engine: &mut crate::cuda_resident::CudaResidentDecode,
+    model: &Phase3RealModel,
+    arm: Phase3Arm,
+    steps: usize,
+) -> (std::time::Duration, [Vec<u32>; 2]) {
+    let dims = DenseLlamaDims::from_config(&model.config).expect("Phase 3 dense dimensions");
+    let head_dim = dims.head_dim;
+    let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale().unwrap());
+    let (mut positions, mut inputs) = phase3_seed_batch2_engine(engine, model);
+    let mut generated = [Vec::with_capacity(steps), Vec::with_capacity(steps)];
+    let started = std::time::Instant::now();
+    for _ in 0..steps {
+        match arm {
+            Phase3Arm::Serial => {
+                for row in 0..2 {
+                    engine
+                        .select_kv_slot(row)
+                        .expect("select serial Phase 3 bank");
+                    let embedding = model
+                        .weights
+                        .token_embedding
+                        .embedding_lookup(&[inputs[row]], "phase3_serial_decode")
+                        .expect("Phase 3 serial embedding");
+                    let tables = rope::resident_decode_rope_tables(
+                        positions[row],
+                        head_dim,
+                        &model.config,
+                        model.weights.rope_freqs.as_ref(),
+                    )
+                    .expect("Phase 3 serial RoPE")
+                    .expect("Phase 3 serial row resident-eligible");
+                    let logits = engine
+                        .forward_token_logits(
+                            &embedding.data,
+                            &tables.cos,
+                            &tables.sin,
+                            positions[row],
+                            scale,
+                        )
+                        .expect("Phase 3 serial forward");
+                    engine.set_filled(positions[row] + 1);
+                    inputs[row] = phase3_argmax(&logits);
+                    generated[row].push(inputs[row]);
+                    positions[row] += 1;
+                }
+            }
+            Phase3Arm::Batch2 => {
+                let mut embeddings = Vec::with_capacity(2 * dims.embedding_length);
+                let mut cos = Vec::with_capacity(2 * head_dim);
+                let mut sin = Vec::with_capacity(2 * head_dim);
+                for row in 0..2 {
+                    let embedding = model
+                        .weights
+                        .token_embedding
+                        .embedding_lookup(&[inputs[row]], "phase3_batch2_decode")
+                        .expect("Phase 3 batch-2 embedding");
+                    embeddings.extend_from_slice(&embedding.data);
+                    let tables = rope::resident_decode_rope_tables(
+                        positions[row],
+                        head_dim,
+                        &model.config,
+                        model.weights.rope_freqs.as_ref(),
+                    )
+                    .expect("Phase 3 batch-2 RoPE")
+                    .expect("Phase 3 batch-2 row resident-eligible");
+                    cos.extend_from_slice(&tables.cos);
+                    sin.extend_from_slice(&tables.sin);
+                }
+                let output = engine
+                    .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, scale, false)
+                    .expect("Phase 3 batch-2 forward");
+                assert_eq!(output.shared_projection_launches, dims.block_count * 7 + 1);
+                let logits = output.logits.expect("full logits requested");
+                for row in 0..2 {
+                    inputs[row] = phase3_argmax(&logits[row]);
+                    generated[row].push(inputs[row]);
+                    positions[row] += 1;
+                }
+            }
+        }
+    }
+    (started.elapsed(), generated)
+}
+
+#[cfg(feature = "cuda")]
+fn phase3_seeded_sampling_parity(
+    engine: &mut crate::cuda_resident::CudaResidentDecode,
+    model: &Phase3RealModel,
+) {
+    let dims = DenseLlamaDims::from_config(&model.config).expect("Phase 3 dense dimensions");
+    let head_dim = dims.head_dim;
+    let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale().unwrap());
+    let (positions, inputs) = phase3_seed_batch2_engine(engine, model);
+    let configs = [
+        SamplingConfig {
+            temperature: 0.8,
+            top_k: Some(40),
+            top_p: Some(0.9),
+            seed: Some(0x1357_2468),
+            ..SamplingConfig::default()
+        },
+        SamplingConfig {
+            temperature: 0.7,
+            top_k: Some(32),
+            top_p: Some(0.85),
+            seed: Some(0x2468_1357),
+            ..SamplingConfig::default()
+        },
+    ];
+    let mut serial_logits: [Vec<f32>; 2] = std::array::from_fn(|_| Vec::new());
+    for row in 0..2 {
+        engine
+            .select_kv_slot(row)
+            .expect("select seeded serial bank");
+        let embedding = model
+            .weights
+            .token_embedding
+            .embedding_lookup(&[inputs[row]], "phase3_seeded_serial")
+            .expect("seeded serial embedding");
+        let tables = rope::resident_decode_rope_tables(
+            positions[row],
+            head_dim,
+            &model.config,
+            model.weights.rope_freqs.as_ref(),
+        )
+        .expect("seeded serial RoPE")
+        .expect("seeded serial row resident-eligible");
+        serial_logits[row] = engine
+            .forward_token_logits(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                positions[row],
+                scale,
+            )
+            .expect("seeded serial forward");
+        engine.set_filled(positions[row] + 1);
+    }
+    let serial_tokens: [u32; 2] = std::array::from_fn(|row| {
+        let logits = CpuTensor::from_f32(
+            format!("phase3_seeded_serial_{row}"),
+            vec![1, dims.vocab_size],
+            serial_logits[row].clone(),
+        )
+        .unwrap();
+        LlamaSampler::Sampling(configs[row].clone())
+            .sample_with_history(&logits, &model.prompts[row])
+            .unwrap()
+    });
+
+    let (positions, inputs) = phase3_seed_batch2_engine(engine, model);
+    let mut embeddings = Vec::with_capacity(2 * dims.embedding_length);
+    let mut cos = Vec::with_capacity(2 * head_dim);
+    let mut sin = Vec::with_capacity(2 * head_dim);
+    for row in 0..2 {
+        let embedding = model
+            .weights
+            .token_embedding
+            .embedding_lookup(&[inputs[row]], "phase3_seeded_batch2")
+            .expect("seeded batch-2 embedding");
+        embeddings.extend_from_slice(&embedding.data);
+        let tables = rope::resident_decode_rope_tables(
+            positions[row],
+            head_dim,
+            &model.config,
+            model.weights.rope_freqs.as_ref(),
+        )
+        .expect("seeded batch-2 RoPE")
+        .expect("seeded batch-2 row resident-eligible");
+        cos.extend_from_slice(&tables.cos);
+        sin.extend_from_slice(&tables.sin);
+    }
+    let batch = engine
+        .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, scale, false)
+        .expect("seeded batch-2 forward");
+    let batch_logits = batch.logits.expect("full logits requested");
+    assert_eq!(batch_logits, serial_logits);
+    let batch_tokens: [u32; 2] = std::array::from_fn(|row| {
+        let logits = CpuTensor::from_f32(
+            format!("phase3_seeded_batch_{row}"),
+            vec![1, dims.vocab_size],
+            batch_logits[row].clone(),
+        )
+        .unwrap();
+        LlamaSampler::Sampling(configs[row].clone())
+            .sample_with_history(&logits, &model.prompts[row])
+            .unwrap()
+    });
+    assert_eq!(batch_tokens, serial_tokens);
+
+    let row_one_logits = CpuTensor::from_f32(
+        "phase3_seeded_row_one_repeat",
+        vec![1, dims.vocab_size],
+        batch_logits[1].clone(),
+    )
+    .unwrap();
+    let row_one_repeat = LlamaSampler::Sampling(configs[1].clone())
+        .sample_with_history(&row_one_logits, &model.prompts[1])
+        .unwrap();
+    assert_eq!(row_one_repeat, batch_tokens[1]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase3_real_model_batch2_correctness_and_performance_gate() {
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 3 real-model gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    const STEPS: usize = 32;
+    let mut engine = phase3_build_batch2_engine(&model);
+    assert!(engine.supports_independent_batch2_q8());
+    phase3_seeded_sampling_parity(&mut engine, &model);
+
+    let _ = phase3_run_arm(&mut engine, &model, Phase3Arm::Serial, 4);
+    let _ = phase3_run_arm(&mut engine, &model, Phase3Arm::Batch2, 4);
+
+    let order = [
+        Phase3Arm::Serial,
+        Phase3Arm::Batch2,
+        Phase3Arm::Batch2,
+        Phase3Arm::Serial,
+        Phase3Arm::Serial,
+        Phase3Arm::Batch2,
+    ];
+    let mut serial_ms = Vec::new();
+    let mut batch_ms = Vec::new();
+    let mut expected: Option<[Vec<u32>; 2]> = None;
+    for arm in order {
+        let (elapsed, generated) = phase3_run_arm(&mut engine, &model, arm, STEPS);
+        if let Some(expected) = &expected {
+            assert_eq!(&generated, expected, "Phase 3 arm changed generated tokens");
+        } else {
+            expected = Some(generated);
+        }
+        match arm {
+            Phase3Arm::Serial => serial_ms.push(elapsed.as_secs_f64() * 1_000.0),
+            Phase3Arm::Batch2 => batch_ms.push(elapsed.as_secs_f64() * 1_000.0),
+        }
+    }
+    serial_ms.sort_by(f64::total_cmp);
+    batch_ms.sort_by(f64::total_cmp);
+    let serial_median = serial_ms[serial_ms.len() / 2];
+    let batch_median = batch_ms[batch_ms.len() / 2];
+    let throughput_speedup = serial_median / batch_median;
+    let per_row_step_ratio = (batch_median / STEPS as f64) / (serial_median / (2 * STEPS) as f64);
+    eprintln!(
+        "PHASE3_REAL_BATCH2 serial_ms={serial_ms:?} batch_ms={batch_ms:?} \
+         median_speedup={throughput_speedup:.4} per_row_step_ratio={per_row_step_ratio:.4}"
+    );
+    assert!(
+        throughput_speedup >= 1.20,
+        "batch-2 throughput speedup {throughput_speedup:.4} is below 1.20"
+    );
+    assert!(
+        per_row_step_ratio <= 1.75,
+        "batch-2 per-row step ratio {per_row_step_ratio:.4} exceeds 1.75"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_PHASE3_GGUF and a CUDA device"]
+fn phase3_two_session_executor_scatter_and_row_failure_isolation() {
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = phase3_real_model() else {
+        eprintln!("SKIP Phase 3 executor gate: set CAMELID_PHASE3_GGUF");
+        return;
+    };
+    std::env::set_var("CAMELID_CUDA_TWO_SEQUENCE_KV", "1");
+    std::env::set_var("CAMELID_CUDA_TRUE_BATCH2", "1");
+    let mut engine = phase3_build_batch2_engine(&model);
+    let (positions, inputs) = phase3_seed_batch2_engine(&mut engine, &model);
+    let key = 0xF103_0002_u64;
+    let mut session_zero =
+        LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+    let mut session_one =
+        LlamaInferenceSession::new(model.config.clone(), Arc::clone(&model.weights)).unwrap();
+    session_zero.set_resident_cache_key(key);
+    session_one.set_resident_cache_key(key);
+    session_zero.kv_cache.position = positions[0];
+    session_one.kv_cache.position = positions[1];
+    let mut owners = cuda_sequence::FixedCudaSequenceSlots::new(2).unwrap();
+    let lease_zero = owners
+        .acquire(session_zero.cuda_sequence_id)
+        .unwrap()
+        .lease();
+    let lease_one = owners
+        .acquire(session_one.cuda_sequence_id)
+        .unwrap()
+        .lease();
+    assert_eq!(lease_zero.slot_id().index(), 0);
+    assert_eq!(lease_one.slot_id().index(), 1);
+    session_zero.cuda_sequence_lease = Some(lease_zero);
+    session_one.cuda_sequence_lease = Some(lease_one);
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ResidentCudaSlot {
+        key: key as usize,
+        engine,
+        sequence_slots: Some(owners),
+        paged_kv: None,
+        range: 0..model.config.block_count as usize,
+    });
+
+    let duplicate = execute_cuda_true_batch2(
+        [&mut session_one, &mut session_zero],
+        [
+            CudaTrueBatch2Request {
+                sequence_id: 77,
+                input_token_id: inputs[1],
+                token_history: &model.prompts[1],
+                sampler: phase1_sampling_for(1),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+            CudaTrueBatch2Request {
+                sequence_id: 77,
+                input_token_id: inputs[0],
+                token_history: &model.prompts[0],
+                sampler: phase1_sampling_for(0),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+        ],
+    );
+    assert_eq!(
+        duplicate,
+        Err(CudaTrueBatch2ContractError::DuplicateSequence(77))
+    );
+    assert_eq!(session_zero.kv_cache.position, positions[0]);
+    assert_eq!(session_one.kv_cache.position, positions[1]);
+
+    let always_cancelled = || true;
+    let cancelled_before = execute_cuda_true_batch2(
+        [&mut session_one, &mut session_zero],
+        [
+            CudaTrueBatch2Request {
+                sequence_id: 200,
+                input_token_id: inputs[1],
+                token_history: &model.prompts[1],
+                sampler: phase1_sampling_for(1),
+                allowed_tokens: None,
+                cancelled: Some(&always_cancelled),
+                stop_token_ids: &[],
+            },
+            CudaTrueBatch2Request {
+                sequence_id: 100,
+                input_token_id: inputs[0],
+                token_history: &model.prompts[0],
+                sampler: phase1_sampling_for(0),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+        ],
+    );
+    assert_eq!(
+        cancelled_before,
+        Err(CudaTrueBatch2ContractError::CancelledBeforeDispatch(200))
+    );
+    assert_eq!(session_zero.kv_cache.position, positions[0]);
+    assert_eq!(session_one.kv_cache.position, positions[1]);
+
+    let execution = execute_cuda_true_batch2(
+        [&mut session_one, &mut session_zero],
+        [
+            CudaTrueBatch2Request {
+                sequence_id: 200,
+                input_token_id: inputs[1],
+                token_history: &model.prompts[1],
+                sampler: phase1_sampling_for(1),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+            CudaTrueBatch2Request {
+                sequence_id: 100,
+                input_token_id: inputs[0],
+                token_history: &model.prompts[0],
+                sampler: phase1_sampling_for(0),
+                allowed_tokens: Some(&[true]),
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        execution.execution_mode,
+        crate::cuda_resident::CudaBatchExecutionMode::TrueBatch
+    );
+    assert_eq!(execution.rows[0].sequence_id, 200);
+    assert_eq!(execution.rows[1].sequence_id, 100);
+    assert!(execution.batch_elapsed_micros > 0);
+    assert_eq!(
+        execution.rows[0].shared_forward_micros,
+        execution.batch_elapsed_micros
+    );
+    assert_eq!(
+        execution.rows[1].shared_forward_micros,
+        execution.batch_elapsed_micros
+    );
+    assert_eq!(
+        execution.rows[0].outcome,
+        CudaTrueBatch2RowOutcome::Generated { next_token_id: 1 }
+    );
+    let CudaTrueBatch2RowOutcome::SamplingFailed { message } = &execution.rows[1].outcome else {
+        panic!("invalid row mask did not produce a row-local failure")
+    };
+    assert!(message.contains("mask"), "{message}");
+    assert_eq!(session_zero.kv_cache.position, positions[0] + 1);
+    assert_eq!(session_one.kv_cache.position, positions[1] + 1);
+    let guard = resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let resident = guard.as_ref().unwrap();
+    assert_eq!(resident.engine.kv_slot_filled(0), Some(positions[0] + 1));
+    assert_eq!(resident.engine.kv_slot_filled(1), Some(positions[1] + 1));
+    drop(guard);
+
+    let cancellation_polls = std::sync::atomic::AtomicUsize::new(0);
+    let cancel_during_dispatch =
+        || cancellation_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+    let cancelled_after = execute_cuda_true_batch2(
+        [&mut session_one, &mut session_zero],
+        [
+            CudaTrueBatch2Request {
+                sequence_id: 200,
+                input_token_id: 1,
+                token_history: &model.prompts[1],
+                sampler: phase1_sampling_for(1),
+                allowed_tokens: None,
+                cancelled: Some(&cancel_during_dispatch),
+                stop_token_ids: &[],
+            },
+            CudaTrueBatch2Request {
+                sequence_id: 100,
+                input_token_id: inputs[0],
+                token_history: &model.prompts[0],
+                sampler: phase1_sampling_for(0),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        cancellation_polls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        cancelled_after.rows[0].outcome,
+        CudaTrueBatch2RowOutcome::CancelledAfterDispatch
+    );
+    assert_eq!(
+        cancelled_after.rows[1].outcome,
+        CudaTrueBatch2RowOutcome::Generated { next_token_id: 0 }
+    );
+    assert_eq!(session_zero.kv_cache.position, positions[0] + 2);
+    assert_eq!(session_one.kv_cache.position, positions[1] + 2);
+
+    let stop_token_ids = [1u32];
+    let stopped = execute_cuda_true_batch2(
+        [&mut session_one, &mut session_zero],
+        [
+            CudaTrueBatch2Request {
+                sequence_id: 200,
+                input_token_id: 1,
+                token_history: &model.prompts[1],
+                sampler: phase1_sampling_for(1),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &stop_token_ids,
+            },
+            CudaTrueBatch2Request {
+                sequence_id: 100,
+                input_token_id: 0,
+                token_history: &model.prompts[0],
+                sampler: phase1_sampling_for(0),
+                allowed_tokens: None,
+                cancelled: None,
+                stop_token_ids: &[],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        stopped.rows[0].outcome,
+        CudaTrueBatch2RowOutcome::Stopped { next_token_id: 1 }
+    );
+    assert_eq!(
+        stopped.rows[1].outcome,
+        CudaTrueBatch2RowOutcome::Generated { next_token_id: 0 }
+    );
+    assert_eq!(session_zero.kv_cache.position, positions[0] + 3);
+    assert_eq!(session_one.kv_cache.position, positions[1] + 3);
+    reset_resident_caches();
+    session_zero.cuda_sequence_lease = None;
+    session_one.cuda_sequence_lease = None;
+    std::env::remove_var("CAMELID_CUDA_TRUE_BATCH2");
+    std::env::remove_var("CAMELID_CUDA_TWO_SEQUENCE_KV");
 }
 
 /// A NoPE model must never reach the resident GPU engines. They build ONE cos/sin
@@ -12911,11 +15624,8 @@ fn q8_0_residency_report_counts_resident_blocks_and_flags_file_backed() {
     );
 }
 
-#[test]
-fn resident_prefill_rope_tables_match_per_position_builder() {
-    // Llama3-scaled config so the batched builder exercises the smooth-factor path the
-    // 3B row actually uses; the claim is bit-identical tables, not approximate ones.
-    let config = LlamaModelConfig {
+fn resident_rope_test_config() -> LlamaModelConfig {
+    LlamaModelConfig {
         architecture: "llama".to_string(),
         context_length: 64,
         embedding_length: 8,
@@ -12944,7 +15654,14 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         qwen35: None,
         lfm2: None,
         mla: None,
-    };
+    }
+}
+
+#[test]
+fn resident_prefill_rope_tables_match_per_position_builder() {
+    // Llama3-scaled config so the batched builder exercises the smooth-factor path the
+    // 3B row actually uses; the claim is bit-identical tables, not approximate ones.
+    let config = resident_rope_test_config();
     let n = 7;
     let head_dim = 8;
     let tables = rope::resident_prefill_rope_tables(n, head_dim, &config, None)
@@ -12969,6 +15686,31 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
             "sin pos {pos}"
         );
         assert_eq!(split_half, t.split_half_pairing);
+    }
+}
+
+#[test]
+fn resident_prefill_rope_table_ranges_match_single_position_builder() {
+    let config = resident_rope_test_config();
+    let head_dim = 8usize;
+    let base = 5usize;
+    let count = 7usize;
+    let ranged = rope::resident_prefill_rope_tables_at(base, count, head_dim, &config, None)
+        .unwrap()
+        .unwrap();
+    let half = ranged.cos.len() / count;
+    for offset in 0..count {
+        let single = rope::resident_decode_rope_tables(base + offset, head_dim, &config, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &ranged.cos[offset * half..(offset + 1) * half],
+            single.cos.as_slice(),
+        );
+        assert_eq!(
+            &ranged.sin[offset * half..(offset + 1) * half],
+            single.sin.as_slice(),
+        );
     }
 }
 

@@ -3,7 +3,10 @@
 //! isolated to a single kernel. All require a CUDA device (`#[ignore]`d in
 //! GPU-less CI); run with `cargo test --features cuda -- --ignored`.
 
-use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant, ResidentCudaArtifact};
+use super::{
+    CudaBatchExecutionMode, CudaDeviceKvPageSnapshot, CudaIndependentBatch2Error,
+    CudaResidentDecode, CudaResidentKernels, ProjQuant, ResidentCudaArtifact,
+};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 #[test]
@@ -3120,6 +3123,43 @@ fn prefill_then_decode_matches_sequential() {
         };
         assert_same_bits(label, &cont_logits, expected);
     }
+
+    // The resumable Phase 5 seam must preserve the same cache when each call
+    // starts at the previous chunk's committed base position.
+    let mut resumed = build_engine(&layers, &final_norm, &output_w);
+    for chunk_start in (0..n - 1).step_by(3) {
+        let chunk_end = (chunk_start + 3).min(n - 1);
+        resumed
+            .prefill_batched_at(
+                &flat_emb[chunk_start * hidden..chunk_end * hidden],
+                &cos_all[chunk_start * half..chunk_end * half],
+                &sin_all[chunk_start * half..chunk_end * half],
+                chunk_start,
+                chunk_end - chunk_start,
+                scale,
+            )
+            .unwrap();
+    }
+    let resumed_logits = resumed
+        .forward_token_logits(
+            &embeddings[n - 1],
+            &cos_all[(n - 1) * half..n * half],
+            &sin_all[(n - 1) * half..n * half],
+            n - 1,
+            scale,
+        )
+        .unwrap();
+    assert!(
+        close(&resumed_logits, &preb_logits, 1e-4),
+        "resumed batched prefill logits diverged from whole batched prefill"
+    );
+    for layer in 0..n_layers {
+        assert_eq!(
+            resumed.read_kv_layer(layer, n - 1).unwrap(),
+            preb.read_kv_layer(layer, n - 1).unwrap(),
+            "resumed prefill KV diverged at layer {layer}",
+        );
+    }
 }
 
 // The bookkeeping half of prefix continuation, which is where a bug would be
@@ -4898,7 +4938,14 @@ impl SynthModel {
     }
 
     fn build(&self) -> CudaResidentDecode {
-        let mut e = CudaResidentDecode::new(
+        self.build_with_kv_quant(crate::model::KvCacheQuantization::F16)
+    }
+
+    fn build_with_kv_quant(
+        &self,
+        kv_quant: crate::model::KvCacheQuantization,
+    ) -> CudaResidentDecode {
+        let mut e = CudaResidentDecode::new_with_kv_quant(
             self.n_layers,
             self.n_heads,
             self.n_kv,
@@ -4910,6 +4957,7 @@ impl SynthModel {
             self.vocab,
             self.eps,
             false,
+            kv_quant,
         )
         .unwrap();
         for l in &self.layers {
@@ -4921,6 +4969,50 @@ impl SynthModel {
         e.set_output(&self.final_norm, &self.output_w, ProjQuant::Q8_0)
             .unwrap();
         e
+    }
+
+    fn build_paged(&self) -> CudaResidentDecode {
+        self.build_paged_with_kv_quant(crate::model::KvCacheQuantization::F16)
+    }
+
+    fn build_paged_with_kv_quant(
+        &self,
+        kv_quant: crate::model::KvCacheQuantization,
+    ) -> CudaResidentDecode {
+        let mut engine = CudaResidentDecode::new_paged_with_kv_quant(
+            self.n_layers,
+            self.n_heads,
+            self.n_kv,
+            self.head_dim,
+            self.hidden,
+            self.ffn,
+            self.rope_dim,
+            self.max_pos,
+            self.vocab,
+            self.eps,
+            false,
+            kv_quant,
+        )
+        .unwrap();
+        for layer in &self.layers {
+            engine
+                .set_layer(
+                    &layer.q,
+                    &layer.k,
+                    &layer.v,
+                    &layer.o,
+                    &layer.gate,
+                    &layer.up,
+                    &layer.down,
+                    &layer.an,
+                    &layer.fnv,
+                )
+                .unwrap();
+        }
+        engine
+            .set_output(&self.final_norm, &self.output_w, ProjQuant::Q8_0)
+            .unwrap();
+        engine
     }
 
     /// Deterministic embedding for a token id (no real embedding table needed —
@@ -4943,6 +5035,1296 @@ impl SynthModel {
         }
         (cos, sin)
     }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase2_two_kv_banks_isolate_equal_position_histories() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut engine = model.build();
+    engine.enable_second_kv_slot().unwrap();
+    assert_eq!(engine.kv_slot_count(), 2);
+
+    let write_one = |engine: &mut CudaResidentDecode, slot: usize, token: u32| {
+        engine.select_kv_slot(slot).unwrap();
+        assert_eq!(engine.filled(), 0);
+        let (cos, sin) = model.rope(0);
+        engine
+            .forward_token(&model.embed(token), &cos, &sin, 0, model.scale, false)
+            .unwrap();
+        engine.set_filled(1);
+        engine.read_kv_layer(0, 1).unwrap()
+    };
+
+    let bank_zero = write_one(&mut engine, 0, 3);
+    let bank_one = write_one(&mut engine, 1, 19);
+    assert_ne!(bank_zero, bank_one);
+
+    engine.select_kv_slot(0).unwrap();
+    assert_eq!(engine.filled(), 1);
+    assert_eq!(engine.read_kv_layer(0, 1).unwrap(), bank_zero);
+    engine.select_kv_slot(1).unwrap();
+    assert_eq!(engine.filled(), 1);
+    assert_eq!(engine.read_kv_layer(0, 1).unwrap(), bank_one);
+
+    engine.clear_kv_slot(0).unwrap();
+    assert_eq!(engine.filled(), 0);
+    let cleared = engine.read_kv_layer(0, 1).unwrap();
+    assert!(cleared.0.iter().all(|value| *value == 0.0));
+    assert!(cleared.1.iter().all(|value| *value == 0.0));
+    engine.select_kv_slot(1).unwrap();
+    assert_eq!(engine.read_kv_layer(0, 1).unwrap(), bank_one);
+
+    engine.clear_kv_slot(0).unwrap();
+    let ablation_first = write_one(&mut engine, 0, 7);
+    engine.set_filled(0);
+    let ablation_second = write_one(&mut engine, 0, 23);
+    assert_ne!(ablation_first, ablation_second);
+    assert_eq!(engine.read_kv_layer(0, 1).unwrap(), ablation_second);
+    assert_ne!(
+        engine.read_kv_layer(0, 1).unwrap(),
+        ablation_first,
+        "removing sequence identity aliases both histories onto one KV bank"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase3_independent_batch2_matches_two_serial_forwards() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let prefixes = [vec![3u32, 7, 11], vec![5u32, 13, 17, 19, 23]];
+    let inputs = [29u32, 31u32];
+    let mut serial = [model.build(), model.build()];
+    let mut batched = model.build();
+    batched.enable_second_kv_slot().unwrap();
+
+    for (row, prefix) in prefixes.iter().enumerate() {
+        for (position, token) in prefix.iter().copied().enumerate() {
+            let (cos, sin) = model.rope(position);
+            serial[row]
+                .forward_token(
+                    &model.embed(token),
+                    &cos,
+                    &sin,
+                    position,
+                    model.scale,
+                    false,
+                )
+                .unwrap();
+            batched.select_kv_slot(row).unwrap();
+            batched
+                .forward_token(
+                    &model.embed(token),
+                    &cos,
+                    &sin,
+                    position,
+                    model.scale,
+                    false,
+                )
+                .unwrap();
+        }
+        serial[row].set_filled(prefixes[row].len());
+        batched.set_filled(prefixes[row].len());
+    }
+
+    let positions = [prefixes[0].len(), prefixes[1].len()];
+    let mut embeddings = Vec::with_capacity(2 * model.hidden);
+    let mut cos = Vec::with_capacity(model.rope_dim);
+    let mut sin = Vec::with_capacity(model.rope_dim);
+    let expected = std::array::from_fn(|row| {
+        embeddings.extend_from_slice(&model.embed(inputs[row]));
+        let (row_cos, row_sin) = model.rope(positions[row]);
+        cos.extend_from_slice(&row_cos);
+        sin.extend_from_slice(&row_sin);
+        serial[row]
+            .forward_token_logits(
+                &model.embed(inputs[row]),
+                &row_cos,
+                &row_sin,
+                positions[row],
+                model.scale,
+            )
+            .unwrap()
+    });
+
+    let actual = batched
+        .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, model.scale, false)
+        .unwrap();
+
+    assert_eq!(actual.logits, Some(expected));
+    assert_eq!(actual.sampled_token_ids, None);
+    assert_eq!(actual.execution_mode, CudaBatchExecutionMode::TrueBatch);
+    assert_eq!(
+        actual.shared_projection_launches,
+        model.n_layers * 7 + 1,
+        "every Q/K/V/O/gate/up/down and lm_head projection must serve both rows"
+    );
+    for row in 0..2 {
+        batched.select_kv_slot(row).unwrap();
+        assert_eq!(batched.filled(), positions[row] + 1);
+        assert_eq!(
+            batched.read_kv_layer(0, positions[row] + 1).unwrap(),
+            serial[row].read_kv_layer(0, positions[row] + 1).unwrap(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase4_independent_batch2_gpu_argmax_matches_full_logits() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let prefixes = [vec![3u32, 7], vec![5u32, 13, 17]];
+    let inputs = [11u32, 19u32];
+    let positions = [prefixes[0].len(), prefixes[1].len()];
+    let mut full_logits = model.build();
+    let mut gpu_argmax = model.build();
+    for engine in [&mut full_logits, &mut gpu_argmax] {
+        engine.enable_second_kv_slot().unwrap();
+        for (row, prefix) in prefixes.iter().enumerate() {
+            engine.select_kv_slot(row).unwrap();
+            for (position, token) in prefix.iter().copied().enumerate() {
+                let (cos, sin) = model.rope(position);
+                engine
+                    .forward_token(
+                        &model.embed(token),
+                        &cos,
+                        &sin,
+                        position,
+                        model.scale,
+                        false,
+                    )
+                    .unwrap();
+            }
+            engine.set_filled(prefix.len());
+        }
+    }
+
+    let mut embeddings = Vec::new();
+    let mut cos = Vec::new();
+    let mut sin = Vec::new();
+    for row in 0..2 {
+        embeddings.extend_from_slice(&model.embed(inputs[row]));
+        let (row_cos, row_sin) = model.rope(positions[row]);
+        cos.extend_from_slice(&row_cos);
+        sin.extend_from_slice(&row_sin);
+    }
+    let full = full_logits
+        .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, model.scale, false)
+        .unwrap();
+    let sampled = gpu_argmax
+        .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, model.scale, true)
+        .unwrap();
+    let expected = full.logits.expect("full-logits mode").map(|row| {
+        row.iter()
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.total_cmp(right)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .expect("non-empty vocabulary")
+            .0 as u32
+    });
+    assert_eq!(sampled.logits, None);
+    assert_eq!(sampled.sampled_token_ids, Some(expected));
+    assert_eq!(sampled.execution_mode, CudaBatchExecutionMode::TrueBatch);
+    for (row, position) in positions.iter().copied().enumerate() {
+        full_logits.select_kv_slot(row).unwrap();
+        gpu_argmax.select_kv_slot(row).unwrap();
+        assert_eq!(gpu_argmax.filled(), full_logits.filled());
+        assert_eq!(
+            gpu_argmax.read_kv_layer(0, position + 1).unwrap(),
+            full_logits.read_kv_layer(0, position + 1).unwrap(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase7_independent_paged_batch4_matches_four_serial_forwards() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let prefixes = [
+        vec![3u32, 7, 11],
+        vec![5u32, 13, 17, 19, 23],
+        vec![29u32, 31, 37, 41, 43, 47, 53],
+        vec![59u32, 61, 67, 71, 73, 79, 83, 89, 91],
+    ];
+    let inputs = [31u32, 37, 97, 93];
+    let mut serial = (0..4).map(|_| model.build()).collect::<Vec<_>>();
+    let mut batched = model.build_paged();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 4).unwrap();
+    let handles = pool.reserve(4).unwrap();
+    let pages = handles
+        .iter()
+        .copied()
+        .map(|page| vec![page])
+        .collect::<Vec<_>>();
+    for page in &handles {
+        batched.allocate_paged_kv_page(*page).unwrap();
+    }
+
+    for (row, prefix) in prefixes.iter().enumerate() {
+        for (position, token) in prefix.iter().copied().enumerate() {
+            let embedding = model.embed(token);
+            let (cos, sin) = model.rope(position);
+            serial[row]
+                .forward_token_logits(&embedding, &cos, &sin, position, model.scale)
+                .unwrap();
+            batched
+                .forward_token_logits_paged(
+                    &embedding,
+                    &cos,
+                    &sin,
+                    position,
+                    model.scale,
+                    &pages[row],
+                )
+                .unwrap();
+        }
+    }
+
+    let positions = prefixes.map(|prefix| prefix.len());
+    let mut embeddings = Vec::with_capacity(4 * model.hidden);
+    let mut cos = Vec::with_capacity(4 * model.rope_dim / 2);
+    let mut sin = Vec::with_capacity(4 * model.rope_dim / 2);
+    let expected = (0..4)
+        .map(|row| {
+            let embedding = model.embed(inputs[row]);
+            embeddings.extend_from_slice(&embedding);
+            let (row_cos, row_sin) = model.rope(positions[row]);
+            cos.extend_from_slice(&row_cos);
+            sin.extend_from_slice(&row_sin);
+            serial[row]
+                .forward_token_logits(&embedding, &row_cos, &row_sin, positions[row], model.scale)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let actual = batched
+        .forward_independent_paged_batch_q8(
+            &embeddings,
+            &cos,
+            &sin,
+            &positions,
+            &pages,
+            model.scale,
+            false,
+        )
+        .unwrap();
+    assert_eq!(actual.logits, Some(expected));
+    assert_eq!(actual.sampled_token_ids, None);
+    assert_eq!(actual.batch_size, 4);
+    assert_eq!(actual.execution_mode, CudaBatchExecutionMode::TrueBatch);
+    assert_eq!(
+        actual.shared_projection_launches,
+        model.n_layers * 7 + 1,
+        "each projection must serve all four rows in one launch"
+    );
+    for row in 0..4 {
+        assert_eq!(
+            batched
+                .read_paged_kv_layer(&pages[row], 0, positions[row] + 1)
+                .unwrap(),
+            serial[row].read_kv_layer(0, positions[row] + 1).unwrap(),
+            "row {row} KV diverged"
+        );
+    }
+
+    for page in handles.into_iter().rev() {
+        batched.release_paged_kv_page(page).unwrap();
+        pool.release(page).unwrap();
+    }
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(batched.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase7_independent_paged_batch8_matches_eight_serial_forwards() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let prefixes = (0..8)
+        .map(|row| {
+            (0..17 + row * 5)
+                .map(|position| 3 + ((row * 19 + position * 11) % 89) as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let inputs = [97u32, 89, 83, 79, 73, 71, 67, 61];
+    for (kv_quant, storage) in [
+        (
+            crate::model::KvCacheQuantization::F16,
+            CudaKvPageStorage::F16,
+        ),
+        (
+            crate::model::KvCacheQuantization::Q8_0,
+            CudaKvPageStorage::Q8_0,
+        ),
+    ] {
+        let mut serial = (0..8)
+            .map(|_| model.build_with_kv_quant(kv_quant))
+            .collect::<Vec<_>>();
+        let mut batched = model.build_paged_with_kv_quant(kv_quant);
+        let layout = CudaKvPageLayout {
+            layer_count: model.n_layers,
+            kv_head_count: model.n_kv,
+            head_dim: model.head_dim,
+            storage,
+        };
+        let page_counts = prefixes
+            .iter()
+            .map(|prefix| {
+                (prefix.len() + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS)
+            })
+            .collect::<Vec<_>>();
+        let total_pages = page_counts.iter().sum();
+        let mut pool = CudaKvPagePool::new(layout, total_pages).unwrap();
+        let handles = pool.reserve(total_pages).unwrap();
+        let mut next_page = 0;
+        let pages = page_counts
+            .iter()
+            .map(|page_count| {
+                let row = handles[next_page..next_page + page_count].to_vec();
+                next_page += page_count;
+                row
+            })
+            .collect::<Vec<_>>();
+        for page in &handles {
+            batched.allocate_paged_kv_page(*page).unwrap();
+        }
+        for (row, prefix) in prefixes.iter().enumerate() {
+            for (position, token) in prefix.iter().copied().enumerate() {
+                let embedding = model.embed(token);
+                let (cos, sin) = model.rope(position);
+                serial[row]
+                    .forward_token_logits(&embedding, &cos, &sin, position, model.scale)
+                    .unwrap();
+                batched
+                    .forward_token_logits_paged(
+                        &embedding,
+                        &cos,
+                        &sin,
+                        position,
+                        model.scale,
+                        &pages[row][..(position + 1)
+                            .div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS)],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let positions = prefixes.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut embeddings = Vec::with_capacity(8 * model.hidden);
+        let mut cos = Vec::with_capacity(8 * model.rope_dim / 2);
+        let mut sin = Vec::with_capacity(8 * model.rope_dim / 2);
+        let expected = (0..8)
+            .map(|row| {
+                let embedding = model.embed(inputs[row]);
+                embeddings.extend_from_slice(&embedding);
+                let (row_cos, row_sin) = model.rope(positions[row]);
+                cos.extend_from_slice(&row_cos);
+                sin.extend_from_slice(&row_sin);
+                serial[row]
+                    .forward_token_logits(
+                        &embedding,
+                        &row_cos,
+                        &row_sin,
+                        positions[row],
+                        model.scale,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let actual = batched
+            .forward_independent_paged_batch_q8(
+                &embeddings,
+                &cos,
+                &sin,
+                &positions,
+                &pages,
+                model.scale,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            actual.logits,
+            Some(expected),
+            "{kv_quant:?} logits diverged"
+        );
+        assert_eq!(actual.sampled_token_ids, None);
+        assert_eq!(actual.batch_size, 8);
+        assert_eq!(actual.execution_mode, CudaBatchExecutionMode::TrueBatch);
+        assert_eq!(actual.shared_projection_launches, model.n_layers * 7 + 1);
+        for row in 0..8 {
+            assert_eq!(
+                batched
+                    .read_paged_kv_layer(&pages[row], 0, positions[row] + 1)
+                    .unwrap(),
+                serial[row].read_kv_layer(0, positions[row] + 1).unwrap(),
+                "{kv_quant:?} row {row} KV diverged"
+            );
+        }
+        for page in handles.into_iter().rev() {
+            batched.release_paged_kv_page(page).unwrap();
+            pool.release(page).unwrap();
+        }
+        assert_eq!(pool.snapshot().allocated_pages, 0);
+        assert_eq!(batched.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase7_independent_paged_prefill_matches_four_serial_histories() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut serial = (0..4).map(|_| model.build()).collect::<Vec<_>>();
+    let mut batched = model.build_paged();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 8).unwrap();
+    let handles = pool.reserve(8).unwrap();
+    for page in &handles {
+        batched.allocate_paged_kv_page(*page).unwrap();
+    }
+    let row_pages = (0..4)
+        .map(|row| vec![handles[2 * row], handles[2 * row + 1]])
+        .collect::<Vec<_>>();
+
+    for position in 0..17 {
+        let mut embeddings = Vec::with_capacity(4 * model.hidden);
+        let mut cos = Vec::with_capacity(4 * model.rope_dim / 2);
+        let mut sin = Vec::with_capacity(4 * model.rope_dim / 2);
+        for (row, serial_row) in serial.iter_mut().enumerate() {
+            let token = 3 + ((row * 23 + position * 17) % 89) as u32;
+            let embedding = model.embed(token);
+            let (row_cos, row_sin) = model.rope(position);
+            serial_row
+                .forward_token_logits(&embedding, &row_cos, &row_sin, position, model.scale)
+                .unwrap();
+            embeddings.extend_from_slice(&embedding);
+            cos.extend_from_slice(&row_cos);
+            sin.extend_from_slice(&row_sin);
+        }
+        let page_count =
+            (position + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
+        let active_pages = row_pages
+            .iter()
+            .map(|pages| pages[..page_count].to_vec())
+            .collect::<Vec<_>>();
+        let output = batched
+            .prefill_independent_paged_batch_q8(
+                &embeddings,
+                &cos,
+                &sin,
+                &[position; 4],
+                &active_pages,
+                model.scale,
+            )
+            .unwrap();
+        assert_eq!(output.batch_size, 4);
+        assert_eq!(output.shared_projection_launches, model.n_layers * 7);
+        assert_eq!(output.execution_mode, CudaBatchExecutionMode::TrueBatch);
+    }
+    for row in 0..4 {
+        assert_eq!(
+            batched.read_paged_kv_layer(&row_pages[row], 0, 17).unwrap(),
+            serial[row].read_kv_layer(0, 17).unwrap(),
+            "prefill row {row} KV diverged"
+        );
+    }
+    for page in handles.into_iter().rev() {
+        batched.release_paged_kv_page(page).unwrap();
+        pool.release(page).unwrap();
+    }
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(batched.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_paged_constructor_skips_eager_contiguous_kv_allocation() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let contiguous = CudaResidentDecode::new(
+        model.n_layers,
+        model.n_heads,
+        model.n_kv,
+        model.head_dim,
+        model.hidden,
+        model.ffn,
+        model.rope_dim,
+        model.max_pos,
+        model.vocab,
+        model.eps,
+        false,
+    )
+    .unwrap();
+    assert!(!contiguous.paged_kv_enabled());
+    assert_eq!(
+        contiguous.contiguous_kv_allocated_bytes(),
+        2 * model.n_layers * model.n_kv * model.head_dim * 2 * model.max_pos
+    );
+
+    let mut paged = CudaResidentDecode::new_paged_with_kv_quant(
+        model.n_layers,
+        model.n_heads,
+        model.n_kv,
+        model.head_dim,
+        model.hidden,
+        model.ffn,
+        model.rope_dim,
+        model.max_pos,
+        model.vocab,
+        model.eps,
+        false,
+        crate::model::KvCacheQuantization::F16,
+    )
+    .unwrap();
+    assert!(paged.paged_kv_enabled());
+    assert_eq!(paged.contiguous_kv_allocated_bytes(), 0);
+    assert_eq!(
+        paged.paged_kv_page_snapshot().unwrap(),
+        CudaDeviceKvPageSnapshot {
+            resident_pages: 0,
+            allocated_bytes: 0,
+            high_watermark_bytes: 0,
+        }
+    );
+    assert!(paged.enable_second_kv_slot().is_err());
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_device_pages_allocate_lazily_and_reclaim_generation_safely() {
+    if kernels().is_none() {
+        return;
+    }
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    let model = SynthModel::new();
+    let mut engine = model.build();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 2).unwrap();
+    engine.enable_paged_kv_pages(layout).unwrap();
+    assert_eq!(
+        engine.paged_kv_page_snapshot().unwrap(),
+        CudaDeviceKvPageSnapshot {
+            resident_pages: 0,
+            allocated_bytes: 0,
+            high_watermark_bytes: 0,
+        }
+    );
+
+    let handles = pool.reserve(2).unwrap();
+    for handle in &handles {
+        engine.allocate_paged_kv_page(*handle).unwrap();
+    }
+    let snapshot = engine.paged_kv_page_snapshot().unwrap();
+    assert_eq!(snapshot.resident_pages, 2);
+    assert_eq!(snapshot.allocated_bytes, 2 * layout.page_bytes().unwrap());
+    assert_eq!(snapshot.high_watermark_bytes, snapshot.allocated_bytes);
+    let (keys, values) = engine.paged_kv_layer_pointers(&handles, 0).unwrap();
+    assert!(keys.iter().chain(&values).all(|pointer| *pointer != 0));
+    assert_ne!(keys[0], keys[1]);
+    assert_ne!(values[0], values[1]);
+    assert_ne!(keys[0], values[0]);
+
+    let stale = handles[0];
+    engine.release_paged_kv_page(stale).unwrap();
+    pool.release(stale).unwrap();
+    assert_eq!(
+        engine.release_paged_kv_page(stale),
+        Err("CUDA KV device page handle is stale".to_string())
+    );
+    let reused = pool.reserve(1).unwrap()[0];
+    assert_eq!(reused.index(), stale.index());
+    assert_ne!(reused.generation(), stale.generation());
+    engine.allocate_paged_kv_page(reused).unwrap();
+    assert!(engine.paged_kv_layer_pointers(&[stale], 0).is_err());
+
+    engine.release_paged_kv_page(handles[1]).unwrap();
+    pool.release(handles[1]).unwrap();
+    engine.release_paged_kv_page(reused).unwrap();
+    pool.release(reused).unwrap();
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(engine.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_device_page_copy_on_write_preserves_source_and_isolates_divergence() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut engine = model.build_paged();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 2).unwrap();
+    let pages = pool.reserve(2).unwrap();
+    let source = pages[0];
+    let target = pages[1];
+    engine.allocate_paged_kv_page(source).unwrap();
+    engine.allocate_paged_kv_page(target).unwrap();
+
+    for position in 0..5 {
+        let (cos, sin) = model.rope(position);
+        engine
+            .forward_token_logits_paged(
+                &model.embed(7 + position as u32),
+                &cos,
+                &sin,
+                position,
+                model.scale,
+                &[source],
+            )
+            .unwrap();
+    }
+    let source_before = (0..model.n_layers)
+        .map(|layer| engine.read_paged_kv_layer(&[source], layer, 6).unwrap())
+        .collect::<Vec<_>>();
+    engine.copy_paged_kv_page(source, target).unwrap();
+    for (layer, source_layer) in source_before.iter().enumerate() {
+        assert_eq!(
+            engine.read_paged_kv_layer(&[target], layer, 6).unwrap(),
+            *source_layer,
+            "copied device page must preserve every source byte before divergence",
+        );
+    }
+
+    let (cos, sin) = model.rope(5);
+    engine
+        .forward_token_logits_paged(&model.embed(91), &cos, &sin, 5, model.scale, &[target])
+        .unwrap();
+    for (layer, source_layer) in source_before.iter().enumerate() {
+        assert_eq!(
+            engine.read_paged_kv_layer(&[source], layer, 6).unwrap(),
+            *source_layer,
+            "target divergence must not mutate the source page",
+        );
+        assert_ne!(
+            engine.read_paged_kv_layer(&[target], layer, 6).unwrap(),
+            *source_layer,
+            "the target page must carry its divergent sixth KV row",
+        );
+    }
+
+    for page in pages.into_iter().rev() {
+        engine.release_paged_kv_page(page).unwrap();
+        pool.release(page).unwrap();
+    }
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(engine.paged_kv_page_snapshot().unwrap().resident_pages, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_scalar_paged_forward_matches_contiguous_across_three_pages() {
+    use crate::inference::cuda_paged_kv::{
+        CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage, CUDA_KV_PAGE_TOKENS,
+    };
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut contiguous = model.build();
+    let mut paged = model.build_paged();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 3).unwrap();
+    let handles = pool.reserve(3).unwrap();
+    for handle in &handles {
+        paged.allocate_paged_kv_page(*handle).unwrap();
+    }
+
+    for position in 0..40 {
+        let token = 3 + (position as u32 * 17) % 71;
+        let embedding = model.embed(token);
+        let (cos, sin) = model.rope(position);
+        let expected = contiguous
+            .forward_token_logits(&embedding, &cos, &sin, position, model.scale)
+            .unwrap();
+        let page_count = (position + 1).div_ceil(CUDA_KV_PAGE_TOKENS);
+        let actual = paged
+            .forward_token_logits_paged(
+                &embedding,
+                &cos,
+                &sin,
+                position,
+                model.scale,
+                &handles[..page_count],
+            )
+            .unwrap();
+        assert_same_bits(
+            &format!("paged scalar logits at position {position}"),
+            &actual,
+            &expected,
+        );
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.total_cmp(right)
+                        .then_with(|| right_index.cmp(left_index))
+                })
+                .unwrap()
+                .0
+        };
+        assert_eq!(argmax(&actual), argmax(&expected));
+    }
+
+    for handle in handles.into_iter().rev() {
+        paged.release_paged_kv_page(handle).unwrap();
+        pool.release(handle).unwrap();
+    }
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(paged.paged_kv_page_snapshot().unwrap().resident_pages, 0);
+    assert_eq!(paged.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_chunked_paged_prefill_matches_contiguous_whole_prefill() {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut contiguous = model.build();
+    let mut paged = model.build_paged();
+    let layout = CudaKvPageLayout {
+        layer_count: model.n_layers,
+        kv_head_count: model.n_kv,
+        head_dim: model.head_dim,
+        storage: CudaKvPageStorage::F16,
+    };
+    let mut pool = CudaKvPagePool::new(layout, 3).unwrap();
+    let handles = pool.reserve(3).unwrap();
+    for handle in &handles {
+        paged.allocate_paged_kv_page(*handle).unwrap();
+    }
+    let tokens = 40usize;
+    let half = model.rope_dim / 2;
+    let mut embeddings = Vec::with_capacity(tokens * model.hidden);
+    let mut cos = Vec::with_capacity(tokens * half);
+    let mut sin = Vec::with_capacity(tokens * half);
+    for position in 0..tokens {
+        embeddings.extend_from_slice(&model.embed(5 + (position as u32 * 19) % 83));
+        let (row_cos, row_sin) = model.rope(position);
+        cos.extend_from_slice(&row_cos);
+        sin.extend_from_slice(&row_sin);
+    }
+    contiguous
+        .prefill(&embeddings, &cos, &sin, tokens, model.scale)
+        .unwrap();
+    let mut base = 0usize;
+    for count in [13usize, 11, 16] {
+        let end = base + count;
+        let pages = end.div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
+        paged
+            .prefill_paged_at(
+                &embeddings[base * model.hidden..end * model.hidden],
+                &cos[base * half..end * half],
+                &sin[base * half..end * half],
+                base,
+                count,
+                model.scale,
+                &handles[..pages],
+            )
+            .unwrap();
+        base = end;
+    }
+    assert_eq!(base, tokens);
+    for layer in 0..model.n_layers {
+        assert_eq!(
+            paged.read_paged_kv_layer(&handles, layer, tokens).unwrap(),
+            contiguous.read_kv_layer(layer, tokens).unwrap(),
+            "paged prefill KV diverged at layer {layer}",
+        );
+    }
+    let next_embedding = model.embed(91);
+    let (next_cos, next_sin) = model.rope(tokens);
+    let expected = contiguous
+        .forward_token_logits(&next_embedding, &next_cos, &next_sin, tokens, model.scale)
+        .unwrap();
+    let actual = paged
+        .forward_token_logits_paged(
+            &next_embedding,
+            &next_cos,
+            &next_sin,
+            tokens,
+            model.scale,
+            &handles,
+        )
+        .unwrap();
+    assert_same_bits("paged chunked prefill next logits", &actual, &expected);
+
+    for handle in handles.into_iter().rev() {
+        paged.release_paged_kv_page(handle).unwrap();
+        pool.release(handle).unwrap();
+    }
+    assert_eq!(pool.snapshot().allocated_pages, 0);
+    assert_eq!(paged.paged_kv_page_snapshot().unwrap().allocated_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_f16_paged_attention_matches_contiguous_across_page_boundaries() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    phase6_paged_attention_matches_contiguous(&kernels, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase6_q8_paged_attention_matches_contiguous_across_page_boundaries() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    phase6_paged_attention_matches_contiguous(&kernels, true);
+}
+
+fn phase6_paged_attention_matches_contiguous(kernels: &CudaResidentKernels, q8: bool) {
+    use crate::inference::cuda_paged_kv::{CudaKvPageLayout, CudaKvPagePool, CudaKvPageStorage};
+
+    let n_heads = 8usize;
+    let n_kv_heads = 2usize;
+    let head_dim = 64usize;
+    let page_count = 3usize;
+    let max_pos = page_count * crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS;
+    let position_count = 40usize;
+    let layout = CudaKvPageLayout {
+        layer_count: 1,
+        kv_head_count: n_kv_heads,
+        head_dim,
+        storage: if q8 {
+            CudaKvPageStorage::Q8_0
+        } else {
+            CudaKvPageStorage::F16
+        },
+    };
+    let mut pool = CudaKvPagePool::new(layout, page_count).unwrap();
+    let handles = pool.reserve(page_count).unwrap();
+    let mut store = super::CudaDeviceKvPageStore::new(layout).unwrap();
+    for handle in &handles {
+        store.allocate(&kernels.stream, *handle).unwrap();
+    }
+    let (key_pages, value_pages) = store
+        .upload_layer_pointer_tables(&kernels.stream, &handles, 0)
+        .unwrap();
+
+    let cache_bytes = if q8 {
+        n_kv_heads * max_pos * (head_dim / 32) * 34
+    } else {
+        n_kv_heads * max_pos * head_dim * std::mem::size_of::<u16>()
+    };
+    let mut contiguous_k = kernels.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    let mut contiguous_v = kernels.stream.alloc_zeros::<u8>(cache_bytes).unwrap();
+    for position in 0..position_count {
+        let keys = (0..n_kv_heads * head_dim)
+            .map(|index| ((position * 131 + index * 17) as f32 * 0.0031).sin())
+            .collect::<Vec<_>>();
+        let values = (0..n_kv_heads * head_dim)
+            .map(|index| ((position * 97 + index * 29) as f32 * 0.0027).cos())
+            .collect::<Vec<_>>();
+        let d_keys = kernels.stream.clone_htod(&keys).unwrap();
+        let d_values = kernels.stream.clone_htod(&values).unwrap();
+        let d_position = kernels.stream.clone_htod(&[position as i32]).unwrap();
+        if q8 {
+            super::launch_kv_scatter_q8_0(
+                &kernels.stream,
+                &kernels.kv_scatter_q8_0,
+                &d_keys,
+                &mut contiguous_k,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+            super::launch_kv_scatter_q8_0(
+                &kernels.stream,
+                &kernels.kv_scatter_q8_0,
+                &d_values,
+                &mut contiguous_v,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+            super::launch_kv_scatter_paged_q8_0(
+                &kernels.stream,
+                &kernels.kv_scatter_paged_q8_0,
+                &d_keys,
+                &key_pages,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+            )
+            .unwrap();
+            super::launch_kv_scatter_paged_q8_0(
+                &kernels.stream,
+                &kernels.kv_scatter_paged_q8_0,
+                &d_values,
+                &value_pages,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+            )
+            .unwrap();
+        } else {
+            super::launch_kv_scatter(
+                &kernels.stream,
+                &kernels.kv_scatter,
+                &d_keys,
+                &mut contiguous_k,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+            super::launch_kv_scatter(
+                &kernels.stream,
+                &kernels.kv_scatter,
+                &d_values,
+                &mut contiguous_v,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+                max_pos,
+            )
+            .unwrap();
+            super::launch_kv_scatter_paged(
+                &kernels.stream,
+                &kernels.kv_scatter_paged,
+                &d_keys,
+                &key_pages,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+            )
+            .unwrap();
+            super::launch_kv_scatter_paged(
+                &kernels.stream,
+                &kernels.kv_scatter_paged,
+                &d_values,
+                &value_pages,
+                &d_position,
+                n_kv_heads,
+                head_dim,
+            )
+            .unwrap();
+        }
+    }
+
+    let query = (0..n_heads * head_dim)
+        .map(|index| ((index * 43) as f32 * 0.0043).sin())
+        .collect::<Vec<_>>();
+    let d_query = kernels.stream.clone_htod(&query).unwrap();
+    let d_position = kernels
+        .stream
+        .clone_htod(&[(position_count - 1) as i32])
+        .unwrap();
+    let mut contiguous_out = kernels
+        .stream
+        .alloc_zeros::<f32>(n_heads * head_dim)
+        .unwrap();
+    let mut paged_out = kernels
+        .stream
+        .alloc_zeros::<f32>(n_heads * head_dim)
+        .unwrap();
+    let mut contiguous_scores = kernels
+        .stream
+        .alloc_zeros::<f32>(n_heads * max_pos)
+        .unwrap();
+    let mut paged_scores = kernels
+        .stream
+        .alloc_zeros::<f32>(n_heads * max_pos)
+        .unwrap();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    super::launch_attention(
+        &kernels.stream,
+        if q8 {
+            &kernels.attention_q8_0
+        } else {
+            &kernels.attention
+        },
+        &d_query,
+        &contiguous_k,
+        &contiguous_v,
+        &mut contiguous_out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        &d_position,
+        position_count,
+        max_pos,
+        scale,
+        &mut contiguous_scores,
+    )
+    .unwrap();
+    super::launch_attention_paged(
+        &kernels.stream,
+        if q8 {
+            &kernels.attention_paged_q8_0
+        } else {
+            &kernels.attention_paged
+        },
+        &d_query,
+        &key_pages,
+        &value_pages,
+        &mut paged_out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        &d_position,
+        position_count,
+        scale,
+        &mut paged_scores,
+    )
+    .unwrap();
+    let mut contiguous = vec![0.0f32; n_heads * head_dim];
+    let mut paged = vec![0.0f32; n_heads * head_dim];
+    kernels
+        .stream
+        .memcpy_dtoh(&contiguous_out, &mut contiguous)
+        .unwrap();
+    kernels.stream.memcpy_dtoh(&paged_out, &mut paged).unwrap();
+    kernels.ctx.synchronize().unwrap();
+    assert_same_bits(
+        if q8 {
+            "Q8 paged attention"
+        } else {
+            "F16 paged attention"
+        },
+        &paged,
+        &contiguous,
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase3_batch2_preflight_refuses_before_mutating_either_bank() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut engine = model.build();
+    engine.enable_second_kv_slot().unwrap();
+    engine.select_kv_slot(0).unwrap();
+    engine.set_filled(1);
+    engine.select_kv_slot(1).unwrap();
+    engine.set_filled(0);
+    let positions_before = [1usize, 0usize];
+    let embeddings = [model.embed(3), model.embed(5)].concat();
+    let (cos, sin) = model.rope(0);
+    let cos = [cos.clone(), cos].concat();
+    let sin = [sin.clone(), sin].concat();
+
+    assert_eq!(
+        engine.forward_independent_batch2_q8(&embeddings, &cos, &sin, [0, 0], model.scale, false,),
+        Err(CudaIndependentBatch2Error::PositionMismatch {
+            requested: [0, 0],
+            resident: positions_before,
+        })
+    );
+    for (slot, expected) in positions_before.into_iter().enumerate() {
+        engine.select_kv_slot(slot).unwrap();
+        assert_eq!(engine.filled(), expected);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase3_batch2_survivor_continues_after_sibling_retirement() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let prefixes = [vec![3u32, 7], vec![5u32, 13, 17]];
+    let inputs = [11u32, 19u32];
+    let mut survivor_oracle = model.build();
+    let mut batched = model.build();
+    batched.enable_second_kv_slot().unwrap();
+
+    for (position, token) in prefixes[1].iter().copied().enumerate() {
+        let (cos, sin) = model.rope(position);
+        survivor_oracle
+            .forward_token(
+                &model.embed(token),
+                &cos,
+                &sin,
+                position,
+                model.scale,
+                false,
+            )
+            .unwrap();
+    }
+    survivor_oracle.set_filled(prefixes[1].len());
+    for (row, prefix) in prefixes.iter().enumerate() {
+        batched.select_kv_slot(row).unwrap();
+        for (position, token) in prefix.iter().copied().enumerate() {
+            let (cos, sin) = model.rope(position);
+            batched
+                .forward_token(
+                    &model.embed(token),
+                    &cos,
+                    &sin,
+                    position,
+                    model.scale,
+                    false,
+                )
+                .unwrap();
+        }
+        batched.set_filled(prefix.len());
+    }
+
+    let positions = [prefixes[0].len(), prefixes[1].len()];
+    let mut embeddings = Vec::new();
+    let mut cos = Vec::new();
+    let mut sin = Vec::new();
+    for row in 0..2 {
+        embeddings.extend_from_slice(&model.embed(inputs[row]));
+        let (row_cos, row_sin) = model.rope(positions[row]);
+        cos.extend_from_slice(&row_cos);
+        sin.extend_from_slice(&row_sin);
+    }
+    let first = batched
+        .forward_independent_batch2_q8(&embeddings, &cos, &sin, positions, model.scale, false)
+        .unwrap();
+    let (oracle_cos, oracle_sin) = model.rope(positions[1]);
+    let oracle_first = survivor_oracle
+        .forward_token_logits(
+            &model.embed(inputs[1]),
+            &oracle_cos,
+            &oracle_sin,
+            positions[1],
+            model.scale,
+        )
+        .unwrap();
+    survivor_oracle.set_filled(positions[1] + 1);
+    let first_logits = first.logits.expect("logits requested");
+    assert_eq!(first_logits[1], oracle_first);
+
+    let next_token = first_logits[1]
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right)
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .unwrap()
+        .0 as u32;
+    batched.clear_kv_slot(0).unwrap();
+    batched.select_kv_slot(1).unwrap();
+    let (next_cos, next_sin) = model.rope(positions[1] + 1);
+    let survivor = batched
+        .forward_token_logits(
+            &model.embed(next_token),
+            &next_cos,
+            &next_sin,
+            positions[1] + 1,
+            model.scale,
+        )
+        .unwrap();
+    batched.set_filled(positions[1] + 2);
+    let oracle_survivor = survivor_oracle
+        .forward_token_logits(
+            &model.embed(next_token),
+            &next_cos,
+            &next_sin,
+            positions[1] + 1,
+            model.scale,
+        )
+        .unwrap();
+    assert_eq!(survivor, oracle_survivor);
+    batched.select_kv_slot(0).unwrap();
+    assert_eq!(batched.filled(), 0);
+    batched.select_kv_slot(1).unwrap();
+    assert_eq!(batched.filled(), positions[1] + 2);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn phase3_batch_size_one_remains_the_existing_scalar_path() {
+    if kernels().is_none() {
+        return;
+    }
+    let model = SynthModel::new();
+    let mut baseline = model.build();
+    let mut dual_bank = model.build();
+    dual_bank.enable_second_kv_slot().unwrap();
+    dual_bank.select_kv_slot(0).unwrap();
+    let token = 23u32;
+    let (cos, sin) = model.rope(0);
+
+    let expected = baseline
+        .forward_token_logits(&model.embed(token), &cos, &sin, 0, model.scale)
+        .unwrap();
+    let actual = dual_bank
+        .forward_token_logits(&model.embed(token), &cos, &sin, 0, model.scale)
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        dual_bank.read_kv_layer(0, 1).unwrap(),
+        baseline.read_kv_layer(0, 1).unwrap()
+    );
 }
 
 /// LINEAR TREE == LINEAR VERIFY: on a single-branch tree, `verify_tree`'s argmax

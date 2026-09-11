@@ -4252,7 +4252,7 @@ extern "C" __global__ void silu_mul_quantize_q8k(
 // win is that each weight block is read from global ONCE and reused for all K
 // tokens (vs K separate GEMVs reading the weights K times). One warp per output
 // row; for each block the weight is loaded once and dotted against all K inputs.
-// The per-block float terms are summed by lane 0 in block order (per token), the
+// The per-block float terms are summed by one lane per token in block order, the
 // SAME ordered sum as the single-token q8_gemv, so verify_batch is bit-identical
 // to K sequential forward_token calls — which makes speculative decode losslessly
 // reproduce greedy decode (not just token-identical-modulo-near-ties). Shared
@@ -4274,34 +4274,85 @@ extern "C" __global__ void q8_gemm_batched(
         const unsigned short* scales =
             reinterpret_cast<const unsigned short*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
-        for (int b = lane; b < blocks_per_row; b += 32) {
-            float w_scale = f16_bits_to_f32(scales[row_block0 + b]);
-            const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
-            int4 w0 = wq[0], w1 = wq[1]; // weight block read once, reused for all K
-            for (int t = 0; t < k_tokens; t++) {
-                const int4* iq = reinterpret_cast<const int4*>(
-                    input_quants + ((long)t * blocks_per_row + b) * 32);
-                int4 i0 = iq[0], i1 = iq[1];
-                int s = 0;
-                s = __dp4a(w0.x, i0.x, s);
-                s = __dp4a(w0.y, i0.y, s);
-                s = __dp4a(w0.z, i0.z, s);
-                s = __dp4a(w0.w, i0.w, s);
-                s = __dp4a(w1.x, i1.x, s);
-                s = __dp4a(w1.y, i1.y, s);
-                s = __dp4a(w1.z, i1.z, s);
-                s = __dp4a(w1.w, i1.w, s);
-                myterms[t * blocks_per_row + b] =
-                    (float)s * w_scale * input_scales[(long)t * blocks_per_row + b];
+        if (k_tokens == 2) {
+            const int U = 4;
+            for (int base = lane; base < blocks_per_row; base += 32 * U) {
+                int4 w0[U], w1[U];
+                float ws[U];
+                int present = 0;
+                #pragma unroll
+                for (int u = 0; u < U; u++) {
+                    int b = base + u * 32;
+                    if (b < blocks_per_row) {
+                        const int4* wq = reinterpret_cast<const int4*>(
+                            quants + (row_block0 + b) * 32);
+                        w0[u] = wq[0];
+                        w1[u] = wq[1];
+                        ws[u] = f16_bits_to_f32(scales[row_block0 + b]);
+                        present |= (1 << u);
+                    }
+                }
+                #pragma unroll
+                for (int u = 0; u < U; u++) {
+                    if (present & (1 << u)) {
+                        int b = base + u * 32;
+                        #pragma unroll
+                        for (int t = 0; t < 2; t++) {
+                            const int4* iq = reinterpret_cast<const int4*>(
+                                input_quants + ((long)t * blocks_per_row + b) * 32);
+                            int4 i0 = iq[0], i1 = iq[1];
+                            int s = 0;
+                            s = __dp4a(w0[u].x, i0.x, s);
+                            s = __dp4a(w0[u].y, i0.y, s);
+                            s = __dp4a(w0[u].z, i0.z, s);
+                            s = __dp4a(w0[u].w, i0.w, s);
+                            s = __dp4a(w1[u].x, i1.x, s);
+                            s = __dp4a(w1[u].y, i1.y, s);
+                            s = __dp4a(w1[u].z, i1.z, s);
+                            s = __dp4a(w1[u].w, i1.w, s);
+                            myterms[t * blocks_per_row + b] = (float)s * ws[u]
+                                * input_scales[(long)t * blocks_per_row + b];
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int b = lane; b < blocks_per_row; b += 32) {
+                float w_scale = f16_bits_to_f32(scales[row_block0 + b]);
+                const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
+                int4 w0 = wq[0], w1 = wq[1]; // weight block read once, reused for all K
+                for (int t = 0; t < k_tokens; t++) {
+                    const int4* iq = reinterpret_cast<const int4*>(
+                        input_quants + ((long)t * blocks_per_row + b) * 32);
+                    int4 i0 = iq[0], i1 = iq[1];
+                    int s = 0;
+                    s = __dp4a(w0.x, i0.x, s);
+                    s = __dp4a(w0.y, i0.y, s);
+                    s = __dp4a(w0.z, i0.z, s);
+                    s = __dp4a(w0.w, i0.w, s);
+                    s = __dp4a(w1.x, i1.x, s);
+                    s = __dp4a(w1.y, i1.y, s);
+                    s = __dp4a(w1.z, i1.z, s);
+                    s = __dp4a(w1.w, i1.w, s);
+                    myterms[t * blocks_per_row + b] =
+                        (float)s * w_scale * input_scales[(long)t * blocks_per_row + b];
+                }
             }
         }
     }
     __syncwarp();
-    if (row < rows && lane == 0) {
-        for (int t = 0; t < k_tokens; t++) {
+    if (row < rows) {
+        if (k_tokens <= 32 && lane < k_tokens) {
+            int t = lane;
             float acc = 0.0f;
             for (int b = 0; b < blocks_per_row; b++) acc += myterms[t * blocks_per_row + b];
             output[(long)t * rows + row] = acc;
+        } else if (k_tokens > 32 && lane == 0) {
+            for (int t = 0; t < k_tokens; t++) {
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; b++) acc += myterms[t * blocks_per_row + b];
+                output[(long)t * rows + row] = acc;
+            }
         }
     }
 }
@@ -4867,6 +4918,241 @@ extern "C" __global__ void attention_decode(
     }
 }
 
+#define CAMELID_KV_PAGE_TOKENS 16
+
+extern "C" __global__ void kv_scatter_paged(
+    const float* __restrict__ src, const unsigned long long* __restrict__ page_ptrs,
+    const int* __restrict__ position_ptr, int page_count, int n_kv_heads, int head_dim
+) {
+    int position = position_ptr[0];
+    int logical_page = position / CAMELID_KV_PAGE_TOKENS;
+    if (logical_page < 0 || logical_page >= page_count) return;
+    unsigned short* page = (unsigned short*)page_ptrs[logical_page];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv_heads * head_dim) return;
+    int kv_head = idx / head_dim;
+    int d = idx % head_dim;
+    int offset = position % CAMELID_KV_PAGE_TOKENS;
+    page[((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim + d] =
+        f32_to_f16_bits(src[(long)kv_head * head_dim + d]);
+}
+
+extern "C" __global__ void attention_decode_paged(
+    const float* __restrict__ q,
+    const unsigned long long* __restrict__ key_pages,
+    const unsigned long long* __restrict__ value_pages,
+    float* __restrict__ out, int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ position_ptr, int page_count, float scale,
+    float* __restrict__ global_scores
+) {
+    int position_count = position_ptr[0] + 1;
+    if (position_count < 1 || position_count > page_count * CAMELID_KV_PAGE_TOKENS) return;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared;
+    float* vpart = shared + head_dim;
+    float* scores = global_scores + (long)head * page_count * CAMELID_KV_PAGE_TOKENS;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const unsigned short* page = (const unsigned short*)key_pages[logical_page];
+        const unsigned short* kp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim;
+        float dot = 0.0f;
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            dot += qsh[d + 0] * f16_bits_to_f32(k8[0]);
+            dot += qsh[d + 1] * f16_bits_to_f32(k8[1]);
+            dot += qsh[d + 2] * f16_bits_to_f32(k8[2]);
+            dot += qsh[d + 3] * f16_bits_to_f32(k8[3]);
+            dot += qsh[d + 4] * f16_bits_to_f32(k8[4]);
+            dot += qsh[d + 5] * f16_bits_to_f32(k8[5]);
+            dot += qsh[d + 6] * f16_bits_to_f32(k8[6]);
+            dot += qsh[d + 7] * f16_bits_to_f32(k8[7]);
+        }
+        for (; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int p = 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int p_lo = (int)((long)gid * position_count / G);
+    int p_hi = (int)((long)(gid + 1) * position_count / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const unsigned short* page = (const unsigned short*)value_pages[logical_page];
+        const unsigned short* vp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim;
+        acc += (scores[p] * inv) * f16_bits_to_f32(vp[did]);
+    }
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
+extern "C" __global__ void kv_scatter_paged_batched(
+    const float* __restrict__ src,
+    const unsigned long long* __restrict__ page_ptrs,
+    const int* __restrict__ positions,
+    const int* __restrict__ page_counts,
+    int page_stride, int n_kv_heads, int head_dim, int rows
+) {
+    int row = blockIdx.y;
+    if (row < 0 || row >= rows) return;
+    int position = positions[row];
+    int page_count = page_counts[row];
+    int logical_page = position / CAMELID_KV_PAGE_TOKENS;
+    if (logical_page < 0 || logical_page >= page_count) return;
+    const unsigned long long* row_pages = page_ptrs + (long)row * page_stride;
+    unsigned short* page = (unsigned short*)row_pages[logical_page];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv_heads * head_dim) return;
+    int kv_head = idx / head_dim;
+    int d = idx % head_dim;
+    int offset = position % CAMELID_KV_PAGE_TOKENS;
+    page[((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim + d] =
+        f32_to_f16_bits(src[((long)row * n_kv_heads + kv_head) * head_dim + d]);
+}
+
+extern "C" __global__ void attention_decode_paged_batched(
+    const float* __restrict__ q,
+    const unsigned long long* __restrict__ key_page_tables,
+    const unsigned long long* __restrict__ value_page_tables,
+    float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ positions,
+    const int* __restrict__ page_counts,
+    int page_stride, int score_stride, float scale,
+    float* __restrict__ global_scores, int rows
+) {
+    int row = blockIdx.y;
+    int head = blockIdx.x;
+    if (row < 0 || row >= rows || head >= n_heads) return;
+    int page_count = page_counts[row];
+    int position_count = positions[row] + 1;
+    if (position_count < 1 || position_count > page_count * CAMELID_KV_PAGE_TOKENS) return;
+    const unsigned long long* key_pages = key_page_tables + (long)row * page_stride;
+    const unsigned long long* value_pages = value_page_tables + (long)row * page_stride;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + ((long)row * n_heads + head) * head_dim;
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int max_groups = blockDim.x / head_dim;
+    int G = (position_count + head_dim - 1) / head_dim;
+    if (G < 1) G = 1;
+    if (G > max_groups) G = max_groups;
+    float* qsh = shared;
+    float* vpart = shared + head_dim;
+    float* scores = global_scores + ((long)row * n_heads + head) * score_stride;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const unsigned short* page = (const unsigned short*)key_pages[logical_page];
+        const unsigned short* kp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim;
+        float dot = 0.0f;
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            dot += qsh[d + 0] * f16_bits_to_f32(k8[0]);
+            dot += qsh[d + 1] * f16_bits_to_f32(k8[1]);
+            dot += qsh[d + 2] * f16_bits_to_f32(k8[2]);
+            dot += qsh[d + 3] * f16_bits_to_f32(k8[3]);
+            dot += qsh[d + 4] * f16_bits_to_f32(k8[4]);
+            dot += qsh[d + 5] * f16_bits_to_f32(k8[5]);
+            dot += qsh[d + 6] * f16_bits_to_f32(k8[6]);
+            dot += qsh[d + 7] * f16_bits_to_f32(k8[7]);
+        }
+        for (; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float maximum = scores[0];
+        for (int p = 1; p < position_count; p++)
+            if (scores[p] > maximum) maximum = scores[p];
+        s_max = maximum;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x)
+        scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    if (gid < G) {
+        float inv = 1.0f / s_sum;
+        int p_lo = (int)((long)gid * position_count / G);
+        int p_hi = (int)((long)(gid + 1) * position_count / G);
+        float acc = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+            int offset = p % CAMELID_KV_PAGE_TOKENS;
+            const unsigned short* page = (const unsigned short*)value_pages[logical_page];
+            const unsigned short* vp = page
+                + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * head_dim;
+            acc += (scores[p] * inv) * f16_bits_to_f32(vp[did]);
+        }
+        vpart[(long)did * max_groups + gid] = acc;
+    }
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int group = 0; group < G; group++)
+            sum += vpart[(long)did * max_groups + group];
+        out[((long)row * n_heads + head) * head_dim + did] = sum;
+    }
+}
+
 // ---- Sliding-window attention decode (gemma4 sliding layers) ---------------
 // Identical to attention_decode but attends only the last `window` keys:
 //   start = (window > 0 && position_count > window) ? position_count - window : 0
@@ -5076,6 +5362,266 @@ extern "C" __global__ void attention_decode_q8_0(
         float sum = 0.0f;
         for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
         out[(long)head * head_dim + did] = sum;
+    }
+}
+
+extern "C" __global__ void kv_scatter_paged_q8_0(
+    const float* __restrict__ src, const unsigned long long* __restrict__ page_ptrs,
+    const int* __restrict__ position_ptr, int page_count, int n_kv_heads, int head_dim
+) {
+    int position = position_ptr[0];
+    int logical_page = position / CAMELID_KV_PAGE_TOKENS;
+    if (logical_page < 0 || logical_page >= page_count) return;
+    block_q8_0* page = (block_q8_0*)page_ptrs[logical_page];
+    int blocks_per_head = head_dim / 32;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv_heads * blocks_per_head) return;
+    int kv_head = idx / blocks_per_head;
+    int b = idx % blocks_per_head;
+    int offset = position % CAMELID_KV_PAGE_TOKENS;
+    const float* chunk = src + ((long)kv_head * head_dim + b * 32);
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = fabsf(chunk[i]);
+        if (v > amax) amax = v;
+    }
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    block_q8_0 blk;
+    blk.scale = f32_to_f16_bits(d);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float val = roundf(chunk[i] * id);
+        if (val < -127.0f) val = -127.0f;
+        if (val > 127.0f) val = 127.0f;
+        blk.qs[i] = (signed char)val;
+    }
+    page[((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head + b] = blk;
+}
+
+extern "C" __global__ void attention_decode_paged_q8_0(
+    const float* __restrict__ q,
+    const unsigned long long* __restrict__ key_pages,
+    const unsigned long long* __restrict__ value_pages,
+    float* __restrict__ out, int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ position_ptr, int page_count, float scale,
+    float* __restrict__ global_scores
+) {
+    int position_count = position_ptr[0] + 1;
+    if (position_count < 1 || position_count > page_count * CAMELID_KV_PAGE_TOKENS) return;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    int blocks_per_head = head_dim / 32;
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared;
+    float* vpart = shared + head_dim;
+    float* scores = global_scores + (long)head * page_count * CAMELID_KV_PAGE_TOKENS;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const block_q8_0* page = (const block_q8_0*)key_pages[logical_page];
+        const block_q8_0* kp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            dot += sum * d;
+        }
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int p = 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int b = did / 32;
+    int bi = did % 32;
+    int p_lo = (int)((long)gid * position_count / G);
+    int p_hi = (int)((long)(gid + 1) * position_count / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const block_q8_0* page = (const block_q8_0*)value_pages[logical_page];
+        const block_q8_0* vp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head + b;
+        float d = f16_bits_to_f32(vp->scale);
+        acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+    }
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
+extern "C" __global__ void kv_scatter_paged_q8_0_batched(
+    const float* __restrict__ src,
+    const unsigned long long* __restrict__ page_ptrs,
+    const int* __restrict__ positions,
+    const int* __restrict__ page_counts,
+    int page_stride, int n_kv_heads, int head_dim, int rows
+) {
+    int row = blockIdx.y;
+    if (row < 0 || row >= rows) return;
+    int position = positions[row];
+    int page_count = page_counts[row];
+    int logical_page = position / CAMELID_KV_PAGE_TOKENS;
+    if (logical_page < 0 || logical_page >= page_count) return;
+    const unsigned long long* row_pages = page_ptrs + (long)row * page_stride;
+    block_q8_0* page = (block_q8_0*)row_pages[logical_page];
+    int blocks_per_head = head_dim / 32;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_kv_heads * blocks_per_head) return;
+    int kv_head = idx / blocks_per_head;
+    int b = idx % blocks_per_head;
+    int offset = position % CAMELID_KV_PAGE_TOKENS;
+    const float* chunk = src
+        + (long)row * n_kv_heads * head_dim
+        + (long)kv_head * head_dim + b * 32;
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(chunk[i]));
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    block_q8_0 blk;
+    blk.scale = f32_to_f16_bits(d);
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float value = roundf(chunk[i] * id);
+        if (value < -127.0f) value = -127.0f;
+        if (value > 127.0f) value = 127.0f;
+        blk.qs[i] = (signed char)value;
+    }
+    page[((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head + b] = blk;
+}
+
+extern "C" __global__ void attention_decode_paged_q8_0_batched(
+    const float* __restrict__ q,
+    const unsigned long long* __restrict__ key_page_tables,
+    const unsigned long long* __restrict__ value_page_tables,
+    float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ positions,
+    const int* __restrict__ page_counts,
+    int page_stride, int score_stride, float scale,
+    float* __restrict__ global_scores, int rows
+) {
+    int row = blockIdx.y;
+    int head = blockIdx.x;
+    if (row < 0 || row >= rows || head >= n_heads) return;
+    int page_count = page_counts[row];
+    int position_count = positions[row] + 1;
+    if (position_count < 1 || position_count > page_count * CAMELID_KV_PAGE_TOKENS) return;
+    const unsigned long long* key_pages = key_page_tables + (long)row * page_stride;
+    const unsigned long long* value_pages = value_page_tables + (long)row * page_stride;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + ((long)row * n_heads + head) * head_dim;
+    int blocks_per_head = head_dim / 32;
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int max_groups = blockDim.x / head_dim;
+    int G = (position_count + head_dim - 1) / head_dim;
+    if (G < 1) G = 1;
+    if (G > max_groups) G = max_groups;
+    float* qsh = shared;
+    float* vpart = shared + head_dim;
+    float* scores = global_scores + ((long)row * n_heads + head) * score_stride;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+        int offset = p % CAMELID_KV_PAGE_TOKENS;
+        const block_q8_0* page = (const block_q8_0*)key_pages[logical_page];
+        const block_q8_0* kp = page
+            + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head;
+        float dot = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            float d = f16_bits_to_f32(kp[b].scale);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) sum += qsh[b * 32 + i] * (float)kp[b].qs[i];
+            dot += sum * d;
+        }
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float maximum = scores[0];
+        for (int p = 1; p < position_count; p++)
+            if (scores[p] > maximum) maximum = scores[p];
+        s_max = maximum;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x)
+        scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    if (gid < G) {
+        float inv = 1.0f / s_sum;
+        int b = did / 32;
+        int bi = did % 32;
+        int p_lo = (int)((long)gid * position_count / G);
+        int p_hi = (int)((long)(gid + 1) * position_count / G);
+        float acc = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            int logical_page = p / CAMELID_KV_PAGE_TOKENS;
+            int offset = p % CAMELID_KV_PAGE_TOKENS;
+            const block_q8_0* page = (const block_q8_0*)value_pages[logical_page];
+            const block_q8_0* vp = page
+                + ((long)kv_head * CAMELID_KV_PAGE_TOKENS + offset) * blocks_per_head + b;
+            float d = f16_bits_to_f32(vp->scale);
+            acc += (scores[p] * inv) * (d * (float)vp->qs[bi]);
+        }
+        vpart[(long)did * max_groups + gid] = acc;
+    }
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int group = 0; group < G; group++)
+            sum += vpart[(long)did * max_groups + group];
+        out[((long)row * n_heads + head) * head_dim + did] = sum;
     }
 }
 
@@ -5832,6 +6378,51 @@ extern "C" __global__ void rms_norm_batched(
     __syncthreads();
     float sc = s_scale;
     for (int i = tid; i < n; i += blockDim.x) outt[i] = xs[i] * sc * weight[i];
+}
+
+extern "C" __global__ void rms_norm_quantize_batched(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales,
+    int n, float eps, int k_tokens
+) {
+    int t = blockIdx.x;
+    if (t >= k_tokens) return;
+    const float* xt = x + (long)t * n;
+    signed char* qt = quants + (long)t * n;
+    float* st = scales + (long)t * (n >> 5);
+    extern __shared__ float xs[];
+    __shared__ float s_scale;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = xt[i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += xs[i] * xs[i];
+        s_scale = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = xs[i] * scale * weight[i];
+    __syncthreads();
+    int n_blocks = n >> 5;
+    for (int b = tid; b < n_blocks; b += blockDim.x) {
+        const float* xb = xs + ((long)b << 5);
+        float max_abs = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float a = fabsf(xb[j]);
+            if (a > max_abs) max_abs = a;
+        }
+        float unrounded = max_abs / 127.0f;
+        st[b] = f16_round(unrounded);
+        float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+        signed char* qb = qt + ((long)b << 5);
+        for (int j = 0; j < 32; j++) {
+            float v = rintf(xb[j] * inv);
+            if (v > 127.0f) v = 127.0f;
+            if (v < -128.0f) v = -128.0f;
+            qb[j] = (signed char)v;
+        }
+    }
 }
 
 // Prism/Bonsai fast RMSNorm -> Q8 activation. One CTA owns one token. The
@@ -8252,6 +8843,14 @@ pub struct CudaResidentKernels {
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
+    pub(crate) kv_scatter_paged: CudaFunction,
+    pub(crate) attention_paged: CudaFunction,
+    pub(crate) kv_scatter_paged_batched: CudaFunction,
+    pub(crate) attention_paged_batched: CudaFunction,
+    pub(crate) kv_scatter_paged_q8_0: CudaFunction,
+    pub(crate) attention_paged_q8_0: CudaFunction,
+    pub(crate) kv_scatter_paged_q8_0_batched: CudaFunction,
+    pub(crate) attention_paged_q8_0_batched: CudaFunction,
     pub(crate) attention_sw: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
     pub(crate) silu_mul_quantize: CudaFunction,
@@ -8287,6 +8886,7 @@ pub struct CudaResidentKernels {
     pub(crate) sample_gumbel: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
     pub(crate) rms_norm_batched: CudaFunction,
+    pub(crate) rms_norm_quantize_batched: CudaFunction,
     pub(crate) prism_rms_norm_q8_batched: CudaFunction,
     pub(crate) prism_silu_mul_q8_batched: CudaFunction,
     pub(crate) rope_batched: CudaFunction,
@@ -8548,6 +9148,14 @@ impl CudaResidentKernels {
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
+            kv_scatter_paged: f("kv_scatter_paged")?,
+            attention_paged: f("attention_decode_paged")?,
+            kv_scatter_paged_batched: f("kv_scatter_paged_batched")?,
+            attention_paged_batched: f("attention_decode_paged_batched")?,
+            kv_scatter_paged_q8_0: f("kv_scatter_paged_q8_0")?,
+            attention_paged_q8_0: f("attention_decode_paged_q8_0")?,
+            kv_scatter_paged_q8_0_batched: f("kv_scatter_paged_q8_0_batched")?,
+            attention_paged_q8_0_batched: f("attention_decode_paged_q8_0_batched")?,
             attention_sw: f("attention_decode_sw")?,
             silu_mul: f("silu_mul")?,
             silu_mul_quantize: f("silu_mul_quantize")?,
@@ -8575,6 +9183,7 @@ impl CudaResidentKernels {
             sample_gumbel: f("sample_gumbel")?,
             gemm_batched: f("q8_gemm_batched")?,
             rms_norm_batched: f("rms_norm_batched")?,
+            rms_norm_quantize_batched: f("rms_norm_quantize_batched")?,
             prism_rms_norm_q8_batched: f("prism_rms_norm_q8_batched")?,
             prism_silu_mul_q8_batched: f("prism_silu_mul_q8_batched")?,
             rope_batched: f("rope_batched")?,
@@ -8680,7 +9289,248 @@ impl CudaResidentKernels {
     }
 }
 
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaViewMut, DevicePtr, LaunchConfig, PushKernelArg};
+
+#[allow(dead_code)] // Phase 6 staged device-page ownership; production wiring follows.
+#[derive(Debug)]
+struct CudaDeviceKvPage {
+    generation: u64,
+    keys: Vec<CudaSlice<u8>>,
+    values: Vec<CudaSlice<u8>>,
+}
+
+#[allow(dead_code)] // Constructed by Phase 6 lifecycle receipts before serving wiring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaDeviceKvPageSnapshot {
+    pub(crate) resident_pages: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) high_watermark_bytes: usize,
+}
+
+#[allow(dead_code)] // Phase 6 staged device-page ownership; production wiring follows.
+#[derive(Debug)]
+struct CudaDeviceKvPageStore {
+    layout: crate::inference::cuda_paged_kv::CudaKvPageLayout,
+    bytes_per_layer_side: usize,
+    pages: Vec<Option<CudaDeviceKvPage>>,
+    allocated_bytes: usize,
+    high_watermark_bytes: usize,
+}
+
+#[allow(dead_code)] // Exercised by physical parity tests until serving owns page tables.
+impl CudaDeviceKvPageStore {
+    fn new(layout: crate::inference::cuda_paged_kv::CudaKvPageLayout) -> Result<Self, String> {
+        let page_bytes = layout.page_bytes().map_err(|error| error.to_string())?;
+        let bytes_per_layer_side = page_bytes
+            .checked_div(layout.layer_count)
+            .and_then(|bytes| bytes.checked_div(2))
+            .ok_or_else(|| "CUDA KV page side byte calculation failed".to_string())?;
+        Ok(Self {
+            layout,
+            bytes_per_layer_side,
+            pages: Vec::new(),
+            allocated_bytes: 0,
+            high_watermark_bytes: 0,
+        })
+    }
+
+    fn allocate(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        handle: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        if self
+            .pages
+            .get(handle.index())
+            .and_then(Option::as_ref)
+            .is_some()
+        {
+            return Err("CUDA KV device page slot is already occupied".to_string());
+        }
+        let allocate_side = || {
+            (0..self.layout.layer_count)
+                .map(|_| {
+                    stream
+                        .alloc_zeros::<u8>(self.bytes_per_layer_side)
+                        .map_err(|error| format!("CUDA KV device page allocation failed: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let page = CudaDeviceKvPage {
+            generation: handle.generation(),
+            keys: allocate_side()?,
+            values: allocate_side()?,
+        };
+        if self.pages.len() <= handle.index() {
+            self.pages.resize_with(handle.index() + 1, || None);
+        }
+        self.pages[handle.index()] = Some(page);
+        self.allocated_bytes = self
+            .allocated_bytes
+            .checked_add(
+                self.bytes_per_layer_side
+                    .checked_mul(self.layout.layer_count)
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or_else(|| "CUDA KV allocated byte count overflowed".to_string())?,
+            )
+            .ok_or_else(|| "CUDA KV allocated byte count overflowed".to_string())?;
+        self.high_watermark_bytes = self.high_watermark_bytes.max(self.allocated_bytes);
+        Ok(())
+    }
+
+    fn validate(&self, handle: crate::inference::cuda_paged_kv::CudaKvPageHandle) -> bool {
+        self.pages
+            .get(handle.index())
+            .and_then(Option::as_ref)
+            .is_some_and(|page| page.generation == handle.generation())
+    }
+    fn copy(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        source: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+        target: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        if source == target || !self.validate(source) || !self.validate(target) {
+            return Err("CUDA KV device page copy contains a stale handle".to_string());
+        }
+        let source_page = self.pages[source.index()]
+            .as_ref()
+            .expect("validated source page exists");
+        let mut host_keys = Vec::with_capacity(self.layout.layer_count);
+        let mut host_values = Vec::with_capacity(self.layout.layer_count);
+        for layer in 0..self.layout.layer_count {
+            let mut keys = vec![0u8; self.bytes_per_layer_side];
+            let mut values = vec![0u8; self.bytes_per_layer_side];
+            stream
+                .memcpy_dtoh(&source_page.keys[layer], &mut keys)
+                .map_err(|error| format!("CUDA KV CoW K readback failed: {error}"))?;
+            stream
+                .memcpy_dtoh(&source_page.values[layer], &mut values)
+                .map_err(|error| format!("CUDA KV CoW V readback failed: {error}"))?;
+            host_keys.push(keys);
+            host_values.push(values);
+        }
+        stream
+            .context()
+            .synchronize()
+            .map_err(|error| format!("CUDA KV CoW readback sync failed: {error}"))?;
+        let target_page = self.pages[target.index()]
+            .as_mut()
+            .expect("validated target page exists");
+        for layer in 0..self.layout.layer_count {
+            stream
+                .memcpy_htod(&host_keys[layer], &mut target_page.keys[layer])
+                .map_err(|error| format!("CUDA KV CoW K upload failed: {error}"))?;
+            stream
+                .memcpy_htod(&host_values[layer], &mut target_page.values[layer])
+                .map_err(|error| format!("CUDA KV CoW V upload failed: {error}"))?;
+        }
+        stream
+            .context()
+            .synchronize()
+            .map_err(|error| format!("CUDA KV CoW upload sync failed: {error}"))
+    }
+
+    fn release(
+        &mut self,
+        context: &Arc<CudaContext>,
+        handle: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        if !self.validate(handle) {
+            return Err("CUDA KV device page handle is stale".to_string());
+        }
+        context
+            .synchronize()
+            .map_err(|error| format!("CUDA KV device page release sync failed: {error}"))?;
+        let page = self.pages[handle.index()]
+            .take()
+            .expect("validated page exists");
+        debug_assert_eq!(page.keys.len(), self.layout.layer_count);
+        debug_assert_eq!(page.values.len(), self.layout.layer_count);
+        self.allocated_bytes = self
+            .allocated_bytes
+            .saturating_sub(self.bytes_per_layer_side * self.layout.layer_count * 2);
+        drop(page);
+        Ok(())
+    }
+
+    fn layer_pointers(
+        &self,
+        stream: &Arc<CudaStream>,
+        handles: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+        layer: usize,
+    ) -> Result<(Vec<u64>, Vec<u64>), String> {
+        if layer >= self.layout.layer_count {
+            return Err("CUDA KV page layer is out of range".to_string());
+        }
+        let mut keys = Vec::with_capacity(handles.len());
+        let mut values = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let page = self
+                .pages
+                .get(handle.index())
+                .and_then(Option::as_ref)
+                .filter(|page| page.generation == handle.generation())
+                .ok_or_else(|| "CUDA KV page table contains a stale handle".to_string())?;
+            let (key, key_guard) = page.keys[layer].device_ptr(stream);
+            let (value, value_guard) = page.values[layer].device_ptr(stream);
+            keys.push(key);
+            values.push(value);
+            drop(key_guard);
+            drop(value_guard);
+        }
+        Ok((keys, values))
+    }
+
+    fn upload_layer_pointer_tables(
+        &self,
+        stream: &Arc<CudaStream>,
+        handles: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+        layer: usize,
+    ) -> Result<(CudaSlice<u64>, CudaSlice<u64>), String> {
+        let (keys, values) = self.layer_pointers(stream, handles, layer)?;
+        let keys = stream
+            .clone_htod(&keys)
+            .map_err(|error| format!("CUDA KV key page-table upload failed: {error}"))?;
+        let values = stream
+            .clone_htod(&values)
+            .map_err(|error| format!("CUDA KV value page-table upload failed: {error}"))?;
+        Ok((keys, values))
+    }
+
+    fn batched_pointer_tables(
+        &self,
+        stream: &Arc<CudaStream>,
+        handles: &[Vec<crate::inference::cuda_paged_kv::CudaKvPageHandle>],
+        layer_count: usize,
+    ) -> Result<(Vec<u64>, Vec<u64>, usize), String> {
+        let page_stride = handles.iter().map(Vec::len).max().unwrap_or(0);
+        if handles.is_empty() || page_stride == 0 {
+            return Err("CUDA KV batched page table cannot be empty".to_string());
+        }
+        let table_len = handles.len() * page_stride;
+        let mut keys = Vec::with_capacity(layer_count * table_len);
+        let mut values = Vec::with_capacity(layer_count * table_len);
+        for layer in 0..layer_count {
+            for row in handles {
+                let (row_keys, row_values) = self.layer_pointers(stream, row, layer)?;
+                keys.extend_from_slice(&row_keys);
+                values.extend_from_slice(&row_values);
+                keys.resize(keys.len() + page_stride - row_keys.len(), 0);
+                values.resize(values.len() + page_stride - row_values.len(), 0);
+            }
+        }
+        Ok((keys, values, page_stride))
+    }
+
+    fn snapshot(&self) -> CudaDeviceKvPageSnapshot {
+        CudaDeviceKvPageSnapshot {
+            resident_pages: self.pages.iter().filter(|page| page.is_some()).count(),
+            allocated_bytes: self.allocated_bytes,
+            high_watermark_bytes: self.high_watermark_bytes,
+        }
+    }
+}
 
 // ---- Free launch helpers (take explicit refs so callers can pass disjoint
 // fields of the resident state without the `&self` whole-struct borrow). ----
@@ -11493,6 +12343,36 @@ pub(crate) fn launch_rms_norm_batched(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn launch_rms_norm_quantize_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (k as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (n as u32) * 4,
+    };
+    let (n, k) = (n as i32, k as i32);
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(x)
+        .arg(w)
+        .arg(quants)
+        .arg(scales)
+        .arg(&n)
+        .arg(&eps)
+        .arg(&k);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
 /// Bonsai fast RMSNorm -> Q8 activation for `k` token rows. This intentionally
 /// uses a parallel reduction and is therefore part of the approximate fast Q1
 /// contract, never the strict parity lane.
@@ -11721,6 +12601,100 @@ pub(crate) fn launch_attention_batched(
         .arg(&splitk_active)
         .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_kv_scatter_batched_row(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaView<f32>,
+    cache: &mut CudaSlice<u8>,
+    position: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+    per_token_dim: usize,
+    q8_0: bool,
+) -> Result<(), cudarc::driver::DriverError> {
+    let elements_per_head = if q8_0 { head_dim / 32 } else { head_dim };
+    let total = (n_kv_heads * elements_per_head) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (position, n_kv_heads, head_dim, max_pos, per_token_dim, rows) = (
+        position as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        per_token_dim as i32,
+        1i32,
+    );
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(src)
+        .arg(cache)
+        .arg(&position)
+        .arg(&n_kv_heads)
+        .arg(&head_dim)
+        .arg(&max_pos)
+        .arg(&per_token_dim)
+        .arg(&rows);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_attention_batched_row(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaView<f32>,
+    cache_k: &CudaSlice<u8>,
+    cache_v: &CudaSlice<u8>,
+    out: &mut CudaViewMut<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position: usize,
+    max_pos: usize,
+    scale: f32,
+    q_per_token: usize,
+    splitk_active: i32,
+    global_scores: &mut CudaViewMut<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let max_groups = (1024 / head_dim).max(1);
+    let shared_mem_bytes = ((head_dim + max_groups * head_dim) as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes,
+    };
+    let (n_heads, n_kv_heads, head_dim, position, max_pos, q_per_token, rows) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        position as i32,
+        max_pos as i32,
+        q_per_token as i32,
+        1i32,
+    );
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(&n_heads)
+        .arg(&n_kv_heads)
+        .arg(&head_dim)
+        .arg(&position)
+        .arg(&max_pos)
+        .arg(&scale)
+        .arg(&q_per_token)
+        .arg(&rows)
+        .arg(&splitk_active)
+        .arg(global_scores);
+    unsafe { launch.launch(cfg) }.map(|_| ())
 }
 
 /// Batched sliding-window attention (`attention_sw_batched`), the windowed counterpart of
@@ -12554,6 +13528,36 @@ pub(crate) fn launch_kv_scatter(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Phase 6 parity-proven kernel; production dispatch follows.
+pub(crate) fn launch_kv_scatter_paged(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    page_table: &CudaSlice<u64>,
+    position: &CudaSlice<i32>,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (pages, n_kv_heads, head_dim) =
+        (page_table.len() as i32, n_kv_heads as i32, head_dim as i32);
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(src)
+        .arg(page_table)
+        .arg(position)
+        .arg(&pages)
+        .arg(&n_kv_heads)
+        .arg(&head_dim);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_kv_scatter_q8_0(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -12582,6 +13586,112 @@ pub(crate) fn launch_kv_scatter_q8_0(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Phase 6 parity-proven kernel; production dispatch follows.
+pub(crate) fn launch_kv_scatter_paged_q8_0(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    page_table: &CudaSlice<u64>,
+    position: &CudaSlice<i32>,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (n_kv_heads * (head_dim / 32)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (pages, n_kv_heads, head_dim) =
+        (page_table.len() as i32, n_kv_heads as i32, head_dim as i32);
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(src)
+        .arg(page_table)
+        .arg(position)
+        .arg(&pages)
+        .arg(&n_kv_heads)
+        .arg(&head_dim);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_scatter_paged_q8_0_batched(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    source: &CudaSlice<f32>,
+    page_tables: &CudaView<u64>,
+    positions: &CudaSlice<i32>,
+    page_counts: &CudaSlice<i32>,
+    page_stride: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    rows: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (kv_head_count * (head_dim / 32)) as u32;
+    let config = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), rows as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (page_stride, kv_head_count, head_dim, rows) = (
+        page_stride as i32,
+        kv_head_count as i32,
+        head_dim as i32,
+        rows as i32,
+    );
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(source)
+        .arg(page_tables)
+        .arg(positions)
+        .arg(page_counts)
+        .arg(&page_stride)
+        .arg(&kv_head_count)
+        .arg(&head_dim)
+        .arg(&rows);
+    unsafe { launch.launch(config) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_scatter_paged_batched(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    source: &CudaSlice<f32>,
+    page_tables: &CudaView<u64>,
+    positions: &CudaSlice<i32>,
+    page_counts: &CudaSlice<i32>,
+    page_stride: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    rows: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (kv_head_count * head_dim) as u32;
+    let config = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), rows as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (page_stride, kv_head_count, head_dim, rows) = (
+        page_stride as i32,
+        kv_head_count as i32,
+        head_dim as i32,
+        rows as i32,
+    );
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(source)
+        .arg(page_tables)
+        .arg(positions)
+        .arg(page_counts)
+        .arg(&page_stride)
+        .arg(&kv_head_count)
+        .arg(&head_dim)
+        .arg(&rows);
+    unsafe { launch.launch(config) }.map(|_| ())
+}
+
 // Max splits the split-K decode attention may use (scratch in CudaResidentDecode is
 // sized to this), and the context length above which it is used. Below the threshold the
 // one-block-per-head `launch_attention` is cheaper (one launch, no scratch round-trip);
@@ -12591,7 +13701,7 @@ pub(crate) fn launch_kv_scatter_q8_0(
 // lifts the V-read bandwidth ~+19% (microbench) where the cap of 16 pinned it. MUST stay in lockstep
 // with the two CUDA verify emulations (attention_batched, attention_tree_batched) or decode != verify.
 const SPLITK_MAX: usize = 32;
-const SPLITK_THRESHOLD: usize = 512;
+pub(crate) const SPLITK_THRESHOLD: usize = 512;
 
 /// Whether spec-verify must EMULATE the split-K attention reduction to stay token-identical to
 /// plain greedy decode. Mirrors the plain-decode dispatch (`!graph_capture && attn_shared >
@@ -12876,6 +13986,113 @@ pub(crate) fn launch_attention(
         .arg(&scale)
         .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Phase 6 parity-proven kernel; production dispatch follows.
+pub(crate) fn launch_attention_paged(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    key_pages: &CudaSlice<u64>,
+    value_pages: &CudaSlice<u64>,
+    out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position: &CudaSlice<i32>,
+    shared_positions: usize,
+    scale: f32,
+    global_scores: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    assert_eq!(key_pages.len(), value_pages.len());
+    let score_capacity = key_pages.len() * crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS;
+    let max_groups = (1024 / head_dim as u32).max(1);
+    let groups = (shared_positions.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (groups * head_dim as u32, 1, 1),
+        shared_mem_bytes: (head_dim as u32 * (1 + groups)) * 4,
+    };
+    let (n_heads, n_kv_heads, head_dim, page_count) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        key_pages.len() as i32,
+    );
+    assert!(global_scores.len() >= n_heads as usize * score_capacity);
+    let mut launch = s.launch_builder(f);
+    launch
+        .arg(q)
+        .arg(key_pages)
+        .arg(value_pages)
+        .arg(out)
+        .arg(&n_heads)
+        .arg(&n_kv_heads)
+        .arg(&head_dim)
+        .arg(position)
+        .arg(&page_count)
+        .arg(&scale)
+        .arg(global_scores);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_paged_batched(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    query: &CudaSlice<f32>,
+    key_page_tables: &CudaView<u64>,
+    value_page_tables: &CudaView<u64>,
+    output: &mut CudaSlice<f32>,
+    head_count: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    positions: &CudaSlice<i32>,
+    page_counts: &CudaSlice<i32>,
+    page_stride: usize,
+    score_stride: usize,
+    max_position_count: usize,
+    scale: f32,
+    scores: &mut CudaSlice<f32>,
+    rows: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let max_groups = (1024 / head_dim as u32).max(1);
+    let groups = (max_position_count.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups);
+    let config = LaunchConfig {
+        grid_dim: (head_count as u32, rows as u32, 1),
+        block_dim: (groups * head_dim as u32, 1, 1),
+        shared_mem_bytes: (head_dim as u32 * (1 + groups)) * 4,
+    };
+    let (head_count, kv_head_count, head_dim, page_stride, score_stride, rows) = (
+        head_count as i32,
+        kv_head_count as i32,
+        head_dim as i32,
+        page_stride as i32,
+        score_stride as i32,
+        rows as i32,
+    );
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(query)
+        .arg(key_page_tables)
+        .arg(value_page_tables)
+        .arg(output)
+        .arg(&head_count)
+        .arg(&kv_head_count)
+        .arg(&head_dim)
+        .arg(positions)
+        .arg(page_counts)
+        .arg(&page_stride)
+        .arg(&score_stride)
+        .arg(&scale)
+        .arg(scores)
+        .arg(&rows);
+    unsafe { launch.launch(config) }.map(|_| ())
 }
 
 /// Sliding-window decode attention (`attention_decode_sw`). Identical launch
@@ -13465,6 +14682,13 @@ struct SendCudaGraph(CudaGraph);
 // SAFETY: see the type doc — all access is serialized behind the resident-cache Mutex.
 unsafe impl Send for SendCudaGraph {}
 
+struct InactiveKvBank {
+    slot: usize,
+    cache_k: Vec<CudaSlice<u8>>,
+    cache_v: Vec<CudaSlice<u8>>,
+    filled: usize,
+}
+
 /// GPU-resident Llama decode engine. Weights and KV cache live on the GPU; one
 /// `forward_token` call runs the whole per-token forward with a single sync.
 pub struct CudaResidentDecode {
@@ -13505,6 +14729,9 @@ pub struct CudaResidentDecode {
     /// a prefill records one; truncated by `set_filled` so it can never outlive
     /// the rows it describes.
     resident_tokens: Vec<u32>,
+    active_kv_slot: usize,
+    inactive_kv_bank: Option<InactiveKvBank>,
+    paged_kv_pages: Option<CudaDeviceKvPageStore>,
     // per-token scratch (reused)
     d_hidden: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
@@ -13608,6 +14835,73 @@ pub struct CudaResidentDecode {
     /// `None` for every other architecture. Set by [`Self::set_gemma3`].
     gemma3: Option<Gemma3Gpu>,
 }
+
+#[allow(dead_code)] // Phase 3 backend result; Phase 4 wires scheduler consumption.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CudaIndependentBatch2Output {
+    pub(crate) logits: Option<[Vec<f32>; 2]>,
+    pub(crate) sampled_token_ids: Option<[u32; 2]>,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: CudaBatchExecutionMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CudaIndependentPagedBatchOutput {
+    pub(crate) logits: Option<Vec<Vec<f32>>>,
+    pub(crate) sampled_token_ids: Option<Vec<u32>>,
+    pub(crate) batch_size: usize,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: CudaBatchExecutionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CudaIndependentPagedPrefillOutput {
+    pub(crate) batch_size: usize,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: CudaBatchExecutionMode,
+}
+
+#[allow(dead_code)] // Phase 3 proves this mode before Phase 4 exposes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaBatchExecutionMode {
+    TrueBatch,
+}
+
+#[allow(dead_code)] // Typed fallback contract for Phase 4 scheduler integration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CudaIndependentBatch2Error {
+    #[error("independent batch-2 is unsupported by this resident engine")]
+    Unsupported,
+    #[error("independent batch-2 input shapes do not match two rows")]
+    InputShape,
+    #[error("independent batch-2 position {position} exceeds resident capacity {capacity}")]
+    PositionOutOfRange { position: usize, capacity: usize },
+    #[error(
+        "independent batch-2 position mismatch: requested {requested:?}, resident {resident:?}"
+    )]
+    PositionMismatch {
+        requested: [usize; 2],
+        resident: [usize; 2],
+    },
+    #[error("independent batch-2 runtime failed: {0}")]
+    Runtime(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CudaIndependentPagedBatchError {
+    #[error("independent paged batch is unsupported by this resident engine")]
+    Unsupported,
+    #[error("independent paged batch size must be between two and eight, got {0}")]
+    InvalidBatchSize(usize),
+    #[error("independent paged batch input shapes do not match its rows")]
+    InputShape,
+    #[error("independent paged batch position {position} exceeds capacity {capacity}")]
+    PositionOutOfRange { position: usize, capacity: usize },
+    #[error("independent paged batch runtime failed: {0}")]
+    Runtime(String),
+}
+
+const MAX_INDEPENDENT_BATCH_ROWS: usize = 8;
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
 /// per-(token,block) sum in shared memory (`k * blocks_per_row * warps_per_block *
@@ -13873,6 +15167,13 @@ struct VerifyScratch {
     vsamp: CudaSlice<u32>,
     vcos: CudaSlice<f32>,
     vsin: CudaSlice<f32>,
+    vpage_positions: CudaSlice<i32>,
+    vpage_counts: CudaSlice<i32>,
+    vkey_page_tables: CudaSlice<u64>,
+    vvalue_page_tables: CudaSlice<u64>,
+    page_table_handles: Vec<Vec<crate::inference::cuda_paged_kv::CudaKvPageHandle>>,
+    page_table_stride: usize,
+    page_pointer_count: usize,
 }
 
 /// Tree-verify scratch: a `VerifyScratch` widened to `TREE_MAX_NODES` plus the
@@ -14020,6 +15321,40 @@ impl CudaResidentDecode {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Phase 6 constructor receipt; production builder wiring follows.
+    pub(crate) fn new_paged_with_kv_quant(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+        split_half_pairing: bool,
+        kv_quant: crate::model::KvCacheQuantization,
+    ) -> Result<Self, String> {
+        Self::new_for_artifact_with_kv_storage(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            split_half_pairing,
+            ResidentCudaArtifact::Generic,
+            kv_quant,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_artifact(
         n_layers: usize,
         n_heads: usize,
@@ -14067,6 +15402,41 @@ impl CudaResidentDecode {
         artifact: ResidentCudaArtifact,
         kv_quant: crate::model::KvCacheQuantization,
     ) -> Result<Self, String> {
+        Self::new_for_artifact_with_kv_storage(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            split_half_pairing,
+            artifact,
+            kv_quant,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_for_artifact_with_kv_storage(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+        split_half_pairing: bool,
+        artifact: ResidentCudaArtifact,
+        kv_quant: crate::model::KvCacheQuantization,
+        paged_kv: bool,
+    ) -> Result<Self, String> {
         if kv_quant == crate::model::KvCacheQuantization::Q8_0 && !head_dim.is_multiple_of(32) {
             return Err(format!(
                 "Q8_0 resident KV cache requires head_dim to be a multiple of 32, got {head_dim}"
@@ -14095,14 +15465,35 @@ impl CudaResidentDecode {
             crate::model::KvCacheQuantization::Q8_0 => (kv_width / 32) * 34,
             _ => kv_width * 2,
         };
-        let cache_k = (0..n_layers)
-            .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("kv alloc: {e}"))?;
-        let cache_v = (0..n_layers)
-            .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("kv alloc: {e}"))?;
+        let (cache_k, cache_v, paged_kv_pages) = if paged_kv {
+            let storage = match kv_quant {
+                crate::model::KvCacheQuantization::Q8_0 => {
+                    crate::inference::cuda_paged_kv::CudaKvPageStorage::Q8_0
+                }
+                _ => crate::inference::cuda_paged_kv::CudaKvPageStorage::F16,
+            };
+            let layout = crate::inference::cuda_paged_kv::CudaKvPageLayout {
+                layer_count: n_layers,
+                kv_head_count: n_kv_heads,
+                head_dim,
+                storage,
+            };
+            (
+                Vec::new(),
+                Vec::new(),
+                Some(CudaDeviceKvPageStore::new(layout)?),
+            )
+        } else {
+            let cache_k = (0..n_layers)
+                .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("kv alloc: {e}"))?;
+            let cache_v = (0..n_layers)
+                .map(|_| s.alloc_zeros::<u8>(kv_bytes_per_elem * max_pos))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("kv alloc: {e}"))?;
+            (cache_k, cache_v, None)
+        };
         // Phase 6 side streams + join events, ONLY when opted in — keeps the default
         // path provably inert: nothing constructed, byte-identical launch sequence
         // (see `StreamOverlap` for why this is NOT a multi-stream-mode switch).
@@ -14178,6 +15569,9 @@ impl CudaResidentDecode {
             kv_quant,
             filled: 0,
             resident_tokens: Vec::new(),
+            active_kv_slot: 0,
+            inactive_kv_bank: None,
+            paged_kv_pages,
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
             d_q: alloc_f(q_width)?,
@@ -15151,6 +16545,281 @@ impl CudaResidentDecode {
         resident_prefix_len(&self.resident_tokens, self.filled, tokens)
     }
 
+    pub(crate) fn kv_slot_count(&self) -> usize {
+        1 + usize::from(self.inactive_kv_bank.is_some())
+    }
+
+    #[allow(dead_code)] // Phase 3 executor validation; Phase 4 adds the production caller.
+    pub(crate) fn kv_slot_filled(&self, slot: usize) -> Option<usize> {
+        if slot == self.active_kv_slot {
+            Some(self.filled)
+        } else {
+            self.inactive_kv_bank
+                .as_ref()
+                .filter(|bank| bank.slot == slot)
+                .map(|bank| bank.filled)
+        }
+    }
+
+    pub(crate) fn enable_second_kv_slot(&mut self) -> Result<(), String> {
+        if self.inactive_kv_bank.is_some() {
+            return Ok(());
+        }
+        if self.paged_kv_pages.is_some() {
+            return Err("paged CUDA KV does not use contiguous KV slots".into());
+        }
+        if self.decode_graph.is_some() || self.device_forward_graph.is_some() {
+            return Err("cannot add a CUDA KV slot after graph capture".into());
+        }
+        let stream = self.k.stream.clone();
+        let cache_k = self
+            .cache_k
+            .iter()
+            .map(|cache| stream.alloc_zeros::<u8>(cache.len()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("second KV K-bank allocation failed: {error}"))?;
+        let cache_v = self
+            .cache_v
+            .iter()
+            .map(|cache| stream.alloc_zeros::<u8>(cache.len()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("second KV V-bank allocation failed: {error}"))?;
+        self.inactive_kv_bank = Some(InactiveKvBank {
+            slot: 1,
+            cache_k,
+            cache_v,
+            filled: 0,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn select_kv_slot(&mut self, slot: usize) -> Result<(), String> {
+        if slot == self.active_kv_slot {
+            return Ok(());
+        }
+        let inactive = self
+            .inactive_kv_bank
+            .as_mut()
+            .ok_or_else(|| format!("CUDA KV slot {slot} is unavailable"))?;
+        if inactive.slot != slot {
+            return Err(format!("CUDA KV slot {slot} is unavailable"));
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|error| format!("CUDA KV slot switch sync failed: {error}"))?;
+        std::mem::swap(&mut self.cache_k, &mut inactive.cache_k);
+        std::mem::swap(&mut self.cache_v, &mut inactive.cache_v);
+        std::mem::swap(&mut self.filled, &mut inactive.filled);
+        std::mem::swap(&mut self.active_kv_slot, &mut inactive.slot);
+        Ok(())
+    }
+
+    pub(crate) fn clear_kv_slot(&mut self, slot: usize) -> Result<(), String> {
+        self.select_kv_slot(slot)?;
+        let stream = self.k.stream.clone();
+        for cache in self.cache_k.iter_mut().chain(self.cache_v.iter_mut()) {
+            stream
+                .memset_zeros(cache)
+                .map_err(|error| format!("CUDA KV slot clear failed: {error}"))?;
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|error| format!("CUDA KV slot clear sync failed: {error}"))?;
+        self.filled = 0;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Phase 6 device lifecycle tests; production owner follows.
+    pub(crate) fn enable_paged_kv_pages(
+        &mut self,
+        layout: crate::inference::cuda_paged_kv::CudaKvPageLayout,
+    ) -> Result<(), String> {
+        if layout.layer_count != self.n_layers
+            || layout.kv_head_count != self.n_kv_heads
+            || layout.head_dim != self.head_dim
+        {
+            return Err("CUDA KV page layout does not match the resident engine".to_string());
+        }
+        let expected_storage = match self.kv_quant {
+            crate::model::KvCacheQuantization::Q8_0 => {
+                crate::inference::cuda_paged_kv::CudaKvPageStorage::Q8_0
+            }
+            _ => crate::inference::cuda_paged_kv::CudaKvPageStorage::F16,
+        };
+        if layout.storage != expected_storage {
+            return Err("CUDA KV page storage does not match the resident KV dtype".to_string());
+        }
+        if self.paged_kv_pages.is_none() {
+            self.paged_kv_pages = Some(CudaDeviceKvPageStore::new(layout)?);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Phase 6 device lifecycle tests; production owner follows.
+    pub(crate) fn allocate_paged_kv_page(
+        &mut self,
+        handle: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        self.paged_kv_pages
+            .as_mut()
+            .ok_or_else(|| "CUDA KV device page store is not enabled".to_string())?
+            .allocate(&self.k.stream, handle)
+    }
+
+    #[allow(dead_code)] // Phase 6 device lifecycle tests; production owner follows.
+    pub(crate) fn release_paged_kv_page(
+        &mut self,
+        handle: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        self.paged_kv_pages
+            .as_mut()
+            .ok_or_else(|| "CUDA KV device page store is not enabled".to_string())?
+            .release(&self.k.ctx, handle)
+    }
+    pub(crate) fn copy_paged_kv_page(
+        &mut self,
+        source: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+        target: crate::inference::cuda_paged_kv::CudaKvPageHandle,
+    ) -> Result<(), String> {
+        let store = self
+            .paged_kv_pages
+            .as_mut()
+            .ok_or_else(|| "CUDA KV device page store is not enabled".to_string())?;
+        store.copy(&self.k.stream, source, target)
+    }
+
+    #[allow(dead_code)] // Phase 6 pointer-table tests; production dispatch follows.
+    pub(crate) fn paged_kv_layer_pointers(
+        &self,
+        handles: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+        layer: usize,
+    ) -> Result<(Vec<u64>, Vec<u64>), String> {
+        self.paged_kv_pages
+            .as_ref()
+            .ok_or_else(|| "CUDA KV device page store is not enabled".to_string())?
+            .layer_pointers(&self.k.stream, handles, layer)
+    }
+
+    pub(crate) fn read_paged_kv_layer(
+        &self,
+        handles: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+        layer: usize,
+        n_positions: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if layer >= self.n_layers || n_positions > handles.len() * 16 {
+            return Err("paged CUDA KV readback range is invalid".to_string());
+        }
+        let store = self
+            .paged_kv_pages
+            .as_ref()
+            .ok_or_else(|| "CUDA KV device page store is not enabled".to_string())?;
+        let mut keys = vec![0.0f32; self.n_kv_heads * n_positions * self.head_dim];
+        let mut values = vec![0.0f32; self.n_kv_heads * n_positions * self.head_dim];
+        for (logical_page, handle) in handles.iter().copied().enumerate() {
+            let page = store
+                .pages
+                .get(handle.index())
+                .and_then(Option::as_ref)
+                .filter(|page| page.generation == handle.generation())
+                .ok_or_else(|| "paged CUDA KV readback contains a stale handle".to_string())?;
+            let mut key_bytes = vec![0u8; store.bytes_per_layer_side];
+            let mut value_bytes = vec![0u8; store.bytes_per_layer_side];
+            self.k
+                .stream
+                .memcpy_dtoh(&page.keys[layer], &mut key_bytes)
+                .map_err(|error| format!("paged CUDA K readback failed: {error}"))?;
+            self.k
+                .stream
+                .memcpy_dtoh(&page.values[layer], &mut value_bytes)
+                .map_err(|error| format!("paged CUDA V readback failed: {error}"))?;
+            self.k
+                .ctx
+                .synchronize()
+                .map_err(|error| format!("paged CUDA KV readback sync failed: {error}"))?;
+            let page_start = logical_page * 16;
+            let live = n_positions.saturating_sub(page_start).min(16);
+            match store.layout.storage {
+                crate::inference::cuda_paged_kv::CudaKvPageStorage::F16 => {
+                    for head in 0..self.n_kv_heads {
+                        for offset in 0..live {
+                            let page_row = (head * 16 + offset) * self.head_dim;
+                            let output_row =
+                                (head * n_positions + page_start + offset) * self.head_dim;
+                            for dimension in 0..self.head_dim {
+                                let byte = (page_row + dimension) * 2;
+                                keys[output_row + dimension] =
+                                    crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                                        key_bytes[byte],
+                                        key_bytes[byte + 1],
+                                    ]));
+                                values[output_row + dimension] =
+                                    crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                                        value_bytes[byte],
+                                        value_bytes[byte + 1],
+                                    ]));
+                            }
+                        }
+                    }
+                }
+                crate::inference::cuda_paged_kv::CudaKvPageStorage::Q8_0 => {
+                    let blocks_per_head = self.head_dim / 32;
+                    let row_bytes = blocks_per_head * 34;
+                    for head in 0..self.n_kv_heads {
+                        for offset in 0..live {
+                            let page_byte = (head * 16 + offset) * row_bytes;
+                            let output_row =
+                                (head * n_positions + page_start + offset) * self.head_dim;
+                            for block in 0..blocks_per_head {
+                                let byte = page_byte + block * 34;
+                                let key_scale =
+                                    crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                                        key_bytes[byte],
+                                        key_bytes[byte + 1],
+                                    ]));
+                                let value_scale =
+                                    crate::inference::f16_bits_to_f32(u16::from_le_bytes([
+                                        value_bytes[byte],
+                                        value_bytes[byte + 1],
+                                    ]));
+                                for element in 0..32 {
+                                    let output = output_row + block * 32 + element;
+                                    keys[output] =
+                                        key_scale * (key_bytes[byte + 2 + element] as i8) as f32;
+                                    values[output] = value_scale
+                                        * (value_bytes[byte + 2 + element] as i8) as f32;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok((keys, values))
+    }
+
+    #[allow(dead_code)] // Phase 6 lifecycle telemetry before production publication.
+    pub(crate) fn paged_kv_page_snapshot(&self) -> Option<CudaDeviceKvPageSnapshot> {
+        self.paged_kv_pages
+            .as_ref()
+            .map(CudaDeviceKvPageStore::snapshot)
+    }
+
+    #[allow(dead_code)] // Phase 6 constructor receipt; production dispatch follows.
+    pub(crate) fn paged_kv_enabled(&self) -> bool {
+        self.paged_kv_pages.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contiguous_kv_allocated_bytes(&self) -> usize {
+        self.cache_k
+            .iter()
+            .chain(&self.cache_v)
+            .map(CudaSlice::len)
+            .sum()
+    }
+
     /// True when any layer's weights live in host RAM and stream to a GPU scratch buffer
     /// each forward (the capacity split for models too big to fit fully resident, e.g.
     /// 8B on a 6 GiB card). Only `forward_pass` implements that streaming; the batched
@@ -15432,6 +17101,35 @@ impl CudaResidentDecode {
             compute_logits,
             graph_capture,
             device_inputs,
+            None,
+        );
+        if r.is_err() && self.overlap.is_some() {
+            let _ = self.k.ctx.synchronize();
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_pass_paged(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        compute_logits: bool,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<(), String> {
+        let r = self.forward_pass_inner(
+            embedding,
+            cos,
+            sin,
+            position,
+            scale,
+            compute_logits,
+            false,
+            false,
+            Some(pages),
         );
         if r.is_err() && self.overlap.is_some() {
             let _ = self.k.ctx.synchronize();
@@ -15459,8 +17157,43 @@ impl CudaResidentDecode {
         // uploads are skipped. Unlike graph_capture, attention shared stays sized
         // to position+1 (each token still launches with live scalars).
         device_inputs: bool,
+        paged_pages: Option<&[crate::inference::cuda_paged_kv::CudaKvPageHandle]>,
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
+        if let Some(pages) = paged_pages {
+            if self.paged_kv_pages.is_none() {
+                return Err("paged CUDA forward requires a device page store".to_string());
+            }
+            if graph_capture
+                || device_inputs
+                || self.overlap.is_some()
+                || self.is_offloaded()
+                || self.is_windowed()
+                || self.qwen35.is_some()
+                || position + 1 > SPLITK_THRESHOLD
+            {
+                return Err(
+                    "paged CUDA forward is unsupported for this execution shape".to_string()
+                );
+            }
+            let required_pages =
+                (position + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
+            if pages.len() != required_pages {
+                return Err(format!(
+                    "paged CUDA forward expected {required_pages} logical pages at position {position}, got {}",
+                    pages.len()
+                ));
+            }
+            if !self
+                .layers
+                .iter()
+                .all(|layer| matches!(&layer.kind, LayerKind::Full))
+            {
+                return Err(
+                    "paged CUDA forward requires a dense full-attention layer stack".to_string(),
+                );
+            }
+        }
         let s = self.k.stream.clone();
         let fused = resident_fusion_enabled();
         // STAMPEDE Phase 6: resolve the overlap side streams once per forward. `None`
@@ -15915,9 +17648,67 @@ impl CudaResidentDecode {
                         pairing,
                     )
                     .map_err(map)?;
+                    let paged_tables = match paged_pages {
+                        Some(pages) => Some(
+                            self.paged_kv_pages
+                                .as_ref()
+                                .expect("paged store was preflighted")
+                                .upload_layer_pointer_tables(&s, pages, li)?,
+                        ),
+                        None => None,
+                    };
                     // KV write
                     let is_q8_kv = self.kv_quant == crate::model::KvCacheQuantization::Q8_0;
-                    if is_q8_kv {
+                    if let Some((key_pages, value_pages)) = paged_tables.as_ref() {
+                        let scatter = if is_q8_kv {
+                            &self.k.kv_scatter_paged_q8_0
+                        } else {
+                            &self.k.kv_scatter_paged
+                        };
+                        if is_q8_kv {
+                            launch_kv_scatter_paged_q8_0(
+                                &s,
+                                scatter,
+                                &self.d_k,
+                                key_pages,
+                                &self.d_position,
+                                self.n_kv_heads,
+                                self.head_dim,
+                            )
+                            .map_err(map)?;
+                            launch_kv_scatter_paged_q8_0(
+                                &s,
+                                scatter,
+                                &self.d_v,
+                                value_pages,
+                                &self.d_position,
+                                self.n_kv_heads,
+                                self.head_dim,
+                            )
+                            .map_err(map)?;
+                        } else {
+                            launch_kv_scatter_paged(
+                                &s,
+                                scatter,
+                                &self.d_k,
+                                key_pages,
+                                &self.d_position,
+                                self.n_kv_heads,
+                                self.head_dim,
+                            )
+                            .map_err(map)?;
+                            launch_kv_scatter_paged(
+                                &s,
+                                scatter,
+                                &self.d_v,
+                                value_pages,
+                                &self.d_position,
+                                self.n_kv_heads,
+                                self.head_dim,
+                            )
+                            .map_err(map)?;
+                        }
+                    } else if is_q8_kv {
                         launch_kv_scatter_q8_0(
                             s_k,
                             &self.k.kv_scatter_q8_0,
@@ -15991,7 +17782,29 @@ impl CudaResidentDecode {
                     // key count is bounded at exactly the point split-K would
                     // start to pay. GLOBAL gemma3 layers fall through to the
                     // unchanged logic below.
-                    if let Some(window) = gemma3_window {
+                    if let Some((key_pages, value_pages)) = paged_tables.as_ref() {
+                        let attention = if is_q8_kv {
+                            &self.k.attention_paged_q8_0
+                        } else {
+                            &self.k.attention_paged
+                        };
+                        launch_attention_paged(
+                            &s,
+                            attention,
+                            &self.d_q,
+                            key_pages,
+                            value_pages,
+                            &mut self.d_attn,
+                            self.n_heads,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            &self.d_position,
+                            attn_shared,
+                            scale,
+                            &mut self.d_sk_scores,
+                        )
+                        .map_err(map)?;
+                    } else if let Some(window) = gemma3_window {
                         let attn_fn = if is_q8_kv {
                             &self.k.attention_sw_q8_0
                         } else {
@@ -17106,7 +18919,11 @@ impl CudaResidentDecode {
         // schedule alternates between `attention_decode_sw` and the full-causal
         // kernel per layer; nothing here has been proven under capture, and the
         // safe outcome of getting it wrong is not a crash but a wrong token.
-        if cuda_graphs_enabled() && self.qwen35.is_none() && self.gemma3.is_none() {
+        if self.kv_slot_count() == 1
+            && cuda_graphs_enabled()
+            && self.qwen35.is_none()
+            && self.gemma3.is_none()
+        {
             return self
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
@@ -17124,6 +18941,35 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(Some(out[0]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_paged(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<u32, String> {
+        let map = |error: cudarc::driver::DriverError| format!("cuda paged forward: {error}");
+        let stream = self.k.stream.clone();
+        self.forward_pass_paged(embedding, cos, sin, position, scale, true, pages)?;
+        launch_argmax(
+            &stream,
+            &self.k.argmax,
+            &self.d_logits,
+            self.vocab,
+            &mut self.d_sampled,
+        )
+        .map_err(map)?;
+        let mut output = [0u32; 1];
+        stream
+            .memcpy_dtoh(&self.d_sampled, &mut output)
+            .map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(output[0])
     }
 
     /// Run the layer stack for one token and return the resulting hidden state
@@ -17316,7 +19162,8 @@ impl CudaResidentDecode {
     }
 
     fn device_forward_graph_eligible(&self) -> bool {
-        qwen35_device_graphs_enabled()
+        self.kv_slot_count() == 1
+            && qwen35_device_graphs_enabled()
             && cuda_manual_stream_order_enabled()
             && self.artifact == ResidentCudaArtifact::PrismBonsai27bQ1
             && self.qwen35.is_some()
@@ -17492,6 +19339,98 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(logits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_logits_paged(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<Vec<f32>, String> {
+        let map = |error: cudarc::driver::DriverError| format!("cuda paged forward: {error}");
+        let stream = self.k.stream.clone();
+        self.forward_pass_paged(embedding, cos, sin, position, scale, true, pages)?;
+        let mut logits = vec![0.0f32; self.vocab];
+        stream
+            .memcpy_dtoh(&self.d_logits, &mut logits)
+            .map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(logits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_sample_paged(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        inv_temp: f32,
+        seed: u64,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<u32, String> {
+        let map = |error: cudarc::driver::DriverError| format!("cuda paged sample: {error}");
+        let stream = self.k.stream.clone();
+        self.forward_pass_paged(embedding, cos, sin, position, scale, true, pages)?;
+        launch_sample_gumbel(
+            &stream,
+            &self.k.sample_gumbel,
+            &self.d_logits,
+            self.vocab,
+            inv_temp,
+            seed,
+            &mut self.d_sampled,
+        )
+        .map_err(map)?;
+        let mut output = [0u32; 1];
+        stream
+            .memcpy_dtoh(&self.d_sampled, &mut output)
+            .map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(output[0])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_paged_at(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        base_position: usize,
+        n: usize,
+        scale: f32,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<(), String> {
+        let half = self.rope_dim / 2;
+        if embeddings.len() < n * self.hidden
+            || cos_all.len() < n * half
+            || sin_all.len() < n * half
+        {
+            return Err("paged CUDA prefill input slices are too short".to_string());
+        }
+        for row in 0..n {
+            let position = base_position + row;
+            let required_pages =
+                (position + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
+            self.forward_pass_paged(
+                &embeddings[row * self.hidden..(row + 1) * self.hidden],
+                &cos_all[row * half..(row + 1) * half],
+                &sin_all[row * half..(row + 1) * half],
+                position,
+                scale,
+                false,
+                &pages[..required_pages],
+            )?;
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|error| format!("paged CUDA prefill sync failed: {error}"))
     }
 
     /// Temperature sampling decode entirely on the GPU: full forward, then a
@@ -17724,6 +19663,1011 @@ impl CudaResidentDecode {
         Ok(out)
     }
 
+    #[allow(dead_code)] // Phase 4 will call this admission predicate.
+    pub(crate) fn supports_independent_batch2_q8(&self) -> bool {
+        self.kv_slot_count() == 2
+            && !self.is_offloaded()
+            && self.qwen35.is_none()
+            && self.gemma3.is_none()
+            && self.output_quant == ProjQuant::Q8_0
+            && self.layers.iter().all(|layer| {
+                matches!(&layer.kind, LayerKind::Full)
+                    && layer.quants.iter().all(|quant| *quant == ProjQuant::Q8_0)
+                    && layer.post_attn_norm.is_none()
+                    && layer.post_ffn_norm.is_none()
+            })
+    }
+
+    pub(crate) fn supports_independent_paged_batch_q8(&self) -> bool {
+        self.paged_kv_pages.is_some()
+            && !self.is_offloaded()
+            && self.qwen35.is_none()
+            && self.gemma3.is_none()
+            && self.output_quant == ProjQuant::Q8_0
+            && self.layers.iter().all(|layer| {
+                matches!(&layer.kind, LayerKind::Full)
+                    && layer.quants.iter().all(|quant| *quant == ProjQuant::Q8_0)
+                    && layer.post_attn_norm.is_none()
+                    && layer.post_ffn_norm.is_none()
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_independent_paged_batch_q8(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        positions: &[usize],
+        pages: &[Vec<crate::inference::cuda_paged_kv::CudaKvPageHandle>],
+        scale: f32,
+        greedy_on_device: bool,
+    ) -> Result<CudaIndependentPagedBatchOutput, CudaIndependentPagedBatchError> {
+        let rows = positions.len();
+        if !(2..=MAX_INDEPENDENT_BATCH_ROWS).contains(&rows) {
+            return Err(CudaIndependentPagedBatchError::InvalidBatchSize(rows));
+        }
+        if !self.supports_independent_paged_batch_q8() {
+            return Err(CudaIndependentPagedBatchError::Unsupported);
+        }
+        if let Some(position) = positions
+            .iter()
+            .copied()
+            .find(|position| *position >= self.max_pos || *position >= SPLITK_THRESHOLD)
+        {
+            return Err(CudaIndependentPagedBatchError::PositionOutOfRange {
+                position,
+                capacity: self.max_pos.min(SPLITK_THRESHOLD),
+            });
+        }
+        let half = self.rope_dim / 2;
+        if embeddings.len() != rows * self.hidden
+            || cos.len() != rows * half
+            || sin.len() != rows * half
+            || pages.len() != rows
+            || pages.iter().zip(positions).any(|(row_pages, position)| {
+                row_pages.len()
+                    != (position + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS)
+            })
+        {
+            return Err(CudaIndependentPagedBatchError::InputShape);
+        }
+
+        self.ensure_verify_scratch()
+            .map_err(CudaIndependentPagedBatchError::Runtime)?;
+        let stream = self.k.stream.clone();
+        let mut scratch = self.verify_scratch.take().expect("allocated above");
+        let result = (|| -> Result<_, CudaIndependentPagedBatchError> {
+            stream
+                .memcpy_htod(embeddings, &mut scratch.vh.slice_mut(0..rows * self.hidden))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!(
+                        "embedding upload failed: {error}"
+                    ))
+                })?;
+            stream
+                .memcpy_htod(cos, &mut scratch.vcos.slice_mut(0..rows * half))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!(
+                        "cosine upload failed: {error}"
+                    ))
+                })?;
+            stream
+                .memcpy_htod(sin, &mut scratch.vsin.slice_mut(0..rows * half))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!("sine upload failed: {error}"))
+                })?;
+
+            let mut shared_projection_launches = self
+                .run_independent_q8_layer_stack(
+                    &mut scratch,
+                    &stream,
+                    positions,
+                    Some(pages),
+                    scale,
+                )
+                .map_err(CudaIndependentPagedBatchError::Runtime)?;
+            launch_rms_norm_batched(
+                &stream,
+                &self.k.rms_norm_batched,
+                &scratch.vh,
+                &self.final_norm,
+                &mut scratch.vn,
+                self.hidden,
+                self.eps,
+                rows,
+            )
+            .map_err(|error| {
+                CudaIndependentPagedBatchError::Runtime(format!("output norm failed: {error}"))
+            })?;
+            launch_quantize(
+                &stream,
+                &self.k.quantize,
+                &scratch.vn,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                rows * (self.hidden / 32),
+            )
+            .map_err(|error| {
+                CudaIndependentPagedBatchError::Runtime(format!("output quantize failed: {error}"))
+            })?;
+            launch_gemm_batched(
+                &stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &self.output_weight,
+                self.vocab,
+                self.hidden / 32,
+                rows,
+                &mut scratch.vlogits,
+            )
+            .map_err(|error| {
+                CudaIndependentPagedBatchError::Runtime(format!(
+                    "output projection failed: {error}"
+                ))
+            })?;
+            shared_projection_launches += 1;
+
+            let (logits, sampled_token_ids) = if greedy_on_device {
+                launch_argmax_batched(
+                    &stream,
+                    &self.k.argmax_batched,
+                    &scratch.vlogits,
+                    self.vocab,
+                    rows,
+                    &mut scratch.vsamp,
+                )
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!("argmax failed: {error}"))
+                })?;
+                let mut sampled = vec![0u32; rows];
+                stream
+                    .memcpy_dtoh(&scratch.vsamp.slice(0..rows), &mut sampled)
+                    .map_err(|error| {
+                        CudaIndependentPagedBatchError::Runtime(format!(
+                            "sampled-token readback failed: {error}"
+                        ))
+                    })?;
+                (None, Some(sampled))
+            } else {
+                let mut flat_logits = vec![0.0f32; rows * self.vocab];
+                stream
+                    .memcpy_dtoh(
+                        &scratch.vlogits.slice(0..rows * self.vocab),
+                        &mut flat_logits,
+                    )
+                    .map_err(|error| {
+                        CudaIndependentPagedBatchError::Runtime(format!(
+                            "logits readback failed: {error}"
+                        ))
+                    })?;
+                let logits = flat_logits
+                    .chunks_exact(self.vocab)
+                    .map(<[f32]>::to_vec)
+                    .collect::<Vec<_>>();
+                (Some(logits), None)
+            };
+            self.k.ctx.synchronize().map_err(|error| {
+                CudaIndependentPagedBatchError::Runtime(format!("synchronize failed: {error}"))
+            })?;
+            Ok(CudaIndependentPagedBatchOutput {
+                logits,
+                sampled_token_ids,
+                batch_size: rows,
+                shared_projection_launches,
+                execution_mode: CudaBatchExecutionMode::TrueBatch,
+            })
+        })();
+        self.verify_scratch = Some(scratch);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_independent_paged_batch_q8(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        positions: &[usize],
+        pages: &[Vec<crate::inference::cuda_paged_kv::CudaKvPageHandle>],
+        scale: f32,
+    ) -> Result<CudaIndependentPagedPrefillOutput, CudaIndependentPagedBatchError> {
+        let rows = positions.len();
+        if !(2..=MAX_INDEPENDENT_BATCH_ROWS).contains(&rows) {
+            return Err(CudaIndependentPagedBatchError::InvalidBatchSize(rows));
+        }
+        if !self.supports_independent_paged_batch_q8() {
+            return Err(CudaIndependentPagedBatchError::Unsupported);
+        }
+        if let Some(position) = positions
+            .iter()
+            .copied()
+            .find(|position| *position >= self.max_pos || *position >= SPLITK_THRESHOLD)
+        {
+            return Err(CudaIndependentPagedBatchError::PositionOutOfRange {
+                position,
+                capacity: self.max_pos.min(SPLITK_THRESHOLD),
+            });
+        }
+        let half = self.rope_dim / 2;
+        if embeddings.len() != rows * self.hidden
+            || cos.len() != rows * half
+            || sin.len() != rows * half
+            || pages.len() != rows
+            || pages.iter().zip(positions).any(|(row_pages, position)| {
+                row_pages.len()
+                    != (position + 1).div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS)
+            })
+        {
+            return Err(CudaIndependentPagedBatchError::InputShape);
+        }
+
+        self.ensure_verify_scratch()
+            .map_err(CudaIndependentPagedBatchError::Runtime)?;
+        let stream = self.k.stream.clone();
+        let mut scratch = self.verify_scratch.take().expect("allocated above");
+        let result = (|| -> Result<_, CudaIndependentPagedBatchError> {
+            stream
+                .memcpy_htod(embeddings, &mut scratch.vh.slice_mut(0..rows * self.hidden))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!(
+                        "embedding upload failed: {error}"
+                    ))
+                })?;
+            stream
+                .memcpy_htod(cos, &mut scratch.vcos.slice_mut(0..rows * half))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!(
+                        "cosine upload failed: {error}"
+                    ))
+                })?;
+            stream
+                .memcpy_htod(sin, &mut scratch.vsin.slice_mut(0..rows * half))
+                .map_err(|error| {
+                    CudaIndependentPagedBatchError::Runtime(format!("sine upload failed: {error}"))
+                })?;
+            let shared_projection_launches = self
+                .run_independent_q8_layer_stack(
+                    &mut scratch,
+                    &stream,
+                    positions,
+                    Some(pages),
+                    scale,
+                )
+                .map_err(CudaIndependentPagedBatchError::Runtime)?;
+            self.k.ctx.synchronize().map_err(|error| {
+                CudaIndependentPagedBatchError::Runtime(format!(
+                    "prefill synchronize failed: {error}"
+                ))
+            })?;
+            Ok(CudaIndependentPagedPrefillOutput {
+                batch_size: rows,
+                shared_projection_launches,
+                execution_mode: CudaBatchExecutionMode::TrueBatch,
+            })
+        })();
+        self.verify_scratch = Some(scratch);
+        result
+    }
+
+    #[allow(dead_code)] // Phase 4 will route compatible ready rows here.
+    pub(crate) fn forward_independent_batch2_q8(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        positions: [usize; 2],
+        scale: f32,
+        greedy_on_device: bool,
+    ) -> Result<CudaIndependentBatch2Output, CudaIndependentBatch2Error> {
+        const ROWS: usize = 2;
+        if !self.supports_independent_batch2_q8() {
+            return Err(CudaIndependentBatch2Error::Unsupported);
+        }
+        if let Some(position) = positions
+            .iter()
+            .copied()
+            .find(|position| *position >= self.max_pos)
+        {
+            return Err(CudaIndependentBatch2Error::PositionOutOfRange {
+                position,
+                capacity: self.max_pos,
+            });
+        }
+        let half = self.rope_dim / 2;
+        if embeddings.len() != ROWS * self.hidden
+            || cos.len() != ROWS * half
+            || sin.len() != ROWS * half
+        {
+            return Err(CudaIndependentBatch2Error::InputShape);
+        }
+        self.select_kv_slot(0)
+            .map_err(CudaIndependentBatch2Error::Runtime)?;
+        let inactive = self
+            .inactive_kv_bank
+            .as_ref()
+            .ok_or(CudaIndependentBatch2Error::Unsupported)?;
+        if inactive.slot != 1 || [self.filled, inactive.filled] != positions {
+            return Err(CudaIndependentBatch2Error::PositionMismatch {
+                requested: positions,
+                resident: [self.filled, inactive.filled],
+            });
+        }
+
+        self.ensure_verify_scratch()
+            .map_err(CudaIndependentBatch2Error::Runtime)?;
+        let stream = self.k.stream.clone();
+        let mut scratch = self.verify_scratch.take().expect("allocated above");
+        let result = (|| -> Result<_, CudaIndependentBatch2Error> {
+            stream
+                .memcpy_htod(embeddings, &mut scratch.vh.slice_mut(0..ROWS * self.hidden))
+                .map_err(|error| {
+                    CudaIndependentBatch2Error::Runtime(format!("embedding upload failed: {error}"))
+                })?;
+            stream
+                .memcpy_htod(cos, &mut scratch.vcos.slice_mut(0..ROWS * half))
+                .map_err(|error| {
+                    CudaIndependentBatch2Error::Runtime(format!("cosine upload failed: {error}"))
+                })?;
+            stream
+                .memcpy_htod(sin, &mut scratch.vsin.slice_mut(0..ROWS * half))
+                .map_err(|error| {
+                    CudaIndependentBatch2Error::Runtime(format!("sine upload failed: {error}"))
+                })?;
+
+            let mut shared_projection_launches = self
+                .run_independent_q8_layer_stack(&mut scratch, &stream, &positions, None, scale)
+                .map_err(CudaIndependentBatch2Error::Runtime)?;
+            launch_rms_norm_batched(
+                &stream,
+                &self.k.rms_norm_batched,
+                &scratch.vh,
+                &self.final_norm,
+                &mut scratch.vn,
+                self.hidden,
+                self.eps,
+                ROWS,
+            )
+            .map_err(|error| {
+                CudaIndependentBatch2Error::Runtime(format!("output norm failed: {error}"))
+            })?;
+            launch_quantize(
+                &stream,
+                &self.k.quantize,
+                &scratch.vn,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                ROWS * (self.hidden / 32),
+            )
+            .map_err(|error| {
+                CudaIndependentBatch2Error::Runtime(format!("output quantize failed: {error}"))
+            })?;
+            launch_gemm_batched(
+                &stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &self.output_weight,
+                self.vocab,
+                self.hidden / 32,
+                ROWS,
+                &mut scratch.vlogits,
+            )
+            .map_err(|error| {
+                CudaIndependentBatch2Error::Runtime(format!("output projection failed: {error}"))
+            })?;
+            shared_projection_launches += 1;
+
+            let (logits, sampled_token_ids) = if greedy_on_device {
+                launch_argmax_batched(
+                    &stream,
+                    &self.k.argmax_batched,
+                    &scratch.vlogits,
+                    self.vocab,
+                    ROWS,
+                    &mut scratch.vsamp,
+                )
+                .map_err(|error| {
+                    CudaIndependentBatch2Error::Runtime(format!("argmax failed: {error}"))
+                })?;
+                let mut sampled = [0u32; ROWS];
+                stream
+                    .memcpy_dtoh(&scratch.vsamp.slice(0..ROWS), &mut sampled)
+                    .map_err(|error| {
+                        CudaIndependentBatch2Error::Runtime(format!(
+                            "sampled-token readback failed: {error}"
+                        ))
+                    })?;
+                (None, Some(sampled))
+            } else {
+                let mut logits = vec![0.0f32; ROWS * self.vocab];
+                stream
+                    .memcpy_dtoh(&scratch.vlogits.slice(0..ROWS * self.vocab), &mut logits)
+                    .map_err(|error| {
+                        CudaIndependentBatch2Error::Runtime(format!(
+                            "logits readback failed: {error}"
+                        ))
+                    })?;
+                let row_one = logits.split_off(self.vocab);
+                (Some([logits, row_one]), None)
+            };
+            self.k.ctx.synchronize().map_err(|error| {
+                CudaIndependentBatch2Error::Runtime(format!("synchronize failed: {error}"))
+            })?;
+
+            self.filled = positions[0] + 1;
+            self.inactive_kv_bank
+                .as_mut()
+                .expect("validated second KV bank")
+                .filled = positions[1] + 1;
+            Ok(CudaIndependentBatch2Output {
+                logits,
+                sampled_token_ids,
+                shared_projection_launches,
+                execution_mode: CudaBatchExecutionMode::TrueBatch,
+            })
+        })();
+        self.verify_scratch = Some(scratch);
+        result
+    }
+
+    #[allow(dead_code)] // Owned by the Phase 3 entry point above.
+    fn run_independent_q8_layer_stack(
+        &mut self,
+        scratch: &mut VerifyScratch,
+        stream: &Arc<CudaStream>,
+        positions: &[usize],
+        paged_pages: Option<&[Vec<crate::inference::cuda_paged_kv::CudaKvPageHandle>]>,
+        scale: f32,
+    ) -> Result<usize, String> {
+        let rows = positions.len();
+        let map =
+            |error: cudarc::driver::DriverError| format!("cuda independent batch layers: {error}");
+        let (hidden, q_width, kv_width, ffn_dim) =
+            (self.hidden, self.q_width, self.kv_width, self.ffn_dim);
+        let (head_dim, n_heads, n_kv, rope_dim, max_pos, eps) = (
+            self.head_dim,
+            self.n_heads,
+            self.n_kv_heads,
+            self.rope_dim,
+            self.max_pos,
+            self.eps,
+        );
+        let mut shared_projection_launches = 0usize;
+        let q8_kv = self.kv_quant == crate::model::KvCacheQuantization::Q8_0;
+        let paged_batch_metadata = paged_pages
+            .map(|pages| {
+                let page_stride = pages.iter().map(Vec::len).max().unwrap_or(0);
+                if page_stride == 0 {
+                    return Err("paged batch cannot contain an empty page table".to_string());
+                }
+                let mut position_values = [0i32; MAX_VERIFY_K];
+                for (target, position) in position_values.iter_mut().zip(positions) {
+                    *target = *position as i32;
+                }
+                stream
+                    .memcpy_htod(
+                        &position_values[..rows],
+                        &mut scratch.vpage_positions.slice_mut(0..rows),
+                    )
+                    .map_err(|error| format!("paged batch position upload failed: {error}"))?;
+                if scratch.page_table_handles.as_slice() != pages {
+                    let store = self
+                        .paged_kv_pages
+                        .as_ref()
+                        .ok_or_else(|| "paged batch requires a device page store".to_string())?;
+                    let (key_pointers, value_pointers, actual_stride) =
+                        store.batched_pointer_tables(stream, pages, self.n_layers)?;
+                    if actual_stride != page_stride {
+                        return Err("paged batch pointer-table stride changed".to_string());
+                    }
+                    if key_pointers.len() > scratch.vkey_page_tables.len()
+                        || value_pointers.len() > scratch.vvalue_page_tables.len()
+                    {
+                        return Err("paged batch pointer-table scratch is too small".to_string());
+                    }
+                    let mut page_counts = [0i32; MAX_VERIFY_K];
+                    for (target, row) in page_counts.iter_mut().zip(pages) {
+                        *target = row.len() as i32;
+                    }
+                    stream
+                        .memcpy_htod(
+                            &page_counts[..rows],
+                            &mut scratch.vpage_counts.slice_mut(0..rows),
+                        )
+                        .map_err(|error| {
+                            format!("paged batch page-count upload failed: {error}")
+                        })?;
+                    stream
+                        .memcpy_htod(
+                            &key_pointers,
+                            &mut scratch.vkey_page_tables.slice_mut(0..key_pointers.len()),
+                        )
+                        .map_err(|error| format!("paged batch key-table upload failed: {error}"))?;
+                    stream
+                        .memcpy_htod(
+                            &value_pointers,
+                            &mut scratch
+                                .vvalue_page_tables
+                                .slice_mut(0..value_pointers.len()),
+                        )
+                        .map_err(|error| {
+                            format!("paged batch value-table upload failed: {error}")
+                        })?;
+                    scratch.page_table_handles = pages.to_vec();
+                    scratch.page_table_stride = page_stride;
+                    scratch.page_pointer_count = key_pointers.len();
+                } else if scratch.page_table_stride != page_stride {
+                    return Err("cached paged batch pointer-table stride changed".to_string());
+                }
+                let max_position_count = positions
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                Ok((
+                    scratch.page_table_stride,
+                    max_position_count,
+                    scratch.page_pointer_count,
+                ))
+            })
+            .transpose()?;
+
+        for layer_index in 0..self.n_layers {
+            let layer = &self.layers[layer_index];
+            launch_rms_norm_quantize_batched(
+                stream,
+                &self.k.rms_norm_quantize_batched,
+                &scratch.vh,
+                &layer.attn_norm,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                hidden,
+                eps,
+                rows,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.q,
+                q_width,
+                hidden / 32,
+                rows,
+                &mut scratch.vq,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.k,
+                kv_width,
+                hidden / 32,
+                rows,
+                &mut scratch.vk,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.v,
+                kv_width,
+                hidden / 32,
+                rows,
+                &mut scratch.vv,
+            )
+            .map_err(map)?;
+            shared_projection_launches += 3;
+
+            if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+                launch_rms_norm_per_head(
+                    stream,
+                    &self.k.rms_norm_per_head,
+                    &mut scratch.vq,
+                    q_norm,
+                    rows * n_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
+                launch_rms_norm_per_head(
+                    stream,
+                    &self.k.rms_norm_per_head,
+                    &mut scratch.vk,
+                    k_norm,
+                    rows * n_kv,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
+            }
+            let pairing = i32::from(self.split_half_pairing);
+            launch_rope_batched(
+                stream,
+                &self.k.rope_batched,
+                &mut scratch.vq,
+                &scratch.vcos,
+                &scratch.vsin,
+                n_heads,
+                head_dim,
+                rope_dim,
+                q_width,
+                rows,
+                pairing,
+            )
+            .map_err(map)?;
+            launch_rope_batched(
+                stream,
+                &self.k.rope_batched,
+                &mut scratch.vk,
+                &scratch.vcos,
+                &scratch.vsin,
+                n_kv,
+                head_dim,
+                rope_dim,
+                kv_width,
+                rows,
+                pairing,
+            )
+            .map_err(map)?;
+
+            if let Some(paged_pages) = paged_pages {
+                if paged_pages.len() != rows {
+                    return Err("paged batch row metadata length mismatch".to_string());
+                }
+                if let Some((page_stride, max_position_count, pointer_count)) =
+                    paged_batch_metadata.as_ref()
+                {
+                    let table_len = rows * page_stride;
+                    debug_assert_eq!(*pointer_count, self.n_layers * table_len);
+                    let table_start = layer_index * table_len;
+                    let key_tables = scratch
+                        .vkey_page_tables
+                        .slice(table_start..table_start + table_len);
+                    let value_tables = scratch
+                        .vvalue_page_tables
+                        .slice(table_start..table_start + table_len);
+                    if q8_kv {
+                        launch_kv_scatter_paged_q8_0_batched(
+                            stream,
+                            &self.k.kv_scatter_paged_q8_0_batched,
+                            &scratch.vk,
+                            &key_tables,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            n_kv,
+                            head_dim,
+                            rows,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter_paged_q8_0_batched(
+                            stream,
+                            &self.k.kv_scatter_paged_q8_0_batched,
+                            &scratch.vv,
+                            &value_tables,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            n_kv,
+                            head_dim,
+                            rows,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_kv_scatter_paged_batched(
+                            stream,
+                            &self.k.kv_scatter_paged_batched,
+                            &scratch.vk,
+                            &key_tables,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            n_kv,
+                            head_dim,
+                            rows,
+                        )
+                        .map_err(map)?;
+                        launch_kv_scatter_paged_batched(
+                            stream,
+                            &self.k.kv_scatter_paged_batched,
+                            &scratch.vv,
+                            &value_tables,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            n_kv,
+                            head_dim,
+                            rows,
+                        )
+                        .map_err(map)?;
+                    }
+                    if q8_kv {
+                        launch_attention_paged_batched(
+                            stream,
+                            &self.k.attention_paged_q8_0_batched,
+                            &scratch.vq,
+                            &key_tables,
+                            &value_tables,
+                            &mut scratch.vattn,
+                            n_heads,
+                            n_kv,
+                            head_dim,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            max_pos,
+                            *max_position_count,
+                            scale,
+                            &mut self.d_verify_scores,
+                            rows,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_attention_paged_batched(
+                            stream,
+                            &self.k.attention_paged_batched,
+                            &scratch.vq,
+                            &key_tables,
+                            &value_tables,
+                            &mut scratch.vattn,
+                            n_heads,
+                            n_kv,
+                            head_dim,
+                            &scratch.vpage_positions,
+                            &scratch.vpage_counts,
+                            *page_stride,
+                            max_pos,
+                            *max_position_count,
+                            scale,
+                            &mut self.d_verify_scores,
+                            rows,
+                        )
+                        .map_err(map)?;
+                    }
+                } else {
+                    return Err("paged batch metadata is missing".to_string());
+                }
+            } else {
+                if rows != 2 {
+                    return Err("fixed independent batch requires exactly two rows".to_string());
+                }
+                let scatter = if q8_kv {
+                    &self.k.kv_scatter_batched_q8_0
+                } else {
+                    &self.k.kv_scatter_batched
+                };
+                let k_row_zero = scratch.vk.slice(0..kv_width);
+                let v_row_zero = scratch.vv.slice(0..kv_width);
+                launch_kv_scatter_batched_row(
+                    stream,
+                    scatter,
+                    &k_row_zero,
+                    &mut self.cache_k[layer_index],
+                    positions[0],
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    q8_kv,
+                )
+                .map_err(map)?;
+                launch_kv_scatter_batched_row(
+                    stream,
+                    scatter,
+                    &v_row_zero,
+                    &mut self.cache_v[layer_index],
+                    positions[0],
+                    n_kv,
+                    head_dim,
+                    max_pos,
+                    kv_width,
+                    q8_kv,
+                )
+                .map_err(map)?;
+                {
+                    let inactive = self
+                        .inactive_kv_bank
+                        .as_mut()
+                        .expect("batch-2 second KV bank was validated");
+                    let k_row_one = scratch.vk.slice(kv_width..2 * kv_width);
+                    let v_row_one = scratch.vv.slice(kv_width..2 * kv_width);
+                    launch_kv_scatter_batched_row(
+                        stream,
+                        scatter,
+                        &k_row_one,
+                        &mut inactive.cache_k[layer_index],
+                        positions[1],
+                        n_kv,
+                        head_dim,
+                        max_pos,
+                        kv_width,
+                        q8_kv,
+                    )
+                    .map_err(map)?;
+                    launch_kv_scatter_batched_row(
+                        stream,
+                        scatter,
+                        &v_row_one,
+                        &mut inactive.cache_v[layer_index],
+                        positions[1],
+                        n_kv,
+                        head_dim,
+                        max_pos,
+                        kv_width,
+                        q8_kv,
+                    )
+                    .map_err(map)?;
+                }
+
+                let attention = if q8_kv {
+                    &self.k.attention_batched_q8_0
+                } else {
+                    &self.k.attention_batched
+                };
+                let q_row = scratch.vq.slice(0..q_width);
+                let mut out_row = scratch.vattn.slice_mut(0..q_width);
+                let mut scores = self.d_verify_scores.slice_mut(0..n_heads * max_pos);
+                launch_attention_batched_row(
+                    stream,
+                    attention,
+                    &q_row,
+                    &self.cache_k[layer_index],
+                    &self.cache_v[layer_index],
+                    &mut out_row,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    positions[0],
+                    max_pos,
+                    scale,
+                    q_width,
+                    i32::from(splitk_verify_active()),
+                    &mut scores,
+                )
+                .map_err(map)?;
+                {
+                    let inactive = self
+                        .inactive_kv_bank
+                        .as_ref()
+                        .expect("batch-2 second KV bank was validated");
+                    let q_row = scratch.vq.slice(q_width..2 * q_width);
+                    let mut out_row = scratch.vattn.slice_mut(q_width..2 * q_width);
+                    let mut scores = self
+                        .d_verify_scores
+                        .slice_mut(n_heads * max_pos..2 * n_heads * max_pos);
+                    launch_attention_batched_row(
+                        stream,
+                        attention,
+                        &q_row,
+                        &inactive.cache_k[layer_index],
+                        &inactive.cache_v[layer_index],
+                        &mut out_row,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        positions[1],
+                        max_pos,
+                        scale,
+                        q_width,
+                        i32::from(splitk_verify_active()),
+                        &mut scores,
+                    )
+                    .map_err(map)?;
+                }
+            }
+
+            launch_quantize(
+                stream,
+                &self.k.quantize,
+                &scratch.vattn,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                rows * (q_width / 32),
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.o,
+                hidden,
+                q_width / 32,
+                rows,
+                &mut scratch.vproj,
+            )
+            .map_err(map)?;
+            shared_projection_launches += 1;
+            launch_residual(
+                stream,
+                &self.k.residual_add,
+                &mut scratch.vh,
+                &scratch.vproj,
+                rows * hidden,
+            )
+            .map_err(map)?;
+
+            launch_rms_norm_quantize_batched(
+                stream,
+                &self.k.rms_norm_quantize_batched,
+                &scratch.vh,
+                &layer.ffn_norm,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                hidden,
+                eps,
+                rows,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.gate,
+                ffn_dim,
+                hidden / 32,
+                rows,
+                &mut scratch.vgate,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.up,
+                ffn_dim,
+                hidden / 32,
+                rows,
+                &mut scratch.vup,
+            )
+            .map_err(map)?;
+            shared_projection_launches += 2;
+            launch_silu_mul_quantize(
+                stream,
+                &self.k.silu_mul_quantize,
+                &scratch.vgate,
+                &scratch.vup,
+                &mut scratch.viq,
+                &mut scratch.vis,
+                rows * (ffn_dim / 32),
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                stream,
+                &self.k.gemm_batched,
+                &scratch.vis,
+                &scratch.viq,
+                &layer.down,
+                hidden,
+                ffn_dim / 32,
+                rows,
+                &mut scratch.vproj,
+            )
+            .map_err(map)?;
+            shared_projection_launches += 1;
+            launch_residual(
+                stream,
+                &self.k.residual_add,
+                &mut scratch.vh,
+                &scratch.vproj,
+                rows * hidden,
+            )
+            .map_err(map)?;
+        }
+        Ok(shared_projection_launches)
+    }
+
     /// Allocate the K-batched scratch (`verify_scratch`) if not already present.
     /// Sized to `MAX_VERIFY_K * dim` and shared by `verify_batch` and `prefill_batched`.
     /// Idempotent — a no-op once the buffers exist.
@@ -17762,6 +20706,9 @@ impl CudaResidentDecode {
         let st = &self.k.stream;
         let mk = cap;
         let max_in = hidden.max(q_width).max(ffn_dim);
+        let max_paged_pages =
+            SPLITK_THRESHOLD.div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
+        let page_table_capacity = self.n_layers * mk * max_paged_pages;
         let af = |n: usize| {
             st.alloc_zeros::<f32>(n)
                 .map_err(|e| format!("verify alloc: {e}"))
@@ -17806,6 +20753,21 @@ impl CudaResidentDecode {
             },
             vcos: af(mk * half)?,
             vsin: af(mk * half)?,
+            vpage_positions: st
+                .alloc_zeros::<i32>(mk)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vpage_counts: st
+                .alloc_zeros::<i32>(mk)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vkey_page_tables: st
+                .alloc_zeros::<u64>(page_table_capacity)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vvalue_page_tables: st
+                .alloc_zeros::<u64>(page_table_capacity)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            page_table_handles: Vec::new(),
+            page_table_stride: 0,
+            page_pointer_count: 0,
         })
     }
 
@@ -19281,13 +22243,46 @@ impl CudaResidentDecode {
         scale: f32,
         start: usize,
     ) -> Result<(), String> {
+        let hidden = self.hidden;
+        let half = self.rope_dim / 2;
+        if start > n {
+            return Err(format!("prefill_batched: start={start} exceeds n={n}"));
+        }
+        if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
+            return Err("prefill_batched: input slices too short".into());
+        }
+        if !self.supports_batched_prefill() {
+            return self.prefill_from(embeddings, cos_all, sin_all, n, scale, start);
+        }
+        self.prefill_batched_at(
+            &embeddings[start * hidden..n * hidden],
+            &cos_all[start * half..n * half],
+            &sin_all[start * half..n * half],
+            start,
+            n - start,
+            scale,
+        )
+    }
+
+    pub(crate) fn prefill_batched_at(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        base_position: usize,
+        n: usize,
+        scale: f32,
+    ) -> Result<(), String> {
         // The batched layer stack reads each layer's VRAM weight slice directly and has
         // no offload-streaming path (unlike forward_pass), so for an offloaded model
         // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
         // serial prefill, which streams offloaded weights correctly. Batching is a
         // resident-only fast path.
         if !self.supports_batched_prefill() {
-            return self.prefill_from(embeddings, cos_all, sin_all, n, scale, start);
+            if base_position == 0 {
+                return self.prefill(embeddings, cos_all, sin_all, n, scale);
+            }
+            return Err("resumable batched prefill requires a resident batched path".to_string());
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
         let hidden = self.hidden;
@@ -19295,15 +22290,18 @@ impl CudaResidentDecode {
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill_batched: input slices too short".into());
         }
-        if start > n {
-            return Err(format!("prefill_batched: start={start} exceeds n={n}"));
+        if base_position.saturating_add(n) > self.max_pos {
+            return Err(format!(
+                "prefill_batched: positions {base_position}..{} exceed resident capacity {}",
+                base_position.saturating_add(n),
+                self.max_pos,
+            ));
         }
         let batch_cap = self.batched_prefill_token_cap();
         self.ensure_prefill_scratch(batch_cap)?;
         let s = self.k.stream.clone();
         let mut sc = self.prefill_scratch.take().expect("allocated above");
-        // Rows [0, start) already hold this prompt's KV from a previous prefill.
-        let mut base = start;
+        let mut base = 0usize;
         while base < n {
             let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at
@@ -19325,7 +22323,7 @@ impl CudaResidentDecode {
             .map_err(map)?;
             // Same stream → the next chunk's stage waits for this chunk's reads; no
             // explicit per-chunk sync needed (matches the serial prefill's one-sync-at-end).
-            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale, true)?;
+            self.run_batched_layer_stack(&mut sc, &s, base_position + base, kk, scale, true)?;
             base += kk;
         }
         self.k

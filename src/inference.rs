@@ -23,8 +23,15 @@ use crate::metal;
 use crate::telemetry;
 
 mod attn_f32_dot;
+#[cfg(test)]
+pub(crate) mod batch;
 #[cfg(target_arch = "aarch64")]
 mod cpu_neon;
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 6 metadata contract; serving ownership is wired next.
+pub(crate) mod cuda_paged_kv;
+#[cfg(feature = "cuda")]
+mod cuda_sequence;
 mod decode_scratch;
 mod diagnostic_config;
 pub mod draft_merge;
@@ -54,6 +61,12 @@ pub mod suffix_decoding;
 pub mod token_recycling;
 mod win_pin;
 
+#[cfg(test)]
+pub(crate) use batch::{
+    BatchCompatibilityKey, BatchContractError, BatchExecutionMode, BatchModelIdentity,
+    BatchOutputMode, BatchRowFailure, BatchRowOutcome, BatchSequenceId, SerialBatchOracle,
+    SerialBatchRow,
+};
 #[cfg(test)]
 use diagnostic_config::diagnostic_zero_delta_value;
 use diagnostic_config::{
@@ -2496,6 +2509,134 @@ enum ResidentForward {
     Sampled(u32),
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaResidentPrefillChunkOutcome {
+    Unsupported,
+    Advanced {
+        end_position: usize,
+        elapsed_micros: u128,
+        finalized: bool,
+    },
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_prefill_chunk_unsupported(
+    continuing: bool,
+    reason: &'static str,
+) -> Result<CudaResidentPrefillChunkOutcome> {
+    if continuing {
+        Err(BackendError::RuntimeShapeMismatch(format!(
+            "resident CUDA prefill continuation became unsupported after partial KV mutation: {reason}"
+        )))
+    } else {
+        Ok(CudaResidentPrefillChunkOutcome::Unsupported)
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 3 contract; Phase 4 wires scheduler construction.
+pub(crate) struct CudaTrueBatch2Request<'a> {
+    pub(crate) sequence_id: u64,
+    pub(crate) input_token_id: u32,
+    pub(crate) token_history: &'a [u32],
+    pub(crate) sampler: LlamaSampler,
+    pub(crate) allowed_tokens: Option<&'a [bool]>,
+    pub(crate) cancelled: Option<&'a dyn Fn() -> bool>,
+    pub(crate) stop_token_ids: &'a [u32],
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 3 contract; Phase 4 consumes row outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CudaTrueBatch2RowOutcome {
+    Generated { next_token_id: u32 },
+    Stopped { next_token_id: u32 },
+    SamplingFailed { message: String },
+    CancelledAfterDispatch,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 3 contract; Phase 4 consumes stable-ID rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CudaTrueBatch2RowResult {
+    pub(crate) sequence_id: u64,
+    pub(crate) position_before: usize,
+    pub(crate) position_after: usize,
+    pub(crate) shared_forward_micros: u128,
+    pub(crate) outcome: CudaTrueBatch2RowOutcome,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 3 contract; Phase 4 publishes execution telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CudaTrueBatch2Execution {
+    pub(crate) rows: [CudaTrueBatch2RowResult; 2],
+    pub(crate) batch_elapsed_micros: u128,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: crate::cuda_resident::CudaBatchExecutionMode,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Phase 3 contract; Phase 4 handles scheduler fallback.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CudaTrueBatch2ContractError {
+    #[error("CUDA true batch-2 is disabled")]
+    Disabled,
+    #[error("CUDA true batch-2 sequence id {0} appears more than once")]
+    DuplicateSequence(u64),
+    #[error("CUDA true batch-2 rows are incompatible")]
+    IncompatibleRows,
+    #[error("CUDA true batch-2 row {0} has no valid resident lease")]
+    MissingLease(u64),
+    #[error("CUDA true batch-2 sequence {0} was cancelled before dispatch")]
+    CancelledBeforeDispatch(u64),
+    #[error("CUDA true batch-2 resident engine is unavailable")]
+    EngineUnavailable,
+    #[error("CUDA true batch-2 backend failed: {0}")]
+    Backend(String),
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CudaTruePagedBatchExecution {
+    pub(crate) rows: Vec<CudaTrueBatch2RowResult>,
+    pub(crate) batch_size: usize,
+    pub(crate) batch_elapsed_micros: u128,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: crate::cuda_resident::CudaBatchExecutionMode,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CudaTruePagedPrefillExecution {
+    pub(crate) batch_size: usize,
+    pub(crate) batch_elapsed_micros: u128,
+    pub(crate) shared_projection_launches: usize,
+    pub(crate) execution_mode: crate::cuda_resident::CudaBatchExecutionMode,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CudaTruePagedBatchContractError {
+    #[error("CUDA true paged batch is disabled")]
+    Disabled,
+    #[error("CUDA true paged batch size must be between two and eight, got {0}")]
+    InvalidBatchSize(usize),
+    #[error("CUDA true paged batch sequence id {0} appears more than once")]
+    DuplicateSequence(u64),
+    #[error("CUDA true paged batch rows are incompatible")]
+    IncompatibleRows,
+    #[error("CUDA true paged batch row {0} has no valid resident lease")]
+    MissingLease(u64),
+    #[error("CUDA true paged batch sequence {0} was cancelled before dispatch")]
+    CancelledBeforeDispatch(u64),
+    #[error("CUDA true paged batch resident engine is unavailable")]
+    EngineUnavailable,
+    #[error("CUDA true paged batch backend failed: {0}")]
+    Backend(String),
+}
+
 pub struct LlamaInferenceSession {
     pub config: LlamaModelConfig,
     pub weights: Arc<LlamaLoadedWeights>,
@@ -2554,6 +2695,10 @@ pub struct LlamaInferenceSession {
     /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
     /// copied by Clone/take_for_step so restored sessions keep the same key.
     resident_cache_key: Option<u64>,
+    #[cfg(feature = "cuda")]
+    cuda_sequence_id: cuda_sequence::CudaSequenceId,
+    #[cfg(feature = "cuda")]
+    cuda_sequence_lease: Option<cuda_sequence::CudaSequenceLease>,
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
@@ -2571,6 +2716,11 @@ pub struct LlamaInferenceSession {
 impl Drop for LlamaInferenceSession {
     fn drop(&mut self) {
         self.park_resident_metal_engine();
+        #[cfg(feature = "cuda")]
+        if let Some(lease) = self.cuda_sequence_lease.take() {
+            let cache = self.resident_cache();
+            release_resident_cuda_sequence(cache, lease);
+        }
     }
 }
 
@@ -2579,6 +2729,108 @@ impl LlamaInferenceSession {
     /// from the model id so every session for one model shares an engine.
     pub fn set_resident_cache_key(&mut self, key: u64) {
         self.resident_cache_key = Some(key);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_sequence_capacity(&self) -> usize {
+        let capacity = resident_cuda_sequence_capacity();
+        let fixed_eligible = self.config.architecture == "llama"
+            && self.config.gemma3.is_none()
+            && self.weights.layer_range.is_none()
+            && !self.is_drafter;
+        let paged_eligible = self.cuda_paged_kv_eligible();
+        if (capacity > 2 && paged_eligible) || (capacity == 2 && fixed_eligible) {
+            capacity
+        } else {
+            1
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_multi_sequence_kv_enabled(&self) -> bool {
+        self.cuda_sequence_capacity() > 1
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_paged_kv_eligible(&self) -> bool {
+        cuda_paged_kv_enabled()
+            && !resident_cuda_true_batch2_active()
+            && self.config.architecture == "llama"
+            && self.config.gemma3.is_none()
+            && self.config.moe.is_none()
+            && self.weights.layer_range.is_none()
+            && !self.is_drafter
+            && matches!(
+                self.config.kv_quant,
+                crate::model::KvCacheQuantization::F16 | crate::model::KvCacheQuantization::Q8_0
+            )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_paged_kv_enabled(&self) -> bool {
+        self.cuda_paged_kv_eligible()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn supports_cuda_multi_sequence_kv(&self) -> bool {
+        self.cuda_multi_sequence_kv_enabled()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn supports_cuda_multi_sequence_kv(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_true_batch_identity(&self) -> Option<(u64, u64, usize)> {
+        if (!resident_cuda_true_batch2_active() && !resident_cuda_true_paged_batch_active())
+            || !self.cuda_multi_sequence_kv_enabled()
+            || self.resident_paths_disabled
+            || self.is_drafter
+            || self.cuda_sequence_lease.is_none()
+        {
+            return None;
+        }
+        Some((
+            self.cuda_sequence_id.get(),
+            self.resident_cache_key?,
+            Arc::as_ptr(&self.weights) as usize,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_true_paged_prefill_identity(&self) -> Option<(u64, u64, usize)> {
+        if !resident_cuda_batched_prefill_active()
+            || !self.cuda_paged_kv_enabled()
+            || self.resident_paths_disabled
+            || self.is_drafter
+        {
+            return None;
+        }
+        Some((
+            self.cuda_sequence_id.get(),
+            self.resident_cache_key?,
+            Arc::as_ptr(&self.weights) as usize,
+        ))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) fn cuda_true_batch_identity(&self) -> Option<(u64, u64, usize)> {
+        None
+    }
+
+    #[cfg(feature = "cuda")]
+    fn resident_cuda_kv_slot_count(&self) -> usize {
+        self.cuda_sequence_capacity()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn resident_cuda_context_cap(&self) -> usize {
+        if self.cuda_multi_sequence_kv_enabled() {
+            resident_cuda_two_sequence_max_context()
+        } else {
+            resident_cuda_max_context()
+        }
     }
 
     /// Mark this session as the speculative draft model so its GPU resident engine
@@ -2646,6 +2898,10 @@ impl LlamaInferenceSession {
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: self.execution_trace.take(),
             resident_cache_key: self.resident_cache_key,
+            #[cfg(feature = "cuda")]
+            cuda_sequence_id: self.cuda_sequence_id,
+            #[cfg(feature = "cuda")]
+            cuda_sequence_lease: self.cuda_sequence_lease.take(),
             is_drafter: self.is_drafter,
         }
     }
@@ -2739,6 +2995,10 @@ impl Clone for LlamaInferenceSession {
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: None,
             resident_cache_key: self.resident_cache_key,
+            #[cfg(feature = "cuda")]
+            cuda_sequence_id: cuda_sequence::CudaSequenceId::next(),
+            #[cfg(feature = "cuda")]
+            cuda_sequence_lease: None,
             is_drafter: self.is_drafter,
         }
     }
@@ -2782,6 +3042,10 @@ impl LlamaInferenceSession {
             resident_encode_ahead_enabled: true,
             execution_trace: None,
             resident_cache_key: None,
+            #[cfg(feature = "cuda")]
+            cuda_sequence_id: cuda_sequence::CudaSequenceId::next(),
+            #[cfg(feature = "cuda")]
+            cuda_sequence_lease: None,
             is_drafter: false,
         })
     }
@@ -2903,7 +3167,12 @@ impl LlamaInferenceSession {
         #[cfg(feature = "cuda")]
         {
             if let Ok(mut guard) = self.resident_cache().lock() {
-                if let Some(slot) = guard.as_mut() {
+                if select_resident_cuda_sequence_or_teardown(
+                    &mut guard,
+                    self.cuda_sequence_id,
+                    &mut self.cuda_sequence_lease,
+                )? {
+                    let slot = guard.as_mut().expect("CUDA sequence selected");
                     if slot.engine.filled() > position {
                         slot.engine.set_filled(position);
                     }
@@ -3264,6 +3533,36 @@ impl LlamaInferenceSession {
     /// back to the CPU prefill for any unsupported config.
     #[cfg(feature = "cuda")]
     fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
+        Ok(matches!(
+            self.try_resident_prefill_cuda_chunk(token_ids, 0, token_ids.len())?,
+            CudaResidentPrefillChunkOutcome::Advanced {
+                finalized: true,
+                ..
+            }
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn try_resident_prefill_cuda_chunk(
+        &mut self,
+        token_ids: &[u32],
+        base_position: usize,
+        total_prefill_tokens: usize,
+    ) -> Result<CudaResidentPrefillChunkOutcome> {
+        let end_position = base_position.checked_add(token_ids.len()).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident CUDA prefill chunk position overflow".to_string(),
+            )
+        })?;
+        if token_ids.is_empty() || total_prefill_tokens < 2 || end_position > total_prefill_tokens {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "invalid resident CUDA prefill chunk {base_position}..{end_position} of {total_prefill_tokens}"
+            )));
+        }
+        let continuing = base_position > 0;
+        if !resident_decode_cuda_enabled() {
+            return cuda_prefill_chunk_unsupported(continuing, "resident CUDA was disabled");
+        }
         // Explicit escape hatch: `CAMELID_CUDA_RESIDENT_PREFILL=0` keeps prefill on
         // the CPU while still allowing GPU-resident decode (debugging / isolation).
         if std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL")
@@ -3274,16 +3573,18 @@ impl LlamaInferenceSession {
             })
             .unwrap_or(false)
         {
-            return Ok(false);
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "resident CUDA prefill was disabled",
+            );
         }
         if self.resident_paths_disabled
-            || token_ids.len() < 2
-            || token_ids.len() > 16384
+            || total_prefill_tokens > 16384
             || self.kv_cache.position != 0
             || self.weights.layer_range.is_some()
             || !self.resident_decode_eligible(false)?
         {
-            return Ok(false);
+            return cuda_prefill_chunk_unsupported(continuing, "session became ineligible");
         }
         // Windowed archs (gemma3) decline the batched resident prefill outright.
         // Two independent reasons, either of which alone is disqualifying:
@@ -3307,7 +3608,17 @@ impl LlamaInferenceSession {
                      in the batched kernels, and this path would cache a non-windowed engine)"
                 );
             }
-            return Ok(false);
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "windowed attention is not supported",
+            );
+        }
+        let paged_kv_enabled = self.cuda_paged_kv_enabled();
+        if paged_kv_enabled && total_prefill_tokens > crate::cuda_resident::SPLITK_THRESHOLD {
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "paged CUDA split-K attention is not implemented",
+            );
         }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -3321,9 +3632,9 @@ impl LlamaInferenceSession {
         let n = token_ids.len();
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
-            .min(resident_cuda_max_context());
-        if n >= kv_cap {
-            return Ok(false);
+            .min(self.resident_cuda_context_cap());
+        if total_prefill_tokens >= kv_cap {
+            return cuda_prefill_chunk_unsupported(continuing, "context capacity was exceeded");
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
@@ -3332,14 +3643,17 @@ impl LlamaInferenceSession {
             .rope_dimension_count
             .map(|v| v as usize)
             .unwrap_or(head_dim);
-        let tables = match rope::resident_prefill_rope_tables(
+        let tables = match rope::resident_prefill_rope_tables_at(
+            base_position,
             n,
             head_dim,
             &self.config,
             weights.rope_freqs.as_ref(),
         )? {
             Some(t) => t,
-            None => return Ok(false),
+            None => {
+                return cuda_prefill_chunk_unsupported(continuing, "RoPE tables are unavailable")
+            }
         };
         let embeddings = weights
             .token_embedding
@@ -3353,6 +3667,7 @@ impl LlamaInferenceSession {
             .resident_cache_key
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let kv_slot_count = self.resident_cuda_kv_slot_count();
         let cache = self.resident_cache();
         let mut guard = cache
             .lock()
@@ -3360,6 +3675,8 @@ impl LlamaInferenceSession {
         let need_build = guard.as_ref().is_none_or(|slot| {
             slot.key != key
                 || !slot.engine.weights_ready()
+                || slot.paged_kv.is_some() != paged_kv_enabled
+                || (!paged_kv_enabled && slot.engine.kv_slot_count() != kv_slot_count)
                 || slot.engine.kv_quant != self.config.kv_quant
         });
         if need_build {
@@ -3389,30 +3706,50 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                kv_slot_count,
                 self.config.kv_quant,
+                paged_kv_enabled,
             ) {
                 Some(engine) => {
+                    let paged_kv = if paged_kv_enabled {
+                        Some(ResidentCudaPagedKv::for_engine(
+                            &engine,
+                            n_layers,
+                            n_kv,
+                            head_dim,
+                            kv_slot_count,
+                            match self.config.kv_quant {
+                                crate::model::KvCacheQuantization::Q8_0 => {
+                                    cuda_paged_kv::CudaKvPageStorage::Q8_0
+                                }
+                                _ => cuda_paged_kv::CudaKvPageStorage::F16,
+                            },
+                        )?)
+                    } else {
+                        None
+                    };
                     // Prefill is whole-model only (`layer_range.is_some()` bails above), so
                     // the built range is the full stack.
                     *guard = Some(ResidentCudaSlot {
                         key,
                         engine,
+                        sequence_slots: (paged_kv_enabled || kv_slot_count == 2).then(|| {
+                            cuda_sequence::FixedCudaSequenceSlots::new(kv_slot_count)
+                                .expect("fixed CUDA slot count is valid")
+                        }),
+                        paged_kv,
                         range: 0..n_layers,
                     })
                 }
-                None => return Ok(false),
+                None => {
+                    return cuda_prefill_chunk_unsupported(
+                        continuing,
+                        "resident engine construction failed",
+                    )
+                }
             }
         }
         let slot = guard.as_mut().expect("resident CUDA engine built above");
-        // The engine's VRAM-sized capacity is authoritative; a prompt longer than it
-        // fits prefills on the CPU instead of overrunning the resident KV.
-        if n > slot.engine.max_pos() {
-            return Ok(false);
-        }
-        // Default to batched prefill on the benchmark-promoted Q8 lane. The
-        // parity-correct Q4_K/Q6_K tiles remain explicit opt-ins because they
-        // regress sustained WDDM throughput on the RTX 3060 Laptop reference.
-        // `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0/1` remains the A/B override.
         let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
             .map(|v| {
                 let v = v.to_string_lossy();
@@ -3420,136 +3757,233 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
-        // Prefix continuation: every turn of a conversation re-sends the whole
-        // history, so the leading positions of this prompt are usually the exact
-        // positions the resident engine just built for the previous turn. A KV row
-        // is a pure function of the token prefix that produced it, so those rows
-        // ARE the rows this prompt needs — reusing them is not an approximation and
-        // needs no host mirror. (That distinction is what makes this safe on a lane
-        // where the prompt-prefix cache is deliberately bypassed: the cache reseeds
-        // GPU KV from f16-rounded host history, which is NOT bit-identical to a
-        // fresh prefill. Continuation never leaves the GPU.)
-        //
-        // The last shared token is always recomputed (`.min(n - 1)`) so the prefill
-        // still ends by writing position n-1, which is the state the decode lane
-        // expects. `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces a full prefill so the
-        // saving can be A/B'd against the same binary.
-        let continuation_enabled = !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
-            .map(|v| {
-                let v = v.to_string_lossy();
-                let v = v.trim();
-                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-            })
-            .unwrap_or(false);
-        let reuse = if continuation_enabled {
+        if !paged_kv_enabled && (serial_prefill || !slot.engine.supports_batched_prefill()) {
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "batched resident prefill is unavailable",
+            );
+        }
+        if total_prefill_tokens > slot.engine.max_pos() {
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "resident engine position capacity was exceeded",
+            );
+        }
+        if !select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )? {
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "no resident sequence slot is available",
+            );
+        }
+        let slot = guard.as_mut().expect("resident CUDA engine built above");
+        let reuse = if !paged_kv_enabled
+            && kv_slot_count == 1
+            && base_position == 0
+            && end_position == total_prefill_tokens
+            && !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    let value = value.trim();
+                    value == "0"
+                        || value.eq_ignore_ascii_case("false")
+                        || value.eq_ignore_ascii_case("off")
+                })
+                .unwrap_or(false)
+        {
             slot.engine
                 .resident_prefix_len(token_ids)
                 .min(n.saturating_sub(1))
         } else {
-            0
+            base_position
         };
-        // Drop the watermark to the reused span before prefilling the rest, so a
-        // failure below leaves no claim on rows this prefill never wrote.
-        slot.engine.set_filled(reuse);
-        let prefill_result = if serial_prefill {
-            slot.engine
-                .prefill_from(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
+        if reuse != base_position {
+            slot.engine.set_filled(reuse);
+        }
+        let gpu_cursor = if paged_kv_enabled {
+            slot.paged_sequence_len(self.cuda_sequence_id)?
         } else {
-            slot.engine.prefill_batched_from(
-                &embeddings.data,
-                &tables.cos,
-                &tables.sin,
-                n,
-                scale,
-                reuse,
-            )
+            slot.engine.filled()
         };
-        if prefill_result.is_err() {
-            // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
-            // decode path rebuilds/reseeds rather than trusting it.
-            slot.engine.set_filled(0);
-            slot.engine.set_resident_tokens(&[]);
-            return Ok(false);
+        if gpu_cursor != reuse {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident CUDA prefill continuation expected GPU cursor {reuse}, found {}",
+                gpu_cursor,
+            )));
         }
-        slot.engine.set_filled(n);
-        // Record the sequence these rows now hold, so the NEXT turn can continue
-        // from it. Ordered after `set_filled(n)`, which truncates the record to the
-        // watermark.
-        slot.engine.set_resident_tokens(token_ids);
-        if trace && reuse > 0 {
-            eprintln!(
-                "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, \
-                 prefilled {}",
-                n - reuse
-            );
+        let input_offset = reuse.saturating_sub(base_position);
+        let prefill_tokens = n.saturating_sub(input_offset);
+        let prefill_result = if paged_kv_enabled {
+            slot.prefill_paged_append(
+                self.cuda_sequence_id,
+                &embeddings.data[input_offset * hidden..],
+                &tables.cos[input_offset * (rope_dim / 2)..],
+                &tables.sin[input_offset * (rope_dim / 2)..],
+                reuse,
+                prefill_tokens,
+                scale,
+            )
+        } else {
+            slot.engine
+                .prefill_batched_at(
+                    &embeddings.data[input_offset * hidden..],
+                    &tables.cos[input_offset * (rope_dim / 2)..],
+                    &tables.sin[input_offset * (rope_dim / 2)..],
+                    reuse,
+                    prefill_tokens,
+                    scale,
+                )
+                .map_err(BackendError::RuntimeShapeMismatch)
+        };
+        if let Err(error) = prefill_result {
+            if paged_kv_enabled {
+                *guard = None;
+                self.cuda_sequence_lease = None;
+                drop(guard);
+                crate::cuda::release_async_pool();
+            }
+            return Err(error);
         }
-        // The GPU prefill fills only the GPU KV cache. The CPU-side cache is mirrored
-        // back LAZILY, by `ensure_cpu_kv_materialized`, at the moment a CPU reader
-        // actually needs the history — not here.
-        //
-        // This used to mirror eagerly on every request, justified by a comment saying
-        // the copy was "a few MB of device->host transfer, negligible next to the
-        // prefill compute it follows". Both halves stopped being true. The copy is
-        // `n_layers * n_kv * n * head_dim * 2` elements, so it scales with the WHOLE
-        // context (~170 MiB on the wire for a 3B at 1.5k positions, plus a scalar
-        // host-side expansion loop); and once prefix continuation cut the prefill down
-        // to the newly appended tokens, there was no longer a large compute for it to
-        // be negligible next to. Measured on the RTX 3060 Laptop reference, the mirror
-        // was 62-74% of a follow-up turn's reported prefill time.
-        //
-        // Lazy is safe for the readers that can always be satisfied on demand: the three
-        // CPU forward readers (`forward_layer_range_from_hidden`,
-        // `forward_single_token_timed_internal`, and the verify path) call
-        // `ensure_cpu_kv_materialized` before touching the history, and they do so while
-        // `filled == position` still holds, which is what the recovery requires. On the
-        // common path — GPU prefill, GPU decode, no fallback — nothing reads it at all.
-        //
-        // `rollback_to_position` is the one that CANNOT always be satisfied that way: a
-        // speculative rollback may run with drafts written past `position`, and the
-        // recovery declines whenever `filled != position`. So rather than reason about
-        // whether that is reachable, sessions that speculate keep the eager copy
-        // (`cpu_kv_mirror_eager`, default true, cleared only by `prepare_generation` for
-        // requests with no speculation).
-        //
-        // REMAINING EXPOSURE, stated rather than argued away: if the resident engine is
-        // rebuilt or evicted BETWEEN this prefill and a later decode of the same request,
-        // a reseed is needed (`filled != position`) at exactly the moment the recovery
-        // declines for the same reason, and that forward attends over a zero-filled
-        // prefix — degraded output with only a one-shot stderr warning. The eager copy
-        // left a host copy that covered this. It needs the engine displaced DURING a
-        // request, which run-to-completion scheduling on this lane makes very hard to
-        // reach, but it is not proven unreachable.
-        // `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the eager copy everywhere.
-        if self.cpu_kv_mirror_eager || eager_kv_mirror_enabled() {
+        slot.engine.set_filled(end_position);
+        let finalized = end_position == total_prefill_tokens;
+        if !paged_kv_enabled && finalized && base_position == 0 {
+            slot.engine.set_resident_tokens(token_ids);
+            if trace && reuse > 0 {
+                eprintln!(
+                    "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, prefilled {}",
+                    n - reuse
+                );
+            }
+        }
+        if finalized && (self.cpu_kv_mirror_eager || eager_kv_mirror_enabled()) {
             let mirror_started = Instant::now();
-            if let Err(e) =
-                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-            {
-                if trace {
-                    eprintln!(
-                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
-                    );
-                }
+            let mirror_result = if paged_kv_enabled {
+                let pages = slot.paged_sequence_pages(self.cuda_sequence_id)?;
+                self.copy_resident_cuda_paged_kv_to_host(
+                    &slot.engine,
+                    &pages,
+                    n_layers,
+                    total_prefill_tokens,
+                    n_kv,
+                    head_dim,
+                )
+            } else {
+                self.copy_resident_cuda_kv_to_host(
+                    &slot.engine,
+                    n_layers,
+                    total_prefill_tokens,
+                    n_kv,
+                    head_dim,
+                )
+            };
+            if let Err(error) = mirror_result {
                 slot.engine.set_filled(0);
                 slot.engine.set_resident_tokens(&[]);
-                return Ok(false);
+                return Err(error);
             }
             if trace {
                 eprintln!(
-                    "[resident-cuda] KV mirror to host: {n} positions in {} ms",
+                    "[resident-cuda] KV mirror to host: {total_prefill_tokens} positions in {} ms",
                     mirror_started.elapsed().as_millis()
                 );
             }
         }
         drop(guard);
-        self.kv_cache.position = n;
+        if finalized {
+            self.kv_cache.position = total_prefill_tokens;
+        }
         if trace {
             eprintln!(
-                "[resident-cuda] GPU prefill {n} tokens in {} ms",
+                "[resident-cuda] GPU prefill chunk {base_position}..{end_position} of {total_prefill_tokens} in {} ms",
                 started.elapsed().as_millis()
             );
         }
-        Ok(true)
+        Ok(CudaResidentPrefillChunkOutcome::Advanced {
+            end_position,
+            elapsed_micros: started.elapsed().as_micros(),
+            finalized,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn finalize_resident_paged_prefill_cuda(
+        &mut self,
+        total_prefill_tokens: usize,
+    ) -> Result<()> {
+        if !self.cuda_paged_kv_enabled() || self.kv_cache.position != 0 {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "resident paged prefill cannot be finalized in this session state".to_string(),
+            ));
+        }
+        let cache = self.resident_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.as_ref().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident paged prefill engine is unavailable".to_string(),
+            )
+        })?;
+        let lease = self.cuda_sequence_lease.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident paged prefill sequence lease is missing".to_string(),
+            )
+        })?;
+        if !slot
+            .sequence_slots
+            .as_ref()
+            .is_some_and(|slots| slots.validate(lease))
+            || slot.paged_sequence_len(self.cuda_sequence_id)? != total_prefill_tokens
+        {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "resident paged prefill finalization state does not match the sequence".to_string(),
+            ));
+        }
+        drop(guard);
+        // Keep the sequence-keyed page table resident and defer its CPU mirror. Eagerly
+        // reading every completed row serialized device synchronizations across all slots
+        // and dominated eight-request TTFT. Any CPU fallback already recovers this exact
+        // table under the resident mutex; prompt-cache storage refuses while the CPU
+        // materialization watermark is behind, so no differently-answering cache entry can
+        // be created in the meantime.
+        self.kv_cache.position = total_prefill_tokens;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn acquire_resident_paged_prefill_sequence_cuda(&mut self) -> Result<bool> {
+        if !self.cuda_paged_kv_enabled()
+            || self.kv_cache.position != 0
+            || self.resident_paths_disabled
+            || self.is_drafter
+        {
+            return Ok(false);
+        }
+        let key = self
+            .resident_cache_key
+            .map(|key| key as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let cache = self.resident_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let compatible = guard.as_ref().is_some_and(|slot| {
+            slot.key == key
+                && slot.engine.weights_ready()
+                && slot.paged_kv.is_some()
+                && slot.engine.kv_quant == self.config.kv_quant
+        });
+        if !compatible {
+            return Ok(false);
+        }
+        select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )
     }
 
     /// Mirror the GPU-resident prefill KV into the CPU KV cache so both backends hold
@@ -3583,6 +4017,37 @@ impl LlamaInferenceSession {
                         h,
                         &k[src..src + head_dim],
                         &v[src..src + head_dim],
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn copy_resident_cuda_paged_kv_to_host(
+        &mut self,
+        engine: &crate::cuda_resident::CudaResidentDecode,
+        pages: &[cuda_paged_kv::CudaKvPageHandle],
+        n_layers: usize,
+        n: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        self.kv_cache.ensure_position_capacity(n)?;
+        for layer in 0..n_layers {
+            let (keys, values) = engine
+                .read_paged_kv_layer(pages, layer, n)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+            for position in 0..n {
+                for head in 0..n_kv {
+                    let source = (head * n + position) * head_dim;
+                    self.kv_cache.store_kv_head_row(
+                        layer,
+                        position,
+                        head,
+                        &keys[source..source + head_dim],
+                        &values[source..source + head_dim],
                     );
                 }
             }
@@ -3644,25 +4109,43 @@ impl LlamaInferenceSession {
         // `resident_cache()` hands back a `'static` handle, so this guard borrows the global
         // cache and NOT the session — the stores below can take `&mut self.kv_cache` under it.
         let cache = self.resident_cache();
-        let guard = cache
+        let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(slot) = guard.as_ref() else {
+        if !select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )? {
             return Ok(false);
-        };
+        }
+        let slot = guard.as_mut().expect("CUDA sequence selected");
         if slot.key != key
             || slot.range != range
             || !slot.engine.weights_ready()
             || slot.engine.n_layers() != range.len()
-            || slot.engine.filled() != position
         {
             return Ok(false);
         }
+        let paged_pages = if slot.paged_kv.is_some() {
+            if slot.paged_sequence_len(self.cuda_sequence_id)? != position {
+                return Ok(false);
+            }
+            Some(slot.paged_sequence_pages(self.cuda_sequence_id)?)
+        } else {
+            if slot.engine.filled() != position {
+                return Ok(false);
+            }
+            None
+        };
         for (engine_layer, layer_idx) in range.clone().enumerate() {
-            let (keys, values) = slot
-                .engine
-                .read_kv_layer(engine_layer, position)
-                .map_err(BackendError::RuntimeShapeMismatch)?;
+            let (keys, values) = match paged_pages.as_deref() {
+                Some(pages) => slot
+                    .engine
+                    .read_paged_kv_layer(pages, engine_layer, position),
+                None => slot.engine.read_kv_layer(engine_layer, position),
+            }
+            .map_err(BackendError::RuntimeShapeMismatch)?;
             self.kv_cache
                 .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
         }
@@ -3872,6 +4355,14 @@ impl LlamaInferenceSession {
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )? {
+            return Ok(None);
+        }
+        let slot = guard.as_mut().expect("CUDA sequence selected");
         // Only run when the engine already holds this model with the KV materialized
         // exactly up to `position` (mid-decode). Otherwise let the caller take a normal
         // step, which builds/seeds the engine. An OFFLOADED engine is also rejected: the
@@ -3880,16 +4371,14 @@ impl LlamaInferenceSession {
         // stream into scratch only on the single-token path), so a batched verify over an
         // offloaded target would read garbage and break losslessness. Falling back to `None`
         // routes the caller to the CPU chunk verify, which is correct for offloaded layers.
-        let ready = guard.as_ref().is_some_and(|slot| {
-            slot.key == key
-                && slot.engine.weights_ready()
-                && slot.engine.filled() == position
-                && slot.engine.supports_batched_verify()
-        });
+        let ready = slot.key == key
+            && slot.paged_kv.is_none()
+            && slot.engine.weights_ready()
+            && slot.engine.filled() == position
+            && slot.engine.supports_batched_verify();
         if !ready {
             return Ok(None);
         }
-        let slot = guard.as_mut().expect("ready checked above");
         let predicted =
             match slot
                 .engine
@@ -3983,16 +4472,22 @@ impl LlamaInferenceSession {
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ready = guard.as_ref().is_some_and(|slot| {
-            slot.key == key
-                && slot.engine.weights_ready()
-                && slot.engine.filled() == position
-                && slot.engine.supports_tree_verify()
-        });
+        if !select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )? {
+            return Ok(None);
+        }
+        let slot = guard.as_mut().expect("CUDA sequence selected");
+        let ready = slot.key == key
+            && slot.paged_kv.is_none()
+            && slot.engine.weights_ready()
+            && slot.engine.filled() == position
+            && slot.engine.supports_tree_verify();
         if !ready {
             return Ok(None);
         }
-        let slot = guard.as_mut().expect("ready checked above");
         let predicted = match slot.engine.verify_tree(
             &embeddings.data,
             &cos_all,
@@ -4142,8 +4637,9 @@ impl LlamaInferenceSession {
         // comfortably; beyond it the per-token guard below falls back to the CPU.
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
-            .min(resident_cuda_max_context());
+            .min(self.resident_cuda_context_cap());
         let position = self.kv_cache.position;
+        let paged_kv_enabled = self.cuda_paged_kv_enabled();
         if position >= kv_cap
             || embedding.data.len() != hidden
             || weights.layers.len() != dims.block_count
@@ -4155,6 +4651,14 @@ impl LlamaInferenceSession {
                     embedding.data.len(),
                     weights.layers.len(),
                     dims.block_count
+                );
+            }
+            return Ok(None);
+        }
+        if paged_kv_enabled && position >= crate::cuda_resident::SPLITK_THRESHOLD {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda] paged position {position} requires unsupported split-K attention"
                 );
             }
             return Ok(None);
@@ -4220,6 +4724,7 @@ impl LlamaInferenceSession {
             .resident_cache_key
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let kv_slot_count = self.resident_cuda_kv_slot_count();
         let cache = self.resident_cache();
         let mut guard = cache
             .lock()
@@ -4248,6 +4753,8 @@ impl LlamaInferenceSession {
             || guard.as_ref().is_none_or(|slot| {
                 slot.key != key
                     || !slot.engine.weights_ready()
+                    || slot.paged_kv.is_some() != paged_kv_enabled
+                    || (!paged_kv_enabled && slot.engine.kv_slot_count() != kv_slot_count)
                     || slot.engine.kv_quant != self.config.kv_quant
             });
         if trace && need_build {
@@ -4287,12 +4794,36 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
                 self.config.gemma3.as_ref(),
+                kv_slot_count,
                 self.config.kv_quant,
+                paged_kv_enabled,
             ) {
                 Some(engine) => {
+                    let paged_kv = if paged_kv_enabled {
+                        Some(ResidentCudaPagedKv::for_engine(
+                            &engine,
+                            n_layers,
+                            n_kv,
+                            head_dim,
+                            kv_slot_count,
+                            match self.config.kv_quant {
+                                crate::model::KvCacheQuantization::Q8_0 => {
+                                    cuda_paged_kv::CudaKvPageStorage::Q8_0
+                                }
+                                _ => cuda_paged_kv::CudaKvPageStorage::F16,
+                            },
+                        )?)
+                    } else {
+                        None
+                    };
                     *guard = Some(ResidentCudaSlot {
                         key,
                         engine,
+                        sequence_slots: (paged_kv_enabled || kv_slot_count == 2).then(|| {
+                            cuda_sequence::FixedCudaSequenceSlots::new(kv_slot_count)
+                                .expect("fixed CUDA slot count is valid")
+                        }),
+                        paged_kv,
                         range: range.clone(),
                     })
                 }
@@ -4311,6 +4842,13 @@ impl LlamaInferenceSession {
             }
         }
 
+        if !select_resident_cuda_sequence_or_teardown(
+            &mut guard,
+            self.cuda_sequence_id,
+            &mut self.cuda_sequence_lease,
+        )? {
+            return Ok(None);
+        }
         let slot = guard.as_mut().expect("resident CUDA engine built above");
 
         // The engine's VRAM-sized capacity is authoritative: a position at or beyond
@@ -4325,6 +4863,55 @@ impl LlamaInferenceSession {
                 );
             }
             return Ok(None);
+        }
+
+        if paged_kv_enabled {
+            let cursor = slot.paged_sequence_len(self.cuda_sequence_id)?;
+            if cursor != position {
+                if trace {
+                    eprintln!(
+                        "[resident-cuda] paged sequence cursor {cursor} did not match position {position}; declining before mutation"
+                    );
+                }
+                return Ok(None);
+            }
+            let output = match slot.forward_paged_append(
+                self.cuda_sequence_id,
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+                gpu_sample_token.is_some(),
+                sample,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    *guard = None;
+                    self.cuda_sequence_lease = None;
+                    drop(guard);
+                    crate::cuda::release_async_pool();
+                    return Err(error);
+                }
+            };
+            let forward = match output {
+                ResidentCudaPagedForward::Sampled(token) => ResidentForward::Sampled(token),
+                ResidentCudaPagedForward::Logits(logits) => {
+                    match CpuTensor::from_f32("resident_logits", vec![1, vocab], logits) {
+                        Ok(logits) => ResidentForward::Logits(logits),
+                        Err(error) => {
+                            *guard = None;
+                            self.cuda_sequence_lease = None;
+                            drop(guard);
+                            crate::cuda::release_async_pool();
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+            let slot = guard.as_mut().expect("resident CUDA paged engine retained");
+            slot.engine.set_filled(position + 1);
+            return Ok(Some(forward));
         }
 
         // (Re)seed the GPU KV cache from the CPU history [0, position) when
@@ -5865,6 +6452,606 @@ impl LlamaInferenceSession {
             diagnostics,
         })
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn execute_cuda_true_paged_prefill_step(
+    sessions: &mut [&mut LlamaInferenceSession],
+    token_ids: &[u32],
+    positions: &[usize],
+) -> std::result::Result<CudaTruePagedPrefillExecution, CudaTruePagedBatchContractError> {
+    if !resident_cuda_batched_prefill_active() {
+        return Err(CudaTruePagedBatchContractError::Disabled);
+    }
+    let batch_size = sessions.len();
+    if token_ids.len() != batch_size
+        || positions.len() != batch_size
+        || !(2..=crate::cuda_resident::MAX_VERIFY_K).contains(&batch_size)
+    {
+        return Err(CudaTruePagedBatchContractError::InvalidBatchSize(
+            batch_size,
+        ));
+    }
+    let first_key = sessions[0].resident_cache_key;
+    let first_config = &sessions[0].config;
+    let first_weights = &sessions[0].weights;
+    let compatible = first_key.is_some()
+        && sessions.iter().all(|session| {
+            session.cuda_paged_kv_enabled()
+                && session.cuda_sequence_capacity() >= batch_size
+                && !session.resident_paths_disabled
+                && !session.is_drafter
+                && session.weights.layer_range.is_none()
+                && session.kv_cache.position == 0
+                && session.resident_cache_key == first_key
+                && session.config == *first_config
+                && Arc::ptr_eq(&session.weights, first_weights)
+        });
+    if !compatible {
+        return Err(CudaTruePagedBatchContractError::IncompatibleRows);
+    }
+    let leases = sessions
+        .iter()
+        .map(|session| {
+            session
+                .cuda_sequence_lease
+                .ok_or(CudaTruePagedBatchContractError::MissingLease(
+                    session.cuda_sequence_id.get(),
+                ))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut physical_slots = std::collections::HashSet::with_capacity(batch_size);
+    for (session, lease) in sessions.iter().zip(&leases) {
+        if lease.sequence_id() != session.cuda_sequence_id
+            || !physical_slots.insert(lease.slot_id().index())
+        {
+            return Err(CudaTruePagedBatchContractError::IncompatibleRows);
+        }
+    }
+
+    let dims = DenseLlamaDims::from_config(first_config)
+        .map_err(|_| CudaTruePagedBatchContractError::IncompatibleRows)?;
+    let scale = attention_score_scale_value(
+        dims.head_dim,
+        diagnostic_attention_score_scale()
+            .map_err(|_| CudaTruePagedBatchContractError::IncompatibleRows)?,
+    );
+    let mut embeddings = Vec::with_capacity(batch_size * dims.embedding_length);
+    let mut cos = Vec::with_capacity(batch_size * dims.head_dim);
+    let mut sin = Vec::with_capacity(batch_size * dims.head_dim);
+    for ((session, token_id), position) in sessions.iter().zip(token_ids).zip(positions) {
+        let embedding = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[*token_id], "cuda_true_paged_prefill_embedding")
+            .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?;
+        embeddings.extend_from_slice(&embedding.data);
+        let tables = rope::resident_decode_rope_tables(
+            *position,
+            dims.head_dim,
+            &session.config,
+            session.weights.rope_freqs.as_ref(),
+        )
+        .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?
+        .ok_or(CudaTruePagedBatchContractError::IncompatibleRows)?;
+        cos.extend_from_slice(&tables.cos);
+        sin.extend_from_slice(&tables.sin);
+    }
+
+    let cache = sessions[0].resident_cache();
+    let internal_sequence_ids = sessions
+        .iter()
+        .map(|session| session.cuda_sequence_id)
+        .collect::<Vec<_>>();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_mut()
+        .ok_or(CudaTruePagedBatchContractError::EngineUnavailable)?;
+    let sequence_slots = slot
+        .sequence_slots
+        .as_ref()
+        .ok_or(CudaTruePagedBatchContractError::EngineUnavailable)?;
+    let engine_ready = slot.key == first_key.expect("checked above") as usize
+        && slot.range == (0..dims.block_count)
+        && slot.paged_kv.is_some()
+        && slot.engine.supports_independent_paged_batch_q8()
+        && leases.iter().all(|lease| sequence_slots.validate(*lease))
+        && internal_sequence_ids
+            .iter()
+            .zip(positions)
+            .all(|(sequence_id, position)| {
+                slot.paged_sequence_len(*sequence_id)
+                    .is_ok_and(|cursor| cursor == *position)
+            });
+    if !engine_ready {
+        return Err(CudaTruePagedBatchContractError::EngineUnavailable);
+    }
+    let started = Instant::now();
+    let backend = slot.prefill_paged_batch_append(
+        &internal_sequence_ids,
+        &embeddings,
+        &cos,
+        &sin,
+        positions,
+        scale,
+    );
+    let batch_elapsed_micros = started.elapsed().as_micros();
+    let backend = match backend {
+        Ok(backend) => backend,
+        Err(error) => {
+            *guard = None;
+            for session in sessions.iter_mut() {
+                session.cuda_sequence_lease = None;
+            }
+            drop(guard);
+            crate::cuda::release_async_pool();
+            return Err(CudaTruePagedBatchContractError::Backend(error.to_string()));
+        }
+    };
+    Ok(CudaTruePagedPrefillExecution {
+        batch_size,
+        batch_elapsed_micros,
+        shared_projection_launches: backend.shared_projection_launches,
+        execution_mode: backend.execution_mode,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn execute_cuda_true_paged_batch(
+    sessions: &mut [&mut LlamaInferenceSession],
+    requests: &[CudaTrueBatch2Request<'_>],
+) -> std::result::Result<CudaTruePagedBatchExecution, CudaTruePagedBatchContractError> {
+    if !resident_cuda_true_paged_batch_active() {
+        return Err(CudaTruePagedBatchContractError::Disabled);
+    }
+    let batch_size = sessions.len();
+    if requests.len() != batch_size
+        || !(2..=crate::cuda_resident::MAX_VERIFY_K).contains(&batch_size)
+    {
+        return Err(CudaTruePagedBatchContractError::InvalidBatchSize(
+            batch_size,
+        ));
+    }
+    let mut sequence_ids = std::collections::HashSet::with_capacity(batch_size);
+    for request in requests {
+        if !sequence_ids.insert(request.sequence_id) {
+            return Err(CudaTruePagedBatchContractError::DuplicateSequence(
+                request.sequence_id,
+            ));
+        }
+        if request.cancelled.is_some_and(|cancelled| cancelled()) {
+            return Err(CudaTruePagedBatchContractError::CancelledBeforeDispatch(
+                request.sequence_id,
+            ));
+        }
+        if let LlamaSampler::Sampling(config) = &request.sampler {
+            config
+                .validate()
+                .map_err(|_| CudaTruePagedBatchContractError::IncompatibleRows)?;
+        }
+    }
+
+    let first_key = sessions[0].resident_cache_key;
+    let first_config = &sessions[0].config;
+    let first_weights = &sessions[0].weights;
+    let compatible = first_key.is_some()
+        && sessions.iter().all(|session| {
+            session.cuda_paged_kv_enabled()
+                && session.cuda_sequence_capacity() >= batch_size
+                && !session.resident_paths_disabled
+                && !session.is_drafter
+                && session.weights.layer_range.is_none()
+                && session.resident_cache_key == first_key
+                && session.config == *first_config
+                && Arc::ptr_eq(&session.weights, first_weights)
+        });
+    if !compatible {
+        return Err(CudaTruePagedBatchContractError::IncompatibleRows);
+    }
+
+    let leases = sessions
+        .iter()
+        .zip(requests)
+        .map(|(session, request)| {
+            session
+                .cuda_sequence_lease
+                .ok_or(CudaTruePagedBatchContractError::MissingLease(
+                    request.sequence_id,
+                ))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut physical_slots = std::collections::HashSet::with_capacity(batch_size);
+    for (session, lease) in sessions.iter().zip(&leases) {
+        if lease.sequence_id() != session.cuda_sequence_id
+            || !physical_slots.insert(lease.slot_id().index())
+        {
+            return Err(CudaTruePagedBatchContractError::IncompatibleRows);
+        }
+    }
+
+    let dims = DenseLlamaDims::from_config(first_config)
+        .map_err(|_| CudaTruePagedBatchContractError::IncompatibleRows)?;
+    let head_dim = dims.head_dim;
+    let scale = attention_score_scale_value(
+        head_dim,
+        diagnostic_attention_score_scale()
+            .map_err(|_| CudaTruePagedBatchContractError::IncompatibleRows)?,
+    );
+    let mut embeddings = Vec::with_capacity(batch_size * dims.embedding_length);
+    let mut cos = Vec::with_capacity(batch_size * head_dim);
+    let mut sin = Vec::with_capacity(batch_size * head_dim);
+    let positions = sessions
+        .iter()
+        .map(|session| session.kv_cache.position)
+        .collect::<Vec<_>>();
+    for (session, request) in sessions.iter().zip(requests) {
+        let embedding = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[request.input_token_id], "cuda_true_paged_batch_embedding")
+            .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?;
+        embeddings.extend_from_slice(&embedding.data);
+        let tables = rope::resident_decode_rope_tables(
+            session.kv_cache.position,
+            head_dim,
+            &session.config,
+            session.weights.rope_freqs.as_ref(),
+        )
+        .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?
+        .ok_or(CudaTruePagedBatchContractError::IncompatibleRows)?;
+        cos.extend_from_slice(&tables.cos);
+        sin.extend_from_slice(&tables.sin);
+    }
+
+    let cache = sessions[0].resident_cache();
+    let internal_sequence_ids = sessions
+        .iter()
+        .map(|session| session.cuda_sequence_id)
+        .collect::<Vec<_>>();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_mut()
+        .ok_or(CudaTruePagedBatchContractError::EngineUnavailable)?;
+    let sequence_slots = slot
+        .sequence_slots
+        .as_ref()
+        .ok_or(CudaTruePagedBatchContractError::EngineUnavailable)?;
+    let engine_ready = slot.key == first_key.expect("checked above") as usize
+        && slot.range == (0..dims.block_count)
+        && slot.paged_kv.is_some()
+        && slot.engine.supports_independent_paged_batch_q8()
+        && leases.iter().all(|lease| sequence_slots.validate(*lease))
+        && internal_sequence_ids
+            .iter()
+            .zip(&positions)
+            .all(|(sequence_id, position)| {
+                slot.paged_sequence_len(*sequence_id)
+                    .is_ok_and(|cursor| cursor == *position)
+            });
+    if !engine_ready {
+        return Err(CudaTruePagedBatchContractError::EngineUnavailable);
+    }
+
+    let greedy_on_device = requests.iter().all(|request| {
+        matches!(&request.sampler, LlamaSampler::Greedy) && request.allowed_tokens.is_none()
+    });
+    let started = Instant::now();
+    let backend = slot.forward_paged_batch_append(
+        &internal_sequence_ids,
+        &embeddings,
+        &cos,
+        &sin,
+        &positions,
+        scale,
+        greedy_on_device,
+    );
+    let batch_elapsed_micros = started.elapsed().as_micros();
+    let backend = match backend {
+        Ok(backend) => backend,
+        Err(error) => {
+            *guard = None;
+            for session in sessions.iter_mut() {
+                session.cuda_sequence_lease = None;
+            }
+            drop(guard);
+            crate::cuda::release_async_pool();
+            return Err(CudaTruePagedBatchContractError::Backend(error.to_string()));
+        }
+    };
+    drop(guard);
+
+    for session in sessions.iter_mut() {
+        session.kv_cache.position += 1;
+    }
+    let mut rows = Vec::with_capacity(batch_size);
+    for (row_index, request) in requests.iter().enumerate() {
+        if request.cancelled.is_some_and(|cancelled| cancelled()) {
+            rows.push(CudaTrueBatch2RowResult {
+                sequence_id: request.sequence_id,
+                position_before: positions[row_index],
+                position_after: positions[row_index] + 1,
+                shared_forward_micros: batch_elapsed_micros,
+                outcome: CudaTrueBatch2RowOutcome::CancelledAfterDispatch,
+            });
+            continue;
+        }
+        let sampled = match &backend.sampled_token_ids {
+            Some(token_ids) => Ok(token_ids[row_index]),
+            None => {
+                let logits = CpuTensor::from_f32(
+                    format!("cuda_true_paged_batch_logits_{}", request.sequence_id),
+                    vec![1, dims.vocab_size],
+                    backend
+                        .logits
+                        .as_ref()
+                        .expect("non-greedy paged batch returns logits")[row_index]
+                        .clone(),
+                )
+                .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?;
+                match request.allowed_tokens {
+                    Some(allowed) => {
+                        let mut masked = logits.clone();
+                        apply_token_mask(&mut masked, allowed).and_then(|()| {
+                            request
+                                .sampler
+                                .sample_with_history(&masked, request.token_history)
+                        })
+                    }
+                    None => request
+                        .sampler
+                        .sample_with_history(&logits, request.token_history),
+                }
+            }
+        };
+        rows.push(CudaTrueBatch2RowResult {
+            sequence_id: request.sequence_id,
+            position_before: positions[row_index],
+            position_after: positions[row_index] + 1,
+            shared_forward_micros: batch_elapsed_micros,
+            outcome: match sampled {
+                Ok(next_token_id) if request.stop_token_ids.contains(&next_token_id) => {
+                    CudaTrueBatch2RowOutcome::Stopped { next_token_id }
+                }
+                Ok(next_token_id) => CudaTrueBatch2RowOutcome::Generated { next_token_id },
+                Err(error) => CudaTrueBatch2RowOutcome::SamplingFailed {
+                    message: error.to_string(),
+                },
+            },
+        });
+    }
+    Ok(CudaTruePagedBatchExecution {
+        rows,
+        batch_size,
+        batch_elapsed_micros,
+        shared_projection_launches: backend.shared_projection_launches,
+        execution_mode: backend.execution_mode,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // Validated Phase 3 executor; Phase 4 supplies ready row pairs.
+pub(crate) fn execute_cuda_true_batch2(
+    mut sessions: [&mut LlamaInferenceSession; 2],
+    requests: [CudaTrueBatch2Request<'_>; 2],
+) -> std::result::Result<CudaTrueBatch2Execution, CudaTrueBatch2ContractError> {
+    if !resident_cuda_true_batch2_active() {
+        return Err(CudaTrueBatch2ContractError::Disabled);
+    }
+    if requests[0].sequence_id == requests[1].sequence_id {
+        return Err(CudaTrueBatch2ContractError::DuplicateSequence(
+            requests[0].sequence_id,
+        ));
+    }
+    for request in &requests {
+        if request.cancelled.is_some_and(|cancelled| cancelled()) {
+            return Err(CudaTrueBatch2ContractError::CancelledBeforeDispatch(
+                request.sequence_id,
+            ));
+        }
+        if let LlamaSampler::Sampling(config) = &request.sampler {
+            config
+                .validate()
+                .map_err(|_| CudaTrueBatch2ContractError::IncompatibleRows)?;
+        }
+    }
+    let compatible = sessions.iter().all(|session| {
+        session.supports_cuda_multi_sequence_kv()
+            && !session.resident_paths_disabled
+            && !session.is_drafter
+            && session.weights.layer_range.is_none()
+    }) && sessions[0].resident_cache_key.is_some()
+        && sessions[0].resident_cache_key == sessions[1].resident_cache_key
+        && sessions[0].config == sessions[1].config
+        && Arc::ptr_eq(&sessions[0].weights, &sessions[1].weights);
+    if !compatible {
+        return Err(CudaTrueBatch2ContractError::IncompatibleRows);
+    }
+
+    let leases = [
+        sessions[0]
+            .cuda_sequence_lease
+            .ok_or(CudaTrueBatch2ContractError::MissingLease(
+                requests[0].sequence_id,
+            ))?,
+        sessions[1]
+            .cuda_sequence_lease
+            .ok_or(CudaTrueBatch2ContractError::MissingLease(
+                requests[1].sequence_id,
+            ))?,
+    ];
+    if leases[0].sequence_id() != sessions[0].cuda_sequence_id
+        || leases[1].sequence_id() != sessions[1].cuda_sequence_id
+        || leases[0].slot_id() == leases[1].slot_id()
+    {
+        return Err(CudaTrueBatch2ContractError::IncompatibleRows);
+    }
+    let mut physical_to_request = [usize::MAX; 2];
+    for (request_index, lease) in leases.iter().enumerate() {
+        let slot = lease.slot_id().index();
+        if slot >= 2 || physical_to_request[slot] != usize::MAX {
+            return Err(CudaTrueBatch2ContractError::IncompatibleRows);
+        }
+        physical_to_request[slot] = request_index;
+    }
+
+    let dims = DenseLlamaDims::from_config(&sessions[0].config)
+        .map_err(|_| CudaTrueBatch2ContractError::IncompatibleRows)?;
+    let head_dim = dims.head_dim;
+    let scale = attention_score_scale_value(
+        head_dim,
+        diagnostic_attention_score_scale()
+            .map_err(|_| CudaTrueBatch2ContractError::IncompatibleRows)?,
+    );
+    let mut embeddings = Vec::with_capacity(2 * dims.embedding_length);
+    let mut cos = Vec::with_capacity(2 * head_dim);
+    let mut sin = Vec::with_capacity(2 * head_dim);
+    let mut positions = [0usize; 2];
+    for slot in 0..2 {
+        let request_index = physical_to_request[slot];
+        let request = &requests[request_index];
+        let session = &sessions[request_index];
+        let embedding = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[request.input_token_id], "cuda_true_batch2_embedding")
+            .map_err(|error| CudaTrueBatch2ContractError::Backend(error.to_string()))?;
+        embeddings.extend_from_slice(&embedding.data);
+        positions[slot] = session.kv_cache.position;
+        let tables = rope::resident_decode_rope_tables(
+            positions[slot],
+            head_dim,
+            &session.config,
+            session.weights.rope_freqs.as_ref(),
+        )
+        .map_err(|error| CudaTrueBatch2ContractError::Backend(error.to_string()))?
+        .ok_or(CudaTrueBatch2ContractError::IncompatibleRows)?;
+        cos.extend_from_slice(&tables.cos);
+        sin.extend_from_slice(&tables.sin);
+    }
+
+    let cache = sessions[0].resident_cache();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot = guard
+        .as_mut()
+        .ok_or(CudaTrueBatch2ContractError::EngineUnavailable)?;
+    let sequence_slots = slot
+        .sequence_slots
+        .as_ref()
+        .ok_or(CudaTrueBatch2ContractError::EngineUnavailable)?;
+    if slot.key != sessions[0].resident_cache_key.expect("checked above") as usize
+        || slot.range != (0..dims.block_count)
+        || slot.paged_kv.is_some()
+        || !sequence_slots.validate(leases[0])
+        || !sequence_slots.validate(leases[1])
+        || !slot.engine.supports_independent_batch2_q8()
+        || slot.engine.kv_slot_filled(0) != Some(positions[0])
+        || slot.engine.kv_slot_filled(1) != Some(positions[1])
+    {
+        return Err(CudaTrueBatch2ContractError::EngineUnavailable);
+    }
+
+    let greedy_on_device = requests.iter().all(|request| {
+        matches!(&request.sampler, LlamaSampler::Greedy) && request.allowed_tokens.is_none()
+    });
+    let started = Instant::now();
+    let backend = slot.engine.forward_independent_batch2_q8(
+        &embeddings,
+        &cos,
+        &sin,
+        positions,
+        scale,
+        greedy_on_device,
+    );
+    let batch_elapsed_micros = started.elapsed().as_micros();
+    let backend = match backend {
+        Ok(output) => output,
+        Err(crate::cuda_resident::CudaIndependentBatch2Error::Runtime(message)) => {
+            *guard = None;
+            sessions[0].cuda_sequence_lease = None;
+            sessions[1].cuda_sequence_lease = None;
+            drop(guard);
+            crate::cuda::release_async_pool();
+            return Err(CudaTrueBatch2ContractError::Backend(message));
+        }
+        Err(error) => return Err(CudaTrueBatch2ContractError::Backend(error.to_string())),
+    };
+    drop(guard);
+
+    for session in &mut sessions {
+        session.kv_cache.position += 1;
+    }
+    let mut rows = Vec::with_capacity(2);
+    for (request_index, request) in requests.into_iter().enumerate() {
+        let physical_slot = leases[request_index].slot_id().index();
+        if request.cancelled.is_some_and(|cancelled| cancelled()) {
+            rows.push(CudaTrueBatch2RowResult {
+                sequence_id: request.sequence_id,
+                position_before: positions[physical_slot],
+                position_after: positions[physical_slot] + 1,
+                shared_forward_micros: batch_elapsed_micros,
+                outcome: CudaTrueBatch2RowOutcome::CancelledAfterDispatch,
+            });
+            continue;
+        }
+        let sampled = match backend.sampled_token_ids {
+            Some(token_ids) => Ok(token_ids[physical_slot]),
+            None => {
+                let logits = CpuTensor::from_f32(
+                    format!("cuda_true_batch2_logits_{}", request.sequence_id),
+                    vec![1, dims.vocab_size],
+                    backend
+                        .logits
+                        .as_ref()
+                        .expect("non-greedy batch-2 returns logits")[physical_slot]
+                        .clone(),
+                )
+                .map_err(|error| CudaTrueBatch2ContractError::Backend(error.to_string()))?;
+                match request.allowed_tokens {
+                    Some(allowed) => {
+                        let mut masked = logits.clone();
+                        apply_token_mask(&mut masked, allowed).and_then(|()| {
+                            request
+                                .sampler
+                                .sample_with_history(&masked, request.token_history)
+                        })
+                    }
+                    None => request
+                        .sampler
+                        .sample_with_history(&logits, request.token_history),
+                }
+            }
+        };
+        rows.push(CudaTrueBatch2RowResult {
+            sequence_id: request.sequence_id,
+            position_before: positions[physical_slot],
+            position_after: positions[physical_slot] + 1,
+            shared_forward_micros: batch_elapsed_micros,
+            outcome: match sampled {
+                Ok(next_token_id) if request.stop_token_ids.contains(&next_token_id) => {
+                    CudaTrueBatch2RowOutcome::Stopped { next_token_id }
+                }
+                Ok(next_token_id) => CudaTrueBatch2RowOutcome::Generated { next_token_id },
+                Err(error) => CudaTrueBatch2RowOutcome::SamplingFailed {
+                    message: error.to_string(),
+                },
+            },
+        });
+    }
+    let rows: [CudaTrueBatch2RowResult; 2] = rows
+        .try_into()
+        .expect("exactly two batch-2 row results were produced");
+    Ok(CudaTrueBatch2Execution {
+        rows,
+        batch_elapsed_micros,
+        shared_projection_launches: backend.shared_projection_launches,
+        execution_mode: backend.execution_mode,
+    })
 }
 
 fn copy_tensor_rows_into_buffer(
@@ -13267,6 +14454,8 @@ fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) ->
 struct ResidentCudaSlot {
     key: usize,
     engine: crate::cuda_resident::CudaResidentDecode,
+    sequence_slots: Option<cuda_sequence::FixedCudaSequenceSlots>,
+    paged_kv: Option<ResidentCudaPagedKv>,
     /// The ABSOLUTE layer range this engine was built over — `0..block_count` for a whole
     /// model, a sub-range for a pipeline shard. Recorded because `key` alone does not
     /// distinguish two shards of the SAME model co-hosted in one process: the API derives the
@@ -13278,22 +14467,657 @@ struct ResidentCudaSlot {
     range: std::ops::Range<usize>,
 }
 
+#[cfg(feature = "cuda")]
+struct ResidentCudaPagedKv {
+    pool: cuda_paged_kv::CudaKvPagePool,
+    tables: HashMap<cuda_sequence::CudaSequenceId, cuda_paged_kv::CudaKvPageTable>,
+}
+
+#[cfg(feature = "cuda")]
+impl ResidentCudaPagedKv {
+    fn new(layout: cuda_paged_kv::CudaKvPageLayout, capacity_pages: usize) -> Result<Self> {
+        Ok(Self {
+            pool: cuda_paged_kv::CudaKvPagePool::new(layout, capacity_pages)
+                .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?,
+            tables: HashMap::new(),
+        })
+    }
+
+    fn for_engine(
+        engine: &crate::cuda_resident::CudaResidentDecode,
+        layer_count: usize,
+        kv_head_count: usize,
+        head_dim: usize,
+        sequence_capacity: usize,
+        storage: cuda_paged_kv::CudaKvPageStorage,
+    ) -> Result<Self> {
+        let capacity_pages = engine
+            .max_pos()
+            .min(crate::cuda_resident::SPLITK_THRESHOLD)
+            .checked_mul(sequence_capacity)
+            .map(|tokens| tokens.div_ceil(cuda_paged_kv::CUDA_KV_PAGE_TOKENS))
+            .filter(|pages| *pages > 0)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "resident CUDA paged KV capacity overflowed".to_string(),
+                )
+            })?;
+        Self::new(
+            cuda_paged_kv::CudaKvPageLayout {
+                layer_count,
+                kv_head_count,
+                head_dim,
+                storage,
+            },
+            capacity_pages,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct ResidentCudaPendingAppend {
+    sequence_id: cuda_sequence::CudaSequenceId,
+    pending: cuda_paged_kv::PendingCudaKvBatchAppend,
+    allocated_pages: Vec<cuda_paged_kv::CudaKvPageHandle>,
+    planned_pages: Vec<cuda_paged_kv::CudaKvPageHandle>,
+}
+
+#[cfg(feature = "cuda")]
+enum ResidentCudaPagedForward {
+    Sampled(u32),
+    Logits(Vec<f32>),
+}
+
+#[cfg(feature = "cuda")]
+impl ResidentCudaSlot {
+    fn paged_sequence_len(&self, sequence_id: cuda_sequence::CudaSequenceId) -> Result<usize> {
+        self.paged_kv
+            .as_ref()
+            .and_then(|paged| paged.tables.get(&sequence_id))
+            .map(cuda_paged_kv::CudaKvPageTable::len)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "resident CUDA paged KV sequence table is missing".to_string(),
+                )
+            })
+    }
+
+    fn paged_sequence_pages(
+        &self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+    ) -> Result<Vec<cuda_paged_kv::CudaKvPageHandle>> {
+        self.paged_kv
+            .as_ref()
+            .and_then(|paged| paged.tables.get(&sequence_id))
+            .map(|table| table.pages().to_vec())
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "resident CUDA paged KV sequence table is missing".to_string(),
+                )
+            })
+    }
+
+    fn prepare_paged_append(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        count: usize,
+    ) -> Result<ResidentCudaPendingAppend> {
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
+        let table = paged.tables.get(&sequence_id).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident CUDA paged KV sequence table is missing".to_string(),
+            )
+        })?;
+        let pending = table
+            .prepare_append_batch(&mut paged.pool, count)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        let planned_pages = table
+            .planned_pages_after_batch(&pending)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        let allocated_pages = pending.allocated_pages().collect::<Vec<_>>();
+        let mut allocated_device_pages = Vec::with_capacity(allocated_pages.len());
+        for page in &allocated_pages {
+            if let Err(error) = self.engine.allocate_paged_kv_page(*page) {
+                for allocated in allocated_device_pages.into_iter().rev() {
+                    let _ = self.engine.release_paged_kv_page(allocated);
+                }
+                cuda_paged_kv::CudaKvPageTable::abort_append_batch(&mut paged.pool, pending)
+                    .map_err(|abort_error| {
+                        BackendError::RuntimeShapeMismatch(format!(
+                            "{error}; paged KV append rollback failed: {abort_error}"
+                        ))
+                    })?;
+                return Err(BackendError::RuntimeShapeMismatch(error));
+            }
+            allocated_device_pages.push(*page);
+        }
+        let copy_on_write_pages = pending.copy_on_write_pages().collect::<Vec<_>>();
+        for (source, target) in copy_on_write_pages {
+            if let Err(error) = self.engine.copy_paged_kv_page(source, target) {
+                for allocated in allocated_device_pages.into_iter().rev() {
+                    let _ = self.engine.release_paged_kv_page(allocated);
+                }
+                cuda_paged_kv::CudaKvPageTable::abort_append_batch(&mut paged.pool, pending)
+                    .map_err(|abort_error| {
+                        BackendError::RuntimeShapeMismatch(format!(
+                            "{error}; paged KV CoW rollback failed: {abort_error}"
+                        ))
+                    })?;
+                return Err(BackendError::RuntimeShapeMismatch(error));
+            }
+        }
+        Ok(ResidentCudaPendingAppend {
+            sequence_id,
+            pending,
+            allocated_pages,
+            planned_pages,
+        })
+    }
+
+    fn commit_paged_append(&mut self, pending: ResidentCudaPendingAppend) -> Result<()> {
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
+        let table = paged.tables.get_mut(&pending.sequence_id).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident CUDA paged KV sequence table is missing".to_string(),
+            )
+        })?;
+        table
+            .commit_append_batch(&mut paged.pool, pending.pending)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_paged_append(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        base_position: usize,
+        count: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let pending = self.prepare_paged_append(sequence_id, count)?;
+        if let Err(kernel_error) = self.engine.prefill_paged_at(
+            embeddings,
+            cos,
+            sin,
+            base_position,
+            count,
+            scale,
+            &pending.planned_pages,
+        ) {
+            return match self.abort_paged_append(pending) {
+                Ok(()) => Err(BackendError::RuntimeShapeMismatch(kernel_error)),
+                Err(abort_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                    "{kernel_error}; paged CUDA prefill rollback failed: {abort_error}"
+                ))),
+            };
+        }
+        self.commit_paged_append(pending)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged_append(
+        &mut self,
+        sequence_id: cuda_sequence::CudaSequenceId,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        greedy: bool,
+        sample: Option<(f32, u64)>,
+    ) -> Result<ResidentCudaPagedForward> {
+        let pending = self.prepare_paged_append(sequence_id, 1)?;
+        let kernel_result = if let Some((inv_temp, seed)) = sample {
+            self.engine
+                .forward_token_sample_paged(
+                    embedding,
+                    cos,
+                    sin,
+                    position,
+                    scale,
+                    inv_temp,
+                    seed,
+                    &pending.planned_pages,
+                )
+                .map(ResidentCudaPagedForward::Sampled)
+        } else if greedy {
+            self.engine
+                .forward_token_paged(embedding, cos, sin, position, scale, &pending.planned_pages)
+                .map(ResidentCudaPagedForward::Sampled)
+        } else {
+            self.engine
+                .forward_token_logits_paged(
+                    embedding,
+                    cos,
+                    sin,
+                    position,
+                    scale,
+                    &pending.planned_pages,
+                )
+                .map(ResidentCudaPagedForward::Logits)
+        };
+        let output = match kernel_result {
+            Ok(output) => output,
+            Err(kernel_error) => {
+                return match self.abort_paged_append(pending) {
+                    Ok(()) => Err(BackendError::RuntimeShapeMismatch(kernel_error)),
+                    Err(abort_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                        "{kernel_error}; paged CUDA decode rollback failed: {abort_error}"
+                    ))),
+                };
+            }
+        };
+        self.commit_paged_append(pending)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged_batch_append(
+        &mut self,
+        sequence_ids: &[cuda_sequence::CudaSequenceId],
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        positions: &[usize],
+        scale: f32,
+        greedy_on_device: bool,
+    ) -> Result<crate::cuda_resident::CudaIndependentPagedBatchOutput> {
+        if sequence_ids.len() != positions.len() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "paged CUDA batch sequence and position counts differ".to_string(),
+            ));
+        }
+        let mut pending_rows = Vec::with_capacity(sequence_ids.len());
+        for sequence_id in sequence_ids {
+            match self.prepare_paged_append(*sequence_id, 1) {
+                Ok(pending) => pending_rows.push(pending),
+                Err(error) => {
+                    let rollback = self.abort_paged_appends(pending_rows);
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                            "{error}; paged CUDA batch prepare rollback failed: {rollback_error}"
+                        ))),
+                    };
+                }
+            }
+        }
+        let planned_pages = pending_rows
+            .iter()
+            .map(|pending| pending.planned_pages.clone())
+            .collect::<Vec<_>>();
+        let backend = self.engine.forward_independent_paged_batch_q8(
+            embeddings,
+            cos,
+            sin,
+            positions,
+            &planned_pages,
+            scale,
+            greedy_on_device,
+        );
+        let backend = match backend {
+            Ok(backend) => backend,
+            Err(error) => {
+                let rollback = self.abort_paged_appends(pending_rows);
+                return match rollback {
+                    Ok(()) => Err(BackendError::RuntimeShapeMismatch(error.to_string())),
+                    Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                        "{error}; paged CUDA batch kernel rollback failed: {rollback_error}"
+                    ))),
+                };
+            }
+        };
+        for pending in pending_rows {
+            self.commit_paged_append(pending)?;
+        }
+        Ok(backend)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_paged_batch_append(
+        &mut self,
+        sequence_ids: &[cuda_sequence::CudaSequenceId],
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        positions: &[usize],
+        scale: f32,
+    ) -> Result<crate::cuda_resident::CudaIndependentPagedPrefillOutput> {
+        if sequence_ids.len() != positions.len() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "paged CUDA prefill sequence and position counts differ".to_string(),
+            ));
+        }
+        let mut pending_rows = Vec::with_capacity(sequence_ids.len());
+        for sequence_id in sequence_ids {
+            match self.prepare_paged_append(*sequence_id, 1) {
+                Ok(pending) => pending_rows.push(pending),
+                Err(error) => {
+                    let rollback = self.abort_paged_appends(pending_rows);
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                            "{error}; paged CUDA prefill prepare rollback failed: {rollback_error}"
+                        ))),
+                    };
+                }
+            }
+        }
+        let planned_pages = pending_rows
+            .iter()
+            .map(|pending| pending.planned_pages.clone())
+            .collect::<Vec<_>>();
+        let backend = self.engine.prefill_independent_paged_batch_q8(
+            embeddings,
+            cos,
+            sin,
+            positions,
+            &planned_pages,
+            scale,
+        );
+        let backend = match backend {
+            Ok(backend) => backend,
+            Err(error) => {
+                let rollback = self.abort_paged_appends(pending_rows);
+                return match rollback {
+                    Ok(()) => Err(BackendError::RuntimeShapeMismatch(error.to_string())),
+                    Err(rollback_error) => Err(BackendError::RuntimeShapeMismatch(format!(
+                        "{error}; paged CUDA prefill kernel rollback failed: {rollback_error}"
+                    ))),
+                };
+            }
+        };
+        for pending in pending_rows {
+            self.commit_paged_append(pending)?;
+        }
+        Ok(backend)
+    }
+
+    fn abort_paged_appends(&mut self, pending_rows: Vec<ResidentCudaPendingAppend>) -> Result<()> {
+        for pending in pending_rows.into_iter().rev() {
+            self.abort_paged_append(pending)?;
+        }
+        Ok(())
+    }
+
+    fn abort_paged_append(&mut self, pending: ResidentCudaPendingAppend) -> Result<()> {
+        for page in pending.allocated_pages.iter().rev() {
+            self.engine
+                .release_paged_kv_page(*page)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+        }
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
+        cuda_paged_kv::CudaKvPageTable::abort_append_batch(&mut paged.pool, pending.pending)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))
+    }
+
+    fn release_paged_sequence(&mut self, sequence_id: cuda_sequence::CudaSequenceId) -> Result<()> {
+        let paged = self.paged_kv.as_mut().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("resident CUDA paged KV is not enabled".to_string())
+        })?;
+        let table = paged.tables.get(&sequence_id).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "resident CUDA paged KV sequence table is missing".to_string(),
+            )
+        })?;
+        let exclusive_pages = table
+            .pages()
+            .iter()
+            .copied()
+            .filter_map(|page| match paged.pool.references(page) {
+                Ok(1) => Some(Ok(page)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        for page in &exclusive_pages {
+            self.engine
+                .release_paged_kv_page(*page)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+        }
+        let table = paged
+            .tables
+            .get_mut(&sequence_id)
+            .expect("paged sequence table was validated above");
+        table
+            .release_all(&mut paged.pool)
+            .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+        paged.tables.remove(&sequence_id);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn select_resident_cuda_sequence(
+    slot: &mut ResidentCudaSlot,
+    sequence_id: cuda_sequence::CudaSequenceId,
+    session_lease: &mut Option<cuda_sequence::CudaSequenceLease>,
+) -> Result<bool> {
+    let Some(sequence_slots) = slot.sequence_slots.as_mut() else {
+        return Ok(true);
+    };
+    if let Some(lease) = *session_lease {
+        if sequence_slots.validate(lease) {
+            if slot.paged_kv.is_none() {
+                slot.engine
+                    .select_kv_slot(lease.slot_id().index())
+                    .map_err(BackendError::RuntimeShapeMismatch)?;
+            }
+            return Ok(true);
+        }
+        *session_lease = None;
+    }
+    let acquisition = match sequence_slots.acquire(sequence_id) {
+        Ok(acquisition) => acquisition,
+        Err(cuda_sequence::CudaSequenceSlotError::CapacityExhausted { .. }) => return Ok(false),
+        Err(error) => return Err(BackendError::RuntimeShapeMismatch(error.to_string())),
+    };
+    let lease = acquisition.lease();
+    if let Some(paged) = slot.paged_kv.as_mut() {
+        if paged
+            .tables
+            .insert(
+                sequence_id,
+                cuda_paged_kv::CudaKvPageTable::new(sequence_id.get()),
+            )
+            .is_some()
+        {
+            let _ = sequence_slots.poison(lease);
+            return Err(BackendError::RuntimeShapeMismatch(
+                "resident CUDA paged KV sequence table already exists".to_string(),
+            ));
+        }
+    } else if let Err(error) = slot.engine.clear_kv_slot(lease.slot_id().index()) {
+        let _ = sequence_slots.poison(lease);
+        return Err(BackendError::RuntimeShapeMismatch(error));
+    }
+    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+        eprintln!(
+            "[resident-cuda-sequence] acquired slot={} mode=cooperative_serial",
+            lease.slot_id().index()
+        );
+    }
+    *session_lease = Some(lease);
+    Ok(true)
+}
+
+#[cfg(feature = "cuda")]
+fn select_resident_cuda_sequence_or_teardown(
+    guard: &mut Option<ResidentCudaSlot>,
+    sequence_id: cuda_sequence::CudaSequenceId,
+    session_lease: &mut Option<cuda_sequence::CudaSequenceLease>,
+) -> Result<bool> {
+    let Some(slot) = guard.as_mut() else {
+        return Ok(false);
+    };
+    match select_resident_cuda_sequence(slot, sequence_id, session_lease) {
+        Ok(selected) => Ok(selected),
+        Err(error) => {
+            *guard = None;
+            *session_lease = None;
+            crate::cuda::release_async_pool();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn release_resident_cuda_sequence(
+    cache: &'static std::sync::Mutex<Option<ResidentCudaSlot>>,
+    lease: cuda_sequence::CudaSequenceLease,
+) {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clear_failed = {
+        let Some(slot) = guard.as_mut() else {
+            return;
+        };
+        let Some(sequence_slots) = slot.sequence_slots.as_ref() else {
+            return;
+        };
+        if !sequence_slots.validate(lease) {
+            return;
+        }
+        let released = if slot.paged_kv.is_some() {
+            slot.release_paged_sequence(lease.sequence_id()).is_ok()
+        } else {
+            slot.engine.clear_kv_slot(lease.slot_id().index()).is_ok()
+        };
+        let sequence_slots = slot
+            .sequence_slots
+            .as_mut()
+            .expect("sequence slots were validated above");
+        if released {
+            let _ = sequence_slots.release(lease);
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda-sequence] released slot={} mode=cooperative_serial",
+                    lease.slot_id().index()
+                );
+            }
+            false
+        } else {
+            let _ = sequence_slots.poison(lease);
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda-sequence] poisoned slot={} tearing_down_engine=true",
+                    lease.slot_id().index()
+                );
+            }
+            true
+        }
+    };
+    if clear_failed {
+        *guard = None;
+        drop(guard);
+        crate::cuda::release_async_pool();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ResidentCudaStatus {
     pub max_positions: usize,
     pub filled_positions: usize,
     pub offloaded: bool,
+    pub kv_slot_capacity: usize,
+    pub occupied_sequences: usize,
+    pub poisoned_slots: usize,
+    pub execution_mode: ResidentCudaExecutionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged_kv: Option<ResidentCudaPagedStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResidentCudaPagedStatus {
+    pub page_tokens: usize,
+    pub page_bytes: usize,
+    pub capacity_pages: usize,
+    pub allocated_pages: usize,
+    pub free_pages: usize,
+    pub fragmented_pages: usize,
+    pub shared_pages: usize,
+    pub high_watermark_pages: usize,
+    pub allocation_failures: u64,
+    pub reclaimed_pages: u64,
+    pub allocated_bytes: usize,
+    pub device_allocated_bytes: usize,
+    pub device_high_watermark_bytes: usize,
+    pub sequence_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidentCudaExecutionMode {
+    Exclusive,
+    CooperativeSerial,
 }
 
 #[cfg(feature = "cuda")]
 pub fn resident_cuda_status(model_cache_key: u64) -> Option<ResidentCudaStatus> {
     let cache = resident_cuda_cache().try_lock().ok()?;
     let slot = cache.as_ref()?;
+    let sequence_snapshot = slot.sequence_slots.as_ref().map(|slots| slots.snapshot());
+    let paged_kv = slot.paged_kv.as_ref().and_then(|paged| {
+        let metadata = paged.pool.snapshot();
+        let device = slot.engine.paged_kv_page_snapshot()?;
+        Some(ResidentCudaPagedStatus {
+            page_tokens: cuda_paged_kv::CUDA_KV_PAGE_TOKENS,
+            page_bytes: metadata.page_bytes,
+            capacity_pages: metadata.capacity_pages,
+            allocated_pages: metadata.allocated_pages,
+            free_pages: metadata
+                .capacity_pages
+                .saturating_sub(metadata.allocated_pages),
+            fragmented_pages: metadata.free_pages,
+            shared_pages: metadata.shared_pages,
+            high_watermark_pages: metadata.high_watermark_pages,
+            allocation_failures: metadata.allocation_failures,
+            reclaimed_pages: metadata.reclaimed_pages,
+            allocated_bytes: metadata.allocated_bytes,
+            device_allocated_bytes: device.allocated_bytes,
+            device_high_watermark_bytes: device.high_watermark_bytes,
+            sequence_count: paged.tables.len(),
+        })
+    });
     (slot.key == model_cache_key as usize).then(|| ResidentCudaStatus {
         max_positions: slot.engine.max_pos(),
         filled_positions: slot.engine.filled(),
         offloaded: slot.engine.is_offloaded(),
+        kv_slot_capacity: sequence_snapshot.map_or(1, |snapshot| snapshot.capacity),
+        occupied_sequences: sequence_snapshot.map_or(1, |snapshot| snapshot.occupied),
+        poisoned_slots: sequence_snapshot.map_or(0, |snapshot| snapshot.poisoned),
+        execution_mode: if sequence_snapshot.is_some() {
+            ResidentCudaExecutionMode::CooperativeSerial
+        } else {
+            ResidentCudaExecutionMode::Exclusive
+        },
+        paged_kv,
     })
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn active_resident_cuda_status() -> Option<ResidentCudaStatus> {
+    let cache = resident_cuda_cache().try_lock().ok()?;
+    let slot = cache.as_ref()?;
+    let key = slot.key as u64;
+    drop(cache);
+    resident_cuda_status(key)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn active_resident_cuda_status() -> Option<ResidentCudaStatus> {
+    None
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -13611,6 +15435,20 @@ fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
     Vec::new()
 }
 
+#[cfg(feature = "cuda")]
+fn resident_projected_kv_bytes(
+    paged_kv: bool,
+    position_capacity: usize,
+    all_sequences_bytes_per_position: u64,
+) -> Option<u64> {
+    let positions = if paged_kv {
+        position_capacity.min(crate::cuda_resident::SPLITK_THRESHOLD)
+    } else {
+        position_capacity
+    };
+    all_sequences_bytes_per_position.checked_mul(positions as u64)
+}
+
 /// Fail the CUDA resident path closed for Qwen3-style per-head QK-norm.
 /// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate
 /// the GPU KV cache, and upload every layer's Q8_0 weights (repacked to SoA) plus
@@ -13641,7 +15479,9 @@ fn build_resident_cuda_engine(
     // the schedule is keyed to the SAME parsed metadata the CPU oracle and the
     // Metal lane use.
     gemma3: Option<&crate::model::Gemma3Metadata>,
+    kv_slot_count: usize,
     kv_quant: crate::model::KvCacheQuantization,
+    paged_kv: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     if kv_quant == crate::model::KvCacheQuantization::Q8_0 && !head_dim.is_multiple_of(32) {
         return None;
@@ -13735,6 +15575,7 @@ fn build_resident_cuda_engine(
         _ => (head_dim * 2) as u64,
     };
     let kv_bytes_per_pos = (n_layers * n_kv * 2) as u64 * kv_bytes_per_elem;
+    let total_kv_bytes_per_pos = kv_bytes_per_pos.checked_mul(kv_slot_count as u64)?;
     let weights_bytes: u64 = weights.layers[range.clone()]
         .iter()
         .flat_map(|l| {
@@ -13765,7 +15606,7 @@ fn build_resident_cuda_engine(
     let free_probe = crate::cuda::probe_capability()
         .map(|c| c.vram_free_bytes)
         .unwrap_or(0);
-    let min_kv_floor = kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
+    let min_kv_floor = total_kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
     // Speculative coexistence: the TARGET reserves the draft's footprint out of its own VRAM
     // budget so the draft can stay GPU-resident beside it (reserve = 0 for the draft, which
     // takes the remaining free VRAM). BUT only honor the reserve when the target still fits
@@ -13873,7 +15714,7 @@ fn build_resident_cuda_engine(
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(2)
         .max(2) as u64;
-    let min_kv = kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
+    let min_kv = total_kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
 
     // Layer-offload split. CAMELID_OFFLOAD_FORCE_LAYERS=N forces the last N layers to
     // host RAM (test/override hook, fires even on a model that fits). Otherwise the
@@ -13909,6 +15750,9 @@ fn build_resident_cuda_engine(
         (0, "none")
     };
     let n_resident_layers = n_layers - offload_count;
+    if paged_kv && offload_count > 0 {
+        return None;
+    }
 
     // VRAM left for the KV cache after the RESIDENT weights and (if offloading) the
     // streaming scratch ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â so freed weight VRAM grows the resident context.
@@ -13919,12 +15763,12 @@ fn build_resident_cuda_engine(
     } else {
         0
     };
-    let cap = if free_vram > 0 && kv_bytes_per_pos > 0 {
+    let cap = if free_vram > 0 && total_kv_bytes_per_pos > 0 {
         let budget = free_vram
             .saturating_sub(resident_weights_bytes)
             .saturating_sub(headroom)
             .saturating_sub(scratch_reserve);
-        let vram_positions = (budget / kv_bytes_per_pos) as usize;
+        let vram_positions = (budget / total_kv_bytes_per_pos) as usize;
         let chosen = kv_cap.min(vram_positions);
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
@@ -13936,7 +15780,7 @@ fn build_resident_cuda_engine(
                 n_layers,
                 scratch_reserve / (1024 * 1024),
                 headroom / (1024 * 1024),
-                kv_bytes_per_pos,
+                total_kv_bytes_per_pos,
                 vram_positions,
                 kv_cap,
                 chosen,
@@ -13964,8 +15808,8 @@ fn build_resident_cuda_engine(
     // eventual mid-load OOM. By construction `cap` already reserves `headroom`, so
     // a model that currently loads still passes; this is the explicit backstop.
     if free_probe > 0 {
-        let projected_alloc =
-            resident_weights_bytes + scratch_reserve + (cap as u64) * kv_bytes_per_pos;
+        let projected_kv = resident_projected_kv_bytes(paged_kv, cap, total_kv_bytes_per_pos)?;
+        let projected_alloc = resident_weights_bytes + scratch_reserve + projected_kv;
         // Evaluate against ACTUAL free VRAM. Under coexistence the budget already excludes the
         // draft's reserve, so the target's sizing leaves that reserve free by construction ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
         // here we only require a small absolute safety margin (NOT reserve+margin, which would
@@ -13982,21 +15826,41 @@ fn build_resident_cuda_engine(
             return None;
         }
     }
-    let mut engine = crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
-        n_layers,
-        n_heads,
-        n_kv,
-        head_dim,
-        hidden,
-        ffn_dim,
-        rope_dim,
-        cap,
-        vocab,
-        rms_eps,
-        split_half_pairing,
-        kv_quant,
-    )
+    let mut engine = if paged_kv {
+        crate::cuda_resident::CudaResidentDecode::new_paged_with_kv_quant(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            cap,
+            vocab,
+            rms_eps,
+            split_half_pairing,
+            kv_quant,
+        )
+    } else {
+        crate::cuda_resident::CudaResidentDecode::new_with_kv_quant(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            cap,
+            vocab,
+            rms_eps,
+            split_half_pairing,
+            kv_quant,
+        )
+    }
     .ok()?;
+    if kv_slot_count == 2 && !paged_kv {
+        engine.enable_second_kv_slot().ok()?;
+    }
     for (idx, l) in weights.layers[range.clone()].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
             raw(&l.attention_q),
@@ -14191,6 +16055,14 @@ fn resident_decode_cuda_enabled() -> bool {
     crate::cuda::gpu_accel_enabled()
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_paged_kv_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_CUDA_PAGED_KV").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 #[cfg(not(feature = "cuda"))]
 fn resident_decode_cuda_enabled() -> bool {
     false
@@ -14206,6 +16078,107 @@ fn resident_decode_cuda_enabled() -> bool {
 /// mode already bypasses the cache on the CPU lane.
 pub fn resident_decode_cuda_active() -> bool {
     resident_decode_cuda_enabled()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_two_sequence_kv_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_CUDA_TWO_SEQUENCE_KV")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_two_sequence_active() -> bool {
+    resident_cuda_sequence_capacity() == 2
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_two_sequence_active() -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_true_batch2_active() -> bool {
+    resident_cuda_sequence_capacity() == 2
+        && matches!(
+            std::env::var("CAMELID_CUDA_TRUE_BATCH2").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_true_paged_batch_active() -> bool {
+    resident_cuda_sequence_capacity() > 1
+        && cuda_paged_kv_enabled()
+        && !resident_cuda_true_batch2_active()
+        && matches!(
+            std::env::var("CAMELID_CUDA_TRUE_BATCH").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_batched_prefill_active() -> bool {
+    resident_cuda_true_paged_batch_active()
+        && matches!(
+            std::env::var("CAMELID_CUDA_BATCHED_PREFILL")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_batched_prefill_active() -> bool {
+    false
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_true_paged_batch_active() -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_sequence_capacity() -> usize {
+    if !resident_decode_cuda_enabled() {
+        return 1;
+    }
+    crate::runtime_config::cuda_sequence_capacity(
+        cuda_two_sequence_kv_enabled(),
+        cuda_paged_kv_enabled(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_multi_sequence_active() -> bool {
+    resident_cuda_sequence_capacity() > 1
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_multi_sequence_active() -> bool {
+    false
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_sequence_capacity() -> usize {
+    1
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_true_batch2_active() -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_two_sequence_max_context() -> usize {
+    std::env::var("CAMELID_CUDA_TWO_SEQUENCE_MAX_CONTEXT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 256)
+        .unwrap_or(8_192)
 }
 
 /// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV
