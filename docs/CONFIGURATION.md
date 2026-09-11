@@ -520,28 +520,40 @@ of the names:
 Ollama's `/api/tags` also carries a `digest`, of the *manifest*: it changes with a template or a
 parameter while the weights stay put, and is never read as a weights digest.
 
-Both sides are read before either generates, and a Camelid side's runs are sent
-`camelid_expected_gguf_sha256` set to the other side's published digest, so the engine itself
+A digest is of a *file*, and which file depends on the engine: Camelid's is the GGUF it loaded,
+Ollama's is the copy it stored. So equal digests show the same file on both sides, but two different
+engines publishing different digests show only two files — not that the tensors in them differ.
+
+Both sides are read before either generates. When **both** sides are Camelid nodes, each side's runs
+are sent `camelid_expected_gguf_sha256` set to the other's published digest, so the engine itself
 checks its loaded bytes on every run. If it refuses (`model_artifact_mismatch`), its weights are
-other bytes and the comparison says so — `different_models` — rather than failing.
+other bytes and the comparison says so — `different_models` — rather than failing. A Camelid side is
+never sent an Ollama blob digest to enforce: that is the digest of the copy Ollama stored, which a
+Camelid node loaded from the original GGUF can never match (below).
 
 | Evidence | Result |
 |---|---|
 | Both sides published, or enforced, one digest | `model_identity: verified_by_digest`, the digest shown, nothing about identity uncontrolled |
-| Published digests differ, or an engine refused the other's | `different_models`, naming each side's GGUF file digest. Different files are shown; different tensors are not, so the headline says the sides are *not shown to serve the same model* |
+| One engine kind published two digests that differ (two Camelid nodes, say), or a Camelid node refused the other's | `different_models`, naming each side's GGUF file digest. Different files are shown; different tensors are not, so the headline says the sides are *not shown to serve the same model* |
+| Two different engines published digests that differ | **Not** `different_models`. The comparison proceeds exactly as it would with no digests: `same_id`; `asserted_by_operator` when the operator paired the ids (`--left-model`/`--right-model`, an `alias` line); or, when the ids differ and nobody asserted, `different_models` naming the two ids. `model identity` is listed as uncontrolled, and its reason names both digests and says a file digest cannot show whether the tensors differ |
 | Anything else | `same_id` or `asserted_by_operator` as before, with the reason naming the side that published no digest |
 
-Measured with `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `432f310a…`) on mini2:
+Measured with `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `432f310a…`) on mini2, `Say hi.` at
+temperature 0, seed 42, three runs a side:
 
-- The same Camelid server under two labels published `432f310a…` on both sides, every run was
-  enforced against it, and the comparison reported `verified_by_digest` and `identical`.
-- Against Ollama 0.33.2 with a model made by `ollama create` from that same file, it did **not**
-  verify. Ollama stored a re-serialized copy — the same size, metadata keys reordered, sha256
-  `a2fa82e5…` — and its modelfile names that blob. Camelid refused runs bound to `a2fa82e5…` and the
-  comparison reported `different_models`. A whole-file digest cannot see past a re-serialization, so
-  Camelid against an Ollama model created from a local GGUF on that version cannot be compared as the
-  same model today; the `asserted_by_operator` path it used before cannot override bytes shown to
-  differ.
+- The same Camelid server under two labels published `432f310a…` on both sides, each side's runs
+  were bound to the other's and enforced, and the comparison reported `verified_by_digest` and
+  `identical` (`Hi!` on every run).
+- Against Ollama 0.33.2 with a model made by `ollama create` from that same file, the digests do not
+  match: Ollama stored a re-serialized copy — the same size, metadata keys reordered, sha256
+  `a2fa82e5…` — and its modelfile names that blob. With `--left-model 'Llama 3.2 1B Instruct'
+  --right-model llama32-1b-q8-r1:latest` the comparison ran as `asserted_by_operator`, neither side
+  was bound to a digest, and `model identity` was listed as uncontrolled naming both digests. Both
+  sides agreed with themselves and disagreed with each other — `divergent`, `Hi!` against
+  `Hi. How can I assist you today?` — while advertising byte-identical chat templates, which the
+  result says do not explain the difference. (An earlier build read the two digests as different
+  models, bound Camelid to `a2fa82e5…`, had it refuse, and reported `different_models`; that made
+  this comparison impossible to run at all.)
 
 #### Request history
 
@@ -559,8 +571,8 @@ happened. Measured on that Ollama, five comparisons per arm in both orders after
 Camelid stable at `adf8c6c4` throughout: without the request, 8 of 10 left Ollama stable at
 `8cd52013` — a confident `divergent` that was its history — and 2 unstable; with it, 8 of 10 were
 unstable and 2 stable at `adf8c6c4`, and none was a confident `divergent`. (Those verdicts are
-derived from each side's recorded samples: on that pair the fabric itself reported
-`different_models`, for the digest reason above.) `--no-history-perturbation` on the CLI, or `"perturb_history": false` on
+derived from each side's recorded samples: the build that took them reported that pair as
+`different_models`, on a digest rule since corrected — see above.) `--no-history-perturbation` on the CLI, or `"perturb_history": false` on
 `POST /v1/fabric/compare`, turns it off.
 
 It exposes a dependence; it does not control one. `request history (prompt cache)` is listed as
@@ -577,9 +589,10 @@ not trigger. Both are why the item stays on the uncontrolled list.
 
 Engines do not agree on what to call the same weights. Ollama suffixes `:latest`, LM Studio does
 not, Camelid uses its catalog id. Exact-match identity therefore refuses a cross-engine comparison
-even when the two nodes really are serving the same file. Where both engines publish the digest of
-the GGUF file they serve, the digests settle it instead (see *Model identity by digest* below); LM
-Studio publishes none, so a comparison against it always needs the declaration described here.
+even when the two nodes really are serving the same file. Where both sides publish the same GGUF
+file digest, that settles it instead (see *Model identity by digest* above). Two engines publishing
+different digests settle nothing — Ollama stores its own copy of a GGUF it imports — so that pair,
+like any comparison against LM Studio, which publishes none, needs the declaration described here.
 
 This build will not guess. Stripping a `:latest` suffix to make two ids match is an inference, and
 it would be wrong the first time somebody has two genuinely different builds under similar names.
