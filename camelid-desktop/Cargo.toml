@@ -24,11 +24,6 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
-# A relaunch while the app is backgrounded must focus the running instance, never start a
-# second sidecar and a second model load. Pinned exactly: 2.4.4 is the newest release whose
-# `tauri ^2.10` requirement the locked tauri satisfies, and a caret range could later pull
-# a Tauri upgrade in through this crate alone.
-tauri-plugin-single-instance = "=2.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -46,6 +41,14 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+# A second launch while the app is backgrounded must focus the running instance, never start
+# a second sidecar and a second model load. Windows only: there the plugin keys on a named
+# mutex and a window class, both local to the user's session. Its macOS socket is a fixed
+# path in the shared /tmp, which another account can own or occupy; macOS relaunches arrive
+# as RunEvent::Reopen instead (see README "What is NOT claimed"). Pinned exactly: 2.4.4 is
+# the newest release whose `tauri ^2.10` requirement the locked tauri satisfies, and a caret
+# range could later pull a Tauri upgrade in through this crate alone.
+tauri-plugin-single-instance = "=2.4.4"
 # Job object with KILL_ON_JOB_CLOSE: ties the sidecar's lifetime to ours so a desktop
 # crash cannot orphan a `camelid` process. Same major as the server crate uses (0.59).
 windows-sys = { version = "0.59", features = [

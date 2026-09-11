@@ -93,12 +93,16 @@ and what both macOS upgrade scripts rely on), and a close with background mode o
 vetoes an exit. A sidecar still inside its 40-second health gate is stopped too; it is held
 in the engine slot from the moment it is spawned.
 
-Relaunching the running app (the Dock icon, `open -a`, Finder, or starting the executable
-again) shows the main window rather than starting a second engine and a second model load.
-macOS Reopen handles the first three; `tauri-plugin-single-instance` (pinned `=2.4.4`)
-handles a second process on both OSes and ignores the arguments it passes. Dev builds share
-the installed app's identifier, so **quit the installed app before
-`cargo run -p camelid-desktop`**, or the dev build focuses the installed app and exits.
+Relaunching the running app is meant to show the main window rather than start a second
+engine and a second model load. On macOS a relaunch through the Dock icon, Finder or
+`open -a` arrives as Reopen, which shows the main window. On Windows,
+`tauri-plugin-single-instance` (pinned `=2.4.4`, Windows only) hands a second launch to the
+running instance through a named mutex and a window class that are local to the user's
+session, and ignores the arguments the second process passes. The plugin is not used on
+macOS (see [What is NOT claimed](#what-is-not-claimed)). Dev builds share the installed
+app's identifier and app data. On Windows a dev build focuses a running installed app and
+exits, so **quit the installed app before `cargo run -p camelid-desktop`**. On macOS it
+starts beside the installed app with a second engine.
 
 Crash backstops, for when the desktop process dies without running any of its own code:
 

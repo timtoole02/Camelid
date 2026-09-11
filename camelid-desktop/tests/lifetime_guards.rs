@@ -190,6 +190,52 @@ fn reopen_and_a_second_launch_show_the_main_window() {
     );
 }
 
+/// On macOS the plugin's socket is a fixed path in the shared /tmp: another account's stale
+/// socket makes it launch with no listener, and a socket another account binds first swallows
+/// every launch. It is compiled and registered on Windows only, where it keys on a named mutex
+/// and a window class local to the session. macOS relaunches arrive as RunEvent::Reopen.
+#[test]
+fn single_instance_plugin_is_windows_only() {
+    let manifest_path = repo_root().join("camelid-desktop/Cargo.toml");
+    let manifest =
+        std::fs::read_to_string(&manifest_path).expect("read camelid-desktop/Cargo.toml");
+    let mut section = String::new();
+    let mut found = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            section = trimmed.to_string();
+        } else if trimmed.starts_with("tauri-plugin-single-instance") {
+            found.push(section.clone());
+        }
+    }
+    assert_eq!(
+        found,
+        ["[target.'cfg(windows)'.dependencies]"],
+        "tauri-plugin-single-instance must be a Windows-only dependency"
+    );
+
+    let main = production_source("camelid-desktop/src/main.rs");
+    let lines: Vec<&str> = main.lines().collect();
+    let registrations: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("tauri_plugin_single_instance::init("))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(registrations.len(), 1, "expected one registration");
+    let attribute = lines[..registrations[0]]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with("//"));
+    assert_eq!(
+        attribute,
+        Some("#[cfg(windows)]"),
+        "the single-instance plugin is registered outside Windows"
+    );
+}
+
 /// Source-level. Every exit reaches the one engine shutdown, and the tray's Quit asks for an
 /// exit rather than doing something narrower.
 #[test]

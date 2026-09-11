@@ -328,13 +328,17 @@ fn emit_error(app: &tauri::AppHandle, title: &str, guidance: &str, detail: &str)
 }
 
 fn main() {
-    tauri::Builder::default()
-        // First, so a second launch hands over to this instance before building anything:
-        // relaunching a backgrounded app must not start a second engine and a second model
-        // load. The other process's arguments are ignored; any process can send them.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_main_window(app)
-        }))
+    let builder = tauri::Builder::default();
+    // Windows only, and first, so a second launch hands over to this instance before building
+    // anything: relaunching a backgrounded app must not start a second engine and a second
+    // model load. The other process's arguments are ignored; any process can send them. On
+    // macOS the plugin listens on a fixed path in the shared /tmp, which another account can
+    // own or occupy; Dock, Finder and `open -a` relaunches arrive as RunEvent::Reopen instead.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        show_main_window(app)
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()

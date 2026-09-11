@@ -742,8 +742,14 @@ unless background mode is on.
 7. **Loopback only, literally.** The tray says "(loopback only)", the literal bind. A Host
    check against DNS rebinding was proposed and declined for this release; the exposure is
    listed as not claimed. Serving other devices is out of scope.
-8. **Single instance.** `tauri-plugin-single-instance` `=2.4.4`, registered first, shows the
-   main window and ignores the other process's arguments; macOS Reopen does the same.
+8. **Single instance.** On Windows, `tauri-plugin-single-instance` `=2.4.4`, registered
+   first, shows the main window and ignores the other process's arguments; its mutex and
+   window class are local to the user's session. On macOS, Reopen shows the main window for
+   Dock, Finder and `open -a` relaunches, and the plugin is not used. Its socket there is a
+   fixed path in the shared `/tmp`: another account's socket makes a launch skip the check
+   silently, and one bound first by someone else swallows every launch. A direct exec,
+   `open -n` or a second copy of the app starts a second instance on macOS; declared, not
+   claimed.
 9. **App Nap.** On macOS an `NSProcessInfo` activity (user-initiated, idle sleep allowed) is
    held only while background mode is on and `main` is hidden.
 
