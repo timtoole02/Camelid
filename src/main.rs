@@ -1505,6 +1505,14 @@ fn configure_node_transport(
     )?)
 }
 
+fn mixed_engines(allowed: bool) -> camelid::fabric::MixedEngines {
+    if allowed {
+        camelid::fabric::MixedEngines::Allowed
+    } else {
+        camelid::fabric::MixedEngines::Refused
+    }
+}
+
 /// Render a comparison for a terminal.
 ///
 /// The verdict comes first and the answers come second, because the answers are
@@ -1729,6 +1737,16 @@ enum FabricAction {
         /// Label of the node that served this session previously.
         #[arg(long)]
         sticky: Option<String>,
+        /// Also place on engines this fabric only reads by default.
+        ///
+        /// Off unless asked for. A foreign engine publishes no load to rank on,
+        /// cannot tell a full queue from a failure, and cannot attest that a
+        /// session's prefix is still warm; turning this on accepts all three.
+        /// Requests carrying tools still never land on a backend nobody has
+        /// measured, and affinity to a node that cannot attest warmth is
+        /// refused rather than silently degraded.
+        #[arg(long)]
+        allow_mixed_engines: bool,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY.
         #[arg(long, value_name = "TOKEN")]
@@ -1768,6 +1786,10 @@ enum FabricAction {
         model: Option<String>,
         #[arg(long)]
         sticky: Option<String>,
+        /// Also place on engines this fabric only reads by default. See
+        /// `fabric route --help` for what turning it on accepts.
+        #[arg(long)]
+        allow_mixed_engines: bool,
         /// Bearer token for nodes started with an API key. Falls back to
         /// CAMELID_API_KEY. Without it, a node that requires a key observes as
         /// ready and then answers this request with 401.
@@ -4510,6 +4532,7 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                allow_mixed_engines,
                 bearer,
                 transport,
                 timeout_ms,
@@ -4523,7 +4546,8 @@ async fn main() -> anyhow::Result<()> {
                 let snapshots = fabric.observe();
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
-                    .with_sticky(sticky.as_deref());
+                    .with_sticky(sticky.as_deref())
+                    .with_mixed_engines(mixed_engines(allow_mixed_engines));
 
                 // A fabric that cannot place the request is a failure the caller
                 // must see in the exit code, not only in the text.
@@ -4556,6 +4580,7 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                allow_mixed_engines,
                 bearer,
                 transport,
                 max_tokens,
@@ -4571,7 +4596,8 @@ async fn main() -> anyhow::Result<()> {
 
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
-                    .with_sticky(sticky.as_deref());
+                    .with_sticky(sticky.as_deref())
+                    .with_mixed_engines(mixed_engines(allow_mixed_engines));
                 // Held until the forward below returns: the node is busy for
                 // exactly that long.
                 let placement = fabric

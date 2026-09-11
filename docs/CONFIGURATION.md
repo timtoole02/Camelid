@@ -386,6 +386,33 @@ reason shown can never drift from the verdict it explains.
 Every answer carries `x-camelid-fabric-engine` alongside `x-camelid-fabric-node`, in every routing
 mode, so a client never has to know which engines a fabric places on to find out which one served it.
 
+### Placing work on an engine this fabric only reads
+
+Off by default: `fabric route` and `fabric run` place on Camelid nodes only, and a healthy foreign
+node is reported and refused. `--allow-mixed-engines` turns that off, and it is worth being precise
+about what it accepts, because none of it goes away by being asked for.
+
+A foreign engine publishes no load, cannot distinguish a full queue from a failure, and cannot
+attest that a session's prefix is still warm. Mixed placement accepts those three, each with a
+stated consequence:
+
+| Consequence | What the fabric does |
+|---|---|
+| No load to rank on | The node is charged a fixed cost rather than treated as idle. Charged nothing it would outrank every node that honestly reported work and win **every** placement, concentrating load exactly where the fabric can see least. The cost is a deliberate guess, which is why this is opt-in. |
+| Tools | A request carrying tools never lands on a backend nobody has measured. The capability table answers `not_probed` for a foreign engine until somebody measures that exact version, and a vendor's documentation is not a measurement. |
+| Affinity | A sticky request for a node that cannot attest warmth is **refused** — `400 affinity_unsupported` through the proxy — not quietly served there. Honouring affinity nothing attests is a slower random choice wearing the word "affinity", and the caller would never learn the difference. Retry without a sticky node to be placed normally. |
+
+```bash
+target/release/camelid fabric route \
+  --node win=127.0.0.1:8181 \
+  --node studio=ollama://127.0.0.1:11434 \
+  --allow-mixed-engines --model llama-3.2-1b-instruct
+```
+
+Every eligibility rule above is written against **capabilities, not engine names**, so a backend
+added later is a new row rather than a new argument — and placement still contains no engine name
+anywhere.
+
 ### Comparing two nodes
 
 `fabric compare` asks two named nodes the same question and reports what differed. It is

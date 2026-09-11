@@ -355,4 +355,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_foreign_engine_is_never_credited_with_tool_calls_without_a_measurement() {
+        // Placement depends on this. `policy::eligible` gates a tool-calling
+        // request on `tool_calls.supported == Some(true)` alone, which is only
+        // safe while a `true` cannot be reached from documentation. If this
+        // ever fails, that gate has quietly become a vendor's word.
+        let versions = [
+            None,
+            Some("0.33.1"),
+            Some("0.33.3"),
+            Some("1.0.0"),
+            Some(""),
+            Some("v0.6.1-267"),
+        ];
+        for engine in [NodeEngine::Ollama, NodeEngine::LmStudio] {
+            for version in versions {
+                let tools = capabilities_of(engine, version).tool_calls;
+                if tools.supported == Some(true) {
+                    assert_eq!(
+                        tools.provenance,
+                        Provenance::Measured,
+                        "{engine} {version:?} was credited with tool calls without a measurement"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn our_own_engine_is_tool_capable_on_every_build_not_only_the_measured_one() {
+        // Its tool-call contract is covered by its own test suite, so gating on
+        // the measurement table would refuse every build that is not the single
+        // version in it.
+        for version in [None, Some("0.5.4"), Some("v0.6.1-267"), Some("v9.9.9")] {
+            assert_eq!(
+                capabilities_of(NodeEngine::Camelid, version)
+                    .tool_calls
+                    .supported,
+                Some(true),
+                "camelid {version:?}"
+            );
+        }
+    }
 }

@@ -49,6 +49,33 @@ pub enum RouteMode {
     Affinity,
 }
 
+/// Whether this fabric will place work on an engine it cannot fully observe.
+///
+/// Refused by default. Turning it on does not make a foreign engine equal to a
+/// Camelid one — it accepts three specific consequences, each handled
+/// explicitly below: such a node publishes no load to rank on, cannot tell a
+/// full queue from a failure, and cannot attest that a session's prefix is
+/// still warm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MixedEngines {
+    #[default]
+    Refused,
+    Allowed,
+}
+
+/// What a node must be able to do before this request may land on it.
+///
+/// Expressed as capabilities rather than engine names on purpose: placement
+/// has never known which engines exist, and a rule written against a name
+/// would have to be revisited for every backend added after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Requirements {
+    /// The request carries tools. A backend that has not been *measured* to
+    /// handle them is not eligible, however confidently its vendor documents
+    /// the feature.
+    pub tool_calls: bool,
+}
+
 /// What the caller is asking the fabric to place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteRequest<'a> {
@@ -60,6 +87,8 @@ pub struct RouteRequest<'a> {
     pub service_class: Option<&'a str>,
     /// Label of the node that served this session previously, if any.
     pub sticky: Option<&'a str>,
+    pub mixed: MixedEngines,
+    pub requires: Requirements,
 }
 
 impl<'a> RouteRequest<'a> {
@@ -69,6 +98,8 @@ impl<'a> RouteRequest<'a> {
             model: None,
             service_class: None,
             sticky: None,
+            mixed: MixedEngines::Refused,
+            requires: Requirements::default(),
         }
     }
 
@@ -86,7 +117,50 @@ impl<'a> RouteRequest<'a> {
         self.sticky = sticky;
         self
     }
+
+    pub fn with_mixed_engines(mut self, mixed: MixedEngines) -> Self {
+        self.mixed = mixed;
+        self
+    }
+
+    pub fn requiring(mut self, requires: Requirements) -> Self {
+        self.requires = requires;
+        self
+    }
 }
+
+/// Whether `snapshot` may be placed on for this request.
+///
+/// Two independent gates. The first is whether this fabric places on such a
+/// node at all; the second is whether the node can do what the request needs,
+/// and applies to every engine including our own.
+fn eligible(snapshot: &NodeSnapshot, request: &RouteRequest<'_>) -> bool {
+    let placeable = snapshot.is_placeable() || request.mixed == MixedEngines::Allowed;
+    if !placeable {
+        return false;
+    }
+    if request.requires.tool_calls {
+        // `supported == Some(true)` is enough here, and deliberately so. The
+        // capability table never credits a foreign engine with tool calls on
+        // documentation alone -- it answers `not_probed` until somebody
+        // measures that exact version -- so a `true` can only have come from a
+        // measurement or from our own engine's test suite. Re-deriving that
+        // rule here would mean placement knowing which engine is ours, and
+        // would have refused every Camelid build not in the measurement table.
+        // The guarantee is pinned by `capability::tests`.
+        return snapshot.capabilities().tool_calls.supported == Some(true);
+    }
+    true
+}
+
+/// What a node that publishes no load is charged when ranking.
+///
+/// Not a measurement, and not pretending to be one. Zero would make an
+/// unobservable node beat every node that honestly reported work, so it would
+/// win every placement and the fabric would concentrate load exactly where it
+/// can least see it. A small positive cost makes it the choice only when the
+/// observable nodes are actually busier than this.
+pub const UNREPORTED_LOAD_COST: usize = 2;
 
 /// How the winning node was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +230,13 @@ pub enum RouteError {
         /// of them may be the node that owns the model.
         unobserved: usize,
     },
+    /// The session asked to go back to a node that cannot say whether its
+    /// prefix is still warm. Refused rather than served there anyway, because
+    /// honouring affinity that nothing attests is just a slower random choice
+    /// wearing the word "affinity".
+    AffinityUnsupported {
+        label: String,
+    },
 }
 
 impl std::fmt::Display for RouteError {
@@ -201,6 +282,12 @@ impl std::fmt::Display for RouteError {
                     ),
                 }
             }
+            Self::AffinityUnsupported { label } => write!(
+                f,
+                "{label} cannot attest that a session's prefix is still warm, so affinity to it \
+                 is refused rather than pretended; retry without a sticky node to be placed \
+                 normally"
+            ),
         }
     }
 }
@@ -518,7 +605,7 @@ fn route_reserved_with_estimates_at(
 
     let ready: Vec<&NodeSnapshot> = snapshots
         .iter()
-        .filter(|snapshot| snapshot.is_placeable())
+        .filter(|snapshot| eligible(snapshot, request))
         .collect();
 
     if ready.is_empty() {
@@ -531,7 +618,7 @@ fn route_reserved_with_estimates_at(
         // fix a machine that is working perfectly.
         let not_placeable = snapshots
             .iter()
-            .filter(|s| s.status.is_ready() && !s.engine().is_placeable())
+            .filter(|s| s.status.is_ready() && !eligible(s, request))
             .count();
         return Err(RouteError::AllNodesUnavailable {
             unreachable,
@@ -581,12 +668,15 @@ fn route_reserved_with_estimates_at(
                 Candidate {
                     label: snapshot.label(),
                     engine: snapshot.engine(),
-                    // A placeable engine always reports load; `unwrap_or` here
-                    // would rank an unknown as idle, so the reservation count
-                    // stands alone instead.
+                    // A node that publishes no load is not an idle one. Left
+                    // at the reservation count it would outrank every node
+                    // that honestly reported work and win every placement, so
+                    // it carries a stated fixed cost instead. This is a
+                    // deliberate guess about an unobservable node, which is
+                    // why mixed placement is off by default.
                     load: match ready.in_flight() {
                         Some(observed) => load_of(observed, reserved.get(snapshot.label())),
-                        None => reserved.get(snapshot.label()),
+                        None => UNREPORTED_LOAD_COST.saturating_add(reserved.get(snapshot.label())),
                     },
                     service_nanos: current
                         .filter(|estimate| estimate.samples >= MIN_SERVICE_TIME_SAMPLES)
@@ -607,7 +697,21 @@ fn route_reserved_with_estimates_at(
 
     if request.mode == RouteMode::Affinity {
         if let Some(sticky) = request.sticky {
+            // Affinity is only worth honouring if the node can say the prefix
+            // is still warm. A node that cannot is refused rather than
+            // silently treated as a cache hit it never claimed.
             if let Some(hit) = candidates.iter().find(|c| c.label == sticky) {
+                let attests = serving_model
+                    .iter()
+                    .find(|snapshot| snapshot.label() == sticky)
+                    .is_some_and(|snapshot| {
+                        snapshot.capabilities().warm_prefix.supported == Some(true)
+                    });
+                if !attests {
+                    return Err(RouteError::AffinityUnsupported {
+                        label: sticky.to_string(),
+                    });
+                }
                 return Ok(RouteDecision {
                     label: hit.label.to_string(),
                     engine: hit.engine,
@@ -707,6 +811,168 @@ mod tests {
             }),
             latency: None,
         }
+    }
+
+    /// A healthy foreign node: serving, and publishing no load, because that
+    /// is what the engines this fabric reads actually do.
+    fn foreign(label: &str, engine: NodeEngine, model: &str) -> NodeSnapshot {
+        NodeSnapshot {
+            spec: NodeSpec {
+                label: label.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: engine.default_port(),
+                engine,
+            },
+            status: NodeStatus::Ready(NodeReady {
+                engine,
+                active_model_id: Some(model.to_string()),
+                models: vec![model.to_string()],
+                backend: None,
+                version: None,
+                load: None,
+            }),
+            latency: None,
+        }
+    }
+
+    const MIXED: MixedEngines = MixedEngines::Allowed;
+
+    #[test]
+    fn a_foreign_node_is_refused_by_default_and_eligible_only_when_mixed_is_asked_for() {
+        let nodes = [foreign("studio", NodeEngine::Ollama, "m")];
+
+        let refused = route(&nodes, &RouteRequest::new(RouteMode::Throughput))
+            .expect_err("default routing places on Camelid only");
+        assert_eq!(
+            refused,
+            RouteError::AllNodesUnavailable {
+                unreachable: 0,
+                not_ready: 0,
+                not_placeable: 1
+            }
+        );
+
+        let placed = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput).with_mixed_engines(MIXED),
+        )
+        .expect("mixed placement was asked for");
+        assert_eq!(placed.label, "studio");
+        assert_eq!(placed.engine, NodeEngine::Ollama);
+    }
+
+    #[test]
+    fn a_node_that_publishes_no_load_does_not_outrank_one_that_reported_being_busy() {
+        // The guard that matters most: charged nothing, an unobservable node
+        // looks permanently idle, wins every placement, and the fabric piles
+        // work exactly where it can see least.
+        let nodes = [
+            ready("win", Some("m"), 1),
+            foreign("studio", NodeEngine::Ollama, "m"),
+        ];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("both are eligible");
+        assert_eq!(
+            decision.label, "win",
+            "one job in flight is better evidence than no evidence at all"
+        );
+    }
+
+    #[test]
+    fn a_node_that_publishes_no_load_still_wins_when_the_observable_nodes_are_busier() {
+        // The other half: the fixed cost is a price, not a ban.
+        let nodes = [
+            ready("win", Some("m"), UNREPORTED_LOAD_COST + 1),
+            foreign("studio", NodeEngine::Ollama, "m"),
+        ];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect("both are eligible");
+        assert_eq!(decision.label, "studio");
+    }
+
+    #[test]
+    fn a_tool_calling_request_never_lands_on_a_backend_nobody_measured() {
+        let nodes = [foreign("studio", NodeEngine::Ollama, "m")];
+        let needs_tools = RouteRequest::new(RouteMode::Throughput)
+            .with_mixed_engines(MIXED)
+            .requiring(Requirements { tool_calls: true });
+
+        assert!(
+            route(&nodes, &needs_tools).is_err(),
+            "an unmeasured backend is not eligible for tools however well documented"
+        );
+        assert!(
+            route(
+                &nodes,
+                &RouteRequest::new(RouteMode::Throughput).with_mixed_engines(MIXED)
+            )
+            .is_ok(),
+            "and the same node still takes ordinary work"
+        );
+    }
+
+    #[test]
+    fn our_own_engine_is_eligible_for_tools_and_a_camelid_only_fabric_is_unaffected() {
+        let nodes = [ready("win", Some("m"), 0)];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Throughput)
+                .with_model(Some("m"))
+                .requiring(Requirements { tool_calls: true }),
+        )
+        .expect("our own engine's tool contract is covered by its test suite");
+        assert_eq!(decision.label, "win");
+    }
+
+    #[test]
+    fn affinity_to_a_node_that_cannot_attest_a_warm_prefix_is_refused_not_degraded() {
+        // Placing it there anyway would be a slower random choice wearing the
+        // word "affinity", and the caller would never learn the difference.
+        let nodes = [
+            foreign("studio", NodeEngine::Ollama, "m"),
+            ready("win", Some("m"), 0),
+        ];
+        let error = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Affinity)
+                .with_model(Some("m"))
+                .with_sticky(Some("studio"))
+                .with_mixed_engines(MIXED),
+        )
+        .expect_err("affinity to an unattesting node is refused");
+
+        assert_eq!(
+            error,
+            RouteError::AffinityUnsupported {
+                label: "studio".to_string()
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("retry without a sticky node"), "{message}");
+    }
+
+    #[test]
+    fn affinity_to_our_own_engine_is_unchanged_by_any_of_this() {
+        let nodes = [ready("warm", Some("m"), 3), ready("idle", Some("m"), 0)];
+        let decision = route(
+            &nodes,
+            &RouteRequest::new(RouteMode::Affinity)
+                .with_model(Some("m"))
+                .with_sticky(Some("warm")),
+        )
+        .expect("a Camelid node attests its own warmth");
+        assert_eq!(decision.label, "warm");
+        assert_eq!(decision.reason, RouteReason::Affinity);
     }
 
     fn unreachable(label: &str) -> NodeSnapshot {

@@ -1435,6 +1435,21 @@ fn rejected_body(rejection: JsonRejection) -> Response {
 
 fn route_error(error: RouteError) -> Response {
     match &error {
+        // The client asked to go back to a node that cannot say its prefix is
+        // still warm. Repeating the request unchanged will never succeed, and
+        // 503 would tell an SDK to keep trying; dropping the sticky header
+        // will, so say that instead.
+        RouteError::AffinityUnsupported { .. } => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": error.to_string(),
+                    "type": "invalid_request_error",
+                    "code": "affinity_unsupported",
+                }
+            })),
+        )
+            .into_response(),
         // Asking again will not make the model appear, and the nodes themselves
         // answer 404 `model_not_found` for exactly this. Answering 503 told
         // clients to retry, so an SDK spent its whole retry budget on a refusal

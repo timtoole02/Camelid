@@ -70,8 +70,8 @@ pub use node::{
 use nodes::NodeSet;
 use policy::{load_of, route_reserved_with_estimates, ServiceTimeEstimates};
 pub use policy::{
-    route, route_reserved, Reservations, RouteDecision, RouteError, RouteMode, RouteReason,
-    RouteRequest,
+    route, route_reserved, MixedEngines, Requirements, Reservations, RouteDecision, RouteError,
+    RouteMode, RouteReason, RouteRequest, UNREPORTED_LOAD_COST,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 pub use sample::SampleError;
