@@ -648,3 +648,101 @@ fn a_measurement_follows_the_version_the_node_actually_reports() {
         "a neighbouring version inherits no measurement"
     );
 }
+
+fn ollama_answering(named: &str, content: &str) -> Bodies {
+    with_body(
+        ollama_bodies(&["m:latest"], &["m:latest"]),
+        "/api/chat",
+        &format!(
+            r#"{{"model":"{named}","message":{{"role":"assistant","content":"{content}"}},"done":true}}"#
+        ),
+    )
+}
+
+/// D3 in production. The model a node's own answer names is the evidence; a
+/// node that answered from other weights is a different model, never a
+/// divergence, however equal the ids asked for were.
+#[test]
+fn a_node_answering_from_other_weights_is_reported_as_a_different_model() {
+    use camelid::fabric::{SamplingPlan, Verdict};
+
+    let honest = StubEngine::start(ollama_answering("m:latest", "12"));
+    let swapped = StubEngine::start(ollama_answering("other:latest", "7"));
+    let fabric = Fabric::new(vec![
+        honest.spec("a", "ollama"),
+        swapped.spec("b", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let comparison = fabric
+        .compare_model("a", "b", "m:latest", "q", SamplingPlan::default())
+        .expect("both sides answered");
+
+    assert_eq!(comparison.right.model.as_deref(), Some("m:latest"));
+    assert_eq!(
+        comparison.right.reported_model.as_deref(),
+        Some("other:latest")
+    );
+    assert_eq!(
+        comparison.verdict,
+        Verdict::DifferentModels {
+            left: "m:latest".to_string(),
+            right: "other:latest".to_string()
+        }
+    );
+}
+
+/// Each adapter reads the name from its own engine's response shape, and a
+/// response that names nothing is recorded as naming nothing.
+#[test]
+fn each_engine_s_answer_is_read_for_the_model_it_names() {
+    use camelid::fabric::{SamplingPlan, Verdict};
+
+    let camelid = StubEngine::start(HashMap::from([
+        ("/v1/health", camelid_health("m")),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"12"}}]}"#
+                .to_string(),
+        ),
+    ]));
+    let desk = StubEngine::start(with_body(
+        lmstudio_bodies(&[("m", "loaded")]),
+        "/api/v0/chat/completions",
+        r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"12"}}],
+            "runtime":{"name":"llama.cpp","version":"b1"}}"#,
+    ));
+    let silent = StubEngine::start(with_body(
+        ollama_bodies(&["m"], &["m"]),
+        "/api/chat",
+        r#"{"message":{"role":"assistant","content":"12"},"done":true}"#,
+    ));
+    let fabric = Fabric::new(vec![
+        camelid.spec("win", "camelid"),
+        desk.spec("desk", "lmstudio"),
+        silent.spec("studio", "ollama"),
+    ])
+    .with_timeout(PROBE_TIMEOUT);
+
+    let named = fabric
+        .compare_model("win", "desk", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+    assert_eq!(named.left.reported_model.as_deref(), Some("m"));
+    assert_eq!(named.right.reported_model.as_deref(), Some("m"));
+    assert_eq!(named.verdict, Verdict::Identical);
+    assert!(
+        named.uncontrolled.contains(&"model identity".to_string()),
+        "an equal id on two engines rests on the name: {:?}",
+        named.uncontrolled
+    );
+
+    let unnamed = fabric
+        .compare_model("win", "studio", "m", "q", SamplingPlan::default())
+        .expect("both sides answered");
+    assert_eq!(unnamed.right.reported_model, None);
+    assert_eq!(
+        unnamed.verdict,
+        Verdict::Identical,
+        "naming nothing is not evidence of a swap"
+    );
+}

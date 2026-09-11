@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::camelid;
 use super::divergence::{
-    stability_of, AppliedSampling, Sample, SamplingPlan, Side, TemplateEvidence,
+    stability_of, AppliedSampling, Ask, Sample, SamplingPlan, Side, TemplateEvidence,
+    MAX_COMPARE_REPETITIONS,
 };
 use super::engine::NodeEngine;
 use super::lmstudio;
@@ -114,9 +115,11 @@ pub(crate) fn measure(
     }
 
     let engine = ready.engine;
-    let mut samples = Vec::with_capacity(request.plan.repetitions);
+    let runs = request.plan.repetitions.clamp(1, MAX_COMPARE_REPETITIONS);
+    let mut samples = Vec::with_capacity(runs);
+    let mut named = Vec::with_capacity(runs);
     let mut runtime_note = None;
-    let ask = super::divergence::Ask {
+    let ask = Ask {
         model: request.model,
         prompt: request.prompt,
         temperature: request.plan.temperature,
@@ -124,9 +127,9 @@ pub(crate) fn measure(
         max_tokens: request.plan.max_tokens,
     };
 
-    for _ in 0..request.plan.repetitions.max(1) {
+    for _ in 0..runs {
         let started = Instant::now();
-        let text = match engine {
+        let answer = match engine {
             NodeEngine::Camelid => camelid::complete(
                 request.spec,
                 &ask,
@@ -138,19 +141,17 @@ pub(crate) fn measure(
                 ollama::complete(request.spec, &ask, request.generation_timeout, transport)
             }
             NodeEngine::LmStudio => {
-                lmstudio::complete(request.spec, &ask, request.generation_timeout, transport).map(
-                    |completion| {
-                        runtime_note = completion.runtime;
-                        completion.text
-                    },
-                )
+                lmstudio::complete(request.spec, &ask, request.generation_timeout, transport)
             }
-        };
-        let text = text.map_err(|detail| SampleError::Failed {
+        }
+        .map_err(|detail| SampleError::Failed {
             label: label.clone(),
             detail,
         })?;
-        samples.push(Sample::new(text, started.elapsed()));
+        let elapsed = started.elapsed();
+        runtime_note = answer.runtime;
+        named.push(answer.model);
+        samples.push(Sample::new(answer.text, elapsed));
     }
 
     Ok(Side {
@@ -161,11 +162,27 @@ pub(crate) fn measure(
         // version, and this is a llama.cpp build, not that.
         runtime: runtime_note,
         model: Some(request.model.to_string()),
+        reported_model: reported_model(request.model, named),
         applied_sampling: AppliedSampling::for_engine(engine),
         stability: stability_of(&samples),
         samples,
         template: capture_template(request, engine, transport),
     })
+}
+
+/// What a node's own answers said it served, as one value.
+///
+/// A run naming something other than what was asked for outranks runs that
+/// matched, so a node that swapped weights on one run of several is still
+/// caught. Runs that named nothing leave this unknown rather than assuming the
+/// request was honoured.
+fn reported_model(asked: &str, named: Vec<Option<String>>) -> Option<String> {
+    let named: Vec<String> = named.into_iter().flatten().collect();
+    named
+        .iter()
+        .find(|model| model.as_str() != asked)
+        .or_else(|| named.first())
+        .cloned()
 }
 
 fn capture_template(
@@ -234,5 +251,24 @@ mod tests {
             available: Vec::new(),
         };
         assert!(error.to_string().contains("it holds nothing"), "{error}");
+    }
+
+    #[test]
+    fn a_run_that_named_other_weights_outranks_runs_that_matched() {
+        let named = vec![
+            Some("m".to_string()),
+            Some("other".to_string()),
+            Some("m".to_string()),
+        ];
+        assert_eq!(reported_model("m", named).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn runs_that_named_nothing_leave_what_was_served_unknown() {
+        assert_eq!(reported_model("m", vec![None, None]), None);
+        assert_eq!(
+            reported_model("m", vec![None, Some("m".to_string())]).as_deref(),
+            Some("m")
+        );
     }
 }

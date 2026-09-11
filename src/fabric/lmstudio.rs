@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::cancel::Cancel;
+use super::divergence::Answer;
 use super::engine::NodeEngine;
 use super::http;
 use super::node::{NodeReady, NodeSpec, NodeStatus};
@@ -179,20 +180,17 @@ struct Runtime {
 
 #[derive(Debug, Deserialize)]
 struct ChatPayload {
+    /// The model LM Studio says answered.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
+    /// `runtime.name` and `runtime.version`. This names the **inference
+    /// runtime** (a llama.cpp build), not the LM Studio application, and is
+    /// reported under that name so it is never mistaken for the engine
+    /// version LM Studio does not publish.
     #[serde(default)]
     runtime: Option<Runtime>,
-}
-
-/// One answer, plus the inference runtime LM Studio says produced it.
-pub(crate) struct Completion {
-    pub(crate) text: String,
-    /// `runtime.name` and `runtime.version` from the response. This names the
-    /// **inference runtime** (a llama.cpp build), not the LM Studio
-    /// application, and is reported under that name so it is never mistaken
-    /// for the engine version LM Studio does not publish.
-    pub(crate) runtime: Option<String>,
 }
 
 /// Ask this server one prompt.
@@ -206,7 +204,7 @@ pub(crate) fn complete(
     ask: &super::divergence::Ask<'_>,
     timeout: Duration,
     transport: &NodeTransport,
-) -> Result<Completion, String> {
+) -> Result<Answer, String> {
     let body = serde_json::json!({
         "model": ask.model,
         "messages": [{ "role": "user", "content": ask.prompt }],
@@ -256,7 +254,11 @@ pub(crate) fn complete(
         }
     });
 
-    Ok(Completion { text, runtime })
+    Ok(Answer {
+        text,
+        model: payload.model.filter(|model| !model.is_empty()),
+        runtime,
+    })
 }
 
 #[cfg(test)]

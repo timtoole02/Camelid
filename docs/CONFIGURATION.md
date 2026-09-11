@@ -467,12 +467,26 @@ Four rules decide what it is allowed to conclude:
 | Rule | Consequence |
 |---|---|
 | Each side is run more than once | A difference between two nodes means nothing until each node has been shown to agree with itself. A side that does not repeat its own answer makes the comparison `not_attributable`, **and the diff is withheld** — rendering one would invite exactly the reading the verdict refused. |
-| Model identity is checked first | Two nodes serving different models can differ for the most boring reason there is. That is `different_models`, never divergence. |
+| Model identity is checked first | Two nodes serving different models can differ for the most boring reason there is. That is `different_models`, never divergence. Each side records the id it was asked for (`model`) and the id its own answers named (`reported_model`, `null` when they named none); a side that answered as a model other than the one it was asked for makes the comparison `different_models` whatever the operator asserted. An equal id on two *different* engines is listed as an uncontrolled `model identity`, because each engine resolves a name by its own rules and an equal name is not equal weights. |
 | Asked is not applied | LM Studio's documented completion API has no seed parameter, so a comparison against it is unseeded however the flag was set. The plan and the per-side reality are reported separately, and the uncontrolled parameter is named. |
 | Correctness is not awarded | No verdict, reason or rendered line ranks the two sides. |
 
 `--repeat 1` is permitted and yields no attributable verdict, by design: one run per side never
 tested self-consistency, which is a different thing from having tested it and found none.
+`--repeat` takes 1 to 5 and `--temperature` 0 to 2, and anything else is refused rather than
+clamped, so the plan a receipt records is the plan that ran. The proxy clamps repetitions to the same
+five and refuses a temperature outside that range with 400.
+
+Each generation is bounded by `--timeout-s` on the CLI and by `--forward-timeout-s` on the proxy's
+`POST /v1/fabric/compare`; the proxy's `--timeout-ms` bounds only the status probe and the template
+read. A comparison that could not run answers **400** when the request was at fault — an unknown
+label, the same node twice, a model the node does not hold — and **502** when a node was: not
+serving, or failing to generate.
+
+The diff keeps line terminators. Every line carries `eol` — `lf`, `crlf`, or `none` for a final line
+with no newline — beside its `text`, which never contains the terminator, so two answers that differ
+only in a trailing newline or in CRLF against LF show a changed line rather than an unchanged one
+under a `divergent` verdict. The terminal draws them as `⏎`, `␍⏎` and `(no newline at end)`.
 
 ### Telling the fabric that two names are the same model
 

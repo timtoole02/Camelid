@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::cancel::Cancel;
+use super::divergence::Answer;
 use super::http;
 use super::node::NodeSpec;
 use super::transport::NodeTransport;
@@ -32,6 +33,10 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ChatPayload {
+    /// Our own engine names its loaded model here — the same id its health
+    /// reports, which is what a comparison asks it for.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
 }
@@ -77,7 +82,7 @@ pub(crate) fn complete(
     bearer: Option<&str>,
     timeout: Duration,
     transport: &NodeTransport,
-) -> Result<String, String> {
+) -> Result<Answer, String> {
     let mut body = serde_json::json!({
         "model": ask.model,
         "messages": [{ "role": "user", "content": ask.prompt }],
@@ -100,13 +105,18 @@ pub(crate) fn complete(
     )?;
     let payload: ChatPayload = serde_json::from_slice(&raw)
         .map_err(|error| format!("/v1/chat/completions was not readable: {error}"))?;
-    payload
+    let text = payload
         .choices
         .into_iter()
         .next()
         .and_then(|choice| choice.message)
         .map(|message| message.content)
-        .ok_or_else(|| "/v1/chat/completions answered without a choice".to_string())
+        .ok_or_else(|| "/v1/chat/completions answered without a choice".to_string())?;
+    Ok(Answer {
+        text,
+        model: payload.model.filter(|model| !model.is_empty()),
+        runtime: None,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -819,11 +819,6 @@ async fn health(State(state): State<ServerState>) -> Response {
 /// serving path, and every byte here is generated against twice.
 const MAX_COMPARE_PROMPT_BYTES: usize = 8 * 1024;
 
-/// Ceiling on repetitions per side. Each one is a full generation on a real
-/// node, so an unbounded value would let one authenticated request occupy two
-/// machines indefinitely.
-const MAX_COMPARE_REPETITIONS: usize = 5;
-
 /// Ceiling on tokens generated per run, for the same reason.
 const MAX_COMPARE_MAX_TOKENS: u32 = 1024;
 
@@ -851,9 +846,11 @@ struct CompareRequest {
 ///
 /// Behind the client key like every other route on this proxy, because unlike
 /// `/v1/health` it *causes work*: it makes an authenticated caller generate on
-/// two machines. The bounds above exist for that reason rather than for
-/// correctness, and are clamped rather than rejected so a caller asking for
-/// more simply gets the maximum, described in the answer it gets back.
+/// two machines. The bounds above, and [`fabric::MAX_COMPARE_REPETITIONS`],
+/// exist for that reason rather than for correctness, and are clamped rather
+/// than rejected so a caller asking for more simply gets the maximum,
+/// described in the answer it gets back. A temperature is refused instead:
+/// clamping it would record a plan other than the one the caller asked about.
 async fn compare(
     State(state): State<ServerState>,
     payload: std::result::Result<Json<CompareRequest>, JsonRejection>,
@@ -878,6 +875,12 @@ async fn compare(
         );
     }
 
+    if let Some(temperature) = request.temperature {
+        if let Err(reason) = fabric::check_temperature(temperature) {
+            return error_response(StatusCode::BAD_REQUEST, &reason);
+        }
+    }
+
     let plan = fabric::SamplingPlan {
         temperature: request.temperature.unwrap_or(0.0),
         seed: request.seed,
@@ -888,7 +891,7 @@ async fn compare(
         repetitions: request
             .repetitions
             .unwrap_or(2)
-            .clamp(1, MAX_COMPARE_REPETITIONS),
+            .clamp(1, fabric::MAX_COMPARE_REPETITIONS),
     };
 
     // Every run is a generation, which is what `forward_timeout` budgets. The
@@ -930,11 +933,29 @@ async fn compare(
         // A comparison that could not be set up or run is a failed request, not
         // a verdict. Returning 200 with an empty comparison would let a caller
         // read "no difference" out of "we never asked".
-        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        Ok(Err(error)) => error_response(compare_status(&error), &error.to_string()),
         Err(join_error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("the comparison did not complete: {join_error}"),
         ),
+    }
+}
+
+/// Whose failure a comparison that did not complete was.
+///
+/// A caller's own mistakes — a label this fabric does not have, one node named
+/// twice, a model the node does not hold — are theirs to fix and stay 400. A
+/// node that is down or failed to generate is the upstream failing; calling
+/// that a bad request sends the caller to fix a request that was fine.
+fn compare_status(error: &fabric::CompareError) -> StatusCode {
+    use fabric::{CompareError, SampleError};
+    match error {
+        CompareError::NoSuchNode { .. }
+        | CompareError::SameNode { .. }
+        | CompareError::Side(SampleError::ModelAbsent { .. }) => StatusCode::BAD_REQUEST,
+        CompareError::Side(SampleError::NotServing { .. } | SampleError::Failed { .. }) => {
+            StatusCode::BAD_GATEWAY
+        }
     }
 }
 
@@ -2768,5 +2789,80 @@ mod tests {
             detail: "connection reset".to_string(),
         });
         assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    fn compare_request(body: Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/fabric/compare")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::new(body.to_string()))
+            .expect("valid request")
+    }
+
+    /// A caller's own mistake is theirs to fix; a node failing is the
+    /// upstream's. Both used to answer 400, which sent a caller whose nodes
+    /// were down to go and fix a request that was fine.
+    #[tokio::test]
+    async fn a_failed_comparison_says_whose_failure_it_was() {
+        // Port 1 is closed, so both sides are observed as unreachable.
+        let dead = Fabric::new(vec![
+            NodeSpec::camelid("a", "127.0.0.1", 1),
+            NodeSpec::camelid("b", "127.0.0.1", 1),
+        ])
+        .with_timeout(Duration::from_millis(200));
+        let asking = |left: &str| serde_json::json!({ "left": left, "right": "b", "model": "m", "prompt": "q" });
+
+        let upstream = proxy(dead.clone())
+            .oneshot(compare_request(asking("a")))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(upstream).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains("a is not serving"),
+            "{body}"
+        );
+
+        let typo = proxy(dead)
+            .oneshot(compare_request(asking("nope")))
+            .await
+            .expect("router answers");
+        let (status, body) = read_json(typo).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains("no node named nope"),
+            "{body}"
+        );
+    }
+
+    /// Refused rather than clamped: a clamped temperature would be recorded as
+    /// a plan the caller never asked about. The fabric is empty, so a request
+    /// that got as far as running would have failed naming a node instead.
+    #[tokio::test]
+    async fn a_temperature_outside_the_documented_range_is_refused_before_any_work() {
+        for temperature in [
+            serde_json::json!(2.5),
+            serde_json::json!(-1.0),
+            serde_json::json!(1e39),
+        ] {
+            let response = proxy(Fabric::new(Vec::new()))
+                .oneshot(compare_request(serde_json::json!({
+                    "left": "a", "right": "b", "model": "m", "prompt": "q",
+                    "temperature": temperature,
+                })))
+                .await
+                .expect("router answers");
+            let (status, body) = read_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{temperature}: {body}");
+            let message = body["error"]["message"].as_str().expect("a message");
+            assert!(message.contains("temperature"), "{temperature}: {message}");
+        }
     }
 }

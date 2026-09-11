@@ -1513,12 +1513,53 @@ fn mixed_engines(allowed: bool) -> camelid::fabric::MixedEngines {
     }
 }
 
+/// Parse `fabric compare --repeat`, refusing a count the comparison would not
+/// run as asked. The proxy clamps to the same bound; a terminal can be told.
+fn compare_repetitions(raw: &str) -> Result<usize, String> {
+    let most = camelid::fabric::MAX_COMPARE_REPETITIONS;
+    let count: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number of runs"))?;
+    if (1..=most).contains(&count) {
+        Ok(count)
+    } else {
+        Err(format!(
+            "each side runs from 1 to {most} times; 2 is the fewest that can show a side agrees with itself"
+        ))
+    }
+}
+
+/// Parse `fabric compare --temperature`, refusing one no engine would apply as
+/// given — which a receipt would then misstate.
+fn compare_temperature(raw: &str) -> Result<f32, String> {
+    let temperature: f32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    camelid::fabric::check_temperature(temperature)?;
+    Ok(temperature)
+}
+
 /// Render a comparison for a terminal.
 ///
 /// The verdict comes first and the answers come second, because the answers are
 /// the thing a reader will over-interpret. Nothing here ranks the two sides.
-fn print_comparison(comparison: &camelid::fabric::Comparison) {
-    use camelid::fabric::{Diff, Op, Stability, TemplateEvidence, Verdict};
+/// Built as a string so what a terminal is shown is covered by a test.
+fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
+    use camelid::fabric::{Diff, Eol, ModelIdentity, Op, Stability, TemplateEvidence, Verdict};
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    // Writing into a `String` cannot fail.
+    macro_rules! say {
+        () => {
+            out.push('\n')
+        };
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, $($arg)*);
+        }};
+    }
 
     let headline = match &comparison.verdict {
         Verdict::Identical => "IDENTICAL — both nodes returned the same bytes".to_string(),
@@ -1530,9 +1571,9 @@ fn print_comparison(comparison: &camelid::fabric::Comparison) {
         }
         Verdict::NotAttributable { reason } => format!("NOT ATTRIBUTABLE — {reason}"),
     };
-    println!("{headline}");
-    println!("prompt sha256 {}", comparison.prompt_sha256);
-    println!(
+    say!("{headline}");
+    say!("prompt sha256 {}", comparison.prompt_sha256);
+    say!(
         "temperature {} · seed {} · max_tokens {} · {} run(s) each",
         comparison.plan.temperature,
         comparison
@@ -1543,22 +1584,28 @@ fn print_comparison(comparison: &camelid::fabric::Comparison) {
         comparison.plan.repetitions
     );
     if !comparison.uncontrolled.is_empty() {
-        println!(
-            "NOT CONTROLLED: {} — at least one engine has no such parameter",
-            comparison.uncontrolled.join(", ")
-        );
+        say!("NOT CONTROLLED: {}", comparison.uncontrolled.join(", "));
     }
-    if comparison.model_identity == camelid::fabric::ModelIdentity::AssertedByOperator {
-        println!(
+    let identity_uncontrolled = comparison
+        .uncontrolled
+        .iter()
+        .any(|variable| variable == "model identity");
+    match comparison.model_identity {
+        ModelIdentity::AssertedByOperator => say!(
             "MODEL IDENTITY ASSERTED, NOT VERIFIED: `{}` and `{}` were declared to be the same weights",
             comparison.left.model.as_deref().unwrap_or("-"),
             comparison.right.model.as_deref().unwrap_or("-")
-        );
+        ),
+        ModelIdentity::SameId if identity_uncontrolled => say!(
+            "MODEL IDENTITY NOT VERIFIED: both were asked for `{}`, but two engines agreeing on a name is not proof of the same weights",
+            comparison.left.model.as_deref().unwrap_or("-")
+        ),
+        ModelIdentity::SameId => {}
     }
 
     for side in [&comparison.left, &comparison.right] {
-        println!();
-        println!(
+        say!();
+        say!(
             "── {} · {} {}",
             side.label,
             side.engine.as_str(),
@@ -1567,42 +1614,45 @@ fn print_comparison(comparison: &camelid::fabric::Comparison) {
                 .unwrap_or("(version unknown)")
         );
         if let Some(runtime) = side.runtime.as_deref() {
-            println!("   runtime: {runtime}");
+            say!("   runtime: {runtime}");
         }
-        if let Some(runtime) = side.runtime.as_deref() {
-            println!("   runtime: {runtime}");
+        let asked = side.model.as_deref().unwrap_or("-");
+        match side.reported_model.as_deref() {
+            Some(named) if named != asked => say!("   asked for {asked}; ANSWERED AS {named}"),
+            Some(_) => say!("   asked for {asked}; answered as {asked}"),
+            None => say!("   asked for {asked}; its answers did not name a model"),
         }
         match &side.stability {
-            Stability::Stable => println!(
+            Stability::Stable => say!(
                 "   agreed with itself across {} runs · sha256 {}",
                 side.samples.len(),
                 side.settled_digest().unwrap_or("-")
             ),
-            Stability::Unstable { digests } => println!(
+            Stability::Unstable { digests } => say!(
                 "   DID NOT agree with itself: {} distinct answers across {} runs",
                 digests.len(),
                 side.samples.len()
             ),
             Stability::Unmeasured => {
-                println!("   run once, so self-consistency was never tested")
+                say!("   run once, so self-consistency was never tested")
             }
         }
         match &side.template {
             TemplateEvidence::Captured { source, template } => {
-                println!("   template via {source}:");
+                say!("   template via {source}:");
                 for line in template.lines() {
-                    println!("     {line}");
+                    say!("     {line}");
                 }
             }
-            TemplateEvidence::NotExposed { detail } => println!("   template: {detail}"),
+            TemplateEvidence::NotExposed { detail } => say!("   template: {detail}"),
             TemplateEvidence::Unavailable { detail } => {
-                println!("   template could not be read: {detail}")
+                say!("   template could not be read: {detail}")
             }
         }
         for (index, sample) in side.samples.iter().enumerate() {
-            println!("   [{}] {} ms", index + 1, sample.elapsed_ms);
+            say!("   [{}] {} ms", index + 1, sample.elapsed_ms);
             for line in sample.text.lines() {
-                println!("     {line}");
+                say!("     {line}");
             }
         }
     }
@@ -1610,10 +1660,11 @@ fn print_comparison(comparison: &camelid::fabric::Comparison) {
     match &comparison.diff {
         Diff::Identical => {}
         Diff::Lines { lines } => {
-            println!();
-            println!(
+            say!();
+            say!(
                 "── diff ({} → {})",
-                comparison.left.label, comparison.right.label
+                comparison.left.label,
+                comparison.right.label
             );
             for line in lines {
                 let marker = match line.op {
@@ -1621,14 +1672,27 @@ fn print_comparison(comparison: &camelid::fabric::Comparison) {
                     Op::Removed => '-',
                     Op::Added => '+',
                 };
-                println!("{marker} {}", line.text);
+                // Drawn rather than left to the terminal: two lines that
+                // differ only in how they end must not print alike.
+                let ending = match line.eol {
+                    Eol::Lf => "⏎",
+                    Eol::Crlf => "␍⏎",
+                    Eol::Missing => " (no newline at end)",
+                };
+                say!("{marker} {}{ending}", line.text.replace('\r', "␍"));
             }
         }
         Diff::Declined { reason } => {
-            println!();
-            println!("── no diff: {reason}");
+            say!();
+            say!("── no diff: {reason}");
         }
     }
+    out
+}
+
+/// Print a comparison for a terminal; see [`render_comparison`].
+fn print_comparison(comparison: &camelid::fabric::Comparison) {
+    print!("{}", render_comparison(comparison));
 }
 
 /// Resolve the token the fabric authenticates to its nodes with.
@@ -1856,11 +1920,13 @@ enum FabricAction {
         /// The user message to send to both.
         #[arg(long)]
         prompt: String,
-        /// How many times to ask each node. Two is the minimum that can show a
-        /// side agrees with itself; one yields no attributable verdict.
-        #[arg(long, default_value_t = 2)]
+        /// How many times to ask each node, from 1 to 5. Two is the minimum
+        /// that can show a side agrees with itself; one yields no attributable
+        /// verdict.
+        #[arg(long, default_value_t = 2, value_parser = compare_repetitions)]
         repeat: usize,
-        #[arg(long, default_value_t = 0.0)]
+        /// From 0 to 2, the range the OpenAI-shaped completion APIs define.
+        #[arg(long, default_value_t = 0.0, value_parser = compare_temperature)]
         temperature: f32,
         /// Omit to run unseeded. Engines without a seed parameter are reported
         /// as uncontrolled either way.
@@ -2070,6 +2136,148 @@ mod fabric_command_tests {
             ];
             Cli::try_parse_from(argv).expect("resident mode must parse");
         });
+    }
+
+    fn compare_argv(extra: &[&'static str]) -> Vec<&'static str> {
+        let mut argv = vec![
+            "camelid",
+            "fabric",
+            "compare",
+            "--node",
+            "a=127.0.0.1",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--model",
+            "m",
+            "--prompt",
+            "q",
+        ];
+        argv.extend_from_slice(extra);
+        argv
+    }
+
+    /// Refused rather than clamped: the CLI can tell its operator, and a
+    /// clamped value would be recorded as a plan that never ran — `--repeat 0`
+    /// used to be recorded as zero repetitions beside the one sample taken.
+    #[test]
+    fn a_comparison_refuses_a_run_count_or_temperature_it_would_not_run_as_asked() {
+        on_cli_test_stack(|| {
+            for refused in [
+                &["--repeat", "0"][..],
+                &["--repeat", "6"],
+                &["--repeat", "1000000000"],
+                &["--temperature", "2.5"],
+                &["--temperature", "nan"],
+                &["--temperature", "inf"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(compare_argv(refused)).is_err(),
+                    "{refused:?} must be refused"
+                );
+            }
+            for accepted in [
+                &["--repeat", "1"][..],
+                &["--repeat", "5"],
+                &["--temperature", "2"],
+            ] {
+                if let Err(error) = Cli::try_parse_from(compare_argv(accepted)) {
+                    panic!("{accepted:?} must be accepted: {error}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn the_proxy_takes_every_browser_origin_it_is_given() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "fabric",
+                "serve",
+                "--node",
+                "a=127.0.0.1",
+                "--cors-origin",
+                "http://127.0.0.1:8181",
+                "--cors-origin",
+                "http://127.0.0.1:5173",
+            ])
+            .expect("parses");
+            match cli.command {
+                Some(Command::Fabric {
+                    action: FabricAction::Serve { cors_origins, .. },
+                }) => assert_eq!(
+                    cors_origins,
+                    ["http://127.0.0.1:8181", "http://127.0.0.1:5173"]
+                ),
+                other => panic!("expected fabric serve, got {other:?}"),
+            }
+        });
+    }
+
+    fn answered(
+        label: &str,
+        engine: camelid::fabric::NodeEngine,
+        text: &str,
+    ) -> camelid::fabric::Side {
+        let samples =
+            vec![
+                camelid::fabric::Sample::new(text.to_string(), std::time::Duration::from_millis(1));
+                2
+            ];
+        camelid::fabric::Side {
+            label: label.to_string(),
+            engine,
+            engine_version: None,
+            runtime: Some("llama.cpp b1".to_string()),
+            model: Some("m".to_string()),
+            reported_model: Some("m".to_string()),
+            applied_sampling: camelid::fabric::AppliedSampling::for_engine(engine),
+            stability: camelid::fabric::divergence::stability_of(&samples),
+            samples,
+            template: camelid::fabric::TemplateEvidence::NotExposed {
+                detail: "test".to_string(),
+            },
+        }
+    }
+
+    /// Measured live: a newline on one side only was reported DIVERGENT beside
+    /// a diff whose one line printed identically on both sides.
+    #[test]
+    fn a_difference_only_in_how_a_line_ends_is_visible_in_the_terminal() {
+        use camelid::fabric::{conclude, ModelIdentity, NodeEngine, SamplingPlan};
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            answered("a", NodeEngine::Camelid, "12\n"),
+            answered("b", NodeEngine::Camelid, "12"),
+            ModelIdentity::SameId,
+        );
+        let rendered = render_comparison(&comparison);
+        assert!(rendered.starts_with("DIVERGENT"), "{rendered}");
+        assert!(rendered.contains("\n- 12⏎\n"), "{rendered}");
+        assert!(
+            rendered.contains("\n+ 12 (no newline at end)\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn each_side_names_its_runtime_once() {
+        use camelid::fabric::{conclude, ModelIdentity, NodeEngine, SamplingPlan};
+        let rendered = render_comparison(&conclude(
+            "q",
+            SamplingPlan::default(),
+            answered("a", NodeEngine::Camelid, "12"),
+            answered("b", NodeEngine::Camelid, "12"),
+            ModelIdentity::SameId,
+        ));
+        assert_eq!(
+            rendered.matches("runtime: llama.cpp b1").count(),
+            2,
+            "once per side: {rendered}"
+        );
     }
 
     #[test]

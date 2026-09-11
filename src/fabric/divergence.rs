@@ -48,6 +48,40 @@ pub(crate) struct Ask<'a> {
     pub(crate) max_tokens: u32,
 }
 
+/// One reply, as the engine itself described it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Answer {
+    pub(crate) text: String,
+    /// The model the response named. `None` when it named none — never filled
+    /// in from the request, because comparing the two is the only evidence
+    /// that a node served what it was asked for.
+    pub(crate) model: Option<String>,
+    /// The inference runtime the response named, for an engine that names one
+    /// apart from its own version; see [`Side::runtime`].
+    pub(crate) runtime: Option<String>,
+}
+
+/// Most runs a side may be asked for. Each is a full generation on a real
+/// node, so this bounds how long one comparison can occupy two machines.
+pub const MAX_COMPARE_REPETITIONS: usize = 5;
+
+/// Hottest temperature a comparison accepts: the top of the range the
+/// OpenAI-shaped completion APIs define. Outside it a node may refuse the
+/// request or adjust the value silently, and an adjusted run would sit under a
+/// recorded plan that never ran.
+pub const MAX_COMPARE_TEMPERATURE: f32 = 2.0;
+
+/// Refuse a temperature a comparison cannot honestly record as applied.
+pub fn check_temperature(temperature: f32) -> Result<(), String> {
+    if temperature.is_finite() && (0.0..=MAX_COMPARE_TEMPERATURE).contains(&temperature) {
+        Ok(())
+    } else {
+        Err(format!(
+            "temperature must be a finite number from 0 to {MAX_COMPARE_TEMPERATURE}; got {temperature}"
+        ))
+    }
+}
+
 /// What the operator asked for. Recorded verbatim so a receipt can be replayed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SamplingPlan {
@@ -69,6 +103,17 @@ impl Default for SamplingPlan {
             max_tokens: 64,
             repetitions: 2,
         }
+    }
+}
+
+impl SamplingPlan {
+    /// This plan with its repetitions inside what a comparison will run, so
+    /// the plan a receipt records is the plan that ran. Zero reads as one: a
+    /// side is always asked at least once, and recording zero beside one
+    /// sample would misstate the receipt.
+    pub fn bounded(mut self) -> Self {
+        self.repetitions = self.repetitions.clamp(1, MAX_COMPARE_REPETITIONS);
+        self
     }
 }
 
@@ -195,9 +240,14 @@ pub struct Side {
     /// version but does name a llama.cpp build, and reporting that as its
     /// version would be inventing the fact P3 refused to invent.
     pub runtime: Option<String>,
-    /// The model the node reported serving, which is not necessarily the model
-    /// the operator named.
+    /// The model id this side was asked for: the id local to this node, after
+    /// any alias. What the node says it actually served is `reported_model`.
     pub model: Option<String>,
+    /// The model the node's own generation responses named. `None` when no
+    /// response named one; never copied from `model`, because a difference
+    /// between the two is the only evidence here that a node answered from
+    /// weights other than the ones it was asked for.
+    pub reported_model: Option<String>,
     pub applied_sampling: AppliedSampling,
     pub samples: Vec<Sample>,
     pub stability: Stability,
@@ -334,8 +384,17 @@ pub fn conclude(
         uncontrolled.push("temperature".to_string());
     }
     // The biggest uncontrolled variable of all when it applies: nobody checked
-    // that these are the same weights.
-    if model_identity == ModelIdentity::AssertedByOperator {
+    // that these are the same weights. An operator's word is one way that
+    // happens; an equal id on two engines is the other, because each engine
+    // resolves a name by its own rules and an equal name is not equal weights.
+    // Not added beside a verdict that already says the models differ.
+    let identity_rests_on_a_name = match model_identity {
+        ModelIdentity::AssertedByOperator => true,
+        ModelIdentity::SameId => {
+            left.engine != right.engine && !matches!(verdict, Verdict::DifferentModels { .. })
+        }
+    };
+    if identity_rests_on_a_name {
         uncontrolled.push("model identity".to_string());
     }
 
@@ -353,6 +412,16 @@ pub fn conclude(
 }
 
 fn verdict_for(left: &Side, right: &Side, model_identity: ModelIdentity) -> Verdict {
+    // What a node's own response says it served outranks every other piece of
+    // identity evidence here, an operator's assertion included: that assertion
+    // is about the ids asked for, and a node that answered from other weights
+    // is not serving the model under comparison at all.
+    if served_other_than_asked(left) || served_other_than_asked(right) {
+        return Verdict::DifferentModels {
+            left: served(left),
+            right: served(right),
+        };
+    }
     if model_identity == ModelIdentity::SameId {
         if let (Some(l), Some(r)) = (left.model.as_deref(), right.model.as_deref()) {
             if l != r {
@@ -394,6 +463,22 @@ fn verdict_for(left: &Side, right: &Side, model_identity: ModelIdentity) -> Verd
     }
 }
 
+fn served_other_than_asked(side: &Side) -> bool {
+    matches!(
+        (side.reported_model.as_deref(), side.model.as_deref()),
+        (Some(reported), Some(asked)) if reported != asked
+    )
+}
+
+/// The best name for what a side served: what it said, else what it was asked.
+fn served(side: &Side) -> String {
+    side.reported_model
+        .as_deref()
+        .or(side.model.as_deref())
+        .unwrap_or("an unnamed model")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +495,7 @@ mod tests {
             engine_version: None,
             runtime: None,
             model: Some(model.to_string()),
+            reported_model: None,
             applied_sampling: AppliedSampling::for_engine(engine),
             stability: stability_of(&samples),
             samples,
@@ -657,12 +743,154 @@ mod tests {
             right,
             ModelIdentity::SameId,
         );
-        assert_eq!(comparison.uncontrolled, ["seed"]);
+        // Seed, because LM Studio takes none. Model identity, because an
+        // equal id on two engines is two names agreeing rather than one set of
+        // weights (pinned on its own below). Nothing else is invented.
+        assert_eq!(comparison.uncontrolled, ["seed", "model identity"]);
         assert_eq!(
             comparison.verdict,
             Verdict::Divergent,
             "an uncontrolled seed is disclosed, not a reason to withhold a verdict both sides earned"
         );
+    }
+
+    fn reporting(mut side: Side, named: &str) -> Side {
+        side.reported_model = Some(named.to_string());
+        side
+    }
+
+    /// D3 could only fire from a hand-built side while `model` held the id
+    /// that was asked for. The id a node's response names is the evidence
+    /// that actually reaches this function in production.
+    #[test]
+    fn a_node_naming_other_weights_than_it_was_asked_for_is_a_different_model_never_a_divergence() {
+        let left = reporting(side("win", NodeEngine::Camelid, "m", &["12", "12"]), "m");
+        let right = reporting(
+            side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
+            "other:latest",
+        );
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            left,
+            right,
+            ModelIdentity::SameId,
+        );
+
+        assert_eq!(
+            comparison.verdict,
+            Verdict::DifferentModels {
+                left: "m".to_string(),
+                right: "other:latest".to_string()
+            }
+        );
+        assert!(matches!(comparison.diff, Diff::Declined { .. }));
+    }
+
+    #[test]
+    fn an_operator_assertion_does_not_cover_a_node_that_served_something_else() {
+        let left = reporting(
+            side("studio", NodeEngine::Ollama, "m:latest", &["12", "12"]),
+            "m:latest",
+        );
+        let right = reporting(side("desk", NodeEngine::LmStudio, "m", &["7", "7"]), "b");
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            left,
+            right,
+            ModelIdentity::AssertedByOperator,
+        );
+        assert_eq!(
+            comparison.verdict,
+            Verdict::DifferentModels {
+                left: "m:latest".to_string(),
+                right: "b".to_string()
+            }
+        );
+    }
+
+    /// The paired "unaffected" case: a response naming exactly what was asked
+    /// for, or naming nothing at all, leaves the verdict to the answers.
+    #[test]
+    fn a_response_naming_the_model_asked_for_or_none_at_all_changes_nothing() {
+        let named = conclude(
+            "q",
+            SamplingPlan::default(),
+            reporting(side("win", NodeEngine::Camelid, "m", &["12", "12"]), "m"),
+            reporting(side("mac", NodeEngine::Camelid, "m", &["7", "7"]), "m"),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(named.verdict, Verdict::Divergent);
+
+        let silent = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(silent.verdict, Verdict::Divergent);
+    }
+
+    /// I14: an equal name is not equal weights. Across two engines the name is
+    /// resolved twice, by two sets of rules, so the comparison rests on it.
+    #[test]
+    fn an_equal_id_on_two_engines_is_disclosed_as_an_uncontrolled_identity() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        assert_eq!(comparison.uncontrolled, ["model identity"]);
+        assert_eq!(
+            comparison.verdict,
+            Verdict::Divergent,
+            "disclosed, not a reason to withhold the verdict"
+        );
+    }
+
+    #[test]
+    fn an_equal_id_on_one_engine_carries_no_identity_caveat() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("mac", NodeEngine::Camelid, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        assert!(
+            comparison.uncontrolled.is_empty(),
+            "{:?}",
+            comparison.uncontrolled
+        );
+    }
+
+    #[test]
+    fn a_plan_records_the_repetitions_that_actually_run() {
+        let asked = |repetitions| SamplingPlan {
+            repetitions,
+            ..SamplingPlan::default()
+        };
+        assert_eq!(asked(0).bounded().repetitions, 1);
+        assert_eq!(
+            asked(1_000_000).bounded().repetitions,
+            MAX_COMPARE_REPETITIONS
+        );
+        assert_eq!(SamplingPlan::default().bounded(), SamplingPlan::default());
+    }
+
+    #[test]
+    fn a_temperature_outside_the_documented_range_is_refused() {
+        for accepted in [0.0, 0.7, MAX_COMPARE_TEMPERATURE] {
+            assert!(check_temperature(accepted).is_ok(), "{accepted}");
+        }
+        for refused in [-0.1, 2.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let reason = check_temperature(refused).expect_err("out of range");
+            assert!(reason.contains("from 0 to 2"), "{reason}");
+        }
     }
 
     #[test]

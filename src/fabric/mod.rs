@@ -55,8 +55,9 @@ pub use aliases::{
 pub use cancel::Cancel;
 pub use capability::{Capabilities, Capability, Provenance};
 pub use divergence::{
-    conclude, sha256_hex, AppliedSampling, Comparison, Honoured, ModelIdentity, Sample,
-    SamplingPlan, Side, Stability, TemplateEvidence, Verdict,
+    check_temperature, conclude, sha256_hex, AppliedSampling, Comparison, Honoured, ModelIdentity,
+    Sample, SamplingPlan, Side, Stability, TemplateEvidence, Verdict, MAX_COMPARE_REPETITIONS,
+    MAX_COMPARE_TEMPERATURE,
 };
 pub use engine::NodeEngine;
 pub use forward::{
@@ -327,6 +328,11 @@ impl Fabric {
     /// two differently-named ids are the same weights. Engines do not agree on
     /// naming, and none of them publishes a digest this fabric could check, so
     /// that claim is recorded as unverified rather than inferred.
+    ///
+    /// Each node is probed within [`Fabric::with_timeout`] and each generation
+    /// within [`Fabric::with_generation_timeout`]. `plan` is bounded to what
+    /// will actually run before anything is sent, so the plan the comparison
+    /// records is the one that ran.
     pub fn compare(
         &self,
         left: &str,
@@ -355,6 +361,7 @@ impl Fabric {
         let left_spec = find(left)?;
         let right_spec = find(right)?;
 
+        let plan = plan.bounded();
         let bearer = self.bearer.as_deref();
         let measure_side = |spec: &NodeSpec, model: &str| {
             sample::measure(

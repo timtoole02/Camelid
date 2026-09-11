@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::cancel::Cancel;
+use super::divergence::Answer;
 use super::engine::NodeEngine;
 use super::http;
 use super::node::{NodeReady, NodeSpec, NodeStatus};
@@ -154,6 +155,9 @@ struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 struct ChatPayload {
+    /// The model Ollama says produced the answer.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     message: Option<ChatMessage>,
 }
@@ -170,7 +174,7 @@ pub(crate) fn complete(
     ask: &super::divergence::Ask<'_>,
     timeout: Duration,
     transport: &NodeTransport,
-) -> Result<String, String> {
+) -> Result<Answer, String> {
     let mut options = serde_json::json!({
         "temperature": ask.temperature,
         "num_predict": ask.max_tokens,
@@ -193,10 +197,15 @@ pub(crate) fn complete(
         timeout,
         transport,
     )?;
-    payload
+    let text = payload
         .message
         .map(|message| message.content)
-        .ok_or_else(|| "/api/chat answered without a message".to_string())
+        .ok_or_else(|| "/api/chat answered without a message".to_string())?;
+    Ok(Answer {
+        text,
+        model: payload.model.filter(|model| !model.is_empty()),
+        runtime: None,
+    })
 }
 
 #[derive(Debug, Deserialize)]
