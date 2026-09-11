@@ -726,14 +726,21 @@ unless background mode is on.
 4. **Status is observed.** A supervisor combines `try_wait` (every second, and on tray
    hover or click) with `/v1/health` (every 5 s). Running needs a live process and a 200 at
    most 12 s old; older reads Checking, two failures read not answering, an exit outranks
-   everything. Results carry an epoch, and Restarting is published before the old engine is
-   reaped, so a replaced engine's port can never reappear. The model line never says "No
-   model loaded", because `busy_health_response` reports no active model during every
+   everything. Within a generation an ending is final: once Stopped or FailedToStart is
+   published, no live status replaces it, and the supervisor publishes the slot as observed
+   after its health probe, not before it. Results carry an epoch. The app opens a
+   generation only through `EngineHost::begin_start` or `begin_restart`, which move the
+   tray's store to it in the same step, and a restart publishes Restarting before it reaps
+   the old engine, so a replaced engine's port can never reappear. The model line never says
+   "No model loaded", because `busy_health_response` reports no active model during every
    model transition.
 5. **A pending sidecar is always reapable.** The sidecar lives in an engine slot from the
    moment it is spawned (Pending, then Ready). Spawning happens under the slot lock after
    checking the epoch and the quit flag, and every shutdown kills Pending and Ready alike.
-   Before this, Quit during Retry left the half-started engine running on macOS.
+   Before this, going by the pre-P7 code (not observed live), a quit during Retry could not
+   reach the half-started engine: `engine::spawn` handed the child back only once its gate
+   passed, so the engine state was still empty and on macOS the engine would have outlived
+   the app.
 6. **Optional engine flags only when advertised.** The desktop runs `serve --help` (5 s
    budget) and passes `--exit-when-stdin-closes` only if listed, so a stale engine or one
    on `PATH` still starts. With the flag, the desktop holds the engine's stdin and the
@@ -757,8 +764,12 @@ unless background mode is on.
 upgrade scripts' `osascript` quit; detaching the sidecar, which escapes the job; and on by
 default, which would keep a model resident after every close on 16 GB machines.
 
-**Not established:** a real-engine receipt on Windows (the CI smoke uses a stub engine), and
-whether App Nap throttles the sidecar itself while the app is backgrounded.
+**Not established:** any live receipt of this build. On macOS only the 0.7.3 regression
+receipt exists; close, hide, the notice, reopen, the quit paths, the stdin backstop and the
+tray's refresh timing are unobserved. On Windows nothing has run: the `cfg(windows)` code
+has not been compiled, the CI smoke (a stand-in engine) has not yet run on a runner, and a
+real-engine receipt from the PR author is owed. Also unmeasured: whether App Nap throttles
+the sidecar itself while the app is backgrounded.
 
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 

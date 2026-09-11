@@ -109,6 +109,8 @@ All of the following is on this PR branch and green. Commits, newest first:
 
 | Commit | One-liner |
 |---|---|
+| `d7fc6278` | P7 review — an engine seen to stop stays stopped in the tray; generations open through the host |
+| `16c930db` | P7 review — single-instance plugin on Windows only (its macOS socket is a shared `/tmp` path) |
 | `8737c504` | P7 — Windows lifetime smoke in CI with a stand-in engine (not yet run on a runner) |
 | `1c4445d7` | P7 — opt-in background lifetime: tray, observed status, reapable pending sidecar, single instance |
 | `35e0612b` | P7 — `camelid serve --exit-when-stdin-closes` (opt-in, no env var) |
@@ -131,7 +133,7 @@ All of the following is on this PR branch and green. Commits, newest first:
 | **O6** Model identity | done | `alias CANONICAL=LABEL:LOCAL` in the nodes file. Ollama suffixes `:latest`, LM Studio does not, neither publishes a comparable digest — so a human declares it and it is recorded as `asserted_by_operator`. |
 | **P5** Mixed routing | **core only** | Eligibility, ranking, tools and affinity guards + CLI flag + 9 tests. **Screen E and a live mixed receipt are NOT done.** |
 | **P4** Discovery | **not started** | |
-| **P7** Background lifetime | **code done; live receipts owed** | Closing the window quits by default again. That reverts a v0.7.0 regression: the hidden Spotlight window kept 0.7.x alive after a close (live receipt on 0.7.3 in the desktop README). The tray's opt-in "Keep engine running when window closes" hides the window and keeps the engine. Status is observed, never assumed. A starting sidecar is reapable, and `serve --exit-when-stdin-closes` is the macOS crash backstop. **The macOS GUI receipt for the new build and the real-engine Windows receipt are not taken yet.** |
+| **P7** Background lifetime | **code done; live receipts owed** | Closing the window quits by default again. That reverts a v0.7.0 regression: the hidden Spotlight window kept 0.7.x alive after a close (live receipt on 0.7.3 in the desktop README). The tray's opt-in "Keep engine running when window closes" hides the window and keeps the engine. Status is observed, never assumed. A starting sidecar is reapable, and `serve --exit-when-stdin-closes` is the macOS crash backstop. **The macOS GUI receipt for the new build and the real-engine Windows receipt are not taken yet, and the Windows code has not yet compiled or run on a runner.** |
 
 ### What is NOT claimed
 
@@ -151,10 +153,12 @@ Stated here so nobody has to discover it by reading code:
 5. **P7 has no live receipt for the new build yet.** The only live receipt is the regression on the
    installed 0.7.3. The macOS GUI walk-through (close quits, background close hides, reopen, Quit,
    crash) is a checklist for the next session, not a result.
-6. **P7 on Windows is unverified against the real engine.** Unit tests cover the policy, and a CI
-   smoke drives the real desktop with a stand-in engine, but that smoke has never run on a GitHub
-   runner. A receipt from the PR author's Windows machine with the real engine is required before
-   P7 is called done.
+6. **P7 on Windows is unverified at every level.** The `cfg(windows)` code has been reviewed and
+   rustfmt'ed but never compiled: the job object's error handling, `launch_contained`'s
+   containment, the single-instance registration, and the job test. The CI smoke that drives the
+   real desktop with a stand-in engine has never run on a GitHub runner. The unit tests have passed
+   on macOS only. A receipt from the PR author's Windows machine with the real engine is required
+   before P7 is called done.
 7. **"Loopback only" is the literal bind, not an access boundary.** A page in a local browser can
    reach a loopback port by DNS rebinding, and the engine's generation and health routes do not
    check `Host`. Background mode makes that exposure last as long as the app runs. No Host check
@@ -166,6 +170,11 @@ Stated here so nobody has to discover it by reading code:
    backgrounded; whether the child engine is throttled is not established. Removing the activity
    is unguarded offline (A20 below).
 10. **No serving of other devices.** The desktop never binds a non-loopback address.
+11. **No single instance on macOS outside LaunchServices.** `tauri-plugin-single-instance` puts its
+    macOS socket at a fixed path in the shared `/tmp`, where another account's socket can make a
+    launch skip the check silently or swallow every launch. So it is registered on Windows only.
+    Dock, Finder and `open -a` relaunches reach the running app as Reopen. A direct exec,
+    `open -n` or a second copy of the app starts a second desktop and engine.
 
 ---
 
@@ -185,8 +194,9 @@ cargo test --test fabric_engines                 # 15
 cargo test --bin camelid                         # 67 (includes serve_optional_desktop_flags_default_off)
 cargo test --test serve_stdin_close              # 2
 cargo clippy -p camelid-desktop --all-targets -- -D warnings   # 0
-cargo test -p camelid-desktop --all-targets      # macOS: 43 unit + 10 installer_hooks + 9 lifetime_guards
-                                                 # Windows: 46 unit (verbatim-path x2, job object) + 10 + 9
+cargo test -p camelid-desktop --all-targets      # macOS: 46 unit + 10 installer_hooks + 12 lifetime_guards
+                                                 # Windows: NOT YET RUN on any runner; expected
+                                                 # 49 unit (+ verbatim-path x2, job object) + 10 + 12
 
 cd frontend
 npm run build
@@ -281,12 +291,19 @@ failed, every file was restored and verified by SHA-256 (9 files, all pristine a
 
 **Any new guard in P4/P5/P7 needs the same treatment.**
 
-P7: 27 ablations, all caught, run at `8737c504` on mini2. Each made one edit to a synced copy
-(the tracked checkout was never touched) and ran one gate. In every case exactly the named test
-failed, with no compile error, and the file was restored and verified by SHA-256. A final pass
-confirmed all five touched files were byte-identical to their preflight hashes. Rows marked
-*source* are text guards in `tests/lifetime_guards.rs`. They keep the shape from regressing
-quietly, but the behaviour itself is proven only by a live receipt.
+P7: 33 ablation rows run at `d7fc6278` on mini2, all caught (the review round; the first 27
+ran at `8737c504`). Each made one behavioural edit (one file, or the manifest plus its
+registration for A24) to a synced copy, never the tracked checkout, and ran one gate. In 32
+rows the named test failed; A5m failed to compile with E0624 (`begin_epoch` is private), which
+is its guard. For the other rows the "compile_errors=1" the harness prints is cargo's
+`error: test failed, to rerun …` summary line, not a compile error. Every file was restored and
+verified by SHA-256 after each row and again at the end. Rows marked *source* are text guards
+in `tests/lifetime_guards.rs`. They keep the shape from regressing quietly, but only a live
+receipt proves the behaviour. In the first round A5b and A14 sabotaged helpers, not the
+production sites the spec names, so deleting the real call left every test green. This round
+ablates the production sites (A5b, A5s, A5m, A14) and keeps the helper rows as A5h and A14h.
+A10 and A10b (`serve --exit-when-stdin-closes`) were not re-run: `src/main.rs` is unchanged
+since they were caught at `8737c504`.
 
 | # | Sabotage | Caught by |
 |---|---|---|
@@ -299,17 +316,21 @@ quietly, but the behaviour itself is proven only by a live receipt.
 | P7-A4c | a recent answer outranks an observed exit | `a_sidecar_that_exited_is_reported_stopped_not_running` |
 | P7-A4d | failed probes never count | `running_requires_a_fresh_health_answer` |
 | P7-A5 | the status store ignores the epoch | `a_health_result_from_a_replaced_engine_is_discarded` |
-| P7-A5b | restart keeps showing the old status | `a_restart_never_publishes_the_previous_port` |
+| P7-A5b | `EngineHost::begin_restart`, the only restart path, skips publishing Restarting | `a_restart_moves_the_tray_to_the_new_engine_and_reaps_the_old_one` |
+| P7-A5s | `EngineHost::begin_start` opens the first generation without moving the tray's store | `a_restart_moves_the_tray_to_the_new_engine_and_reaps_the_old_one` |
+| P7-A5m | `restart_engine` takes an epoch without `begin_restart` | does not compile: `begin_epoch` is private |
+| P7-A5h | the `restart_transition` helper keeps the old status | `a_restart_never_publishes_the_previous_port` |
 | P7-A6 | an unparseable body renders "No model ready" | `a_busy_health_body_never_claims_no_model_is_loaded` |
 | P7-A6b | the busy body renders "No model loaded" | `a_busy_health_body_never_claims_no_model_is_loaded` |
 | P7-A7 | drop `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | `sidecar_is_never_detached_from_its_job` (*source*); the behavioural `job_object_kills_the_sidecar_when_its_last_handle_closes` needs a throwaway windows-latest run, **not done** |
 | P7-A8 | `api.prevent_exit()` on ExitRequested | `desktop_never_prevents_app_exit` (*source*) |
 | P7-A9 | remove `.show_menu_on_left_click(false)` | `tray_menu_does_not_steal_the_spotlight_click` (*source*) |
-| P7-A10 | start the stdin watcher without the flag | `serve_without_the_flag_survives_a_closed_stdin` |
-| P7-A10b | never start the stdin watcher | `serve_exits_when_its_stdin_closes_under_the_flag` |
+| P7-A10 | start the stdin watcher without the flag | `serve_without_the_flag_survives_a_closed_stdin` (at `8737c504`; not re-run) |
+| P7-A10b | never start the stdin watcher | `serve_exits_when_its_stdin_closes_under_the_flag` (at `8737c504`; not re-run) |
 | P7-A12 | Windows background without the job | `windows_background_requires_a_kill_on_close_job` |
 | P7-A13 | background without a tray | `background_requires_a_live_tray` |
-| P7-A14 | shutdown leaves a sidecar that is still in its health gate | `shutdown_during_the_health_gate_reaps_the_child` |
+| P7-A14 | `start_with`, the body of `EngineHost::start`, holds the child outside the slot until its gate passes (the pre-P7 shape) | `shutdown_during_the_health_gate_reaps_the_child`, driven through `start_with` |
+| P7-A14h | the `reap` helper skips a pending sidecar | `shutdown_during_the_health_gate_reaps_the_child` |
 | P7-AQ | quit reaps nothing | `quit_reaps_a_running_engine_and_refuses_new_starts` |
 | P7-AQm | the tray's Quit does nothing | `every_quit_path_reaches_the_engine_shutdown` (*source*) |
 | P7-A15 | the flag changes before the write succeeds | `a_failed_preference_write_leaves_the_effective_setting_unchanged` |
@@ -317,11 +338,16 @@ quietly, but the behaviour itself is proven only by a live receipt.
 | P7-A19 | `get-desktop-macos.sh` hard-kills the app | `upgrade_scripts_still_quit_the_app_and_wait_on_the_sidecar` |
 | P7-A21 | the single-instance callback reads argv | `single_instance_callback_ignores_foreign_arguments` (*source*) |
 | P7-AR | drop the macOS Reopen arm | `reopen_and_a_second_launch_show_the_main_window` (*source*) |
+| P7-A22 | `StatusStore::apply` lets a live status replace Stopped in the same generation | `an_observed_exit_is_never_replaced_by_a_stale_live_snapshot` |
+| P7-A23 | `EngineHost::supervisor_tick` returns the snapshot taken before its probe | `a_supervisor_tick_reports_an_exit_that_happened_during_its_probe` |
+| P7-A24 | compile and register the single-instance plugin on macOS (manifest section and `#[cfg(windows)]`) | `single_instance_plugin_is_windows_only` (*source*) |
+| P7-A25 | the tray's Restart item reroutes to the lifetime toggle | `every_tray_menu_action_reaches_its_handler` (*source*) |
 
 Declared **unguarded offline**, each closed only by a receipt that is not taken yet:
 
-- **P7-A11**, removing the single-instance plugin: the text guard sees only the callback. It is
-  closed by the GUI walk-through's second-launch step and the CI smoke's `SINGLE-INSTANCE` check.
+- **P7-A11**, removing the single-instance plugin on Windows: the text guards see only the
+  registration and its callback. It is closed by the CI smoke's `SINGLE-INSTANCE` check, which
+  has not run yet. On macOS the plugin is not registered at all (A24).
 - **P7-A20**, removing the App Nap activity: closed by an idle receipt on macOS (Activity
   Monitor's App Nap column, and the tray status after the idle period).
 - P7-A17 and P7-A18 do not apply: they guarded the declined Host check.

@@ -48,7 +48,8 @@ camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral>
 By default, **closing the main window quits Camelid Desktop and stops the engine**, which is
 the documented behaviour through v0.6.x. From v0.7.0 to v0.7.3 a close left the desktop and
 its engine running with no window (see [the v0.7.0 regression](#the-v070-regression)). This
-release restores close = quit.
+release restores close = quit in code; [What is NOT claimed](#what-is-not-claimed) says what
+has been observed live.
 
 **Keep engine running when window closes**, a check item in the tray menu, is off by default.
 With it on, closing the main window hides it, the engine keeps serving, and the tray states
@@ -76,8 +77,10 @@ The tray (menu bar on macOS, notification area on Windows):
   127.0.0.1:<port>…`, `Engine not answering on 127.0.0.1:<port>`, `Engine stopped (exit
   code <n>)` or `(killed by signal <n>)`, `Engine failed to start: <reason>`. Running needs a
   live process and a `/v1/health` 200 at most 12 s old. An older answer reads Checking, two
-  failed probes in a row read not answering, and an observed exit outranks any answer.
-  Pointing at or clicking the icon re-reads the exit status before the menu is read.
+  failed probes in a row read not answering, and an observed exit outranks any answer; once
+  an engine is seen to stop, no later status for it reads as running. Pointing at or
+  clicking the icon also requests an immediate re-read of the exit status. Whether that
+  re-read lands before macOS draws the menu has not been observed.
 - The model line comes from `/v1/health`: `Model: <id>`, `Model: <id> (not ready)`, or
   `No model ready`. It never says "No model loaded": while it switches models, a busy
   engine reports no active model whatever is loaded.
@@ -131,9 +134,23 @@ The sidecar stays bound to `127.0.0.1`. Serving other devices is not offered her
   Background mode lengthens how long that exposure lasts. This release adds no Host check.
 - **A macOS crash backstop with an engine that predates `--exit-when-stdin-closes`.**
   Without the flag, a desktop that is killed leaves the engine running on macOS.
-- **Windows behaviour against the real engine.** It is covered by unit tests and by a CI
-  smoke that runs the real desktop with a stub engine. A receipt from real Windows hardware
-  with the real engine is still owed.
+- **The macOS behaviour of this build, observed.** Close quits, background hide, the
+  one-time notice, reopen, the quit paths, the stdin crash backstop and the tray's refresh
+  timing are described here as designed and unit-tested. None of it has been observed live
+  on this build yet. The only live receipt is the 0.7.3 regression below.
+- **Any Windows behaviour of this build.** The `cfg(windows)` code (the kill-on-close job and
+  its test, the single-instance registration) has been reviewed but not yet compiled. The
+  CI smoke that drives the real desktop with a stand-in engine
+  (`scripts/desktop-lifetime-smoke.ps1`) is written but has not yet run on a runner. On top
+  of both, a receipt from real Windows hardware with the real engine is owed by the PR
+  author.
+- **A single instance on macOS outside LaunchServices.** Starting the executable directly,
+  `open -n`, or a second copy of the app at another path starts a second desktop with its
+  own engine and model load. `tauri-plugin-single-instance` would cover that, but on macOS
+  its socket is a fixed path in the shared `/tmp` (`/tmp/app_camelid_desktop_si.sock`). On a
+  Mac with several accounts, another user's socket there makes a launch skip the check
+  silently, and a socket someone else binds first swallows every launch before a window
+  appears. So it is registered on Windows only.
 - **Launch at login.** Not offered.
 
 ### The v0.7.0 regression
