@@ -35,7 +35,7 @@ performance, or compatibility.
 
 ```
 camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral> --no-open
-        │                                  │  (loopback only)
+        │                                  │  [--exit-when-stdin-closes]  (loopback only)
         │  poll /v1/health (backoff)       │
         ▼                                  ▼
    Native webview   ──navigates to──▶  http://127.0.0.1:<ephemeral>/
@@ -43,8 +43,105 @@ camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral>
                                         embedded React UI from its `*` fallback route)
 ```
 
-On window close the sidecar is terminated cleanly. On Windows, a **job object** with
-`KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
+## Closing the window, the tray, and Quit
+
+By default, **closing the main window quits Camelid Desktop and stops the engine**, which is
+the documented behaviour through v0.6.x. From v0.7.0 to v0.7.3 a close left the desktop and
+its engine running with no window (see [the v0.7.0 regression](#the-v070-regression)). This
+release restores close = quit.
+
+**Keep engine running when window closes**, a check item in the tray menu, is off by default.
+With it on, closing the main window hides it, the engine keeps serving, and the tray states
+what the engine is doing. The first such close shows a one-time notice saying so and where
+Quit is. The setting is stored in `desktop-lifetime.json` in the app-data directory
+(`~/Library/Application Support/app.camelid.desktop/` on macOS,
+`%APPDATA%\app.camelid.desktop\` on Windows). A missing, unreadable or unknown-version file
+means off. If saving fails, the check mark stays where it was and the menu shows
+`Could not save preference: …`.
+
+Background mode is honoured only when it can be controlled and contained:
+
+- a tray icon must exist, on both OSes, because it is the only surface that states the
+  engine's status and offers Quit once the window is hidden;
+- on Windows the engine must be inside the kill-on-close job object.
+
+When either is missing, the check item is unchecked, disabled and says why, and closing the
+window quits. The check mark always shows what the next close will do.
+
+The tray (menu bar on macOS, notification area on Windows):
+
+- **Left click** toggles Spotlight, as it has since v0.7.0. **Right click** opens the menu.
+- The status line is observed, never assumed: `Engine starting…`, `Engine restarting…`,
+  `Engine running on 127.0.0.1:<port> (loopback only)`, `Checking engine on
+  127.0.0.1:<port>…`, `Engine not answering on 127.0.0.1:<port>`, `Engine stopped (exit
+  code <n>)` or `(killed by signal <n>)`, `Engine failed to start: <reason>`. Running needs a
+  live process and a `/v1/health` 200 at most 12 s old. An older answer reads Checking, two
+  failed probes in a row read not answering, and an observed exit outranks any answer.
+  Pointing at or clicking the icon re-reads the exit status before the menu is read.
+- The model line comes from `/v1/health`: `Model: <id>`, `Model: <id> (not ready)`, or
+  `No model ready`. It never says "No model loaded": while it switches models, a busy
+  engine reports no active model whatever is loaded.
+- After the engine stops, `Last engine message: …` shows the last line of its stderr.
+  Stderr is drained into a 16 KiB tail once the health gate passes, so a chatty engine
+  cannot block on a full pipe.
+- Open Camelid, Show Spotlight, Restart engine, Keep engine running when window closes, and
+  **Quit Camelid (stops the engine)**.
+
+Every quit path stops the engine: the tray's Quit, Cmd+Q and the app menu,
+`osascript -e 'tell application "Camelid Desktop" to quit'` (the Apple Event logout sends,
+and what both macOS upgrade scripts rely on), and a close with background mode off. Nothing
+vetoes an exit. A sidecar still inside its 40-second health gate is stopped too; it is held
+in the engine slot from the moment it is spawned.
+
+Relaunching the running app (the Dock icon, `open -a`, Finder, or starting the executable
+again) shows the main window rather than starting a second engine and a second model load.
+macOS Reopen handles the first three; `tauri-plugin-single-instance` (pinned `=2.4.4`)
+handles a second process on both OSes and ignores the arguments it passes. Dev builds share
+the installed app's identifier, so **quit the installed app before
+`cargo run -p camelid-desktop`**, or the dev build focuses the installed app and exits.
+
+Crash backstops, for when the desktop process dies without running any of its own code:
+
+- **Windows:** the engine is in a job object with `KILL_ON_JOB_CLOSE`, so the OS kills it.
+- **Every OS:** if the engine's `serve --help` lists `--exit-when-stdin-closes`, the desktop
+  passes it and holds the engine's stdin open. The OS closes the pipe when the desktop dies
+  and the engine exits. The desktop probes `serve --help` before every start, so an older
+  engine, or one found on `PATH`, starts exactly as before, without the flag.
+
+While backgrounded on macOS, the app holds an App Nap activity (user-initiated, idle system
+sleep still allowed) so the tray's checks are not throttled. It is released when the window
+is shown, when background mode is turned off, and on quit, so App Nap behaviour with
+background mode off is unchanged. The hidden main webview stays resident in background mode,
+on top of the engine and its model.
+
+The sidecar stays bound to `127.0.0.1`. Serving other devices is not offered here.
+
+### What is NOT claimed
+
+- **Serving other devices.** The engine never binds a non-loopback address from the
+  desktop. That needs its own explicit confirmation, a generated API key file, TLS or a
+  shown cleartext acknowledgement, `--lan-chat-only`, and a stable port.
+- **"Only this computer can reach it."** `(loopback only)` is the literal bind address, not
+  an access boundary: a web page in a local browser can reach a loopback port through DNS
+  rebinding, and the engine's generation and health routes do not check the `Host` header.
+  Background mode lengthens how long that exposure lasts. This release adds no Host check.
+- **A macOS crash backstop with an engine that predates `--exit-when-stdin-closes`.**
+  Without the flag, a desktop that is killed leaves the engine running on macOS.
+- **Windows behaviour against the real engine.** It is covered by unit tests and by a CI
+  smoke that runs the real desktop with a stub engine. A receipt from real Windows hardware
+  with the real engine is still owed.
+- **Launch at login.** Not offered.
+
+### The v0.7.0 regression
+
+48c3c261 (between v0.6.1 and v0.7.0) added the hidden `spotlight` window. It is never
+destroyed, so closing `main` never emptied the window set and the app never exited.
+Measured on an installed 0.7.3: after the close button every app window was off screen, yet
+the desktop and its sidecar kept running and `/v1/health` still answered 200. `open -a
+"Camelid Desktop"` did not bring the window back, the only tray icon toggled Spotlight, and
+the app menu's Quit stopped both processes within 3 s. Closing the window now requests an
+exit explicitly, so Spotlight no longer outlives the main window unless background mode is
+on.
 
 The sidecar receives a new ephemeral port on each launch, so browser-origin storage cannot be
 the desktop app's durable authority. Before React starts, the shell hydrates Camelid-owned UI
@@ -223,7 +320,7 @@ v1 deliberately keeps the native shell thin and ships the engine's real UI as-is
 - **No fabricated metrics, by construction.** The splash shows only real lifecycle status;
   all chat metrics (e.g. tokens/sec) come from the embedded UI rendering the engine's real
   generation/telemetry events. Nothing in this crate computes or smooths a metric.
-- **Native tray / arbitrary GGUF file-picker are deferred.** The loopback-origin page receives
+- **An arbitrary GGUF file-picker is deferred.** The loopback-origin page receives
   a scoped native folder chooser plus Camelid-keyed UI-state commands confined to the app-data
   directory; it does not receive broad filesystem access. Local/catalog model loading still
   goes through the engine's existing API.

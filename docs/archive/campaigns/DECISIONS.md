@@ -696,6 +696,64 @@ invocations spawn.
    explicit `CAMELID_DESKTOP_TAG` still fails hard rather than silently substituting a version
    the user did not ask for.
 
+## D11 cont. — background lifetime (P7): close quits by default, the tray keeps the engine on request (2026-09-11)
+
+**The v0.7.0 regression this reverts.** 48c3c261 added the hidden `spotlight` window, which
+is never destroyed, so destroying `main` never emptied the window set and Tauri never raised
+`ExitRequested`. Receipt on an installed 0.7.3: after the close button every app window was
+off screen, yet the desktop and its sidecar stayed alive and `/v1/health` answered 200;
+`open -a` did not bring the window back; the only tray icon toggled Spotlight; the menu's
+Quit stopped both within 3 s. Closing `main` now requests the exit explicitly. This is a
+disclosed change to shipped 0.7.x behaviour: Spotlight no longer outlives the main window
+unless background mode is on.
+
+**Binding choices:**
+
+1. **Opt-in.** Background lifetime is off by default on macOS and Windows: the documented
+   contract was close = quit, new behaviour in this lane is opt-in, and on 16 GB machines a
+   resident model should not survive a close unless someone asked for that. The switch is
+   the tray check item "Keep engine running when window closes", stored in a native file
+   (`desktop-lifetime.json`, version 1, temp + sync + rename). A missing, corrupt or
+   unknown-version file reads as off. The in-memory flag changes only after the write
+   succeeds, so a failed save cannot leave the check mark promising a close it will not do.
+2. **Hide, never detach.** Background means the desktop process stays alive with `main`
+   hidden. The sidecar is never detached, so the Windows `KILL_ON_JOB_CLOSE` job still
+   holds it. Nothing vetoes an exit, so Cmd+Q, AppleScript quit, logout and the tray's Quit
+   all reach the one shutdown path.
+3. **Background needs a control surface and containment.** Hide is chosen only when a tray
+   icon exists (both OSes) and, on Windows, when the engine is in the job. Otherwise close
+   quits, and the check item is disabled and says why.
+4. **Status is observed.** A supervisor combines `try_wait` (every second, and on tray
+   hover or click) with `/v1/health` (every 5 s). Running needs a live process and a 200 at
+   most 12 s old; older reads Checking, two failures read not answering, an exit outranks
+   everything. Results carry an epoch, and Restarting is published before the old engine is
+   reaped, so a replaced engine's port can never reappear. The model line never says "No
+   model loaded", because `busy_health_response` reports no active model during every
+   model transition.
+5. **A pending sidecar is always reapable.** The sidecar lives in an engine slot from the
+   moment it is spawned (Pending, then Ready). Spawning happens under the slot lock after
+   checking the epoch and the quit flag, and every shutdown kills Pending and Ready alike.
+   Before this, Quit during Retry left the half-started engine running on macOS.
+6. **Optional engine flags only when advertised.** The desktop runs `serve --help` (5 s
+   budget) and passes `--exit-when-stdin-closes` only if listed, so a stale engine or one
+   on `PATH` still starts. With the flag, the desktop holds the engine's stdin and the
+   engine exits when the pipe closes: the macOS crash backstop. The flag has no environment
+   variable and is off for every other launcher.
+7. **Loopback only, literally.** The tray says "(loopback only)", the literal bind. A Host
+   check against DNS rebinding was proposed and declined for this release; the exposure is
+   listed as not claimed. Serving other devices is out of scope.
+8. **Single instance.** `tauri-plugin-single-instance` `=2.4.4`, registered first, shows the
+   main window and ignores the other process's arguments; macOS Reopen does the same.
+9. **App Nap.** On macOS an `NSProcessInfo` activity (user-initiated, idle sleep allowed) is
+   held only while background mode is on and `main` is hidden.
+
+**Rejected:** `prevent_exit` on `ExitRequested`, which breaks every quit path including the
+upgrade scripts' `osascript` quit; detaching the sidecar, which escapes the job; and on by
+default, which would keep a model resident after every close on 16 GB machines.
+
+**Not established:** a real-engine receipt on Windows (the CI smoke uses a stub engine), and
+whether App Nap throttles the sidecar itself while the app is backgrounded.
+
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 
 Measured finding (Item-3 recon): the CPU KV write path has rounded every stored
