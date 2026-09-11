@@ -546,6 +546,48 @@ mod ghost_moe_cli_tests {
     }
 
     #[test]
+    fn serve_optional_desktop_flags_default_off() {
+        on_cli_test_stack(|| {
+            let armed = Cli::try_parse_from(["camelid", "serve", "--exit-when-stdin-closes"])
+                .expect("parse the stdin-close flag");
+            match armed.command {
+                Some(Command::Serve {
+                    exit_when_stdin_closes,
+                    ..
+                }) => assert!(exit_when_stdin_closes),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+
+            let plain = Cli::try_parse_from(["camelid", "serve"]).expect("parse plain serve");
+            match plain.command {
+                Some(Command::Serve {
+                    exit_when_stdin_closes,
+                    ..
+                }) => assert!(!exit_when_stdin_closes),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+
+            match default_launch_command() {
+                Command::Serve {
+                    exit_when_stdin_closes,
+                    ..
+                } => assert!(!exit_when_stdin_closes),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+
+            // Only the process holding the pipe may arm it, so no environment variable can.
+            use clap::CommandFactory;
+            let cli = Cli::command();
+            let serve = cli.find_subcommand("serve").expect("serve subcommand");
+            let flag = serve
+                .get_arguments()
+                .find(|arg| arg.get_id() == "exit_when_stdin_closes")
+                .expect("the flag is declared on serve");
+            assert_eq!(flag.get_env(), None);
+        });
+    }
+
+    #[test]
     fn serve_parses_lan_chat_only_and_refuses_the_anonymous_override() {
         on_cli_test_stack(|| {
             let cli = Cli::try_parse_from([
@@ -735,6 +777,7 @@ fn default_launch_command() -> Command {
             })
             .unwrap_or(false),
         no_open: false,
+        exit_when_stdin_closes: false,
         deterministic: false,
         enable_thinking: false,
         models_dir: std::env::var_os("CAMELID_MODELS_DIR").map(PathBuf::from),
@@ -2982,6 +3025,14 @@ enum Command {
         /// interactively, `serve` opens the chat surface automatically.
         #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
         no_open: bool,
+        /// Exit as soon as standard input reaches end-of-file or can no longer be read.
+        /// For a launcher that holds the other end of a pipe: when it dies, even by a
+        /// crash, the OS closes the pipe and the server stops instead of outliving it with
+        /// the model resident. Off by default, because launchd, systemd and most service
+        /// managers start servers with stdin already closed. Deliberately no environment
+        /// variable: only the launching process knows whether it holds the pipe.
+        #[arg(long, default_value_t = false)]
+        exit_when_stdin_closes: bool,
         /// Opt into deterministic inference: pin the forward pass to the order-stable
         /// CPU path (the whole Metal/GPU fast stack is forced off) so the supported
         /// TinyLlama 1.1B Q8_0 lane is bit-exact and reduction-order-stable across runs.
@@ -4723,6 +4774,7 @@ async fn main() -> anyhow::Result<()> {
             expert_cache_mib,
             ghost_strict_cache,
             no_open,
+            exit_when_stdin_closes,
             deterministic,
             enable_thinking,
             models_dir,
@@ -4730,6 +4782,9 @@ async fn main() -> anyhow::Result<()> {
             kv_quant,
             server,
         } => {
+            if exit_when_stdin_closes {
+                spawn_stdin_close_watcher()?;
+            }
             std::env::set_var("CAMELID_KV_QUANT", kv_quant.to_string());
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
@@ -11738,6 +11793,32 @@ fn apply_default_fast_stack() {
     if cfg!(target_os = "macos") && std::env::var_os("CAMELID_METAL_KQUANT").is_none() {
         std::env::set_var("CAMELID_METAL_KQUANT", "1");
     }
+}
+
+/// `serve --exit-when-stdin-closes`. A read error counts as end-of-file too: a parent's
+/// closed pipe can surface as an error rather than a zero-length read on Windows, and a
+/// server that kept running after that would have lost the only signal its parent can still
+/// send.
+fn spawn_stdin_close_watcher() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("stdin-close-watcher".into())
+        .spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 512];
+            loop {
+                match std::io::Read::read(&mut stdin, &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            eprintln!("  stdin closed; exiting (--exit-when-stdin-closes)");
+            camelid::diagnostics::record_session_exit("stdin_closed", None);
+            std::process::exit(0);
+        })
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("could not start the stdin watcher: {err}"))
 }
 
 /// True when the parsed subcommand opted into deterministic inference (`--deterministic`).
