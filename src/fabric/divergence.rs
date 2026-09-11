@@ -383,9 +383,24 @@ pub struct Comparison {
     pub verdict: Verdict,
     pub diff: Diff,
     pub model_identity: ModelIdentity,
-    /// Controls the plan asked for that at least one side could not honour.
-    /// Empty when both sides were fully controlled.
+    /// What this comparison did not control, by name. Empty when nothing is
+    /// listed. The same names, in the same order, as `uncontrolled_detail`,
+    /// which says why each one is here; kept as bare names so a reader of the
+    /// original wire shape still gets them.
     pub uncontrolled: Vec<String>,
+    pub uncontrolled_detail: Vec<Uncontrolled>,
+}
+
+/// One thing a comparison did not control, and why.
+///
+/// Each item has its own reason because they are different kinds of gap: a
+/// seed is a parameter an engine may lack, while model identity is a check
+/// nobody ran. One sentence for all of them printed "model identity — at
+/// least one engine has no such parameter", which is false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Uncontrolled {
+    pub name: String,
+    pub reason: String,
 }
 
 /// Whether two captured texts are the same bytes, when both were captured.
@@ -468,31 +483,55 @@ pub fn conclude(
         },
     };
 
-    let mut uncontrolled = Vec::new();
-    if left.applied_sampling.seed == Honoured::Unsupported
-        || right.applied_sampling.seed == Honoured::Unsupported
-    {
-        uncontrolled.push("seed".to_string());
-    }
-    if left.applied_sampling.temperature == Honoured::Unsupported
-        || right.applied_sampling.temperature == Honoured::Unsupported
-    {
-        uncontrolled.push("temperature".to_string());
+    let mut uncontrolled_detail = Vec::new();
+    for (name, missing) in [
+        ("seed", missing_parameter(&left, &right, |s| s.seed, "seed")),
+        (
+            "temperature",
+            missing_parameter(&left, &right, |s| s.temperature, "temperature"),
+        ),
+    ] {
+        if let Some(reason) = missing {
+            uncontrolled_detail.push(Uncontrolled {
+                name: name.to_string(),
+                reason,
+            });
+        }
     }
     // The biggest uncontrolled variable of all when it applies: nobody checked
     // that these are the same weights. An operator's word is one way that
     // happens; an equal id on two engines is the other, because each engine
     // resolves a name by its own rules and an equal name is not equal weights.
     // Not added beside a verdict that already says the models differ.
-    let identity_rests_on_a_name = match model_identity {
-        ModelIdentity::AssertedByOperator => true,
-        ModelIdentity::SameId => {
-            left.engine != right.engine && !matches!(verdict, Verdict::DifferentModels { .. })
+    let identity_reason = match model_identity {
+        ModelIdentity::AssertedByOperator => Some(format!(
+            "the operator declared `{}` and `{}` to be the same weights, and nothing here checked it",
+            left.model.as_deref().unwrap_or("-"),
+            right.model.as_deref().unwrap_or("-"),
+        )),
+        ModelIdentity::SameId
+            if left.engine != right.engine
+                && !matches!(verdict, Verdict::DifferentModels { .. }) =>
+        {
+            Some(format!(
+                "both sides were asked for `{}`, but {} and {} each resolve a name by their own rules, so an equal name is not shown to be the same weights",
+                left.model.as_deref().unwrap_or("-"),
+                left.engine,
+                right.engine,
+            ))
         }
+        ModelIdentity::SameId => None,
     };
-    if identity_rests_on_a_name {
-        uncontrolled.push("model identity".to_string());
+    if let Some(reason) = identity_reason {
+        uncontrolled_detail.push(Uncontrolled {
+            name: "model identity".to_string(),
+            reason,
+        });
     }
+    let uncontrolled = uncontrolled_detail
+        .iter()
+        .map(|item| item.name.clone())
+        .collect();
 
     Comparison {
         prompt: prompt.to_string(),
@@ -504,6 +543,32 @@ pub fn conclude(
         diff,
         model_identity,
         uncontrolled,
+        uncontrolled_detail,
+    }
+}
+
+/// Why a sampling parameter was not controlled, naming the side or sides
+/// whose engine has no such parameter; `None` when both sent it.
+fn missing_parameter(
+    left: &Side,
+    right: &Side,
+    pick: fn(&AppliedSampling) -> Honoured,
+    parameter: &str,
+) -> Option<String> {
+    let lacking: Vec<String> = [left, right]
+        .into_iter()
+        .filter(|side| pick(&side.applied_sampling) == Honoured::Unsupported)
+        .map(|side| format!("{} ({})", side.label, side.engine))
+        .collect();
+    match lacking.as_slice() {
+        [] => None,
+        [one] => Some(format!(
+            "{one} runs an engine whose documented completion API has no {parameter} parameter, so its runs were sent none"
+        )),
+        _ => Some(format!(
+            "{} run engines whose documented completion APIs have no {parameter} parameter, so their runs were sent none",
+            lacking.join(" and ")
+        )),
     }
 }
 
@@ -1061,6 +1126,99 @@ mod tests {
             comparison.verdict,
             Verdict::Divergent,
             "disclosed, not a reason to withhold the verdict"
+        );
+    }
+
+    /// C3. Every uncontrolled item says why it is there, in its own words. A
+    /// shared sentence called model identity a missing engine parameter.
+    #[test]
+    fn every_uncontrolled_item_carries_its_own_reason() {
+        let left = side(
+            "studio",
+            NodeEngine::Ollama,
+            "llama-3.2-1b-instruct:latest",
+            &["12", "12"],
+        );
+        let right = side(
+            "desk",
+            NodeEngine::LmStudio,
+            "llama-3.2-1b-instruct",
+            &["7", "7"],
+        );
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            left,
+            right,
+            ModelIdentity::AssertedByOperator,
+        );
+
+        assert_eq!(comparison.uncontrolled, ["seed", "model identity"]);
+        let names: Vec<&str> = comparison
+            .uncontrolled_detail
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(
+            names, comparison.uncontrolled,
+            "the bare names and the detail stay parallel"
+        );
+
+        let reason = |name: &str| {
+            comparison
+                .uncontrolled_detail
+                .iter()
+                .find(|item| item.name == name)
+                .map(|item| item.reason.as_str())
+                .expect("listed")
+        };
+        let seed = reason("seed");
+        assert!(
+            seed.contains("desk (lmstudio)") && seed.contains("no seed parameter"),
+            "{seed}"
+        );
+        assert!(
+            !seed.contains("studio (ollama)"),
+            "ollama sends a seed: {seed}"
+        );
+        let identity = reason("model identity");
+        assert!(
+            identity.contains("declared")
+                && identity.contains("`llama-3.2-1b-instruct:latest`")
+                && identity.contains("`llama-3.2-1b-instruct`"),
+            "{identity}"
+        );
+        assert!(
+            !identity.contains("parameter"),
+            "model identity is not a parameter any engine could lack: {identity}"
+        );
+        assert_ne!(seed, identity);
+    }
+
+    #[test]
+    fn an_equal_id_on_two_engines_says_the_name_is_all_that_matched() {
+        let comparison = conclude(
+            "q",
+            SamplingPlan::default(),
+            side("win", NodeEngine::Camelid, "m", &["12", "12"]),
+            side("studio", NodeEngine::Ollama, "m", &["7", "7"]),
+            ModelIdentity::SameId,
+        );
+        let [only] = comparison.uncontrolled_detail.as_slice() else {
+            panic!("{:?}", comparison.uncontrolled_detail);
+        };
+        assert_eq!(only.name, "model identity");
+        assert!(
+            only.reason.contains("both sides were asked for `m`")
+                && only
+                    .reason
+                    .contains("camelid and ollama each resolve a name"),
+            "{}",
+            only.reason
+        );
+        assert!(
+            !only.reason.contains("declared"),
+            "nobody declared anything here"
         );
     }
 

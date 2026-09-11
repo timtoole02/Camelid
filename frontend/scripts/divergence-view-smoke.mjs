@@ -103,6 +103,9 @@ const LMSTUDIO_UNSEEDED = {
     rendered_prompt: { kind: 'unavailable', reason: "LM Studio's documented API has no route that renders a chat prompt without generating" },
   },
   uncontrolled: ['seed'],
+  uncontrolled_detail: [
+    { name: 'seed', reason: 'desk (lmstudio) runs an engine whose documented completion API has no seed parameter, so its runs were sent none' },
+  ],
 }
 
 /* Two answers that differ only in how their last line ends, from a pair of
@@ -246,7 +249,14 @@ function comparisonFor(fixture, request) {
     if (side.reported_model === ECHO_REQUESTED) side.reported_model = side.model
   }
   body.model_identity = leftId === rightId ? 'same_id' : 'asserted_by_operator'
-  if (body.model_identity === 'asserted_by_operator') body.uncontrolled = [...body.uncontrolled, 'model identity']
+  body.uncontrolled_detail = body.uncontrolled_detail || []
+  if (body.model_identity === 'asserted_by_operator') {
+    body.uncontrolled = [...body.uncontrolled, 'model identity']
+    body.uncontrolled_detail = [...body.uncontrolled_detail, {
+      name: 'model identity',
+      reason: `the operator declared \`${leftId}\` and \`${rightId}\` to be the same weights, and nothing here checked it`,
+    }]
+  }
   return body
 }
 
@@ -652,9 +662,17 @@ try {
     await page.waitForSelector('[data-testid="divergence-caveats"]', { timeout: 10000 })
 
     const caveats = await textOf(page, '[data-testid="divergence-caveats"]')
-    assert.match(caveats, /seed was not controlled/)
     assert.match(caveats, /exposes no prompt template/)
+    const seed = await textOf(page, '[data-testid="divergence-uncontrolled"] [data-uncontrolled="seed"]')
+    assert.match(seed, /^seed — desk \(lmstudio\) runs an engine whose documented completion API has no seed parameter/)
     check('an uncontrolled seed and a missing template are disclosed on the finding itself')
+
+    const items = await page.$$eval('[data-testid="divergence-uncontrolled"] li', (els) =>
+      els.map((el) => ({ name: el.getAttribute('data-uncontrolled'), text: el.textContent.replace(/\s+/g, ' ').trim() })))
+    assert.deepEqual(items.map((item) => item.name), ['seed', 'model identity'])
+    assert.match(items[1].text, /^model identity — the operator declared/)
+    assert.doesNotMatch(items[1].text, /parameter/, 'model identity is not a parameter an engine lacks')
+    check('each uncontrolled item is listed once, with its own reason')
 
     assert.equal(
       await page.$eval('[data-testid="divergence-verdict"]', (el) => el.getAttribute('data-attributable')),

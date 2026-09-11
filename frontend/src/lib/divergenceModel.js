@@ -184,7 +184,36 @@ export function describeComparison(body) {
       : [],
     // An absent list is "not reported", which must not render as "nothing".
     uncontrolledReported: Array.isArray(body.uncontrolled),
+    // Why each item is listed. Absent from an older proxy, which named the
+    // items without saying why.
+    uncontrolledDetail: Array.isArray(body.uncontrolled_detail)
+      ? body.uncontrolled_detail
+        .filter(isPlainObject)
+        .map((item) => ({ name: stringOrNull(item.name), reason: stringOrNull(item.reason) }))
+        .filter((item) => item.name)
+      : null,
   }
+}
+
+/* One sentence per uncontrolled item, each with the reason the proxy gave.
+ *
+ * An older proxy gave none. For its seed and temperature the only reason it
+ * ever had was an engine lacking the parameter; for anything else — model
+ * identity is not a parameter — this build does not invent one. */
+export function uncontrolledStatements(comparison) {
+  if (!comparison) return []
+  if (comparison.uncontrolledDetail) {
+    return comparison.uncontrolledDetail.map((item) => ({
+      name: item.name,
+      text: item.reason || 'this proxy did not say why.',
+    }))
+  }
+  return comparison.uncontrolled.map((name) => ({
+    name,
+    text: name === 'seed' || name === 'temperature'
+      ? 'at least one engine has no such parameter.'
+      : 'this proxy did not say why.',
+  }))
 }
 
 /* Whether this comparison established anything about the engines.
@@ -270,19 +299,14 @@ export function reportedModelMismatch(side) {
   )
 }
 
-/* What still has to be said even when a verdict was reached: controls that did
- * not reach an engine, and sides that never proved they repeat themselves. */
+/* What still has to be said about each side even when a verdict was reached:
+ * a node answering under another name, sides that never proved they repeat
+ * themselves, templates that could not be read. What was not controlled is
+ * listed once, with its reasons, by `uncontrolledStatements`. */
 export function comparisonCaveats(comparison) {
   if (!comparison) return []
   const caveats = []
 
-  for (const name of comparison.uncontrolled) {
-    // Model identity is not an engine parameter; calling it one would misstate
-    // what is missing, which is a check nobody can run.
-    caveats.push(name === 'model identity'
-      ? "model identity was not verified: it rests on the operator's assertion that the two ids are the same weights."
-      : `${name} was not controlled: at least one engine has no such parameter.`)
-  }
   for (const side of [comparison.left, comparison.right]) {
     if (!side) continue
     if (reportedModelMismatch(side)) {

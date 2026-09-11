@@ -1586,8 +1586,11 @@ fn render_comparison(comparison: &camelid::fabric::Comparison) -> String {
         comparison.plan.max_tokens,
         comparison.plan.repetitions
     );
-    if !comparison.uncontrolled.is_empty() {
-        say!("NOT CONTROLLED: {}", comparison.uncontrolled.join(", "));
+    if !comparison.uncontrolled_detail.is_empty() {
+        say!("NOT CONTROLLED:");
+        for item in &comparison.uncontrolled_detail {
+            say!("  - {}: {}", item.name, item.reason);
+        }
     }
     let identity_uncontrolled = comparison
         .uncontrolled
@@ -2275,6 +2278,34 @@ mod fabric_command_tests {
                 reason: "test".to_string(),
             },
         }
+    }
+
+    /// C3. The terminal printed "NOT CONTROLLED: model identity" beside a
+    /// reading that it was a parameter some engine lacked. Each item now prints
+    /// with its own reason.
+    #[test]
+    fn each_uncontrolled_item_is_printed_with_its_own_reason() {
+        use camelid::fabric::{conclude, ModelIdentity, NodeEngine, SamplingPlan};
+        let rendered = render_comparison(&conclude(
+            "q",
+            SamplingPlan::default(),
+            answered("studio", NodeEngine::Ollama, "12"),
+            answered("desk", NodeEngine::LmStudio, "7"),
+            ModelIdentity::SameId,
+        ));
+        assert!(rendered.contains("\nNOT CONTROLLED:\n"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "\n  - seed: desk (lmstudio) runs an engine whose documented completion API has no seed parameter"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "\n  - model identity: both sides were asked for `m`, but ollama and lmstudio each resolve a name"
+            ),
+            "{rendered}"
+        );
     }
 
     /// C1. The terminal must never present a captured template as the one an

@@ -221,6 +221,14 @@
 }
 
 .divergence__basis p { margin: 0; }
+.divergence__uncontrolled {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  overflow-wrap: anywhere;
+}
 .divergence__basis[data-identity='asserted_by_operator'] { border: 1px dashed var(--color-warning); }
 
 .divergence__caveats {

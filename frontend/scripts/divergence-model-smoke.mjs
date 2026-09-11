@@ -22,6 +22,7 @@ import {
   reportedModelMismatch,
   templateDivergence,
   tokenCapStatement,
+  uncontrolledStatements,
   verdictHeadline,
 } from '../src/lib/divergenceModel.js'
 import { requestComparison } from '../src/lib/divergenceClient.js'
@@ -252,7 +253,9 @@ check('an engine with no seed parameter is disclosed even on an attributable ver
     'the runtime is reported under its own name, never as the engine version',
   )
   const caveats = comparisonCaveats(comparison)
-  assert.ok(caveats.some((c) => /seed was not controlled/.test(c)), caveats.join(' | '))
+  assert.deepEqual(uncontrolledStatements(comparison), [
+    { name: 'seed', text: 'at least one engine has no such parameter.' },
+  ], 'an older proxy that named seed gave no other reason than a missing parameter')
   assert.ok(caveats.some((c) => /exposes no prompt template/.test(c)), caveats.join(' | '))
   assert.equal(templateDivergence(comparison), null, 'one template is not a comparison of two')
 })
@@ -403,12 +406,40 @@ check('a proxy that records no identity is never read as "same id"', () => {
     'a future identity kind must not read as one this build knows')
 })
 
-check('an unverified identity is disclosed as unverified, not as a missing engine parameter', () => {
-  const caveats = comparisonCaveats(describeComparison(body({ uncontrolled: ['seed', 'model identity'] })))
-  assert.ok(caveats.some((c) => /model identity was not verified/.test(c)), caveats.join(' | '))
-  assert.ok(!caveats.some((c) => /model identity was not controlled/.test(c)),
-    'no engine has a "model identity" parameter to lack')
-  assert.ok(caveats.some((c) => /seed was not controlled/.test(c)))
+check('an older proxy\'s unverified identity is never described as a missing engine parameter', () => {
+  const statements = uncontrolledStatements(describeComparison(body({ uncontrolled: ['seed', 'model identity'] })))
+  const byName = Object.fromEntries(statements.map((item) => [item.name, item.text]))
+  assert.doesNotMatch(byName['model identity'], /parameter/, 'no engine has a "model identity" parameter to lack')
+  assert.match(byName['model identity'], /did not say why/, 'an unstated reason is not invented')
+  assert.match(byName.seed, /no such parameter/)
+})
+
+check('every uncontrolled item carries the reason the proxy gave it, not a shared one', () => {
+  const comparison = describeComparison(body({
+    uncontrolled: ['seed', 'model identity'],
+    uncontrolled_detail: [
+      { name: 'seed', reason: 'desk (lmstudio) runs an engine whose documented completion API has no seed parameter, so its runs were sent none' },
+      { name: 'model identity', reason: 'the operator declared `a:latest` and `a` to be the same weights, and nothing here checked it' },
+    ],
+  }))
+  const statements = uncontrolledStatements(comparison)
+  assert.deepEqual(statements.map((item) => item.name), ['seed', 'model identity'])
+  assert.match(statements[0].text, /desk \(lmstudio\).*no seed parameter/)
+  assert.match(statements[1].text, /operator declared/)
+  assert.notEqual(statements[0].text, statements[1].text)
+  assert.ok(!comparisonCaveats(comparison).some((c) => /seed|model identity/.test(c)),
+    'each item is said once, with its reason, not again as a caveat')
+})
+
+check('an item the proxy gave no reason for says so, never borrowing another item\'s', () => {
+  const statements = uncontrolledStatements(describeComparison(body({
+    uncontrolled: ['seed', 'request history'],
+    uncontrolled_detail: [{ name: 'seed', reason: 'x lacks it' }, { name: 'request history' }],
+  })))
+  assert.deepEqual(statements, [
+    { name: 'seed', text: 'x lacks it' },
+    { name: 'request history', text: 'this proxy did not say why.' },
+  ])
 })
 
 check('an absent uncontrolled list is "not reported", never "nothing uncontrolled"', () => {

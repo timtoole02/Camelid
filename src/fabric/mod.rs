@@ -56,8 +56,8 @@ pub use cancel::Cancel;
 pub use capability::{Capabilities, Capability, Provenance};
 pub use divergence::{
     check_temperature, conclude, sha256_hex, AppliedSampling, Comparison, Honoured, ModelIdentity,
-    RenderedPrompt, Sample, SamplingPlan, Side, Stability, TemplateEvidence, TextMatch, Verdict,
-    MAX_COMPARE_REPETITIONS, MAX_COMPARE_TEMPERATURE,
+    RenderedPrompt, Sample, SamplingPlan, Side, Stability, TemplateEvidence, TextMatch,
+    Uncontrolled, Verdict, MAX_COMPARE_REPETITIONS, MAX_COMPARE_TEMPERATURE,
 };
 pub use engine::NodeEngine;
 pub use forward::{

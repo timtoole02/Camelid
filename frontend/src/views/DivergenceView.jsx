@@ -17,6 +17,7 @@ import {
   reportedModelMismatch,
   templateDivergence,
   tokenCapStatement,
+  uncontrolledStatements,
   verdictHeadline,
 } from '../lib/divergenceModel.js'
 import { DETAIL_WITHHELD_REASON, crossOriginDiagnosis, fabricProblemMessage } from '../lib/fabricModel.js'
@@ -356,6 +357,7 @@ export default function DivergenceView() {
   const blocked = mustAssert && !asserted
 
   const caveats = comparison ? comparisonCaveats(comparison) : []
+  const uncontrolled = comparison ? uncontrolledStatements(comparison) : []
   const templates = comparison ? templateDivergence(comparison) : null
   const templateNote = comparison ? advertisedTemplateNote(comparison) : null
   const rendered = comparison ? renderedPromptComparison(comparison) : null
@@ -497,15 +499,25 @@ export default function DivergenceView() {
             <p data-testid="divergence-identity" data-identity={identity.kind}>
               <strong>Model identity.</strong> {identity.text}
             </p>
-            <p data-testid="divergence-uncontrolled">
-              <strong>Not controlled.</strong>{' '}
-              {!comparison.uncontrolledReported && (
-                <Unknown why="This proxy did not report which controls it could not apply." />
+            <div data-testid="divergence-uncontrolled">
+              <p>
+                <strong>Not controlled.</strong>{' '}
+                {!comparison.uncontrolledReported && (
+                  <Unknown why="This proxy did not report which controls it could not apply." />
+                )}
+                {comparison.uncontrolledReported && uncontrolled.length === 0
+                  && 'Nothing: every control this comparison asked for was sent to both engines.'}
+              </p>
+              {uncontrolled.length > 0 && (
+                <ul className="divergence__uncontrolled">
+                  {uncontrolled.map((item) => (
+                    <li key={item.name} data-uncontrolled={item.name}>
+                      <strong>{item.name}</strong> — {item.text}
+                    </li>
+                  ))}
+                </ul>
               )}
-              {comparison.uncontrolledReported && comparison.uncontrolled.length > 0 && comparison.uncontrolled.join(', ')}
-              {comparison.uncontrolledReported && comparison.uncontrolled.length === 0
-                && 'Nothing: every control this comparison asked for was sent to both engines.'}
-            </p>
+            </div>
           </section>
 
           {caveats.length > 0 && (
