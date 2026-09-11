@@ -388,6 +388,35 @@ jobs:
       - name: Tests (camelid-desktop)
         run: cargo test -p camelid-desktop --all-targets
 
+      # The real debug desktop with a stand-in engine beside it, so window close, the tray,
+      # the kill-on-close job and single-instance run on real Windows without building the
+      # engine. See scripts/desktop-lifetime-smoke.ps1.
+      - name: Build the desktop and a stand-in engine
+        run: |
+          cargo build -p camelid-desktop --example fake_sidecar
+          cargo build -p camelid-desktop
+          Copy-Item target\debug\examples\fake_sidecar.exe target\debug\camelid.exe -Force
+
+      - name: Lifetime smoke (camelid-desktop)
+        run: |
+          pwsh -NoProfile -File scripts/desktop-lifetime-smoke.ps1 *> smoke.log
+          $code = $LASTEXITCODE
+          Get-Content smoke.log
+          exit $code
+
+      # A smoke that exits 0 without its PASS lines did not run its checks.
+      - name: Require every lifetime smoke check
+        run: |
+          $log = Get-Content smoke.log -Raw
+          $missing = @()
+          foreach ($check in @('LIFETIME-OFF close quits', 'LIFETIME-ON close hides', 'SINGLE-INSTANCE', 'LIFETIME-ON crash')) {
+            if (-not $log.Contains("LIFETIME-SMOKE PASS: $check")) { $missing += $check }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output "missing PASS lines: $($missing -join ', ')"
+            exit 1
+          }
+
   validation-scripts:
     runs-on: ubuntu-latest
     needs: public-scrub
