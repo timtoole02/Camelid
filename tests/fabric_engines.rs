@@ -17,18 +17,29 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use camelid::fabric::{
-    parse_node_spec, probe_node, route, Fabric, NodeEngine, NodeSpec, NodeStatus, Provenance,
-    RouteError, RouteMode, RouteRequest,
+    parse_node_spec, probe_node, route, Cancel, Fabric, MixedEngines, NodeEngine, NodeSpec,
+    NodeStatus, Provenance, RouteError, RouteMode, RouteRequest,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One request a stub received: which path, and the credential it carried.
+///
+/// The credential is recorded because a stub that kept only paths is exactly
+/// how the fabric's bearer reached a foreign engine without a test noticing.
+#[derive(Debug, Clone)]
+struct Received {
+    path: String,
+    /// The `Authorization` header verbatim, or `None` if there was none.
+    authorization: Option<String>,
+}
 
 /// Answers a fixed set of paths from canned bodies, and 404s everything else.
 /// One shape serves every engine, because what distinguishes them is which
@@ -36,7 +47,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 struct StubEngine {
     port: u16,
     shutdown: Arc<AtomicBool>,
-    paths: Arc<Mutex<Vec<String>>>,
+    received: Arc<Mutex<Vec<Received>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -92,15 +103,48 @@ fn ollama_without_ps(installed: &[&str]) -> Bodies {
     bodies
 }
 
+/// Read one request through the end of its body. Answering after the head
+/// alone and closing on an unread body resets the connection on some
+/// platforms, and the answer goes with it.
+fn read_request(stream: &mut TcpStream) -> Option<Received> {
+    let mut raw = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&raw[..end]).to_string();
+            let header = |wanted: &str| {
+                head.lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case(wanted))
+                    .map(|(_, value)| value.trim().to_string())
+            };
+            let length = header("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if raw.len() >= end + 4 + length {
+                return Some(Received {
+                    path: head.lines().next()?.split_whitespace().nth(1)?.to_string(),
+                    authorization: header("authorization"),
+                });
+            }
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => raw.extend_from_slice(&buffer[..read]),
+        }
+    }
+}
+
 impl StubEngine {
     fn start(bodies: Bodies) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let paths = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(Mutex::new(Vec::new()));
 
         let thread_shutdown = Arc::clone(&shutdown);
-        let thread_paths = Arc::clone(&paths);
+        let thread_received = Arc::clone(&received);
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if thread_shutdown.load(Ordering::SeqCst) {
@@ -109,22 +153,11 @@ impl StubEngine {
                 let Ok(mut stream) = stream else { continue };
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
 
-                let mut raw = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => raw.extend_from_slice(&buffer[..read]),
-                    }
-                }
-                let request = String::from_utf8_lossy(&raw).to_string();
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                thread_paths.lock().expect("paths").push(path.clone());
+                let Some(request) = read_request(&mut stream) else {
+                    continue;
+                };
+                let path = request.path.clone();
+                thread_received.lock().expect("received").push(request);
 
                 let response = match bodies.get(path.as_str()) {
                     Some(body) => format!(
@@ -141,7 +174,7 @@ impl StubEngine {
         Self {
             port,
             shutdown,
-            paths,
+            received,
             thread: Some(thread),
         }
     }
@@ -151,9 +184,162 @@ impl StubEngine {
             .expect("spec parses")
     }
 
-    fn paths(&self) -> Vec<String> {
-        self.paths.lock().expect("paths").clone()
+    fn received(&self) -> Vec<Received> {
+        self.received.lock().expect("received").clone()
     }
+
+    fn paths(&self) -> Vec<String> {
+        self.received()
+            .into_iter()
+            .map(|request| request.path)
+            .collect()
+    }
+}
+
+fn with_body(mut bodies: Bodies, path: &'static str, body: &str) -> Bodies {
+    bodies.insert(path, body.to_string());
+    bodies
+}
+
+const FABRIC_SECRET: &str = "SECRET-FABRIC-TOKEN";
+
+const CHAT_COMPLETION: &str =
+    r#"{"choices":[{"message":{"role":"assistant","content":"served"}}]}"#;
+
+fn camelid_health(model: &str) -> String {
+    format!(
+        r#"{{"ok":true,"generation_ready":true,"active_model_id":"{model}","backend":"llama",
+            "version":"0.5.4","engine_queued_tasks":0,"engine_queue_depth":0}}"#
+    )
+}
+
+fn chat(stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": stream,
+    })
+}
+
+/// Send one chat request down each path a placed request leaves the fabric
+/// by — placed, placed and streamed, and sent to a node already chosen — with
+/// mixed placement on.
+fn send_every_way(fabric: &Fabric, spec: &NodeSpec) {
+    let mixed = RouteRequest::new(RouteMode::Throughput)
+        .with_model(Some("m"))
+        .with_mixed_engines(MixedEngines::Allowed);
+
+    let answered = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &chat(false),
+            &mixed,
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("mixed placement takes the node");
+    assert_eq!(answered.decision.label, spec.label);
+
+    let streamed = fabric
+        .dispatch_streaming(
+            "/v1/chat/completions",
+            &chat(true),
+            &mixed,
+            PROBE_TIMEOUT,
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("mixed placement takes the stream");
+    assert_eq!(streamed.placement.decision().label, spec.label);
+    drop(streamed);
+
+    fabric
+        .forward_to(
+            spec,
+            "/v1/chat/completions",
+            &chat(false),
+            PROBE_TIMEOUT,
+            &Cancel::never(),
+        )
+        .expect("the one-shot path sends");
+}
+
+/// I11 under mixed placement. Turning it on lets a foreign engine take work;
+/// nothing about that may carry this fabric's credential there. Measured live
+/// before this held: a stand-in Ollama received the fabric's bearer on
+/// `POST /v1/chat/completions`. Every path a placed request leaves by is
+/// exercised, and the token stands for one taken from `CAMELID_API_KEY` as
+/// much as one passed as a flag — both end up in the same place.
+#[test]
+fn mixed_placement_never_presents_the_fabric_bearer_to_a_foreign_engine() {
+    for (engine, bodies) in [
+        ("ollama", ollama_bodies(&["m"], &["m"])),
+        ("lmstudio", lmstudio_bodies(&[("m", "loaded")])),
+    ] {
+        let node = StubEngine::start(with_body(bodies, "/v1/chat/completions", CHAT_COMPLETION));
+        let spec = node.spec("foreign", engine);
+        let fabric = Fabric::new(vec![spec.clone()])
+            .with_timeout(PROBE_TIMEOUT)
+            .with_bearer(Some(FABRIC_SECRET));
+
+        send_every_way(&fabric, &spec);
+
+        let received = node.received();
+        let sent = received
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .count();
+        assert_eq!(
+            sent, 3,
+            "{engine}: every path must actually have reached the node: {received:?}"
+        );
+        for request in &received {
+            assert_eq!(
+                request.authorization, None,
+                "{engine} was shown the fabric's credential on {}",
+                request.path
+            );
+        }
+    }
+}
+
+/// The paired "unaffected" case: the engine that issued the key still gets it
+/// on every path, in a fabric that also holds a foreign engine.
+#[test]
+fn a_camelid_node_in_a_mixed_fabric_is_still_shown_the_bearer() {
+    let camelid = StubEngine::start(HashMap::from([
+        ("/v1/health", camelid_health("m")),
+        ("/v1/chat/completions", CHAT_COMPLETION.to_string()),
+    ]));
+    let foreign = StubEngine::start(ollama_bodies(&["m"], &["m"]));
+    let spec = camelid.spec("win", "camelid");
+    let fabric = Fabric::new(vec![spec.clone(), foreign.spec("studio", "ollama")])
+        .with_timeout(PROBE_TIMEOUT)
+        .with_bearer(Some(FABRIC_SECRET));
+
+    // The Camelid node reports an empty queue, so it outranks the node that
+    // publishes no load and every placed request lands on it.
+    send_every_way(&fabric, &spec);
+
+    let chats: Vec<Received> = camelid
+        .received()
+        .into_iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .collect();
+    assert_eq!(chats.len(), 3, "{chats:?}");
+    for request in chats {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer SECRET-FABRIC-TOKEN")
+        );
+    }
+    assert!(
+        foreign
+            .received()
+            .iter()
+            .all(|request| request.authorization.is_none()),
+        "the foreign node's probes carry no credential either"
+    );
 }
 
 impl Drop for StubEngine {

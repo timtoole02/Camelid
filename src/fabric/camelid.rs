@@ -45,6 +45,9 @@ fn request(
     timeout: Duration,
     transport: &NodeTransport,
 ) -> Result<Vec<u8>, String> {
+    // Only ever reached for a Camelid node today; gated anyway, so that
+    // stays true if a caller ever routes another engine through here.
+    let bearer = spec.engine.fabric_bearer(bearer);
     let response = http::request_with_transport(
         &spec.host,
         spec.port,

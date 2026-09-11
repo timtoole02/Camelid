@@ -409,6 +409,13 @@ target/release/camelid fabric route \
   --allow-mixed-engines --model llama-3.2-1b-instruct
 ```
 
+Two things the flag never changes. A node must still be **ready**: mixed placement relaxes which
+engines are placed on, not whether a down or still-loading node can take work, so a fabric with
+nothing ready refuses exactly as it would without the flag — retryably, never as a permanent
+`model_not_found`. And the fabric's bearer (`--bearer` or `CAMELID_API_KEY`) is only ever sent to a
+**Camelid** node: it is a Camelid API key, and a foreign engine that takes work under this flag
+never receives it, on any path.
+
 Every eligibility rule above is written against **capabilities, not engine names**, so a backend
 added later is a new row rather than a new argument — and placement still contains no engine name
 anywhere.

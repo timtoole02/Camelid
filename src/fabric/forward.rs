@@ -227,7 +227,8 @@ pub fn error_message(body: &Value) -> Option<&str> {
 ///
 /// `bearer` is required by any node started with an API key: `/v1/health` is
 /// exempt from the server's auth but `/v1/chat/completions` is not, so without
-/// it this is the call that comes back 401.
+/// it this is the call that comes back 401. It is only ever presented to a
+/// Camelid node; see [`forward_with_transport`].
 ///
 /// `cancel` ends the exchange and hangs up on the node, which is what stops it
 /// generating; pass [`Cancel::never`] where nothing can ask for that.
@@ -261,6 +262,12 @@ pub(crate) fn forward_with_transport(
     transport: &NodeTransport,
 ) -> Result<Forwarded, ForwardError> {
     reject_streaming(body)?;
+    // Decided here rather than by each caller: every placed request leaves
+    // through this function or the streaming one below, and these are the
+    // last points that still know which engine the node runs. A caller that
+    // forgot — or a token that arrived from `CAMELID_API_KEY` rather than a
+    // flag — cannot reach a foreign engine past this line.
+    let bearer = spec.engine.fabric_bearer(bearer);
 
     let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
         label: spec.label.clone(),
@@ -412,6 +419,9 @@ pub(crate) fn forward_streaming_with_transport(
     cancel: &Cancel,
     transport: &NodeTransport,
 ) -> Result<StreamOutcome, ForwardError> {
+    // See `forward_with_transport`: the same gate, for the same reason.
+    let bearer = spec.engine.fabric_bearer(bearer);
+
     let encoded = serde_json::to_vec(body).map_err(|error| ForwardError::Json {
         label: spec.label.clone(),
         detail: format!("request body could not be encoded: {error}"),

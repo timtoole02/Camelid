@@ -86,6 +86,16 @@ impl NodeEngine {
     pub fn reports_load(self) -> bool {
         matches!(self, Self::Camelid)
     }
+
+    /// The fabric's bearer, where this engine may be shown it at all.
+    ///
+    /// That token is a Camelid API key. Any other engine has no place for it,
+    /// and presenting it hands this fabric's credential to a foreign process —
+    /// which mixed placement must never make possible, however the token was
+    /// configured and whichever path the request took.
+    pub(crate) fn fabric_bearer(self, bearer: Option<&str>) -> Option<&str> {
+        bearer.filter(|_| matches!(self, Self::Camelid))
+    }
 }
 
 impl fmt::Display for NodeEngine {
@@ -126,6 +136,15 @@ mod tests {
         for foreign in [NodeEngine::Ollama, NodeEngine::LmStudio] {
             assert!(!foreign.is_placeable());
             assert!(!foreign.reports_load());
+        }
+    }
+
+    #[test]
+    fn only_our_own_engine_is_ever_shown_the_fabric_bearer() {
+        assert_eq!(NodeEngine::Camelid.fabric_bearer(Some("k")), Some("k"));
+        assert_eq!(NodeEngine::Camelid.fabric_bearer(None), None);
+        for foreign in [NodeEngine::Ollama, NodeEngine::LmStudio] {
+            assert_eq!(foreign.fabric_bearer(Some("k")), None, "{foreign}");
         }
     }
 
