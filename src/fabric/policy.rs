@@ -135,7 +135,13 @@ impl<'a> RouteRequest<'a> {
 /// node at all; the second is whether the node can do what the request needs,
 /// and applies to every engine including our own.
 fn eligible(snapshot: &NodeSnapshot, request: &RouteRequest<'_>) -> bool {
-    let placeable = snapshot.is_placeable() || request.mixed == MixedEngines::Allowed;
+    // Mixed placement relaxes which engines are placed on, never whether the
+    // node can take work now. With the two folded into one test, every down
+    // or still-loading node became eligible the moment mixed placement was
+    // asked for, and a request for a model against a dead fabric was refused
+    // as permanently absent instead of as something that can clear.
+    let placeable = snapshot.status.is_ready()
+        && (snapshot.is_placeable() || request.mixed == MixedEngines::Allowed);
     if !placeable {
         return false;
     }
@@ -993,6 +999,48 @@ mod tests {
             },
             latency: None,
         }
+    }
+
+    /// The flag accepts an engine this fabric cannot fully observe; it does
+    /// not accept a node that cannot answer. Folded together, a model request
+    /// against a dead fabric came back as a permanent `ModelUnavailable` —
+    /// a 404 a client is told never to retry — instead of the refusal that
+    /// can clear.
+    #[test]
+    fn mixed_placement_refuses_an_unreachable_node_exactly_as_camelid_only_placement_does() {
+        let nodes = [unreachable("gone")];
+        let camelid_only = RouteRequest::new(RouteMode::Throughput).with_model(Some("m"));
+        let mixed = camelid_only.with_mixed_engines(MIXED);
+
+        let expected = route(&nodes, &camelid_only).expect_err("nothing answered");
+        assert!(
+            matches!(
+                expected,
+                RouteError::AllNodesUnavailable { unreachable: 1, .. }
+            ),
+            "{expected:?}"
+        );
+        assert_eq!(route(&nodes, &mixed), Err(expected));
+    }
+
+    #[test]
+    fn mixed_placement_does_not_make_a_node_that_is_still_loading_eligible() {
+        let warming = not_ready("warming");
+        let mixed = RouteRequest::new(RouteMode::Throughput).with_mixed_engines(MIXED);
+        assert!(!eligible(&warming, &mixed));
+
+        // And what that changes on the wire: while the loading node is
+        // unaccounted for it may be the one that owns the model, so the
+        // refusal has to stay the retryable one.
+        let nodes = [warming, ready("win", Some("other"), 0)];
+        let camelid_only = RouteRequest::new(RouteMode::Throughput).with_model(Some("m"));
+        let refused = route(&nodes, &camelid_only.with_mixed_engines(MIXED))
+            .expect_err("nobody ready serves m");
+        assert_eq!(refused, route(&nodes, &camelid_only).expect_err("same"));
+        assert!(
+            matches!(refused, RouteError::ModelUnavailable { unobserved: 1, .. }),
+            "{refused:?}"
+        );
     }
 
     #[test]
