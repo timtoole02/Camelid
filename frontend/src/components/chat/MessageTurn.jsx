@@ -1,9 +1,11 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay, IconTrash } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
+import { continuationCountOf } from '../../lib/chatContinuation'
+import { activeVariantIndexOf, variantCountOf } from '../../lib/messageVariants'
 import { formatModelLabel } from '../../lib/formatters'
 import { cleanLegacyDemoCapCopy } from '../../lib/conversationStorage'
 import {
@@ -13,6 +15,9 @@ import {
 } from './render/StreamingIndicator'
 import { ParityReceiptCard } from './render/ParityReceipt'
 import { DeveloperDiagnosticsBlock } from './render/Diagnostics'
+import { TokenInspectorCard } from './render/TokenInspector'
+import { StructuredOutputCard } from './render/StructuredOutput'
+import { ToolCallsCard } from './render/ToolCalls'
 
 const formatMs = (value) => {
   const ms = Number(value)
@@ -98,6 +103,52 @@ function WebResearchSources({ research }) {
   )
 }
 
+/* Sibling navigation for a re-rolled reply.
+
+   Placed at the START of the actions row, before Copy and Regenerate: it is
+   the control that tells the reader the other answers still exist, and it is
+   useless if they have to discover it after pressing the button that used to
+   destroy them. Hidden entirely at one variant, so an ordinary reply is
+   visually unchanged. */
+function VariantNav({ index, count, onSelect, onDiscard }) {
+  if (count <= 1) return null
+  const goto = (next) => onSelect?.((next + count) % count)
+  return (
+    <span className="cxturn__variants" role="group" aria-label={`Reply ${index + 1} of ${count}`}>
+      <button
+        type="button"
+        className="cxturn__variant-step"
+        onClick={() => goto(index - 1)}
+        aria-label="Previous version of this reply"
+        title="Previous version of this reply"
+      >
+        ‹
+      </button>
+      <span className="cxturn__variant-count" aria-live="polite">{index + 1}/{count}</span>
+      <button
+        type="button"
+        className="cxturn__variant-step"
+        onClick={() => goto(index + 1)}
+        aria-label="Next version of this reply"
+        title="Next version of this reply"
+      >
+        ›
+      </button>
+      {onDiscard && (
+        <button
+          type="button"
+          className="cxturn__variant-step cxturn__variant-discard"
+          onClick={() => onDiscard()}
+          aria-label="Discard this version"
+          title="Discard the version shown; the others are kept"
+        >
+          <IconTrash size={13} />
+        </button>
+      )}
+    </span>
+  )
+}
+
 /* Per-message metadata footer. Token counts are labeled by source (backend
    usage vs client estimate); TTFT and tok/s are always client-measured and say
    so — operational telemetry, never support evidence (I4). The Evidence Chip
@@ -109,6 +160,9 @@ function MessageMetaFooter({ message }) {
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
+  /* A continued reply is more than one request. Disclose that rather than
+     letting one set of timings quietly describe only its last segment. */
+  const continuedTimes = continuationCountOf(message)
   if (!usage && !ttft && !rate && !message.model_id && !sentAt) return null
   return (
     <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
@@ -151,6 +205,14 @@ function MessageMetaFooter({ message }) {
       {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
       {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
+      {continuedTimes > 0 && (
+        <span
+          className="cxturn__meta-item"
+          title={`Resumed ${continuedTimes === 1 ? 'once' : `${continuedTimes} times`} after hitting the response budget. Token counts cover the whole reply; the timings here cover the last segment only.`}
+        >
+          continued{continuedTimes > 1 ? ` ×${continuedTimes}` : ''}
+        </span>
+      )}
       {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
     </footer>
@@ -255,7 +317,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend }) {
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -275,6 +337,11 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
   const showInterruptedWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'interrupted'
   const showReusePromptAction = Boolean(priorUserPrompt) && (showErrorWarning || showInterruptedWarning)
   const showMessageActions = message.role === 'assistant' && Boolean(String(messageContent || '').trim())
+  const variantCount = variantCountOf(message)
+  const variantIndex = activeVariantIndexOf(message)
+  /* Navigation stays usable while another turn streams: switching is a local
+     edit with no request behind it. */
+  const showVariantNav = message.role === 'assistant' && !assistantStreaming && variantCount > 1
 
   useEffect(() => () => {
     if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
@@ -334,7 +401,22 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         )}
 
         {showLengthWarning && (
-          <div className="cxturn__warning" role="status">Stopped before completing. Ask “continue” for a complete file.</div>
+          <div className="cxturn__warning" role="status">
+            <span>Stopped at the response budget, not at the end of the answer.</span>
+            {onContinue && (
+              /* Resumes this same reply in place. Regenerate, one row down,
+                 throws the text away and starts over — keep the two verbs
+                 visibly different so neither is clicked for the other. */
+              <button
+                type="button"
+                className="cxturn__warning-action"
+                onClick={() => onContinue()}
+                title="Ask the model to pick up exactly where it stopped and add to this reply"
+              >
+                <IconPlay size={13} /> <span>Continue</span>
+              </button>
+            )}
+          </div>
         )}
         {showErrorWarning && (
           <div className="cxturn__warning cxturn__warning--error" role="status">Generation stopped before Camelid returned a complete reply.</div>
@@ -343,8 +425,16 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
           <div className="cxturn__warning cxturn__warning--interrupted" role="status">Generation was interrupted before the reply finished.</div>
         )}
 
-        {(showMessageActions || showReusePromptAction) && (
+        {(showMessageActions || showReusePromptAction || showVariantNav) && (
           <div className="cxturn__actions" aria-label="Message actions">
+            {showVariantNav && (
+              <VariantNav
+                index={variantIndex}
+                count={variantCount}
+                onSelect={onSelectVariant}
+                onDiscard={onDiscardVariant}
+              />
+            )}
             {showMessageActions && (
               <button
                 type="button"
@@ -357,12 +447,20 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
               </button>
             )}
             {showMessageActions && onRegenerate && (
+              /* Two different promises behind one icon, so the label has to
+                 carry the difference: on the last reply the answer on screen
+                 is KEPT as a sibling; mid-thread it is replaced along with
+                 every turn after it. */
               <button
                 type="button"
                 className="cxturn__action cxturn__action--icon"
                 onClick={() => onRegenerate()}
-                title="Regenerate response"
-                aria-label="Regenerate response"
+                title={regenerateReplacesThread
+                  ? 'Regenerate — replaces this reply and every turn after it'
+                  : 'Regenerate — writes another answer and keeps this one alongside it'}
+                aria-label={regenerateReplacesThread
+                  ? 'Regenerate response, replacing this reply and every turn after it'
+                  : 'Regenerate response, keeping this one as another version'}
               >
                 <IconRefresh size={16} />
               </button>
@@ -384,6 +482,18 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && structuredRecord && (
+          <StructuredOutputCard record={structuredRecord} />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && tokenInspection && (
+          <TokenInspectorCard
+            inspection={tokenInspection.logprobs}
+            absence={tokenInspection.absence}
+          />
+        )}
+        {message.role === 'assistant' && !assistantStreaming && message.tool_calls && (
+          <ToolCallsCard toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>

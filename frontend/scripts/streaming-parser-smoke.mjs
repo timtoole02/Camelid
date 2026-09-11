@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 
 import { extractSseEvents, readChatCompletionJsonPayload, readStreamingChatCompletion } from '../src/lib/chatCompletionStream.js'
+import { authoritativeOutputRate, describeMtp12WidthSchedule, readTargetVerifiedMtp12 } from '../src/lib/nativeGenerationMetrics.js'
 
 const partial = 'data: {"choices":[{"delta":{"content":"hel"}}]}\r\n\r\ndata: {"choices":[{"delta":{"content":"lo"}}]}'
 const firstPass = extractSseEvents(partial)
@@ -54,7 +55,7 @@ const response = new Response(streamFromChunks([
   'data: {"choices":[{"delta":{"content":"```js\\nconst"}}]}\n\n',
   'data: {"choices":[{"delta":{"content":" answer = 42"}}]}\n',
   '\n',
-  'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":7,"total_tokens":10}}\n\n',
+  'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":7,"total_tokens":10},"camelid":{"mtp12":{"lossless_target_verified":true,"decode_tokens_per_second":51.494,"decode_us":135937,"decode_output_tokens":7,"configured_verify_width":16,"accepted_drafts":6,"drafted":7,"selector":"CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16","width_schedule":{"selector":"CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16","selector_value":"1","enabled":true,"active_for_configured_width":true,"warmup_verify_width":8,"padded_tail_policy":"remaining_10_through_15_reserves_bonus_anchor; logical_remaining_minus_1; physical_w16; repeat_anchor_padding","policy":"one_shot_w8_then_w16; partial_acceptance_does_not_fallback; padded_w16_tail"}}}}\n\n',
   'data: [DONE]\n\n',
 ]), {
   status: 200,
@@ -77,6 +78,15 @@ assert.deepEqual(deltas.map((item) => item.fullContent), ['```js\nconst', '```js
 assert.deepEqual(deltas.map((item) => item.completionTokens), [1, 2], 'stream metrics should advance while generation is active')
 assert.equal(streamed.completionTokens, 7, 'stream parser should preserve exact backend completion-token usage from the terminal chunk')
 assert.deepEqual(streamed.usage, { prompt_tokens: 3, completion_tokens: 7, total_tokens: 10 }, 'stream parser should preserve exact backend usage evidence instead of replacing it with estimates')
+assert.equal(streamed.camelid?.mtp12?.decode_tokens_per_second, 51.494, 'terminal SSE should preserve native MTP12 diagnostics')
+assert.equal(readTargetVerifiedMtp12(streamed.camelid)?.configured_verify_width, 16, 'target-verified MTP12 diagnostics should normalize finite native fields')
+assert.deepEqual(
+  describeMtp12WidthSchedule(streamed.camelid.mtp12),
+  { widths: 'W8 bootstrap → W16 verify', policy: 'remaining 10 through 15 reserves bonus anchor; logical remaining minus 1; physical W16; repeat anchor padding' },
+  'the UI should derive readable widths from the backend provenance object instead of assuming an invented array',
+)
+assert.equal(authoritativeOutputRate({ camelid: streamed.camelid, tokens_out_per_sec: 2 }), 51.494, 'native target-verified rate should outrank the browser estimate')
+assert.equal(authoritativeOutputRate({ camelid: { mtp12: { lossless_target_verified: false, decode_tokens_per_second: 99 } }, tokens_out_per_sec: 2 }), 2, 'unverified native claims must not replace the browser estimate')
 assert.ok(streamEvents.includes('bytes'), 'stream parser should expose first-byte progress before content')
 assert.ok(streamEvents.includes('role'), 'stream parser should expose role-only chunks while waiting for first content token')
 assert.ok(streamEvents.includes('usage'), 'stream parser should expose backend usage chunks before finalizing the assistant row')
@@ -125,6 +135,30 @@ const batchedPayload = await readStreamingChatCompletion(new Response(streamFrom
 })
 assert.equal(batchedPayload.content, 'batched', 'SSE parser should keep accepting backend batches with several JSON payloads in one event')
 assert.deepEqual(batchedPayloadDeltas, ['batch', 'batched'], 'batched payloads should still stream each visible update')
+
+const segmentedDeltas = []
+const segmentedEvents = []
+const segmentedPayload = await readStreamingChatCompletion(new Response(streamFromChunks([
+  'data: {"choices":[{"delta":{"content":"## First"}}]}\n\n',
+  'data: {"choices":[{"delta":{"camelid_segment":{"index":0,"token_ids_exact":true,"requested_tokens":1,"verified_tokens":1,"decode_output_tokens":1,"decode_us":20000,"render_tokens_per_second":50,"boundary":"\\n\\n"}}}]}\n\n',
+  'data: {"choices":[{"delta":{"content":"## Second"}}]}\n\n',
+  'data: {"choices":[{"delta":{"camelid_segment":{"index":1,"token_ids_exact":true,"requested_tokens":1,"verified_tokens":1,"decode_output_tokens":1,"decode_us":19608,"render_tokens_per_second":51,"boundary":""}}}],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}\n\n',
+  'data: [DONE]\n\n',
+]), {
+  status: 200,
+  headers: { 'content-type': 'text/event-stream' },
+}), (delta, fullContent, metrics) => {
+  segmentedDeltas.push({ delta, fullContent, completionTokens: metrics.completionTokens })
+}, {
+  onStreamEvent(event) {
+    if (event.type === 'segment') segmentedEvents.push(event.segment)
+  },
+})
+assert.equal(segmentedPayload.content, '## First\n\n## Second', 'UI-authored segment boundaries should produce clean Markdown exactly once')
+assert.deepEqual(segmentedDeltas.map((item) => item.completionTokens), [1, 1, 2], 'presentation boundaries must not inflate exact model-token counts')
+assert.equal(segmentedEvents.length, 2, 'every backend segment progress item should surface to the live UI')
+assert.equal(segmentedEvents[0].render_tokens_per_second, 50, 'the completed section native rate should remain available during the next prefill gap')
+assert.equal(segmentedEvents[1].boundary, '', 'the final progress item should not append a trailing separator')
 
 const partialBeforeError = []
 const errorEvents = []

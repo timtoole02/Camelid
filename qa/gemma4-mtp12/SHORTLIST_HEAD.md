@@ -1,0 +1,96 @@
+# Overlapping assistant head shortlist
+
+`CAMELID_GEMMA4_MTP12_SHORTLIST=/path/to/assistant.c4sl` enables an optional,
+draft-only head shortlist. `CAMELID_GEMMA4_MTP12_SHORTLIST_TOP=192` selects the
+number of the 2,048 raw-mean centroids to keep; admitted values are 1..=2048.
+The default is 192. An absent sidecar setting preserves the full-head path;
+a malformed configured sidecar is an error. The sidecar is tied to the exact
+assistant SHA and adds 10,502,144 bytes of resident storage.
+
+The GPU scores the centroids, selects the highest scores with stable ties,
+and keeps a token if any of its three cluster IDs is selected. Kept rows use
+the identical Q4 dot/reduction as the full head; omitted logits are -infinity.
+The ordinary vocabulary argmax then chooses the draft. Only the resident
+chain uses this path: K=1 full-logit APIs retain the full-head oracle.
+The target verifier is unchanged and remains authoritative for emitted tokens.
+A shortlist may alter draft proposals and acceptance; output parity and
+acceptance must be measured on the actual target workload before enabling it.
+
+The earlier single-assignment clustering experiment attained only 94.8%
+recall at top128. The existing overlapping top3 sidecar changes that tradeoff:
+on the saved 1,587 W8 draft queries, top128 recall is 98.74% and top192 is
+99.18%. The production Metal centroid kernel reproduced these recall figures on all
+1,587 saved queries (top128: 20 misses; top192: 13; top256: 9). These are
+offline draft recall figures, not a generation acceptance or throughput claim.
+
+Local M4 synthetic Q4 head timing, 262,144 rows x 1,024 columns, nonzero
+18-byte matrix offset, actual sidecar and first saved query, 7 sequential
+heads per command, median of 8 warmed commands (2026-09-04):
+
+| Head path | Selected rows | Median per draft |
+|---|---:|---:|
+| Full | 262,144 | 1,627 us |
+| Top128 | 28,318 | 574 us |
+| Top192 | 41,735 | 576 us |
+| Top256 | 54,767 | 621 us |
+| Top2048 | 262,144 | 1,788 us |
+
+Shortlist timings include centroid scoring and selection. All kept row
+logits matched the full head bit for bit; all omitted rows were -infinity.
+Top2048 matched all full-head logits. GPU-selected centroid IDs matched CPU
+stable ranking. These timings are isolated kernel measurements, not mini2
+end-to-end results.
+
+Validation:
+
+```sh
+cargo test --lib assistant_shortlist -- --nocapture
+cargo test --lib gemma4_mtp12::shortlist -- --nocapture
+```
+
+The GPU fixture checks tied centroid scores, top1/17/128/192/256/2048,
+8,193 nontrivial Q4 rows, a nonzero matrix offset, exact kept logits,
+masked-out logits, and both vocabulary argmax kernels. Parser tests cover
+identity, dimensions, nonfinite centroid values, cluster bounds/duplicates,
+invalid padding, truncation, and trailing bytes.
+
+Rebuild the sidecar with `generate_shortlist_sidecar.py model.safetensors
+output.c4sl` (NumPy required). It checks the actual source SHA before reading
+weights, writes explicit little-endian arrays, and atomically replaces the
+output only after all validation succeeds. Defaults remain 15 iterations,
+seed 12345, K=2048 and M=3. Stable grouping removes repeated boolean scans
+while preserving each original float32 sum's row order; a reduced training
+fixture compares the resulting centroid and assignment bits to the original
+generator. `test_generate_shortlist_sidecar.py` also checks hash refusal,
+header/endianness and destination preservation on invalid output. Full
+artifact regeneration was not performed during the kernel experiment.
+
+## Optional local compaction
+
+`CAMELID_GEMMA4_MTP12_SHORTLIST_COMPACT=1` selects a second bit-exact masked
+head kernel. Each 256-row threadgroup builds a local list of retained row
+IDs, then its eight SIMDgroups evaluate only those rows. It initializes all
+vocabulary logits to -infinity before writing retained results, so the
+ordinary stable argmax is unchanged. There are no extra resident buffers,
+global prefix passes or indirect-dispatch dependencies. Each group uses
+1,092 bytes of threadgroup storage for its compact IDs, counts and offsets.
+The selector defaults off and has no effect without a shortlist.
+
+Local M4 measurements with three saved queries (indices 0, 512 and 1200),
+synthetic full-size Q4 weights and the actual sidecar, 70 heads per command,
+median of five warmed commands; scoring and selection included:
+
+| Top clusters | Masked head, mean of medians | Local compaction | Saving per W8 chain of 7 drafts |
+|---|---:|---:|---:|
+| 128 | 596 us | 455 us | 0.99 ms |
+| 192 | 628 us | 531 us | 0.68 ms |
+| 256 | 671 us | 624 us | 0.33 ms |
+
+A separate global prefix-scan/scatter plus indirect-dispatch prototype was
+slower than local compaction and was not integrated. These small isolated
+savings require an in-situ mini2 gate before any default change.
+The GPU fixture compares every retained and omitted logit bit for
+TOP1/17/128/192/256/2048, including an 8,193-row partial final block and
+all-empty blocks. It also explicitly clears the complete selected mask and
+checks all -infinity logits and first-index-zero argmax after a prior full
+head, ruling out stale output in empty work.

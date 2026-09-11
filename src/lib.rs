@@ -14,6 +14,8 @@ pub mod cuda_vram;
 pub mod diagnostics;
 pub mod diffusion_gemma;
 pub mod distributed;
+pub mod eagle3;
+pub mod eagle3_runtime;
 pub mod embedding;
 pub mod error;
 pub mod execution_plan;
@@ -21,9 +23,14 @@ pub mod fabric;
 pub mod fit;
 pub mod fit_dims;
 pub mod gait;
+#[cfg(target_os = "macos")]
+pub(crate) mod gemma4_attention_metal;
 pub mod gemma4_distributed;
 pub mod gemma4_mtp;
+/// Metal-free decision logic for the Gemma 4 12B W8 draft tree.
+pub(crate) mod gemma4_mtp12_tree_menu;
 pub mod gemma4_mtp_cuda;
+pub mod gemma4_q4_sidecar;
 pub mod gemma4_runtime;
 pub mod gguf;
 pub mod ghost;

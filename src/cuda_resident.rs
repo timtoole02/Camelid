@@ -12720,8 +12720,20 @@ pub(crate) fn launch_attention_splitk(
 }
 
 /// Whether flash prefill attention is enabled.
-/// Opt-in via `CAMELID_FLASH_PREFILL=1` (prefill-only, token-parity).
-/// Default is off (retaining bit-identity with serial forward pass).
+/// Opt-in via `CAMELID_FLASH_PREFILL=1`, prefill-only. Default off, which retains
+/// bit-identity with the serial forward pass.
+///
+/// MEASURED 2026-09-10 on an RTX 3060 Laptop (sm_86), and both halves are worth
+/// knowing before enabling it — receipts in
+/// `qa/evidence-bundles/cuda-flash-prefill-ab-20260910/`:
+///   - It is SLOWER here, and worse with context: 1.11x / 1.17x / 1.22x at
+///     1424 / 3025 / 6024 prompt tokens. Developed and reported on sm_89, where the
+///     register-vs-occupancy tradeoff may land differently; no committed evidence
+///     isolates this flag on any device.
+///   - It is NOT token-parity in general. The online-softmax reassociation runs per
+///     LAYER, so its error compounds: greedy output was identical 3/3 at 1429 tokens
+///     but only 1/3 at 6029 tokens, deterministically. Earlier comments here claimed
+///     token-parity without a length bound; that claim did not survive measurement.
 fn flash_prefill_enabled() -> bool {
     std::env::var("CAMELID_FLASH_PREFILL").is_ok_and(|v| {
         v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off")
@@ -13487,6 +13499,12 @@ pub struct CudaResidentDecode {
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
+    /// The token sequence whose KV occupies rows `[0, resident_tokens.len())`,
+    /// recorded by prefill so a later prompt sharing a leading run of tokens can
+    /// skip rebuilding rows that already hold exactly those tokens. Empty until
+    /// a prefill records one; truncated by `set_filled` so it can never outlive
+    /// the rows it describes.
+    resident_tokens: Vec<u32>,
     // per-token scratch (reused)
     d_hidden: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
@@ -13600,7 +13618,36 @@ pub struct CudaResidentDecode {
 /// per-row block-order reduction — the result stays bit-identical). A larger K
 /// lets each weight read verify more drafts per round, raising the ceiling on
 /// repetitive/structured output where n-gram acceptance is high.
-pub(crate) const MAX_VERIFY_K: usize = 8;
+// 16 (was 8): the host draft/verify gate in inference.rs clamps BOTH GPU
+// lanes with this constant, and the Metal multi-column verify profits from
+// deeper windows. CUDA-side cost is scratch sizing only (d_verify_scores and
+// friends scale linearly with this constant).
+/// Leading positions of `tokens` whose KV a previous prefill already built.
+///
+/// A KV row is a pure function of the token prefix that produced it, so rows an
+/// engine already holds for an identical prefix ARE the rows a new prompt needs.
+/// Recomputing them would reproduce the same values with the same kernels in the
+/// same order, which is why skipping them is not an approximation and needs no
+/// host mirror.
+///
+/// Bounded by BOTH the recorded sequence and the `filled` watermark: decode
+/// advances `filled` past the recorded prompt (those rows hold generated tokens
+/// this function cannot vouch for), and a rewind lowers it. Claiming a row the
+/// engine cannot account for would skip a prefill of KV that does not hold these
+/// tokens — silently wrong output, not a slow path — so the bound is
+/// deliberately the pessimistic one.
+///
+/// Split out of the engine so the bookkeeping is testable without a GPU.
+fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize {
+    let limit = resident.len().min(filled).min(tokens.len());
+    let mut shared = 0usize;
+    while shared < limit && resident[shared] == tokens[shared] {
+        shared += 1;
+    }
+    shared
+}
+
+pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
 
@@ -14130,6 +14177,7 @@ impl CudaResidentDecode {
             cache_v,
             kv_quant,
             filled: 0,
+            resident_tokens: Vec::new(),
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
             d_q: alloc_f(q_width)?,
@@ -14619,6 +14667,8 @@ impl CudaResidentDecode {
     /// driver only uses `forward_token` (never seed_layer/read_kv_layer). Absolute `li`
     /// indexing is preserved (the Vecs stay length `n_layers`).
     pub fn sparsify_kv(&mut self, keep_full: &[bool]) -> Result<(), String> {
+        // Layers about to lose their cache cannot serve a continued prefix.
+        self.invalidate_resident_tokens();
         let s = self.k.stream.clone();
         for li in 0..self.n_layers {
             if !keep_full.get(li).copied().unwrap_or(false) {
@@ -14650,6 +14700,10 @@ impl CudaResidentDecode {
             }
         }
         self.filled = 0;
+        // The rows this record described have just been invalidated; leaving it
+        // in place would let a later prompt continue from KV that no longer holds
+        // those tokens.
+        self.invalidate_resident_tokens();
         Ok(())
     }
 
@@ -15062,6 +15116,39 @@ impl CudaResidentDecode {
 
     pub fn set_filled(&mut self, filled: usize) {
         self.filled = filled;
+        // Never let the token record outlive the rows it describes. A rewind
+        // (speculative reject, error reset, a fresh prefill starting over)
+        // invalidates everything past the new watermark, and a stale tail would
+        // authorize reusing rows that no longer hold those tokens.
+        if self.resident_tokens.len() > filled {
+            self.resident_tokens.truncate(filled);
+        }
+    }
+
+    /// Record the prompt whose KV now occupies rows `[0, tokens.len())`.
+    ///
+    /// Call this only after a prefill has actually written those rows; the
+    /// record is what later prompts are matched against.
+    pub fn set_resident_tokens(&mut self, tokens: &[u32]) {
+        self.resident_tokens.clear();
+        self.resident_tokens.extend_from_slice(tokens);
+    }
+
+    /// Stop vouching for the KV cache's contents.
+    ///
+    /// Every path that writes KV by any route other than a prefill — a reseed
+    /// from host history, a tree compaction, dropping a layer's cache — must call
+    /// this. A stale record does not cause a slow path, it causes a later prompt
+    /// to skip prefilling rows that no longer hold its tokens, which is silently
+    /// wrong output.
+    fn invalidate_resident_tokens(&mut self) {
+        self.resident_tokens.clear();
+    }
+
+    /// How many leading positions of `tokens` are ALREADY materialized in this
+    /// engine's KV cache and can therefore be skipped by a prefill.
+    pub fn resident_prefix_len(&self, tokens: &[u32]) -> usize {
+        resident_prefix_len(&self.resident_tokens, self.filled, tokens)
     }
 
     /// True when any layer's weights live in host RAM and stream to a GPU scratch buffer
@@ -15109,6 +15196,13 @@ impl CudaResidentDecode {
         if position == 0 {
             return Ok(());
         }
+        // These rows are about to be overwritten from the f16-rounded HOST history.
+        // They will hold the right tokens, but not the bit-identical values a fresh
+        // GPU prefill produces — which is exactly the hazard that keeps the
+        // prompt-prefix cache off this lane. Continuation's guarantee is bit-identity,
+        // so a reseeded span must never be continued from: drop the record and let the
+        // next prompt pay one cold prefill.
+        self.invalidate_resident_tokens();
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
         let s = self.k.stream.clone();
         if self.kv_quant == crate::model::KvCacheQuantization::Q8_0 {
@@ -17452,12 +17546,35 @@ impl CudaResidentDecode {
         n: usize,
         scale: f32,
     ) -> Result<(), String> {
+        self.prefill_from(embeddings, cos_all, sin_all, n, scale, 0)
+    }
+
+    /// [`prefill`](Self::prefill), resuming at `start`: positions `[0, start)`
+    /// are left untouched because a previous prefill of the SAME token prefix
+    /// already materialized them (see [`resident_prefix_len`]). `start == 0` is
+    /// the ordinary cold prefill and runs the identical loop.
+    ///
+    /// The caller is responsible for establishing that rows `[0, start)` really
+    /// hold these tokens; passing a `start` the KV cache does not account for
+    /// silently produces wrong output rather than a slow path.
+    pub fn prefill_from(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        n: usize,
+        scale: f32,
+        start: usize,
+    ) -> Result<(), String> {
         let half = self.rope_dim / 2;
         let hidden = self.hidden;
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill: input slices too short".into());
         }
-        for i in 0..n {
+        if start > n {
+            return Err(format!("prefill: start={start} exceeds n={n}"));
+        }
+        for i in start..n {
             let emb = &embeddings[i * hidden..(i + 1) * hidden];
             let cos = &cos_all[i * half..(i + 1) * half];
             let sin = &sin_all[i * half..(i + 1) * half];
@@ -17705,8 +17822,10 @@ impl CudaResidentDecode {
     /// projection reproduces its decode GEMV's integer decomposition and ordered fp32 sum,
     /// and the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
     /// When opt-in flash prefill is enabled (`CAMELID_FLASH_PREFILL=1`, prefill only), the fused
-    /// online-softmax attention kernel preserves greedy token-parity while eliminating intermediate
-    /// DRAM scratch.
+    /// online-softmax attention kernel eliminates intermediate DRAM scratch but is an
+    /// APPROXIMATION whose error grows with context: measured greedy-identical 3/3 at
+    /// 1429 prompt tokens and 1/3 at 6029 (see `flash_prefill_enabled`). It is off by
+    /// default, so this stack is bit-identical to the serial path unless asked otherwise.
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
@@ -19081,6 +19200,10 @@ impl CudaResidentDecode {
     /// slot is never below the destination, so a forward copy never clobbers a source
     /// it still needs. After compaction the caller sets position/filled = base + L.
     pub fn compact_tree_kv_path(&mut self, path: &[usize], base: usize) -> Result<(), String> {
+        // Compaction relocates rows, so position -> token no longer matches the
+        // record. Anything past `base` is a speculative slot the record never
+        // covered, but the move itself is enough to stop vouching for the cache.
+        self.invalidate_resident_tokens();
         let map = |e: cudarc::driver::DriverError| format!("cuda compact: {e}");
         let s = self.k.stream.clone();
         let (n_kv, head_dim, max_pos) = (self.n_kv_heads, self.head_dim, self.max_pos);
@@ -19141,13 +19264,30 @@ impl CudaResidentDecode {
         n: usize,
         scale: f32,
     ) -> Result<(), String> {
+        self.prefill_batched_from(embeddings, cos_all, sin_all, n, scale, 0)
+    }
+
+    /// [`prefill_batched`](Self::prefill_batched), resuming at `start`. The
+    /// chunk loop simply begins at `start` instead of 0; every chunk it does run
+    /// is staged and scattered exactly as on the cold path, so the KV it writes
+    /// is bit-identical to a full prefill's. See [`prefill_from`](Self::prefill_from)
+    /// for the caller's obligation.
+    pub fn prefill_batched_from(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        n: usize,
+        scale: f32,
+        start: usize,
+    ) -> Result<(), String> {
         // The batched layer stack reads each layer's VRAM weight slice directly and has
         // no offload-streaming path (unlike forward_pass), so for an offloaded model
         // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
         // serial prefill, which streams offloaded weights correctly. Batching is a
         // resident-only fast path.
         if !self.supports_batched_prefill() {
-            return self.prefill(embeddings, cos_all, sin_all, n, scale);
+            return self.prefill_from(embeddings, cos_all, sin_all, n, scale, start);
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
         let hidden = self.hidden;
@@ -19155,11 +19295,15 @@ impl CudaResidentDecode {
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill_batched: input slices too short".into());
         }
+        if start > n {
+            return Err(format!("prefill_batched: start={start} exceeds n={n}"));
+        }
         let batch_cap = self.batched_prefill_token_cap();
         self.ensure_prefill_scratch(batch_cap)?;
         let s = self.k.stream.clone();
         let mut sc = self.prefill_scratch.take().expect("allocated above");
-        let mut base = 0usize;
+        // Rows [0, start) already hold this prompt's KV from a previous prefill.
+        let mut base = start;
         while base < n {
             let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at

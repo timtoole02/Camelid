@@ -1,7 +1,8 @@
 [package]
 name = "camelid-desktop"
-version = "0.6.1"
+version = "0.7.2"
 edition = "2021"
+# MSRV floor, not the build toolchain — see the note in the workspace Cargo.toml.
 rust-version = "1.89"
 description = "Camelid Desktop — native chat app that embeds the Camelid engine as a loopback sidecar"
 license = "MIT"

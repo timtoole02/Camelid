@@ -4923,6 +4923,89 @@ async fn streaming_completion_honors_stop_sequence_finish_reason() {
     assert!(body.contains("data: [DONE]"));
 }
 
+/// A stop string that STRADDLES a token boundary. The tiny fixture emits `<unk>`
+/// per step, so `"><"` spans the join between token 1 and token 2: it is absent
+/// from `"<unk>"` and present in `"<unk><unk>"`, starting at byte 4 — BEHIND the
+/// end of the text already streamed.
+///
+/// The lane used to decode the full reply each step, truncate at the match start,
+/// and diff with `strip_prefix`. On this input the truncated text is SHORTER than
+/// what the client already holds, `strip_prefix` returns None, and the fallback
+/// re-emitted the entire reply as one delta — the client, which concatenates
+/// deltas verbatim, saw the reply's prefix twice.
+///
+/// The old assertions never concatenated the deltas, which is why it shipped. This
+/// one does, and pins the streamed answer to the non-streamed one.
+#[tokio::test]
+async fn streaming_completion_stop_straddling_a_token_matches_the_nonstreaming_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-generation.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router();
+    let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request = |stream: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"tiny-generation","prompt":"hello","max_tokens":2,"stream":{stream},"stop":"><"}}"#
+            )))
+            .unwrap()
+    };
+
+    let response = app.clone().oneshot(request(false)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let nonstreaming: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let expected = nonstreaming["choices"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(expected, "<unk", "fixture changed: {nonstreaming}");
+    assert_eq!(nonstreaming["choices"][0]["finish_reason"], "stop");
+
+    let response = app.oneshot(request(true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+    // Reassemble the reply exactly as a client does.
+    let mut streamed = String::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload.trim() == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(payload).unwrap();
+        if let Some(text) = chunk["choices"][0]["text"].as_str() {
+            streamed.push_str(text);
+        }
+    }
+    assert_eq!(
+        streamed, expected,
+        "streamed deltas must concatenate to the non-streamed answer; got {streamed:?}\n{body}"
+    );
+    assert!(body.contains("\"finish_reason\":\"stop\""));
+}
+
 #[tokio::test]
 async fn completion_endpoint_streams_openai_compatible_sse_chunks() {
     let dir = tempfile::tempdir().unwrap();

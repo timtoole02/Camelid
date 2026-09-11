@@ -5,8 +5,12 @@ import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
 import { isEmbeddingOnlyModel, isGenerationCapableModel, matchResidentItemsToLocalRecords, modelCapabilityFields } from '../lib/modelCapabilities.js'
 import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation.js'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
+import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/nativeGenerationMetrics'
+import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
+import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
+import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import {
@@ -16,6 +20,11 @@ import {
 } from '../lib/conversationCompaction.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { CONTINUATION_INSTRUCTION, canContinueMessage, joinContinuation, mergeContinuedUsage } from '../lib/chatContinuation'
+import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withVariantAppended } from '../lib/messageVariants'
+import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
+import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
+import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import {
   createPacerState,
@@ -46,6 +55,8 @@ import {
   modelContextLength,
 } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
+import { isGemma4Mtp12TargetVerifiedVideoOptedIn, shouldUseGemma4Mtp12TargetVerifiedRender } from '../lib/targetVerifiedRender.js'
+import { isGemma4Mtp12SegmentedVideoOptedIn, readGemma4Mtp12PreparedSegments } from '../lib/segmentedWebResearchSynthesis.js'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -54,7 +65,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena'])
+const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;
@@ -694,6 +705,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
   const [selectedModelId, setSelectedModelId] = useState(getInitialModelId)
   const [search, setSearch] = useState('')
+  /* Session-scoped on purpose. A filter that survived a restart would hide
+     most of the list with no obvious cause; the pins and tags it filters on
+     are the durable part. */
+  const [conversationTagFilter, setConversationTagFilter] = useState([])
+  const [showArchivedConversations, setShowArchivedConversations] = useState(false)
   const [memorySearch, setMemorySearch] = useState('')
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
@@ -703,6 +719,36 @@ export function useDashboardData({ showNotice, clearNotice }) {
   // Opt-in parity receipts: sends the next message non-streaming with
   // camelid_receipt:true so the response carries a verifiable receipt.
   const [receiptMode, setReceiptMode] = useState(false)
+  /* Opt-in token inspection: sends the next message non-streaming with
+     logprobs:true so the reply carries the model's per-token scores. Captured
+     DURING the decode that produces the visible reply — never reconstructed by a
+     second generation, which would describe a different generation.
+
+     Deliberately held OUTSIDE the conversation: a 120-token reply carries roughly
+     414 bytes per token at depth 5 and 1.4 KB per token at depth 20 — two orders
+     of magnitude more than the reply text. Persisting that would march a
+     conversation into the localStorage quota, and persistConversations swallows
+     the quota error, so the failure would silently stop saving the WHOLE
+     conversation rather than just this record. Session-scoped by design; the
+     panel says so and offers a download. */
+  const [inspectMode, setInspectMode] = useState(false)
+  /* Constrained decoding is a per-turn choice like inspection, and for the same
+     reason: the engine refuses a constraint on a streaming request, so the turn
+     has to be composed non-streaming before it is sent. */
+  const [structuredMode, setStructuredMode] = useState(STRUCTURED_MODES.OFF)
+  const [structuredSchema, setStructuredSchema] = useState(DEFAULT_SCHEMA)
+  const [structuredGrammar, setStructuredGrammar] = useState(DEFAULT_GRAMMAR)
+  const [structuredRecords, setStructuredRecords] = useState({})
+  const [tokenInspections, setTokenInspections] = useState({})
+  /* Tool definitions are a per-session editing surface, not a persisted setting:
+     they are a developer probe against the loaded model, and a stale definition
+     silently shaping a later conversation would be worse than retyping one. */
+  const [toolsEnabled, setToolsEnabled] = useState(false)
+  const [toolsText, setToolsText] = useState(DEFAULT_TOOLS)
+  /* Signatures of every call already requested in this conversation, so a model
+     that ignores a tool result and re-asks can be named rather than looping
+     invisibly. Verified live: Llama 3.2 3B does exactly this. */
+  const [toolCallSignatures, setToolCallSignatures] = useState({})
   // Opt-in thinking mode (experimental — NOT parity-locked): sends
   // camelid_enable_thinking:true so the model emits its own <think>…</think>
   // reasoning. Default OFF so chat stays on the parity-locked thinking-DISABLED
@@ -1049,6 +1095,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
     [models, runtime, selectedModelId],
   )
   const selectedModelChatGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+  /* Whether this engine's contract permits token inspection at all. Surfaced so
+     the composer control can render GUARDED rather than appearing live and
+     silently recording nothing — a toggle that reads "on" while contributing no
+     request fields is exactly the caveated-live surface I3 forbids. */
+  const inspectionSupported = readInspectionContract(dashboard?.capabilities).nonStreamingSupported
+  const structuredContract = readStructuredOutputContract(dashboard?.capabilities)
+  const structuredSupported = structuredContract.nonStreamingSupported
+  const structuredReadiness = structuredOutputReadiness({
+    enabled: structuredMode !== STRUCTURED_MODES.OFF,
+    mode: structuredMode,
+    contract: structuredContract,
+    schemaText: structuredSchema,
+    grammarText: structuredGrammar,
+  })
+  const toolContract = readToolContract(dashboard?.capabilities)
+  const toolCapability = readModelToolCapability(dashboard?.capabilities, selectedModel, runtime)
+  const toolsReadiness = toolReadiness({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
   // Experimental lane: loaded + generation-ready implemented model that is NOT a
   // supported row. Enables a weaker chat affordance; never the supported badge.
@@ -1058,14 +1121,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
     ? pendingChat
     : null
 
-  const filteredConversations = useMemo(() => {
-    if (!search.trim()) return conversations
-    const q = search.toLowerCase()
-    return conversations.filter((conversation) =>
-      conversation.title.toLowerCase().includes(q)
-      || conversation.messages.some((message) => message.content.toLowerCase().includes(q)),
-    )
-  }, [conversations, search])
+  /* One place decides what the list contains and how it is ordered, so the
+     sidebar, the history page and the tag counts cannot disagree. Search now
+     also matches tags, and pinned threads sort above the rest. */
+  const filteredConversations = useMemo(() => organizeConversations(conversations, {
+    search,
+    tags: conversationTagFilter,
+    includeArchived: showArchivedConversations,
+  }), [conversations, search, conversationTagFilter, showArchivedConversations])
+
+  const conversationTags = useMemo(() => allTags(conversations), [conversations])
+  const archivedConversationCount = useMemo(() => archivedCount(conversations), [conversations])
 
   const filteredMemories = useMemo(() => {
     if (!memorySearch.trim()) return memories
@@ -1137,11 +1203,63 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
+  /* Re-roll a reply, keeping the one already there as a sibling. Regenerate
+     was destructive before this: if the first answer was better it was gone,
+     which is exactly what makes people not press it. */
+  const regenerateAsVariant = async (messageId) => {
+    const target = (selectedConversation?.messages || []).find((message) => message.id === messageId)
+    if (!canBranchMessage(target)) return
+    await sendMessage({ variantOfMessageId: messageId })
+  }
+
+  /* Switching is a pure local edit -- no request, no model, no cost -- so it
+     stays available while another turn is streaming. */
+  const selectMessageVariant = (messageId, index) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariant(message, index) : message
+            )),
+          }
+        : conversation
+    )))
+  }
+
+  /* Discarding the shown alternative selects a neighbour. The last remaining
+     one cannot be discarded: a reply with no content has nothing to render. */
+  const discardMessageVariant = (messageId) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === selectedConversationIdRef.current
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? withActiveVariantRemoved(message) : message
+            )),
+            updated_at: nowIso(),
+          }
+        : conversation
+    )))
+  }
+
+  /* Resume a reply that stopped on the response budget. The gate checks, the
+     model lane and the send path are the ordinary ones -- only the transcript
+     bookkeeping differs, and that lives in sendMessage. */
+  const continueFromMessage = async (messageId) => {
+    const target = (selectedConversation?.messages || []).find((message) => message.id === messageId)
+    if (!canContinueMessage(target)) return
+    await sendMessage({ continueFromMessageId: messageId })
+  }
+
   /* options.overrideContent: replace the composer draft in both transcript and
      request (regenerate / edit-and-resend). options.requestContent: replace only
      the current request payload while preserving what the user typed in the
      transcript. options.truncateFromMessageId drops that message and everything
-     after it first. The gate checks below are identical for every path. */
+     after it first. options.continueFromMessageId resumes a length-truncated
+     assistant message in place: no user turn is stored, the reply streams onto
+     the existing message, and the instruction that drives it is request-only.
+     The gate checks below are identical for every path. */
   const sendMessage = async (options = {}) => {
     const {
       overrideContent = null,
@@ -1149,8 +1267,43 @@ export function useDashboardData({ showNotice, clearNotice }) {
       requestContent = null,
       citations = [],
       truncateFromMessageId = null,
+      continueFromMessageId = null,
+      variantOfMessageId = null,
     } = options
-    const draftContent = overrideContent ?? composer
+    /* Continuing supplies its own request text, so it never reads the composer
+       and never blocks on an empty one. */
+    const continuedMessage = continueFromMessageId
+      ? (selectedConversation?.messages || []).find((message) => message.id === continueFromMessageId) || null
+      : null
+    if (continueFromMessageId && !canContinueMessage(continuedMessage)) return
+    /* Regenerating into a variant re-asks the SAME question: the prompt is
+       already the last turn of the stored history, so no user turn is added
+       and the reply lands on the existing message as a new alternative. */
+    const variantMessage = variantOfMessageId
+      ? (selectedConversation?.messages || []).find((message) => message.id === variantOfMessageId) || null
+      : null
+    if (variantOfMessageId && !canBranchMessage(variantMessage)) return
+    const reusedMessage = continuedMessage || variantMessage
+    const continuationPrefix = continuedMessage ? String(continuedMessage.content || '') : ''
+    const continuedCompletionTokens = continuedMessage
+      ? Math.max(0, Number(continuedMessage.usage?.completion_tokens) || 0)
+      : 0
+    /* Neither reuse path reads the composer. A continuation supplies its own
+       instruction; a variant re-sends the question already in the transcript. */
+    const priorPromptForVariant = variantMessage
+      ? (() => {
+          const messages = selectedConversation?.messages || []
+          const at = messages.findIndex((message) => message.id === variantOfMessageId)
+          const prior = at > 0 ? [...messages.slice(0, at)].reverse().find((m) => m.role === 'user') : null
+          return String(prior?.content || '')
+        })()
+      : ''
+    if (variantMessage && !priorPromptForVariant.trim()) return
+    const draftContent = continuedMessage
+      ? CONTINUATION_INSTRUCTION
+      : variantMessage
+        ? priorPromptForVariant
+        : (overrideContent ?? composer)
     if (!draftContent.trim()) return
     // Supported rows chat through the full gate. Implemented-but-unsupported rows
     // chat through the weaker EXPERIMENTAL lane (every turn marked unverified). Only
@@ -1191,10 +1344,27 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const truncateIndex = truncateFromMessageId
         ? (conversation.messages || []).findIndex((message) => message.id === truncateFromMessageId)
         : -1
+      /* A continuation resumes ONE reply, so the request stops at it. The
+         button is only offered on the last reply, but bounding here keeps a
+         stale click from silently re-sending turns that came after it. */
+      const continueIndex = continueFromMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === continueFromMessageId)
+        : -1
+      const variantIndex = variantOfMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === variantOfMessageId)
+        : -1
       const baseMessages = truncateIndex >= 0
         ? (conversation.messages || []).slice(0, truncateIndex)
-        : (conversation.messages || [])
-      const history = [...baseMessages, userMessage]
+        : continueIndex >= 0
+          ? (conversation.messages || []).slice(0, continueIndex + 1)
+          : variantIndex >= 0
+            /* Everything BEFORE the reply being re-rolled, which already ends
+               with the question that produced it. */
+            ? (conversation.messages || []).slice(0, variantIndex)
+            : (conversation.messages || [])
+      /* A variant adds no user turn: appending one would duplicate the
+         question in the prompt and in the transcript. */
+      const history = variantMessage ? [...baseMessages] : [...baseMessages, userMessage]
         // A token budget can end entirely inside a model-hidden channel. Keep
         // that diagnostic turn in the transcript, but never feed an empty
         // assistant message back into the next model prompt.
@@ -1257,6 +1427,20 @@ export function useDashboardData({ showNotice, clearNotice }) {
       })
       requestMessages = sendCompaction.messages
 
+      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const preparedVideoArtifact = isGemma4Mtp12SegmentedVideoOptedIn()
+        ? readGemma4Mtp12PreparedSegments()
+        : null
+      const segmentedVideoRigRequested = Boolean(preparedVideoArtifact) && shouldUseGemma4Mtp12TargetVerifiedRender({
+        runtime,
+        requestModelId,
+        compatibilityRowId: sendGate.hint?.target?.id,
+        research: { sources: [{}, {}] },
+        receiptMode,
+        videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+      })
+
       const estimateResearchPromptTokens = (candidateMessages) => estimateWebResearchChatTokens(
         candidateMessages,
         { visionTokenAllowance: runtime?.vision_token_allowance },
@@ -1266,31 +1450,34 @@ export function useDashboardData({ showNotice, clearNotice }) {
         maxPromptTokens: runtime?.max_prompt_tokens,
         estimateTokenCount: estimateResearchPromptTokens,
       })
-      if (baseContextFit.unfit) {
+      if (!segmentedVideoRigRequested && baseContextFit.unfit) {
         showNotice(baseContextFit.message, 'error')
         return
       }
 
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
-      if (overrideContent === null) setComposer('')
+      if (overrideContent === null && !continuedMessage) setComposer('')
 
-      persistConversations((current) => current.map((item) => (
-        item.id === conversation.id
-          ? {
-              ...item,
-              model_id: selectedModelId,
-              messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
-              updated_at: nowIso(),
-            }
-          : item
-      )))
+      /* The continuation instruction is request-only: storing it would leave a
+         "Continue your previous reply..." turn in the transcript and re-send it
+         on every later turn. */
+      if (!reusedMessage) {
+        persistConversations((current) => current.map((item) => (
+          item.id === conversation.id
+            ? {
+                ...item,
+                model_id: selectedModelId,
+                messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
+                updated_at: nowIso(),
+              }
+            : item
+        )))
+      }
 
       // Gemma 4 26B is not advertised as function-tool-capable by Camelid, so
       // Web UI research is a deterministic preflight: resolve linked/current
       // sources first, then give the ordinary chat request a leading, untrusted
       // evidence message. No tools/tool_choice payload is sent to the model.
-      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
-      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
       const bitNetB158Chat = isBitNetB158ChatModel(selectedModel, runtime, requestModelId)
       const responseLimitModelIds = [...new Set([
         requestModelId,
@@ -1335,6 +1522,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
           })
           const researchElapsedMs = performance.now() - researchStartedAt
           webResearchMs = researchResult?.triggered ? researchElapsedMs : null
+          if (segmentedVideoRigRequested) {
+            // The exact prompt and live source response remain visible and
+            // auditable, but the model inputs are the separately prepared,
+            // hash-gated <=512-position sections. Do not reject this mode by
+            // trying to fit the monolithic prompt/evidence into a 512 runtime.
+            requestMessages = [{
+              role: 'user',
+              content: 'Prepared Web research multi-pass synthesis. Exact user request and live sources are attached to the visible turn; model execution uses the hash-gated bounded section messages.',
+            }]
+            requestMaxTokens = preparedVideoArtifact.total_tokens
+            setWebResearchStatus({
+              phase: researchResult?.status === 'failed' ? 'failed' : 'complete',
+              sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
+              conversationId: conversation.id,
+            })
+          } else {
           const configuredContext = runtime?.active_context_length || modelContextLength(selectedModel)
           const researchBudget = deriveWebResearchPromptBudget({
             contextLength: configuredContext,
@@ -1385,6 +1588,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
             sourceCount: Array.isArray(researchResult?.sources) ? researchResult.sources.length : 0,
             conversationId: conversation.id,
           })
+          }
         } catch (error) {
           const researchElapsedMs = performance.now() - researchStartedAt
           if (error?.name === 'AbortError') throw error
@@ -1405,6 +1609,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const researchAtSend = webResearchMetadata(researchResult, researchFailure)
       const promptTokenEstimate = estimateResearchPromptTokens(requestMessages)
+      const targetVerifiedRender = shouldUseGemma4Mtp12TargetVerifiedRender({
+        runtime,
+        requestModelId,
+        compatibilityRowId: sendGate.hint?.target?.id,
+        // Use the fitted source groups, not flattened display metadata where
+        // two chunks from one repository could look like two sources.
+        research: researchResult,
+        receiptMode,
+        videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn(),
+      })
+      const segmentedTargetVerifiedRender = targetVerifiedRender
+        && isGemma4Mtp12SegmentedVideoOptedIn()
+      const preparedSegmentedSynthesis = segmentedTargetVerifiedRender
+        ? preparedVideoArtifact
+        : null
+      if (segmentedTargetVerifiedRender && !preparedSegmentedSynthesis) {
+        throw new Error('Prepared Web research synthesis artifact is missing or failed its exact schema/source gate')
+      }
 
       const requestStartedAt = performance.now()
       // Fresh per-token decode trace for this generation (auditable backing for
@@ -1415,8 +1637,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let firstContentEmitted = false
       let firstTokenAt = null
       let decodeStartTokens = 0
+      let latestNativeSegmentRate = null
       let lastProgressAt = 0
-      const pacer = createPacerState()
+      // The private, prepared research lane completes independently verified
+      // sections. Hold two completed sections as a reservoir, then reveal only
+      // received bytes at a frame-timed cadence. The 240 chars/s cadence is
+      // separately gated against exact verified output tokens by the capture
+      // rig; ordinary chats retain the low-lag pacer.
+      const smoothSegmentedPacing = segmentedTargetVerifiedRender
+      const pacer = createPacerState(smoothSegmentedPacing
+        ? { steadyCharsPerSecond: 240 }
+        : undefined)
       /* The pacer is driven by its own animation frame loop rather than by token
          arrival, so the text keeps flowing smoothly between bursty SSE chunks
          and advances once per display refresh (120Hz where the panel supports
@@ -1425,6 +1656,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let latestReceivedContent = ''
       let lastPacedContent = ''
       let pacingFrame = null
+      let segmentedPacingReady = !smoothSegmentedPacing
+      let completedVerifiedSegments = 0
+      let pacingSettle = null
+      let streamTransportComplete = false
       stopPacing = () => {
         if (pacingFrame !== null && typeof window !== 'undefined') window.cancelAnimationFrame(pacingFrame)
         pacingFrame = null
@@ -1437,12 +1672,42 @@ export function useDashboardData({ showNotice, clearNotice }) {
           lastPacedContent = paced
           markAssistantStreamState({ content: paced })
         }
-        if (paceHasPendingText(paced, fullContent)) startPacing()
+        if (paceHasPendingText(paced, fullContent)) {
+          startPacing()
+        } else {
+          // If an unexpectedly long verifier prefill exhausts the received-text
+          // reservoir, keep the stock response row communicative instead of
+          // looking frozen. The next real content delta restores "Streaming
+          // response"; successful paced takes normally never enter this state.
+          if (smoothSegmentedPacing && !streamTransportComplete && lastPacedContent) {
+            markAssistantStreamState({ streaming_phase: 'thinking' })
+          }
+          if (pacingSettle) {
+            const { resolve, timeout } = pacingSettle
+            pacingSettle = null
+            window.clearTimeout(timeout)
+            resolve()
+          }
+        }
       }
       const startPacing = () => {
         if (pacingFrame === null && typeof window !== 'undefined') pacingFrame = window.requestAnimationFrame(pacingTick)
       }
-      assistantId = makeId('message')
+      const waitForPacingToSettle = () => {
+        if (!paceHasPendingText(lastPacedContent, latestReceivedContent)) return Promise.resolve()
+        return new Promise((resolve, reject) => {
+          const timeout = window.setTimeout(() => {
+            pacingSettle = null
+            reject(new Error('Smooth received-text reservoir did not settle before its safety deadline'))
+          }, 12_000)
+          pacingSettle = { resolve, timeout }
+          startPacing()
+        })
+      }
+      /* Continuing reuses the truncated message's id, so every stream patch
+         below lands on the reply already on screen instead of opening a second
+         bubble under it. */
+      assistantId = reusedMessage ? reusedMessage.id : makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
          cite the exact contract row that gated this generation. */
@@ -1455,14 +1720,25 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // their contract status in support_row.
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
       const assistantMessageBase = {
+        ...(continuedMessage || {}),
+        /* A variant is a FRESH reply that only shares an id and a sibling
+           list. Spreading the old reply here would carry its receipt, its web
+           sources and its continuation count onto a generation that produced
+           none of them. */
+        ...(variantMessage ? { variants: variantsOf(variantMessage) } : {}),
         id: assistantId,
         role: 'assistant',
-        content: '',
+        /* A continuation keeps what it already generated on screen; a variant
+           starts empty, and its siblings ride along untouched until the
+           terminal write appends this reply to them. */
+        content: continuationPrefix,
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
         support_row: supportRowAtSend,
         experimental_lane: experimentalLaneAtSend,
-        created_at: nowIso(),
+        /* A continued reply keeps the timestamp it was first sent at — the
+           footer time is when the reader asked, not when they resumed. */
+        created_at: continuedMessage?.created_at || nowIso(),
         tokens_in_per_sec: null,
         tokens_out_per_sec: null,
         generated_token_ids: [],
@@ -1472,12 +1748,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
         // is replaced by backend-reported totals when they arrive.
         usage: {
           prompt_tokens: promptTokenEstimate,
-          completion_tokens: 0,
-          total_tokens: promptTokenEstimate,
+          completion_tokens: continuedCompletionTokens,
+          total_tokens: promptTokenEstimate + continuedCompletionTokens,
         },
         usage_source: 'client_estimate',
         streaming: true,
-        streaming_phase: 'preparing',
+        streaming_phase: targetVerifiedRender ? 'generating' : 'preparing',
+        synthesis_mode: segmentedTargetVerifiedRender ? 'prepared_web_research_multi_pass_lossless' : null,
         first_byte_ms: null,
         first_event_ms: null,
         first_content_ms: null,
@@ -1487,7 +1764,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
-          ? { ...item, title: item.title === 'New conversation' ? messageContent.slice(0, 64) : item.title, messages: [...(item.messages || []), assistantMessageBase], updated_at: nowIso() }
+          ? {
+              ...item,
+              title: item.title === 'New conversation' && !reusedMessage
+                ? messageContent.slice(0, 64)
+                : item.title,
+              messages: reusedMessage
+                ? (item.messages || []).map((message) => (
+                    message.id === assistantId ? assistantMessageBase : message
+                  ))
+                : [...(item.messages || []), assistantMessageBase],
+              updated_at: nowIso(),
+            }
           : item
       )))
       setPendingChat(null)
@@ -1496,45 +1784,159 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
       const useExperimentalSampling = sendGate.chatMode === 'experimental' && !bitNetB158Chat
+      /* Token inspection rides on THIS request rather than a later replay, so the
+         scores describe the decode the reader is about to see. The contract is
+         resolved once per send and reused for both the stream flag and the
+         request fields. */
+      const inspectionContract = readInspectionContract(dashboard?.capabilities)
+      const inspecting = !targetVerifiedRender
+        && inspectionForcesNonStreaming({ enabled: inspectMode, contract: inspectionContract })
+      /* A constraint and stream:true is a hard 400, and the streaming decode job
+         never builds a grammar state — that route refusal is the only thing
+         standing between a streamed constrained request and silently
+         unconstrained output. Derived from one predicate with the request fields
+         so the two cannot drift. */
+      const sendStructuredContract = readStructuredOutputContract(dashboard?.capabilities)
+      const constraining = !targetVerifiedRender
+        && structuredOutputForcesNonStreaming({ enabled: true, mode: structuredMode, contract: sendStructuredContract })
+        && structuredOutputReadiness({ enabled: true, mode: structuredMode, contract: sendStructuredContract, schemaText: structuredSchema, grammarText: structuredGrammar }).ready
+      const baseRequestBody = {
+        model: requestModelId,
+        messages: requestMessages,
+        // Supported rows stay greedy (temperature 0) — their behavior is parity-
+        // locked. Experimental rows have no parity contract and small models loop
+        // badly under greedy decoding, so they sample for usable output. BitNet's
+        // runnable lane is explicitly greedy even while its row is experimental.
+        temperature: useExperimentalSampling ? 0.7 : 0,
+        ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
+        max_tokens: requestMaxTokens,
+        ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
+        ...(thinkingMode && !bitNetB158Chat ? { camelid_enable_thinking: true } : {}),
+      }
+
+      let targetVerifiedDraftTokenIds = []
+      let targetVerifiedSegments = []
+      let targetVerifiedPlannerMs = null
+      let targetVerifiedPlannerCamelid = null
+      if (targetVerifiedRender) {
+        const plannerStartedAt = performance.now()
+        const segmentPlans = [{ messages: requestMessages, maxTokens: requestMaxTokens }]
+        if (segmentedTargetVerifiedRender) {
+          targetVerifiedSegments = preparedSegmentedSynthesis.segments
+        }
+        if (!segmentedTargetVerifiedRender) {
+        for (let segmentIndex = 0; segmentIndex < segmentPlans.length; segmentIndex += 1) {
+          const segmentPlan = segmentPlans[segmentIndex]
+          const plannerResponse = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: requestController.signal,
+            // Every draft is freshly generated for this turn. In segmented
+            // mode each compact, grounded section stays inside the backend's
+            // 512-position qualification envelope.
+            body: JSON.stringify({
+              ...baseRequestBody,
+              messages: segmentPlan.messages,
+              max_tokens: segmentPlan.maxTokens,
+              stream: false,
+            }),
+          })
+          let plannerPayload = null
+          try {
+            plannerPayload = await plannerResponse.json()
+          } catch {
+            // The typed error below remains useful if a proxy returned non-JSON.
+          }
+          if (!plannerResponse.ok) {
+            throw new Error(plannerPayload?.error?.message || `Gemma 4 section ${segmentIndex + 1} planning failed with HTTP ${plannerResponse.status}`)
+          }
+          if (String(plannerPayload?.model || '') !== String(requestModelId)) {
+            throw new Error(`Gemma 4 planning resolved model ${plannerPayload?.model || '(missing)'}, expected ${requestModelId}`)
+          }
+          if (plannerPayload?.choices?.[0]?.finish_reason !== 'stop') {
+            throw new Error(`Gemma 4 section ${segmentIndex + 1} did not finish naturally (${plannerPayload?.choices?.[0]?.finish_reason || 'missing finish reason'})`)
+          }
+          const tokenIds = plannerPayload?.camelid?.generated_token_ids || []
+          if (!Array.isArray(tokenIds)
+            || tokenIds.length === 0
+            || tokenIds.length !== Number(plannerPayload?.usage?.completion_tokens)
+            || tokenIds.some((token) => !Number.isInteger(token) || token < 0)) {
+            throw new Error(`Gemma 4 section ${segmentIndex + 1} did not return a complete authoritative token-id draft`)
+          }
+          targetVerifiedDraftTokenIds = tokenIds
+          targetVerifiedPlannerCamelid = plannerPayload?.camelid
+            ? {
+                mtp12: plannerPayload.camelid.mtp12 || null,
+                timings_ms: plannerPayload.camelid.timings_ms || null,
+              }
+            : null
+        }
+        }
+        targetVerifiedPlannerMs = performance.now() - plannerStartedAt
+        if (segmentedTargetVerifiedRender) targetVerifiedPlannerMs = null
+        updateConversationsState((current) => current.map((item) => (
+          item.id === conversation.id
+            ? {
+                ...item,
+                messages: (item.messages || []).map((message) => (
+                  message.id === assistantId
+                    ? {
+                        ...message,
+                        streaming_phase: 'generating',
+                        planner_ms: targetVerifiedPlannerMs,
+                        prepared_segment_count: segmentedTargetVerifiedRender ? targetVerifiedSegments.length : null,
+                      }
+                    : message
+                )),
+                updated_at: nowIso(),
+              }
+            : item
+        )))
+      }
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: requestController.signal,
         body: JSON.stringify({
-          model: requestModelId,
-          messages: requestMessages,
-          // Supported rows stay greedy (temperature 0) — their behavior is parity-
-          // locked. Experimental rows have no parity contract and small models loop
-          // badly under greedy decoding, so they sample for usable output. BitNet's
-          // runnable lane is explicitly greedy even while its row is experimental.
-          temperature: useExperimentalSampling ? 0.7 : 0,
-          // Prism's checked 27B demo sampler: keep the experimental lane aligned
-          // with the model authors instead of letting low-bit greedy decode fall
-          // into exact repetition loops.
-          ...(useExperimentalSampling ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
-          // Gemma 4 may spend its first four tokens on a hidden channel
-          // envelope before the first visible token. Keep at least that visible
-          // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
-          // default does not pre-admit normal chats to CPU common execution.
-          max_tokens: requestMaxTokens,
-          /* Empty today: a sampling override is sent only when /api/capabilities
-             advertises a supported row for that exact parameter. */
-          ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
-          // Opt-in thinking mode (experimental — not parity-locked). Only sent
-          // when the user turns it on; silence keeps the thinking-DISABLED
-          // parity-locked rendering.
-          ...(thinkingMode && !bitNetB158Chat ? { camelid_enable_thinking: true } : {}),
-          // Receipts only attach to non-streaming responses; the JSON
-          // fallback in readStreamingChatCompletion handles that shape.
-          stream: !receiptMode,
+          ...baseRequestBody,
+          // Receipts and token inspection only attach to non-streaming
+          // responses; the JSON fallback in readStreamingChatCompletion handles
+          // that shape. The engine returns a typed 400 for logprobs with
+          // stream:true, so `inspecting` MUST also clear the stream flag — the
+          // two conditions are derived from one source in tokenInspection.js
+          // rather than restated, so they cannot drift apart.
+          stream: targetVerifiedRender || !(receiptMode || inspecting || constraining),
           // Ask for the authoritative token count in the final stream chunk.
           // Without it the client can only ESTIMATE from visible content, which
           // undercounts badly on a thinking model: LFM2 emits its reasoning as
           // `reasoning_content`, so a reply that is mostly reasoning looked like
           // almost no tokens and the tok/s readout reported a fraction of the
           // real rate.
-          ...(receiptMode ? {} : { stream_options: { include_usage: true } }),
-          ...(receiptMode ? { camelid_receipt: true } : {}),
+          ...(targetVerifiedRender || !(receiptMode || inspecting || constraining) ? { stream_options: { include_usage: true } } : {}),
+          ...(!targetVerifiedRender && receiptMode ? { camelid_receipt: true } : {}),
+          /* Contributes nothing unless the contract permits inspection on this
+             engine, so a guarded row simply never reaches the wire. */
+          ...(targetVerifiedRender ? {} : inspectionRequestFields({ enabled: inspectMode, contract: inspectionContract })),
+          ...(targetVerifiedRender ? {} : structuredOutputRequestFields({ enabled: true, mode: structuredMode, contract: sendStructuredContract, schemaText: structuredSchema, grammarText: structuredGrammar })),
+          /* Tool calling is supported on BOTH the streaming and non-streaming
+             paths, so unlike receipts and constrained decoding it does not force
+             the turn off the stream. Contributes nothing unless the engine row
+             AND the loaded model both carry the capability. */
+          ...(targetVerifiedRender ? {} : toolRequestFields({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })),
+          ...(targetVerifiedRender ? {
+            // The private verifier contract is exact: its output allowance is
+            // the complete fresh draft, not the planner's larger upper bound.
+            max_tokens: segmentedTargetVerifiedRender
+              ? targetVerifiedSegments.reduce((sum, segment) => sum + segment.token_ids.length, 0)
+              : targetVerifiedDraftTokenIds.length,
+            ...(segmentedTargetVerifiedRender
+              ? {
+                  n: 1,
+                  camelid_target_verified_render_segments: targetVerifiedSegments,
+                  camelid_expected_gguf_sha256: '93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b',
+                }
+              : { camelid_target_verified_render_draft_token_ids: targetVerifiedDraftTokenIds }),
+          } : {}),
         }),
       })
       const responseIsStreaming = response.ok && !response.headers.get('content-type')?.includes('application/json')
@@ -1544,13 +1946,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
             ? {
                 ...item,
                 messages: (item.messages || []).map((message) => (
-                  message.id === assistantId ? { ...message, ...patch } : message
+                  message.id === assistantId
+                    ? { ...message, ...patch, ...contentPatchForContinuation(patch) }
+                    : message
                 )),
                 updated_at: nowIso(),
               }
             : item
         )))
       }
+      /* The stream reports only what THIS request generated. On a continuation
+         the message already holds everything the earlier request produced, so
+         a raw content patch would wipe it and replay the reply from the
+         resume point. Re-joining here keeps the single choke point single: the
+         pacer, the token counters and the terminal write all stay unaware that
+         a continuation is in flight. */
+      const contentPatchForContinuation = (patch) => (
+        continuedMessage && patch.content !== undefined
+          ? { content: joinContinuation(continuationPrefix, patch.content) }
+          : {}
+      )
       const flushAssistantStreamPatch = () => {
         pendingAssistantFrame = null
         if (!pendingAssistantPatch) return
@@ -1588,9 +2003,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
           firstContentEmitted = true
           emitFirstContent(lifecycleId, liveElapsedMs)
         }
+        // The decode window opens at the first GENERATED token, never at request
+        // start, so public-web research and model TTFT cannot dilute this rate.
         const decodedTokens = firstTokenAt === null ? 0 : Math.max(0, realTokens - decodeStartTokens)
         const decodeElapsedMs = firstTokenAt === null ? 0 : now - firstTokenAt
-        const liveTps = responseIsStreaming ? tokensPerSecond(decodedTokens, decodeElapsedMs) : null
+        // This live value is a browser-observed delivery rate computed from
+        // real SSE token arrivals. The backend's native target-verifier clock
+        // replaces it after each verified segment and in terminal diagnostics.
+        const liveTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200
+          ? tokensPerSecond(decodedTokens, decodeElapsedMs)
+          : null
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
           window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
@@ -1601,12 +2023,30 @@ export function useDashboardData({ showNotice, clearNotice }) {
         }
         /* Record what truly arrived; the pacing loop above owns the display. */
         latestReceivedContent = fullContent
+        if (!segmentedPacingReady) {
+          // Do not expose text until two sections have completed and can bridge
+          // the final verifier prefill. The buffer contains model output already
+          // received in this turn; no prepared response text is read.
+          markAssistantStreamState({
+            streaming_phase: completedVerifiedSegments > 0 ? 'thinking' : 'generating',
+            tokens_in_per_sec: null,
+            tokens_out_per_sec: null,
+            usage: {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: realTokens,
+              total_tokens: promptTokenEstimate + realTokens,
+            },
+            usage_source: 'client_estimate',
+          })
+          return
+        }
         // Browsers suspend requestAnimationFrame in a hidden tab. Commit the
         // first small text prefix synchronously so a healthy decode cannot sit
         // at "out 0". The rest of a large first network chunk remains paced;
         // later deltas keep frame-batched updates rather than rendering once
         // per generated token.
-        const displayedContent = firstVisibleContent
+        const firstRenderedContent = !lastPacedContent && Boolean(fullContent)
+        const displayedContent = firstRenderedContent
           ? paceFirstVisiblePrefix(pacer, fullContent, now)
           : paceStep(pacer, fullContent, performance.now()) || '…'
         const contentChanged = displayedContent !== lastPacedContent
@@ -1615,7 +2055,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ...(contentChanged ? { content: displayedContent } : {}),
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
-          tokens_out_per_sec: liveTps,
+          // The segmented lane exposes its backend-native completed-section
+          // clock in the single stock streaming badge. Keep the footer rate
+          // empty until terminal aggregate diagnostics so two clocks cannot
+          // appear simultaneously or disagree on screen.
+          tokens_out_per_sec: segmentedTargetVerifiedRender ? null : liveTps,
+          streaming_native_segment_rate: latestNativeSegmentRate,
           usage: {
             prompt_tokens: promptTokenEstimate,
             completion_tokens: realTokens,
@@ -1627,9 +2072,46 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }, {
         estimateTokenCount,
         onStreamEvent(event) {
-          if ((event.type === 'reasoning' || event.type === 'content') && firstTokenAt === null) {
-            firstTokenAt = performance.now()
-            decodeStartTokens = Number(event.completionTokens) || 0
+          if (event.type === 'segment') {
+            completedVerifiedSegments += 1
+            const segmentRate = Number(event.segment?.render_tokens_per_second)
+            latestNativeSegmentRate = Number.isFinite(segmentRate) && segmentRate > 0 ? segmentRate : null
+            // Start a new browser-arrival window for the next independently
+            // verified section. The completed section's backend-native rate is
+            // surfaced alongside it and is never confused with this clock.
+            if (!segmentedPacingReady && completedVerifiedSegments >= 2) {
+              segmentedPacingReady = true
+              const initialContent = paceFirstVisiblePrefix(
+                pacer,
+                latestReceivedContent,
+                performance.now(),
+              )
+              lastPacedContent = initialContent
+              markAssistantStreamState({
+                content: initialContent,
+                streaming_phase: 'streaming',
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+              if (paceHasPendingText(initialContent, latestReceivedContent)) startPacing()
+            } else if (!segmentedPacingReady) {
+              markAssistantStreamState({
+                streaming_phase: 'thinking',
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+            } else {
+              markAssistantStreamState({
+                streaming_native_segment_rate: latestNativeSegmentRate,
+                streaming_segment_index: Number(event.segment?.index) + 1,
+              }, { immediate: true })
+            }
+          }
+          if (event.type === 'reasoning' || event.type === 'content') {
+            if (firstTokenAt === null) {
+              firstTokenAt = performance.now()
+              decodeStartTokens = Number(event.completionTokens) || 0
+            }
           }
           if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {
             markAssistantStreamState({
@@ -1646,29 +2128,117 @@ export function useDashboardData({ showNotice, clearNotice }) {
           }
         },
       })
+      streamTransportComplete = true
+      const streamCompletedAt = performance.now()
+      if (smoothSegmentedPacing) {
+        latestReceivedContent = streamed.content || ''
+        await waitForPacingToSettle()
+      }
       stopPacing()
       flushAssistantStreamPatch()
-      const elapsedMs = performance.now() - requestStartedAt
+      const targetVerifiedRenderDiagnostics = readExactTargetVerifiedRender(streamed.camelid)
+      const targetVerifiedSegmentedDiagnostics = readExactTargetVerifiedSegmentedRender(streamed.camelid)
+      if (segmentedTargetVerifiedRender && !targetVerifiedSegmentedDiagnostics) {
+        throw new Error('Gemma 4 segmented target verification did not reproduce every prepared section exactly')
+      }
+      if (targetVerifiedRender && !segmentedTargetVerifiedRender && !targetVerifiedRenderDiagnostics) {
+        throw new Error('Gemma 4 target verification did not reproduce the fresh planning draft exactly')
+      }
+      const elapsedMs = streamCompletedAt - requestStartedAt
       const modelTtftMs = firstTokenAt === null ? null : firstTokenAt - requestStartedAt
-      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, performance.now() - firstTokenAt)
+      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, streamCompletedAt - firstTokenAt)
       const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
       const decodedTokenCount = Math.max(0, completionTokenCount - decodeStartTokens)
+      // Native facts replace browser-arrival estimates after the backend has
+      // completed and attached the lossless verification record. A two-pass
+      // turn is fail-closed above, so it never falls through to client timing.
+      const nativeMtp12 = readTargetVerifiedMtp12(streamed.camelid)
+        || readTargetVerifiedMtp12(targetVerifiedPlannerCamelid)
+      /* Inspection lands in session state keyed by message id, NOT on the message
+         object — see the state declaration for why persisting it is unsafe.
+         Absence is recorded too: a lane that answers 200 without the key must be
+         reported as an unmeasured position, never as a flat distribution. */
+      if (inspecting) {
+        const absence = inspectionAbsenceReason({
+          requested: true,
+          responded: true,
+          hasLogprobs: Boolean(streamed.logprobs),
+          streamed: responseIsStreaming,
+        })
+        setTokenInspections((current) => ({
+          ...current,
+          [assistantId]: { logprobs: streamed.logprobs || null, absence },
+        }))
+      }
+      /* The strongest evidence a constrained reply can carry is a position whose
+         emitted token was not the highest-scoring one — the returned scores are
+         unmasked, so that is the mask visibly diverting the decode. It is only
+         available when token inspection was ALSO requested, which is why the
+         composer says so rather than the card inventing a weaker claim. */
+      if (constraining) {
+        const record = normalizeInspection(streamed.logprobs || null)
+        setStructuredRecords((current) => ({
+          ...current,
+          [assistantId]: {
+            content: streamed.content || '',
+            mode: structuredMode,
+            schemaText: structuredSchema,
+            divertedPositions: record ? record.stats.offTopCount : null,
+            greedy: !useExperimentalSampling,
+          },
+        }))
+      }
+      /* Record what was asked so a later identical request can be named. Keyed
+         by conversation: a repeat only means something within one thread. */
+      if (streamed.toolCalls && streamed.toolCalls.length) {
+        const signatures = (normalizeToolCalls(streamed.toolCalls) || []).map(toolCallSignature).filter(Boolean)
+        if (signatures.length) {
+          setToolCallSignatures((current) => ({
+            ...current,
+            [conversation.id]: [...(current[conversation.id] || []), ...signatures],
+          }))
+        }
+      }
+      const streamedContent = paceDrain(pacer, streamed.content || '')
       const assistantMessage = {
         ...assistantMessageBase,
-        content: paceDrain(pacer, streamed.content || ''),
+        content: continuedMessage
+          ? joinContinuation(continuationPrefix, streamedContent)
+          : streamedContent,
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, modelTtftMs),
-        tokens_out_per_sec: responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null,
+        tokens_out_per_sec: targetVerifiedRender
+          ? (targetVerifiedSegmentedDiagnostics || targetVerifiedRenderDiagnostics).render_tokens_per_second
+          : nativeMtp12?.decode_tokens_per_second
+            ?? (responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
-        usage: streamed.usage || {
-          prompt_tokens: promptTokenEstimate,
-          completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
-          total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
-        },
+        usage: continuedMessage
+          /* Output accumulates across continuations so the footer describes the
+             whole reply on screen; the prompt count stays the LAST request's,
+             because a summed prompt would describe no request ever made. */
+          ? mergeContinuedUsage(continuedMessage.usage, streamed.usage || {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
+            })
+          : streamed.usage || {
+              prompt_tokens: promptTokenEstimate,
+              completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
+              total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
+            },
         /* Footer labeling: backend-reported usage vs client estimate (I4). */
         usage_source: streamed.usage ? 'backend' : 'client_estimate',
+        ...(continuedMessage
+          ? { continuation_count: Math.max(0, Number(continuedMessage.continuation_count) || 0) + 1 }
+          : {}),
         camelid: streamed.camelid || null,
+        planner_camelid: targetVerifiedPlannerCamelid,
         camelid_receipt: streamed.camelidReceipt || null,
+        /* Persisted on the message: unlike per-token logprobs these are small, and
+           a turn that ended in a tool request is meaningless without them. */
+        tool_calls: streamed.toolCalls || null,
+        planner_ms: targetVerifiedPlannerMs,
+        target_verified_render: targetVerifiedRender,
+        segmented_target_verified_render: segmentedTargetVerifiedRender,
         streaming: false,
         streaming_phase: null,
         first_byte_ms: streamed.firstByteMs ?? null,
@@ -1680,7 +2250,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           ? {
               ...item,
               messages: (item.messages || []).map((message) => (
-                message.id === assistantId ? assistantMessage : message
+                message.id === assistantId
+                  /* Siblings come from the message as it was BEFORE this
+                     regeneration, so a re-roll of a re-roll keeps the whole
+                     set rather than collapsing to two. */
+                  ? (variantMessage ? withVariantAppended(variantMessage, assistantMessage) : assistantMessage)
+                  : message
               )),
               updated_at: nowIso(),
             }
@@ -1757,6 +2332,47 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSending(false)
       await loadDashboard({ silent: true })
     }
+  }
+
+  const updateConversationRecord = (id, update) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === id ? { ...update(conversation), updated_at: conversation.updated_at } : conversation
+    )))
+  }
+
+  /* Organizing a thread is not editing it: updated_at stays put above, so
+     pinning or tagging does not shuffle the recency order it is meant to
+     work with. */
+  const setConversationPinned = (id, pinned) => updateConversationRecord(id, (c) => withPinned(c, pinned))
+  const setConversationArchived = (id, archived) => updateConversationRecord(id, (c) => withArchived(c, archived))
+  const addConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagAdded(c, tag))
+  const removeConversationTag = (id, tag) => updateConversationRecord(id, (c) => withTagRemoved(c, tag))
+
+  const toggleConversationTagFilter = (tag) => {
+    setConversationTagFilter((current) => (
+      current.includes(tag) ? current.filter((entry) => entry !== tag) : [...current, tag]
+    ))
+  }
+  const clearConversationTagFilter = () => setConversationTagFilter([])
+
+  /* Imported threads are prepended, never merged onto existing ids: an import
+     that silently overwrites a conversation already here is worse than no
+     import at all. */
+  const importConversationsFromText = (text) => {
+    const { conversations: imported, skipped, error } = parseImportedConversations(text)
+    if (error) {
+      showNotice(error, 'error')
+      return { imported: 0, skipped }
+    }
+    persistConversations((current) => [...imported, ...current])
+    const noun = imported.length === 1 ? 'conversation' : 'conversations'
+    showNotice(
+      skipped > 0
+        ? `Imported ${imported.length} ${noun}; skipped ${skipped} with no readable messages.`
+        : `Imported ${imported.length} ${noun}.`,
+      'success',
+    )
+    return { imported: imported.length, skipped }
   }
 
   const renameConversation = async (id, nextTitle) => {
@@ -2170,6 +2786,27 @@ export function useDashboardData({ showNotice, clearNotice }) {
     webResearchStatus,
     receiptMode,
     setReceiptMode,
+    inspectMode,
+    setInspectMode,
+    tokenInspections,
+    inspectionSupported,
+    structuredMode,
+    setStructuredMode,
+    structuredSchema,
+    setStructuredSchema,
+    structuredGrammar,
+    setStructuredGrammar,
+    structuredRecords,
+    structuredSupported,
+    structuredReadiness,
+    toolsEnabled,
+    setToolsEnabled,
+    toolsText,
+    setToolsText,
+    toolContract,
+    toolCapability,
+    toolsReadiness,
+    toolCallSignatures,
     thinkingMode,
     setThinkingMode,
     loadingModelId,
@@ -2193,6 +2830,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
     showNewChatLanding,
     sendMessage,
     resendFromMessage,
+    continueFromMessage,
+    regenerateAsVariant,
+    selectMessageVariant,
+    discardMessageVariant,
+    conversationTags,
+    archivedConversationCount,
+    conversationTagFilter,
+    toggleConversationTagFilter,
+    clearConversationTagFilter,
+    showArchivedConversations,
+    setShowArchivedConversations,
+    setConversationPinned,
+    setConversationArchived,
+    addConversationTag,
+    removeConversationTag,
+    importConversationsFromText,
     stopGeneration,
     saveToMemory,
     createMemory,

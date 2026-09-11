@@ -132,6 +132,30 @@ impl TokenTree {
         (bits, words)
     }
 
+    /// Compact root-to-row paths for a packed-forest verifier.
+    ///
+    /// Unlike the generic tree-attention lane, a packed-forest verifier can keep each layer's
+    /// node K/V in a small `[node][kv]` scratch buffer.  Immediately before running the ordinary
+    /// lossless linear attention kernel for row `r`, it copies that row's CSR slice from
+    /// `path_rows` into the canonical contiguous future KV slots.
+    /// Thus the proven linear kernel sees exactly `[committed prefix || root-to-r path]`, while
+    /// every large target projection still batches all forest rows and reads target weights
+    /// once.  `u32` matches Metal buffer/scalar indexing and supports trees larger than the
+    /// current production cap without changing this ABI.
+    pub fn packed_forest_plan(&self) -> PackedForestPlan {
+        let mut path_offsets = Vec::with_capacity(self.nodes() + 1);
+        let mut path_rows = Vec::new();
+        path_offsets.push(0);
+        for row in 0..self.nodes() {
+            path_rows.extend(self.path_to(row).into_iter().map(|node| node as u32));
+            path_offsets.push(path_rows.len() as u32);
+        }
+        PackedForestPlan {
+            path_offsets,
+            path_rows,
+        }
+    }
+
     /// Lossless greedy-exact tree accept.
     ///
     /// `predicted[i]` is the target model's greedy argmax for node `i` (i.e.
@@ -185,6 +209,283 @@ impl TokenTree {
                 }
             }
         }
+    }
+}
+
+/// CSR-style ancestry rows consumed by the packed-forest materialization kernel described in
+/// [`TokenTree::packed_forest_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedForestPlan {
+    /// `nodes + 1` offsets into `path_rows`.
+    pub path_offsets: Vec<u32>,
+    /// Concatenated root-to-node verifier row ids, including each row itself.
+    pub path_rows: Vec<u32>,
+}
+
+impl PackedForestPlan {
+    pub fn path(&self, row: usize) -> Option<&[u32]> {
+        let start = usize::try_from(*self.path_offsets.get(row)?).ok()?;
+        let end = usize::try_from(*self.path_offsets.get(row + 1)?).ok()?;
+        self.path_rows.get(start..end)
+    }
+}
+
+/// One conditional candidate produced while expanding a learned draft lattice.
+///
+/// `log_probability` is the draft model's normalized log probability for this token
+/// conditioned on `parent`'s path.  Keeping the score normalized (rather than accepting a
+/// raw logit) gives the lattice a useful invariant: cumulative path scores never increase,
+/// so a global top-N rerank is parent-closed when ties prefer shallower nodes.  That is the
+/// small but important property used by EAGLE-2-style dynamic trees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DraftCandidateScore {
+    pub token: u32,
+    pub log_probability: f32,
+}
+
+/// Convert retained top-k raw logits into normalized candidate scores using the log-sum-exp
+/// over the **entire** draft vocabulary.
+///
+/// The caller must supply `full_vocab_logsumexp`, not a normalizer computed from `top_logits`.
+/// Normalizing only the retained candidates would redistribute omitted probability mass and
+/// systematically over-rank wide branches.  Token/logit input order is preserved so the
+/// learned head's deterministic tie-break remains available to later reranking.
+pub fn normalize_draft_top_logits(
+    top_logits: &[(u32, f32)],
+    full_vocab_logsumexp: f32,
+) -> Result<Vec<DraftCandidateScore>, String> {
+    if !full_vocab_logsumexp.is_finite() {
+        return Err(format!(
+            "draft full-vocabulary logsumexp must be finite, got {full_vocab_logsumexp}"
+        ));
+    }
+    top_logits
+        .iter()
+        .enumerate()
+        .map(|(slot, &(token, logit))| {
+            if !logit.is_finite() {
+                return Err(format!("draft top-k logit {slot} is not finite: {logit}"));
+            }
+            let log_probability = logit - full_vocab_logsumexp;
+            if log_probability > 1.0e-5 {
+                return Err(format!(
+                    "draft top-k logit {slot} exceeds the full-vocabulary logsumexp"
+                ));
+            }
+            Ok(DraftCandidateScore {
+                token,
+                // A tiny positive value is possible if the all-vocabulary reduction and the
+                // retained scalar were rounded along different f32 paths.  Probability one is
+                // the conservative normalized ceiling.
+                log_probability: log_probability.min(0.0),
+            })
+        })
+        .collect()
+}
+
+/// A node in the expansion-time candidate lattice.  Indices are stable and parents always
+/// precede children; the final verifier layout is produced separately by
+/// [`DynamicDraftLattice::rerank_connected`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredDraftNode {
+    pub token: u32,
+    pub parent: Option<usize>,
+    pub depth: u16,
+    /// Sum of conditional log probabilities from the root to this node.  The root is 0.
+    pub cumulative_log_probability: f32,
+}
+
+/// CPU-side EAGLE-2-style dynamic draft lattice.
+///
+/// Expansion and verification are deliberately separate.  A learned head may grow a wider
+/// temporary lattice, then [`rerank_connected`](Self::rerank_connected) keeps only the nodes
+/// with the greatest estimated chance of surviving target verification.  The result is an
+/// ordinary [`TokenTree`], so target-authoritative [`TokenTree::accept_longest_path`] remains
+/// the sole acceptance rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicDraftLattice {
+    nodes: Vec<ScoredDraftNode>,
+}
+
+/// Connected verifier-ready subset selected from a [`DynamicDraftLattice`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredTokenTree {
+    pub tree: TokenTree,
+    /// Cumulative log probability in the same BFS row order as `tree`.
+    pub cumulative_log_probability: Vec<f32>,
+    /// Stable expansion-lattice index for every verifier row.  Useful for gathering the
+    /// corresponding recurrent state/KV row without relying on token ids being unique.
+    pub source_node: Vec<usize>,
+}
+
+impl ScoredTokenTree {
+    /// Expected target-emitted tokens per verify round under calibrated draft confidence.
+    ///
+    /// Every selected non-root node contributes one token iff its entire path is accepted,
+    /// whose estimated probability is its cumulative path probability.  The target's final
+    /// authoritative bonus token contributes one unconditionally.
+    pub fn estimated_emitted_tokens(&self) -> f64 {
+        1.0 + self
+            .cumulative_log_probability
+            .iter()
+            .skip(1)
+            .map(|&score| f64::from(score).exp())
+            .sum::<f64>()
+    }
+}
+
+impl DynamicDraftLattice {
+    pub fn new(anchor: u32) -> Self {
+        Self {
+            nodes: vec![ScoredDraftNode {
+                token: anchor,
+                parent: None,
+                depth: 0,
+                cumulative_log_probability: 0.0,
+            }],
+        }
+    }
+
+    pub fn nodes(&self) -> &[ScoredDraftNode] {
+        &self.nodes
+    }
+
+    /// Append one normalized top-k expansion under `parent`, returning stable node indices.
+    ///
+    /// Sibling probabilities must sum to at most one (a top-k subset may sum to less).  A
+    /// repeated token under the same parent is rejected because it would spend a verifier row
+    /// without adding a distinct greedy path.  Errors leave the lattice unchanged.
+    pub fn expand(
+        &mut self,
+        parent: usize,
+        candidates: &[DraftCandidateScore],
+    ) -> Result<Vec<usize>, String> {
+        let Some(parent_node) = self.nodes.get(parent) else {
+            return Err(format!("draft lattice parent {parent} is out of range"));
+        };
+        let depth = parent_node
+            .depth
+            .checked_add(1)
+            .ok_or_else(|| "draft lattice depth exceeds u16".to_string())?;
+        let parent_score = parent_node.cumulative_log_probability;
+        let mut probability_sum = 0.0f64;
+        for (slot, candidate) in candidates.iter().enumerate() {
+            if !candidate.log_probability.is_finite() || candidate.log_probability > 0.0 {
+                return Err(format!(
+                    "draft candidate {slot} has invalid normalized log probability {}",
+                    candidate.log_probability
+                ));
+            }
+            probability_sum += f64::from(candidate.log_probability).exp();
+            if candidates[..slot]
+                .iter()
+                .any(|earlier| earlier.token == candidate.token)
+                || self
+                    .nodes
+                    .iter()
+                    .any(|node| node.parent == Some(parent) && node.token == candidate.token)
+            {
+                return Err(format!(
+                    "draft lattice parent {parent} has duplicate child token {}",
+                    candidate.token
+                ));
+            }
+        }
+        // Accommodate the final few ulps of a correctly normalized f32 softmax, but reject
+        // raw-logit inputs and otherwise malformed sibling distributions.
+        if probability_sum > 1.0 + 1.0e-5 {
+            return Err(format!(
+                "draft candidate probabilities sum to {probability_sum}, above one"
+            ));
+        }
+
+        let start = self.nodes.len();
+        self.nodes
+            .extend(candidates.iter().map(|candidate| ScoredDraftNode {
+                token: candidate.token,
+                parent: Some(parent),
+                depth,
+                cumulative_log_probability: parent_score + candidate.log_probability,
+            }));
+        Ok((start..self.nodes.len()).collect())
+    }
+
+    /// Select the globally strongest `max_nodes` rows while preserving parent closure, then
+    /// lay them out in deterministic BFS order for target verification.
+    ///
+    /// Ranking is cumulative probability descending, depth ascending, then stable expansion
+    /// index ascending.  Because every conditional log probability is <= 0, a parent always
+    /// ranks before its child (including exact-probability-one ties); therefore truncating this
+    /// order cannot orphan a selected node.
+    pub fn rerank_connected(
+        &self,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<ScoredTokenTree, String> {
+        if max_nodes == 0 {
+            return Err("a verifier tree must retain at least its root".to_string());
+        }
+        let mut selected: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| (usize::from(node.depth) <= max_depth).then_some(index))
+            .collect();
+        selected.sort_by(|&left, &right| {
+            self.nodes[right]
+                .cumulative_log_probability
+                .total_cmp(&self.nodes[left].cumulative_log_probability)
+                .then_with(|| self.nodes[left].depth.cmp(&self.nodes[right].depth))
+                .then_with(|| left.cmp(&right))
+        });
+        selected.truncate(max_nodes);
+        // The root is score 0/depth 0 and every child is <= it, so it must survive any
+        // non-empty truncation.  Keep this a checked contract rather than a debug-only claim.
+        if !selected.contains(&0) {
+            return Err("dynamic draft rerank dropped the root".to_string());
+        }
+        for &node in &selected {
+            if let Some(parent) = self.nodes[node].parent {
+                if !selected.contains(&parent) {
+                    return Err(format!(
+                        "dynamic draft rerank selected node {node} without parent {parent}"
+                    ));
+                }
+            }
+        }
+
+        // Matrix rows may be ranked in any order, but the shared tree substrate promises BFS.
+        // Restore level order while retaining stable expansion order inside each level.
+        selected.sort_by_key(|&index| (self.nodes[index].depth, index));
+        let mut remap = vec![usize::MAX; self.nodes.len()];
+        for (row, &source) in selected.iter().enumerate() {
+            remap[source] = row;
+        }
+
+        let mut tokens = Vec::with_capacity(selected.len());
+        let mut parent = Vec::with_capacity(selected.len());
+        let mut depth = Vec::with_capacity(selected.len());
+        let mut cumulative_log_probability = Vec::with_capacity(selected.len());
+        for &source in &selected {
+            let node = &self.nodes[source];
+            tokens.push(node.token);
+            parent.push(match node.parent {
+                None => -1,
+                Some(source_parent) => i32::try_from(remap[source_parent])
+                    .map_err(|_| "verifier tree row exceeds i32".to_string())?,
+            });
+            depth.push(node.depth);
+            cumulative_log_probability.push(node.cumulative_log_probability);
+        }
+        Ok(ScoredTokenTree {
+            tree: TokenTree {
+                tokens,
+                parent,
+                depth,
+            },
+            cumulative_log_probability,
+            source_node: selected,
+        })
     }
 }
 
@@ -346,6 +647,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn packed_forest_plan_lists_each_root_to_row_path() {
+        let t = branchy_tree();
+        let packed = t.packed_forest_plan();
+        assert_eq!(packed.path_offsets, vec![0, 1, 3, 5, 8, 11, 14]);
+        assert_eq!(packed.path(0), Some(&[0][..]));
+        assert_eq!(packed.path(1), Some(&[0, 1][..]));
+        assert_eq!(packed.path(2), Some(&[0, 2][..]));
+        assert_eq!(packed.path(3), Some(&[0, 1, 3][..]));
+        assert_eq!(packed.path(4), Some(&[0, 2, 4][..]));
+        assert_eq!(packed.path(5), Some(&[0, 2, 5][..]));
+        assert_eq!(packed.path(6), None);
+    }
+
     // --- accept_longest_path == linear accept (the oracle) ------------------
 
     /// Today's linear accept, reproduced verbatim from the verify_drafts_gpu /
@@ -436,6 +751,153 @@ mod tests {
         let (emitted, leaf) = t.accept_longest_path(&predicted);
         assert_eq!(emitted, vec![99]);
         assert_eq!(leaf, 0);
+    }
+
+    #[test]
+    fn dynamic_lattice_reranks_by_global_path_probability_and_stays_connected() {
+        let mut lattice = DynamicDraftLattice::new(10);
+        let first = lattice
+            .expand(
+                0,
+                &[
+                    DraftCandidateScore {
+                        token: 11,
+                        log_probability: 0.6f32.ln(),
+                    },
+                    DraftCandidateScore {
+                        token: 12,
+                        log_probability: 0.4f32.ln(),
+                    },
+                ],
+            )
+            .unwrap();
+        let under_11 = lattice
+            .expand(
+                first[0],
+                &[
+                    DraftCandidateScore {
+                        token: 13,
+                        log_probability: 0.5f32.ln(), // global 0.30
+                    },
+                    DraftCandidateScore {
+                        token: 14,
+                        log_probability: 0.4f32.ln(), // global 0.24; pruned
+                    },
+                ],
+            )
+            .unwrap();
+        let under_12 = lattice
+            .expand(
+                first[1],
+                &[DraftCandidateScore {
+                    token: 15,
+                    log_probability: 0.9f32.ln(), // global 0.36
+                }],
+            )
+            .unwrap();
+
+        // Root + both depth-1 nodes + the two strongest depth-2 nodes.  The global rerank
+        // prefers token 15 (0.36) over token 13 (0.30), but verifier rows are restored to BFS
+        // expansion order and remain parent-before-child.
+        let plan = lattice.rerank_connected(5, 8).unwrap();
+        assert_eq!(plan.tree.tokens, vec![10, 11, 12, 13, 15]);
+        assert_eq!(plan.tree.parent, vec![-1, 0, 0, 1, 2]);
+        assert_eq!(plan.tree.depth, vec![0, 1, 1, 2, 2]);
+        assert_eq!(
+            plan.source_node,
+            vec![0, first[0], first[1], under_11[0], under_12[0]]
+        );
+        for row in 1..plan.tree.nodes() {
+            assert!(plan.tree.parent[row] < row as i32);
+        }
+        let expected = 1.0 + 0.6 + 0.4 + 0.30 + 0.36;
+        assert!((plan.estimated_emitted_tokens() - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn full_vocab_normalizer_preserves_probability_mass_omitted_by_top_k() {
+        // Full distribution is [0.50, 0.30, 0.20], while only its top two entries survive.
+        let normalized = normalize_draft_top_logits(
+            &[(11, 0.5f32.ln()), (12, 0.3f32.ln())],
+            0.0, // ln(0.50 + 0.30 + 0.20)
+        )
+        .unwrap();
+        assert_eq!(normalized[0].token, 11);
+        assert_eq!(normalized[1].token, 12);
+        let retained_mass: f32 = normalized
+            .iter()
+            .map(|candidate| candidate.log_probability.exp())
+            .sum();
+        assert!((retained_mass - 0.8).abs() < 1.0e-6);
+        assert!(retained_mass < 1.0, "top-k must not be renormalized");
+    }
+
+    #[test]
+    fn dynamic_lattice_probability_one_ties_still_keep_parent_before_child() {
+        let mut lattice = DynamicDraftLattice::new(1);
+        let child = lattice
+            .expand(
+                0,
+                &[DraftCandidateScore {
+                    token: 2,
+                    log_probability: 0.0,
+                }],
+            )
+            .unwrap()[0];
+        lattice
+            .expand(
+                child,
+                &[DraftCandidateScore {
+                    token: 3,
+                    log_probability: 0.0,
+                }],
+            )
+            .unwrap();
+
+        let root_only = lattice.rerank_connected(1, 8).unwrap();
+        assert_eq!(root_only.tree.tokens, vec![1]);
+        let root_and_child = lattice.rerank_connected(2, 8).unwrap();
+        assert_eq!(root_and_child.tree.tokens, vec![1, 2]);
+        assert_eq!(root_and_child.tree.parent, vec![-1, 0]);
+    }
+
+    #[test]
+    fn dynamic_lattice_rejects_unnormalized_or_duplicate_siblings_without_mutation() {
+        let mut lattice = DynamicDraftLattice::new(1);
+        let before = lattice.clone();
+        assert!(lattice
+            .expand(
+                0,
+                &[
+                    DraftCandidateScore {
+                        token: 2,
+                        log_probability: 0.8f32.ln(),
+                    },
+                    DraftCandidateScore {
+                        token: 3,
+                        log_probability: 0.8f32.ln(),
+                    },
+                ],
+            )
+            .is_err());
+        assert_eq!(lattice, before);
+
+        assert!(lattice
+            .expand(
+                0,
+                &[
+                    DraftCandidateScore {
+                        token: 2,
+                        log_probability: 0.5f32.ln(),
+                    },
+                    DraftCandidateScore {
+                        token: 2,
+                        log_probability: 0.4f32.ln(),
+                    },
+                ],
+            )
+            .is_err());
+        assert_eq!(lattice, before);
     }
 
     #[test]

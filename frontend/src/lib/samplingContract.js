@@ -15,12 +15,14 @@ import { appStorage } from './appStorage.js'
 import { isSupportedCapabilityStatus } from './capabilities.js'
 
 export const SAMPLING_PARAMS = [
-  { key: 'temperature', label: 'temperature', current: '0 (greedy)', hint: 'Chat always sends temperature=0. Greedy decoding is what the parity evidence was produced with.' },
-  { key: 'top_p', label: 'top_p', current: 'not sent', hint: 'Nucleus sampling is not part of any checked evidence lane.' },
-  { key: 'top_k', label: 'top_k', current: 'not sent', hint: 'Top-k sampling is not part of any checked evidence lane.' },
+  { key: 'temperature', label: 'temperature', current: '0 (greedy)', hint: 'Above 0 the reply is sampled. The parity evidence behind a supported row was produced greedily, so a sampled reply is outside it.' },
+  { key: 'top_p', label: 'top_p', current: 'not sent', hint: 'Nucleus sampling. Only has an effect above temperature 0.' },
+  { key: 'top_k', label: 'top_k', current: 'not sent', hint: 'Keeps only the k highest-scoring tokens. k=1 reproduces greedy decoding.' },
+  { key: 'min_p', label: 'min_p', current: 'not sent', hint: 'Drops tokens below a fraction of the top token. Only has an effect above temperature 0.' },
   { key: 'max_tokens', label: 'max_tokens', current: 'Settings budget', hint: 'The response budget comes from Settings → Chat; the chat surface itself does not expose a cap.' },
-  { key: 'stop', label: 'stop sequences', current: 'not sent', hint: 'Custom stop sequences are not part of any checked evidence lane.' },
-  { key: 'seed', label: 'seed', current: 'not sent', hint: 'Seeded sampling is meaningless under greedy decoding and is not advertised by the contract.' },
+  { key: 'stop', label: 'stop sequences', current: 'not sent', hint: 'Up to 4 strings. The reply is cut at the first one and reports finish_reason stop.' },
+  { key: 'seed', label: 'seed', current: 'not sent', hint: 'Makes a sampled reply reproducible. No observable effect at temperature 0, where decoding is greedy.' },
+  { key: 'repeat_penalty', label: 'repeat_penalty', current: 'not sent', hint: 'Penalizes tokens already generated. Only observable on a reply with something to repeat.' },
 ]
 
 /* A feature row counts for a parameter only on exact id match

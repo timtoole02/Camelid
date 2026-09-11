@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "5f715152",
+    "source_head": "02cd1add",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -48,7 +48,7 @@
       {
         "id": "Q4_0 (QAT rows)",
         "status": "supported_named_exact_rows_only",
-        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
+        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either its distributed lane or the catalog-managed Windows CUDA Ghost-MoE lane; its single-M4 Ghost-MoE/MTP path remains explicitly experimental. gemma4_12b_it_qat_q4_0 is a downloadable, single-M4 active-validation row, not a supported row yet. The Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
       },
       {
         "id": "TQ2_0",
@@ -267,6 +267,41 @@
         "id": "rich_logprobs",
         "status": "supported_current_gate_nonstreaming",
         "notes": "POST /v1/chat/completions supports OpenAI-shaped logprobs/top_logprobs and POST /v1/completions supports legacy parallel-array logprobs for one non-streaming choice. Streaming and n>1 logprobs remain typed unsupported."
+      },
+      {
+        "id": "sampling_temperature",
+        "status": "supported_current_gate",
+        "notes": "temperature is applied on the dense and runnable chat lanes, streaming and non-streaming. On those lanes a value below 0, or a non-finite value, is a typed 400; there is no upper bound and high values produce incoherent text. Parity evidence for supported rows is greedy (temperature 0) only — sampled output is outside it. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
+      },
+      {
+        "id": "sampling_top_p",
+        "status": "supported_current_gate",
+        "notes": "top_p is applied on the dense and runnable chat lanes, streaming and non-streaming. Must be finite and in (0, 1]; anything else is a typed 400. Only meaningful with temperature above 0. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
+      },
+      {
+        "id": "sampling_top_k",
+        "status": "supported_current_gate",
+        "notes": "top_k is applied on the dense and runnable chat lanes, streaming and non-streaming. top_k of 1 keeps only the highest-scoring token. top_k of 0 is a typed 400 invalid_sampling_parameter; a negative value cannot deserialize into an unsigned field and is a typed 400 malformed JSON instead. Only meaningful with temperature above 0. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
+      },
+      {
+        "id": "sampling_min_p",
+        "status": "supported_current_gate",
+        "notes": "min_p is applied on the dense and runnable chat lanes, streaming and non-streaming. Must be finite and in [0, 1]; anything else is a typed 400. Only meaningful with temperature above 0. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
+      },
+      {
+        "id": "sampling_seed",
+        "status": "supported_current_gate",
+        "notes": "seed makes sampled generation reproducible on the dense and runnable chat lanes: the same seed and request return the same text. Two different seeds are NOT guaranteed to differ — a peaked step, or top_k of 1, selects the same token for every seed. Without a seed, sampled decoding is still deterministic per request. The two lanes do not share a random stream, so a seed reproduces a reply within a lane, not across them. A seed has no observable effect at temperature 0, where decoding is greedy. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
+      },
+      {
+        "id": "sampling_stop",
+        "status": "supported_current_gate",
+        "notes": "Up to 4 stop strings truncate the reply on the dense and runnable chat lanes, streaming and non-streaming; the response reports finish_reason stop. A stop string may span or split tokens, so the token that completes it is retained in the token ids and in usage.completion_tokens while only the text is cut. An empty array, an empty string, or more than 4 sequences is a typed 400. Deciding a stop over decoded text costs a detokenization of the generated prefix per step, so a request carrying stop is quadratic in reply length; a request without stop short-circuits and is unaffected. The gemma4 and diffusion-gemma lanes do not read stop."
+      },
+      {
+        "id": "sampling_repeat_penalty",
+        "status": "supported_current_gate",
+        "notes": "repeat_penalty, presence_penalty and frequency_penalty are applied on the dense and runnable chat lanes over the penalty window. Their effect is only observable on a generation with something to penalize; a short reply may be unchanged. Parity evidence for supported rows is greedy and unpenalized. The gemma4 and diffusion-gemma lanes ignore sampling and always decode greedily, so neither the typed 400s nor the parameter itself applies there."
       }
     ],
     "notes": [
@@ -1141,6 +1176,108 @@
         "latest_checked_output": "Paris",
         "evidence": "the exact tracked gemma-4-12b-it-Q8_0 GGUF (12,669,646,240 bytes, general.architecture=gemma4, 48 layers with the per-layer attention.head_count_kv array and V-less full-attention layers parsed from the GGUF) runs as two-Mac distributed layer sharding: the CLI lane is token-identical to single-node camelid on all five basic_v1 prompts (qa/evidence-bundles/gemma4-12b-it-q8-0-two-mac-20260610T103711Z-head-96a75007b156; decode 6.2-6.75 tok/s across the pair, both 16GB nodes within budget; 3/5 prompts match the pinned comparator full-budget with two recorded reference-comparator frontiers), and the distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair (qa/evidence-bundles/gemma4-12b-it-q8-0-distributed-serve-20260610T235155Z-head-80e3dddfbdb4; master shard 0..24 + worker 24..48, wire protocol v1 with per-request worker sessions). Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
         "next_step": "durable current-head refresh, bounded context buckets through the distributed lane, and performance/RSS gates before any wider 12B claim; single-node support is not a goal on 16GB hosts"
+      }
+    },
+    {
+      "identity": {
+        "id": "gemma4_12b_it_qat_q4_0_mtp12",
+        "family": "gemma4_dense_decoder_mtp12",
+        "quantization": "Q4_0",
+        "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+        "gguf_filename": "gemma-4-12b-it-qat-q4_0.gguf"
+      },
+      "contract": {
+        "id": "gemma4_12b_it_qat_q4_0_mtp12",
+        "tool_capable": false,
+        "family": "gemma4_dense_decoder_mtp12",
+        "quantization": "Q4_0",
+        "status": "supported_exact_row_smoke",
+        "support_scope": "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only",
+        "full_support_status": "blocked_pending_normalized_full_support",
+        "full_support_blockers": "the supported claim is pinned to one target SHA and one assistant SHA on Apple Metal with the explicit MTP12 serve opt-in; the 51 tok/s receipts cover a 96-token qualification prompt at a 512-row KV capacity, not arbitrary long-form quality or a bounded-context ladder; portability, normalized API/WebUI evidence, broader prompts, and durable current-head performance/RSS gates remain pending",
+        "metadata_parses": "validated_exact_gemma4_12b_qat_q4_0_target",
+        "tokenizer_works": "validated_for_gemma4_spm",
+        "tensors_load": "validated_single_node_metal_resident_q4_0_target_plus_exact_resident_mtp12_assistant",
+        "generation_runs": "lossless_ordered_target_verified_mtp12_greedy_decode",
+        "parity_audited": "ordered_k1_token_ids_and_text_exact_for_the_qualified_96_token_run",
+        "performance_measured": "51_494_tok_s_confirmation_51_305_two_run_mean_51_399_zero_swap_on_base_m4_16gb",
+        "frontend_load_path_verified": "explicit_mtp12_api_serve_lane_pending_normalized_webui_capture",
+        "frontend_readiness_gate": "green only on the receipted base-M4 Mac mini profile (Mac16,10 / Apple M4 / macOS 26.5.x / Metal available) when the exact target filename and SHA match this row, CAMELID_GEMMA4_MTP12_ASSISTANT names the exact admitted assistant, and health reports the mtp12_metal serve lane",
+        "tested_context": "96_output_token_performance_qualification_with_512_row_kv_capacity",
+        "chat_template_renderer": "gemma4_marker",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "performance_qualification_only_not_promoted_as_context_pack",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "single_node_macos_metal_mtp12_96_token_performance_qualification",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "51.494 tok/s; confirmation 51.305 tok/s; ordered-K1 token ids and text exact; zero swaps",
+        "evidence": "The exact Gemma 4 12B QAT Q4_0 target (SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b) and exact official MTP12 assistant (SHA-256 67f1420cf24aa5065089aaed175223f7c245ccfda16111b6c56765afd7280db6) ran the lossless ordered target-verification lane on a 16GB base Apple M4. The primary 96-token qualification measured 51.493947835 tok/s and the confirmation measured 51.304677961 tok/s (mean 51.399), with ordered-K1 token IDs and decoded text exact and zero swaps. The winning selector was CAMELID_GEMMA4_MTP_W16_ONESHOT_W8_PAD16=1. These are native decode-forward receipts using (emitted_tokens-1)/decode_us; they do not establish response quality or transfer that rate to arbitrary prompts/context sizes. The claim covers this row only: the exact target and assistant SHAs named above, on Apple Metal, behind the explicit MTP12 serve opt-in.",
+        "next_step": "capture the normalized long-form API/WebUI run at a larger KV allocation, verify quality and memory behavior, and add bounded-context and portable performance gates before widening this exact-row claim"
+      }
+    },
+    {
+      "identity": {
+        "id": "gemma4_12b_it_qat_q4_0",
+        "family": "gemma4_dense_decoder",
+        "quantization": "Q4_0",
+        "gguf_filename": "gemma-4-12b-it-qat-q4_0.gguf",
+        "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
+      },
+      "contract": {
+        "id": "gemma4_12b_it_qat_q4_0",
+        "tool_capable": false,
+        "family": "gemma4_dense_decoder",
+        "quantization": "Q4_0",
+        "status": "active_validation_single_node_metal",
+        "support_scope": "active_validation_only",
+        "full_support_status": "blocked_pending_normalized_full_support",
+        "full_support_blockers": "the single-node Apple M4 lane has load, generation, component-parity, and whole-output K=1 evidence, but the final speculative-throughput promotion, guarded API/WebUI smoke, bounded-context ladder, broader sampling, portability, and normalized performance/RSS gates remain open",
+        "metadata_parses": "validated_including_per_layer_kv_head_array_and_vless_layers",
+        "tokenizer_works": "validated_for_gemma4_spm",
+        "tensors_load": "validated_mmap_wire_backed_q4_0_decoder_and_q6_k_tied_head",
+        "generation_runs": "validated_single_node_apple_m4_metal_greedy_generation",
+        "parity_audited": "validated_component_parity_and_whole_output_k1_identity_with_speculative_promotion_pending",
+        "performance_measured": "single_apple_m4_measurement_exists_not_a_portable_throughput_claim",
+        "frontend_load_path_verified": "catalog_download_added_promotion_smoke_pending",
+        "frontend_readiness_gate": "download is available from the Models page; after load, chat remains on the explicitly experimental runtime lane until the exact guarded API/WebUI promotion gate passes",
+        "tested_context": "short_single_node_apple_m4_generation_smoke",
+        "chat_template_renderer": "gemma4_marker",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "single_node_apple_m4_qat_q4_0_generation",
+        "latest_checked_result": "pass_active_validation",
+        "latest_checked_output": "single-node generation completed",
+        "evidence": "the exact official gemma-4-12b-it-qat-q4_0.gguf artifact (6,975,879,296 bytes, SHA-256 93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b, general.architecture=gemma4) loads and generates on one tested 16 GB Apple M4 Mac through Camelid's Metal path. The model-development receipts anchored at agent/gemma4-w16-bootstrap commit cf0b54a6 record the external baseline, exact Q4 projection checks, Q6_K head check, and whole-output ordered K=1 identity. This is an active-validation claim for this row only; it is not Supported and makes no portable throughput, broad hardware, bounded-context, multimodal, or speculative-acceptance claim",
+        "next_step": "finish the end-to-end speculative throughput receipt and guarded Models-page/API/WebUI smoke, then run bounded-context and normalized memory/performance gates before any support promotion"
       }
     },
     {

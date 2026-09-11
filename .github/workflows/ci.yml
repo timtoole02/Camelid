@@ -129,6 +129,13 @@ jobs:
       - name: Check for private operator details
         run: bash scripts/check-public-scrub.sh
 
+      # Cheap, and it gates every job that installs a toolchain (`rust` and
+      # `desktop` both `needs:` this one), so drift fails before three OS
+      # runners spin up. Covers release.yml's four pins too — those builds ship
+      # artifacts, so they earn the same guard.
+      - name: Check toolchain pins agree with rust-toolchain.toml
+        run: bash scripts/check-toolchain-pins.sh
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
@@ -209,10 +216,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; this ref only mirrors it. rustup treats the toolchain file as a
+      # directory override, which outranks the `rustup default` this action sets,
+      # so the version named here does NOT decide what the cargo steps below run
+      # -- the file does. Keeping them equal is what makes this step useful (it
+      # pre-installs the toolchain that will actually be used, instead of a second
+      # one nothing runs). The `public-scrub` job fails the run if they drift.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
+
+      # Print the toolchain that actually resolved, so a log answers "what did
+      # this run lint with?" without re-deriving it from rustup's override rules.
+      - name: Show effective toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo clippy --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -343,10 +365,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Mirrors rust-toolchain.toml; see the note on the `rust` job's copy of
+      # this step. The toolchain file wins regardless, and `public-scrub` fails
+      # the run if this ref drifts away from it.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
+
+      - name: Show effective toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo clippy --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -447,6 +478,52 @@ jobs:
       - name: Frontend streaming telemetry smoke
         if: ${{ !cancelled() }}
         run: npm run smoke:streaming
+
+      # Continuing a reply that stopped on the response budget. Pure half:
+      # which replies may be continued, how the resumed text rejoins the kept
+      # text (mid-word resumes, restated sentences), and cumulative usage.
+      - name: Frontend chat continuation smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:continuation
+
+      # The half a pure test cannot reach: that the continuation lands on the
+      # SAME assistant message, that the request-only instruction never enters
+      # the stored transcript, and that a later turn therefore sends one merged
+      # reply instead of replaying a "continue" turn forever.
+      - name: Frontend chat continuation browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:continuation-browser
+
+      # Regenerated replies kept side by side. The contract under test is the
+      # mirroring one: the active version's fields are also the message's own,
+      # so every existing reader keeps working without knowing versions exist.
+      - name: Frontend reply variants smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:variants
+
+      # What a pure test cannot reach: that a re-roll does not duplicate the
+      # question or show the model the answer it is replacing, that switching
+      # moves the telemetry with the text, and that the NEXT turn sends
+      # whichever version is selected.
+      - name: Frontend reply variants browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:variants-browser
+
+      # Pins, archive, tags, bulk export and import. Most of this gate is the
+      # IMPORT half: it reads a user-chosen file into stored state, so the
+      # bounds, the field whitelist, the regenerated ids and the refusal to
+      # trust a claimed usage_source are all asserted here.
+      - name: Frontend conversation organization smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:organization
+
+      # The wiring an organization feature actually fails on: a pin that still
+      # falls off the recent limit, a filter that hides everything, an archive
+      # with no way back, and the export -> import round trip through the real
+      # file picker.
+      - name: Frontend conversation organization browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:organization-browser
 
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
@@ -551,9 +628,35 @@ jobs:
           curl --fail --silent http://127.0.0.1:4175/ >/dev/null
           npm run smoke:workspace-visual
 
+      - name: Retrieval rerank smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:rerank
+      - name: Engine metrics smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:engine-metrics
+      - name: Tool calling smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:tool-calling
+
       - name: Frontend UI regression smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
+
+      - name: Structured output smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:structured-output
+
+      - name: Token inspector smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:token-inspector
+
+      # Wired here because the token inspector adds the first value-encoding
+      # colors to the UI. The script has existed since the design-token work but
+      # was never added to this job, so every palette change since then shipped
+      # unaudited — the same gap this file already records for other lanes.
+      - name: Design token contrast audit
+        if: ${{ !cancelled() }}
+        run: npm run smoke:contrast
 
   # ---------------------------------------------------------------------------
   # Single aggregate gate. Make THIS the only required status check in branch

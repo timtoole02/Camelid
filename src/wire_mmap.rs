@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{platform_fs::read_exact_at, BackendError, Result};
+use crate::{BackendError, Result};
 
 /// System page size, used for window/buffer alignment.
 #[cfg(unix)]
@@ -190,6 +190,35 @@ impl GgufWireMmap {
         }
     }
 
+    /// Release clean resident pages for `[offset, offset + len)` while retaining
+    /// the read-only mapping. A later access faults the source file back in.
+    ///
+    /// This is used after a validated native-weight sidecar replaces a GGUF
+    /// projection: the original file bytes stay addressable for identity and
+    /// metadata, but should not compete with the sidecar's anonymous NoCopy
+    /// pages in unified memory.
+    pub fn advise_dontneed_range(&self, offset: usize, len: usize) {
+        if len == 0 || offset >= self.mapped_len {
+            return;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let start = offset - (offset % page);
+        let end = offset.saturating_add(len).min(self.mapped_len);
+        let Some(span) = end.checked_sub(start).filter(|s| *s > 0) else {
+            return;
+        };
+        // SAFETY: `start` is page-aligned and the clamped span stays inside the
+        // immutable mapping. MADV_DONTNEED discards only clean resident pages.
+        unsafe {
+            libc::madvise(
+                self.ptr.add(start) as *mut libc::c_void,
+                span,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
@@ -289,6 +318,9 @@ impl GgufWireMmap {
     /// Ranged population hint; a no-op on Windows (see `advise_sequential`).
     pub fn advise_willneed_range(&self, _offset: usize, _len: usize) {}
 
+    /// Ranged eviction hint; a no-op on Windows (see `advise_sequential`).
+    pub fn advise_dontneed_range(&self, _offset: usize, _len: usize) {}
+
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
@@ -329,9 +361,11 @@ impl GgufWireMmap {
 /// A page-aligned, heap-owned copy of one tensor's wire-format bytes, suitable
 /// for an offset-0 `newBufferWithBytesNoCopy` Metal buffer: the GPU reads this
 /// allocation in place, so it is the ONLY resident copy of the weight (no
-/// 36-byte CPU decode, no GPU upload copy). Filled by one sequential read of
-/// the tensor's file range with the page cache enabled, so reloading a model
-/// runs at page-cache speed instead of re-streaming the disk.
+/// 36-byte CPU decode, no GPU upload copy). Filled by reading the tensor's
+/// file range with the page cache enabled — one sequential read by default,
+/// or parallel chunked preads under the CAMELID_DENSE_WAVE_CHUNKED_READ
+/// opt-in — so reloading a model runs at page-cache speed instead of
+/// re-streaming the disk.
 #[derive(Debug)]
 pub struct WirePages {
     ptr: *mut u8,
@@ -361,7 +395,11 @@ impl Drop for WirePages {
 
 impl WirePages {
     /// Allocate page-aligned storage and fill it with `byte_len` bytes read from
-    /// `file` at `offset` (one sequential read, page cache enabled).
+    /// `file` at `offset`. One sequential read with the page cache enabled by
+    /// default; the CAMELID_DENSE_WAVE_CHUNKED_READ opt-in fills the same bytes
+    /// through up to four parallel positioned reads instead. Every
+    /// `WirePages` consumer (dense, gemma4 resident/ghost-common, vision)
+    /// inherits that opt-in.
     pub fn read_from_file(file: &File, offset: u64, byte_len: usize) -> Result<Arc<Self>> {
         if byte_len == 0 {
             return Err(BackendError::InvalidTensorData(
@@ -387,7 +425,10 @@ impl WirePages {
         };
         // SAFETY: the allocation is alloc_len >= byte_len bytes and exclusively owned here.
         let fill = unsafe { std::slice::from_raw_parts_mut(ptr, byte_len) };
-        read_exact_at(file, fill, offset).map_err(|err| {
+        // Wave-chunked opt-in: fill the resident pages through parallel
+        // positioned reads instead of one serial pread per tensor. Off by
+        // default; the single-read path below it is byte-identical.
+        crate::tensor::wave_chunked_read_exact_at(file, fill, offset).map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire pages read of {byte_len} bytes at offset {offset} failed: {err}"
             ))

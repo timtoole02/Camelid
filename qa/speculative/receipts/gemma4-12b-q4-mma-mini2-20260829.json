@@ -1,0 +1,93 @@
+{
+  "schema": "camelid.gemma4.q4-mma-padded8.v1",
+  "date": "2026-08-29",
+  "source": {
+    "base_commit": "07e3e400327ded8ed51be48f010b79f649c5f9a5",
+    "implementation_commit": "1985c7c3",
+    "branch": "agent/gemma4-q4mma",
+    "main_cherry_pick": "ee0261d1"
+  },
+  "hardware": {
+    "host": "mini2",
+    "model": "Mac mini",
+    "model_identifier": "Mac16,10",
+    "chip": "Apple M4",
+    "gpu_cores": 10,
+    "memory_gib": 16,
+    "max_threadgroup_memory_bytes": 32768,
+    "thermal_warning": false,
+    "swap_bytes": 0
+  },
+  "binary": {
+    "remote_path": "~/gemma4-12b-speed/camelid-q4mma-tests-1985c7c3",
+    "sha256": "35eee8cec2a06291f35477251081ec45ef0ae8ca4cfd662504ebaa7dea216af8",
+    "profile": "release"
+  },
+  "arithmetic_contract": {
+    "fast_math": false,
+    "matrix_tile": "8 output rows x 8 padded activation columns",
+    "q4_integer_range": "[-8, 7]",
+    "q8_integer_range_tested": "[-128, 127]",
+    "mma_operands": "exact integer half",
+    "mma_accumulator": "f32",
+    "mma_per_q4_block": "four 8x8x8 operations over 32 positions",
+    "maximum_tested_integer_dot_magnitude": 32768,
+    "materialization": "explicit simdgroup_store to synchronized threadgroup f32[8][8]",
+    "term": "(float(isum) * weight_scale) * input_scale",
+    "fold": "one lane-owned accumulator per output cell, Q4 blocks visited in increasing order",
+    "staged_panel": "position-major half[width][8], zero padded",
+    "static_threadgroup_bytes": 800,
+    "global_term_slab_traffic": 0
+  },
+  "exactness": {
+    "status": "pass",
+    "widths": [1, 2, 4, 8],
+    "adversarial_blocks_per_row": [1, 31, 32, 33, 120, 480],
+    "adversarial_values": "signed zero, f32 minimum normal, small/large activation scales, f16 subnormal/normal/extreme signed weight scales, extreme i8 quants, packed-nibble patterns",
+    "adversarial_oracle": "to_bits equality: MMA == global slab == established ordered K1",
+    "production_shape_oracle": "every scalar/slab/direct/MMA output word compared with to_bits equality",
+    "focused_test": "metal_gemma4_q4_0_q8_columns_are_bit_exact_for_12b_widths",
+    "focused_test_result": "1 passed; 0 failed",
+    "production_test": "metal_gemma4_q4_0_q8_columns_full_12b_shape_receipt",
+    "production_test_result": "1 passed; 0 failed"
+  },
+  "benchmark": {
+    "metric": "Metal command-buffer GPU busy window, median of 7, microseconds",
+    "warmups": 2,
+    "includes_activation_stage": true,
+    "measurements": [
+      {"shape":"3840-to-4096","k":2,"scalar_us":546,"slab_us":541,"direct_tg_us":588,"mma_us":574,"mma_vs_slab":0.943},
+      {"shape":"3840-to-4096","k":4,"scalar_us":1039,"slab_us":1108,"direct_tg_us":1120,"mma_us":575,"mma_vs_slab":1.927},
+      {"shape":"3840-to-4096","k":8,"scalar_us":2011,"slab_us":2357,"direct_tg_us":2655,"mma_us":565,"mma_vs_slab":4.172},
+      {"shape":"3840-to-8192","k":2,"scalar_us":724,"slab_us":750,"direct_tg_us":768,"mma_us":748,"mma_vs_slab":1.003},
+      {"shape":"3840-to-8192","k":4,"scalar_us":1085,"slab_us":1091,"direct_tg_us":1107,"mma_us":569,"mma_vs_slab":1.917},
+      {"shape":"3840-to-8192","k":8,"scalar_us":1983,"slab_us":2274,"direct_tg_us":2630,"mma_us":536,"mma_vs_slab":4.243},
+      {"shape":"3840-to-2048","k":2,"scalar_us":157,"slab_us":136,"direct_tg_us":153,"mma_us":163,"mma_vs_slab":0.834},
+      {"shape":"3840-to-2048","k":4,"scalar_us":269,"slab_us":266,"direct_tg_us":298,"mma_us":164,"mma_vs_slab":1.622},
+      {"shape":"3840-to-2048","k":8,"scalar_us":517,"slab_us":584,"direct_tg_us":702,"mma_us":163,"mma_vs_slab":3.583},
+      {"shape":"3840-to-512","k":2,"scalar_us":58,"slab_us":46,"direct_tg_us":51,"mma_us":91,"mma_vs_slab":0.505},
+      {"shape":"3840-to-512","k":4,"scalar_us":94,"slab_us":75,"direct_tg_us":95,"mma_us":91,"mma_vs_slab":0.824},
+      {"shape":"3840-to-512","k":8,"scalar_us":155,"slab_us":148,"direct_tg_us":223,"mma_us":89,"mma_vs_slab":1.663},
+      {"shape":"3840-to-15360-gate-up","k":2,"scalar_us":944,"slab_us":1026,"direct_tg_us":1031,"mma_us":966,"mma_vs_slab":1.062},
+      {"shape":"3840-to-15360-gate-up","k":4,"scalar_us":1874,"slab_us":1974,"direct_tg_us":2042,"mma_us":963,"mma_vs_slab":2.050},
+      {"shape":"3840-to-15360-gate-up","k":8,"scalar_us":3698,"slab_us":4207,"direct_tg_us":4875,"mma_us":952,"mma_vs_slab":4.419},
+      {"shape":"15360-to-3840-down","k":2,"scalar_us":988,"slab_us":977,"direct_tg_us":1232,"mma_us":1036,"mma_vs_slab":0.943},
+      {"shape":"15360-to-3840-down","k":4,"scalar_us":1903,"slab_us":1889,"direct_tg_us":4564,"mma_us":1038,"mma_vs_slab":1.820},
+      {"shape":"15360-to-3840-down","k":8,"scalar_us":3723,"slab_us":4011,"direct_tg_us":17793,"mma_us":1021,"mma_vs_slab":3.929},
+      {"shape":"4096-attention-to-3840","k":2,"scalar_us":269,"slab_us":252,"direct_tg_us":279,"mma_us":280,"mma_vs_slab":0.900},
+      {"shape":"4096-attention-to-3840","k":4,"scalar_us":512,"slab_us":517,"direct_tg_us":548,"mma_us":281,"mma_vs_slab":1.840},
+      {"shape":"4096-attention-to-3840","k":8,"scalar_us":999,"slab_us":1106,"direct_tg_us":1359,"mma_us":277,"mma_vs_slab":3.993}
+    ],
+    "headline": "Major K8 production projections are 3.58x-4.42x faster than the exact global-slab path and MMA cost is effectively flat from K4 to K8; K2 is neutral or slower.",
+    "scope": "projection microbenchmark only; not a whole-target or speculative tok/s claim"
+  },
+  "remote_receipts": {
+    "stdout": "~/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stdout",
+    "stderr": "~/gemma4-12b-speed/receipts/q4mma-shapes-1985c7c3.stderr"
+  },
+  "selection": {
+    "default": "established scalar/slab/direct policy",
+    "CAMELID_GEMMA4_Q4_MMA=1": "exact padded-eight MMA for K=1/2/4/8 when admitted; established path retained as fallback",
+    "recommendation": "Whole-target A/B K4 and K8; do not select MMA for K2 based on these component medians."
+  }
+}

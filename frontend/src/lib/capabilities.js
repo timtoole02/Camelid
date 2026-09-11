@@ -154,6 +154,11 @@ const EXACT_ARTIFACT_GATED_ROWS = {
   gemma2_9b_it_q8_0: 'gemma-2-9b-it-q8_0.gguf',
   smollm3_3b_q8_0: 'SmolLM3-Q8_0.gguf',
   aya_expanse_8b_q4_k_m: 'aya-expanse-8b-Q4_K_M.gguf',
+  // Non-catalog, hash-pinned by the backend. The filename deliberately does
+  // not contain the `_mtp12` row suffix, so generic row-id matching cannot
+  // identify it without this explicit join. Chat gating separately requires
+  // the backend's exact-artifact lane verdict and `mtp12_metal` health lane.
+  gemma4_12b_it_qat_q4_0_mtp12: 'gemma-4-12b-it-qat-q4_0.gguf',
 }
 
 function pathBasename(value) {
@@ -728,6 +733,22 @@ function normalizeExactRowIdentity(value) {
 function findExactCompatibilityRowByIdentity(rows, model, catalogItem) {
   const identities = new Set(getModelCapabilityFields(model, catalogItem).map(normalizeExactRowIdentity).filter(Boolean))
   if (!identities.size) return null
+  // Some exact, backend-hash-pinned artifacts are intentionally outside the
+  // download catalog and their release filenames are not the capability-row
+  // id. Give the observed exact filename priority over a stale saved catalog
+  // id: the bytes on disk own artifact identity. Resolve only explicit joins
+  // from the same artifact gate used below; never infer from family/size.
+  const observedFilenames = new Set([
+    model?.model_path,
+    model?.path,
+    model?.hf_filename,
+    catalogItem?.filename,
+  ].map(pathBasename).filter(Boolean).map((value) => value.toLowerCase()))
+  const artifactMatch = rows.find((row) => {
+    const requiredFilename = exactArtifactFilenameForRow(row)
+    return requiredFilename && observedFilenames.has(requiredFilename.toLowerCase())
+  })
+  if (artifactMatch) return artifactMatch
   return rows.find((row) => row?.id && identities.has(normalizeExactRowIdentity(row.id))) || null
 }
 

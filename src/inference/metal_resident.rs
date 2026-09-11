@@ -9,6 +9,166 @@ use crate::metal;
 
 pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
+/// The engine geometry a parked state was built for. Compared on reclaim so a state can
+/// only ever be handed to a session whose dimensions match it exactly — a key collision, or
+/// the same model id reloaded at different dimensions, must rebuild rather than reuse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ResidentMetalGeometry {
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+}
+
+/// A resident Metal engine parked between requests, with the prompt its KV rows hold.
+///
+/// The API builds a fresh `LlamaInferenceSession` per request, so a session-owned engine
+/// dies at the end of every turn and the next turn re-prefills the whole conversation.
+/// CUDA does not have this problem because its engine lives in a process-global cache. This
+/// is the Metal equivalent, kept deliberately smaller: the session still OWNS the engine
+/// while it runs, and only hands it back here on the way out, so the ~30 sites that use
+/// `resident_decode` are untouched.
+struct ResidentMetalParking {
+    /// `LlamaInferenceSession::resident_cache_key` — the API sets it from the model id
+    /// precisely so the same model is recognised across separately-loaded weight Arcs.
+    key: u64,
+    geometry: ResidentMetalGeometry,
+    state: ResidentDecodeState,
+    /// The prompt whose rows `state` holds in `[0, tokens.len())`. `state.filled()` is kept
+    /// equal to this length when parking, so the record and the watermark cannot disagree.
+    tokens: Vec<u32>,
+}
+
+/// The single parking slot. One entry, like the CUDA engine cache: two models alternating
+/// will evict each other rather than both staying resident, which is the same trade that
+/// cache already makes and is what a 16 GiB unified-memory budget wants.
+fn resident_metal_park() -> &'static std::sync::Mutex<Option<ResidentMetalParking>> {
+    static PARK: std::sync::OnceLock<std::sync::Mutex<Option<ResidentMetalParking>>> =
+        std::sync::OnceLock::new();
+    PARK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Drop whatever is parked. Used when a model is released, and by tests that must not
+/// inherit another test's engine.
+///
+/// macOS-only: its sole caller is the macOS arm of `reset_resident_caches`, and nothing can
+/// park on a target with no resident engine, so on every other target this is dead code
+/// that `-D dead-code` rejects. The park/reclaim pair below stays unconditional because the
+/// `Drop` hook and the prefill both reach them on every target — they simply decline at
+/// runtime.
+#[cfg(target_os = "macos")]
+pub(crate) fn clear_parked_resident_metal() {
+    *resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Hand a finished engine back for the next request, or drop it.
+///
+/// The two directions of disagreement between the record and the watermark are NOT
+/// symmetric, and treating them alike is what makes parking never fire:
+///
+/// * `filled > tokens.len()` is the ORDINARY case, not an error. Decode advances the
+///   watermark past the prompt, one row per generated token, so by the time a request ends
+///   the engine holds prompt + reply while the record names only the prompt. Those extra
+///   rows are real K/V, they simply have no name here, so the watermark is rewound to the
+///   record and they stop being vouched for. The next turn overwrites them anyway: its
+///   prompt continues from the end of THIS prompt, and the reply is re-prefilled as part of
+///   its suffix. (Recording generated tokens too would extend the reuse across the reply;
+///   that is a follow-up, not a correctness matter.)
+/// * `filled < tokens.len()` IS an error — the record claims rows the engine never wrote,
+///   which is what a failed prefill or a rewind leaves behind. Keep nothing.
+fn park_resident_metal(
+    key: u64,
+    geometry: ResidentMetalGeometry,
+    mut state: ResidentDecodeState,
+    tokens: Vec<u32>,
+) {
+    if tokens.is_empty() || state.filled() < tokens.len() {
+        return;
+    }
+    state.set_filled(tokens.len());
+    *resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(ResidentMetalParking {
+        key,
+        geometry,
+        state,
+        tokens,
+    });
+}
+
+/// Take the parked engine when it belongs to this model AND was built at these dimensions.
+///
+/// Both halves matter. The key alone does not pin geometry — the same model id reloaded with
+/// a different context or layer range would collide — and handing a session an engine whose
+/// per-layer strides differ from its own would read another shape's rows as if they were
+/// this one's.
+fn reclaim_resident_metal(
+    key: u64,
+    geometry: ResidentMetalGeometry,
+) -> Option<(ResidentDecodeState, Vec<u32>)> {
+    let mut guard = resident_metal_park()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let matches = guard
+        .as_ref()
+        .is_some_and(|p| p.key == key && p.geometry == geometry);
+    if !matches {
+        return None;
+    }
+    guard.take().map(|p| (p.state, p.tokens))
+}
+
+/// Leading run two token sequences share.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+impl ResidentMetalGeometry {
+    fn of(state: &ResidentDecodeState) -> Self {
+        let (n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn_dim) = state.geometry();
+        Self {
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+        }
+    }
+}
+
+impl super::LlamaInferenceSession {
+    /// Hand this session's resident Metal engine to the parking slot on the way out, so the
+    /// next turn of the same conversation can continue from the rows it already holds.
+    ///
+    /// Called from `Drop`, which is the only hook that catches every way a request ends —
+    /// the API builds a fresh session per request and simply lets it fall out of scope.
+    /// Everything that would make the handoff unsafe is refused rather than papered over:
+    /// no model identity, no engine, or a record that disagrees with the watermark.
+    pub(super) fn park_resident_metal_engine(&mut self) {
+        // Never park what can never be continued. Continuation is admitted only on an F32
+        // KV primary (see `metal::resident_kv_primary_is_half`), so on a half primary this
+        // would hold a GPU KV cache alive between requests to no purpose. Refusing here
+        // keeps that configuration byte-for-byte on its previous behaviour.
+        if metal::resident_kv_primary_is_half() {
+            return;
+        }
+        let Some(key) = self.resident_cache_key else {
+            return;
+        };
+        let Some(state) = self.resident_decode.take() else {
+            return;
+        };
+        let tokens = std::mem::take(&mut self.resident_tokens);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(key, geometry, state, tokens);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MetalSampleRequest {
     Greedy {
@@ -49,7 +209,7 @@ impl MetalSampleRequest {
 // callers are `#[cfg(not(feature = "cuda"))]` — so on a cuda build (Windows default / Linux
 // --all-features) this is genuinely unused; allow it rather than trip clippy `-D dead_code`.
 #[allow(dead_code)]
-pub(super) const MAX_VERIFY_K: usize = 8;
+pub(super) const MAX_VERIFY_K: usize = 16;
 
 /// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
 /// prompt-prefix-cache host-safety gate. Default ON except on hosts with 8 GiB
@@ -262,13 +422,22 @@ impl super::LlamaInferenceSession {
     }
 
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
-        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
-        if trace {
-            eprintln!(
-                "[resident-prefill] try_metal_resident_prefill ENTER n={}",
-                token_ids.len()
-            );
-        }
+        Ok(self
+            .try_metal_resident_prefill_inner(token_ids, &[])?
+            .is_some())
+    }
+
+    /// The arming and shape conditions the batched Metal prefill needs, DELIBERATELY
+    /// excluding the KV-position clause.
+    ///
+    /// Split out because two callers need the same predicate for different reasons.
+    /// `try_metal_resident_prefill_inner` adds `kv_cache.position == 0`, because the
+    /// batched prefill builds a cache from empty. The prompt-prefix cache asks WITHOUT
+    /// that clause, because it needs to know whether this prompt would have taken the
+    /// batched path had it not resumed a cached session — see
+    /// `metal_resident_prefill_would_apply`. Keeping one body means the two can never
+    /// drift into disagreeing about eligibility.
+    fn metal_resident_prefill_shape_admits(&self, n_tokens: usize) -> Result<bool> {
         // Two independent arming gates for two different batched prefills:
         //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
         //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
@@ -282,19 +451,75 @@ impl super::LlamaInferenceSession {
         let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        if (!resident_prefill_armed && !gemma3_batched)
-            || token_ids.len() < 2
-            || token_ids.len() > 16384
-            || self.kv_cache.position != 0
-            || self.weights.layer_range.is_some()
-            || !self.resident_decode_eligible(false)?
+        Ok((resident_prefill_armed || gemma3_batched)
+            && (2..=16384).contains(&n_tokens)
+            && self.weights.layer_range.is_none()
+            && self.resident_decode_eligible(false)?)
+    }
+
+    /// Would a prompt of `n_tokens` take the batched Metal prefill, if it started from an
+    /// empty cache?
+    ///
+    /// Asked by the prompt-prefix cache before it resumes a PARTIAL hit. A partial hit
+    /// rolls the cached session back to `kv_position = p > 0`, and the position clause in
+    /// `try_metal_resident_prefill_inner` then declines the batched prefill outright, so
+    /// the divergent suffix falls to the CPU dense forward. That is not a smaller win, it
+    /// is a large loss: measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a
+    /// ~500-token prompt, a cold miss prefills in 1.33 s and a partial hit takes 20.79 s —
+    /// a 15.6x REGRESSION, from the second turn of any conversation carrying a system
+    /// prompt. Q8_0 escapes it only because `kv_roundtrips_through_cpu_exactly` refuses it
+    /// entry to the pool at all, which leaves K-quant models ~18x slower than Q8_0 on
+    /// turn 2 despite being the smaller weights.
+    ///
+    /// So the cache declines the partial resume when this returns true and pays a cold GPU
+    /// prefill instead — faster, and the bit-exact reference path. Exact hits are
+    /// unaffected: they replay a stored logits vector and never prefill at all.
+    ///
+    /// This is a floor, not the ceiling. Threading a base position through
+    /// `prefill_tokens` so the batched prefill can CONTINUE from `p` would beat both arms;
+    /// the scatter and attention uniforms are already there and hardwired to zero
+    /// (`src/metal.rs`, "base position: prefill always starts an empty cache"), and the
+    /// MSL kernels already take `base_position`.
+    pub(crate) fn metal_resident_prefill_would_apply(&self, n_tokens: usize) -> bool {
+        // Eligibility probing must never itself fail a request: an Err here means "cannot
+        // establish that the batched path applies", which is exactly the conservative
+        // answer (keep the existing resume behaviour).
+        self.metal_resident_prefill_shape_admits(n_tokens)
+            .unwrap_or(false)
+    }
+
+    /// Shared resident prefill builder. A successful result owns a live resident session at
+    /// `token_ids.len()` and carries requested pre-layer activation snapshots; `None` keeps the
+    /// ordinary lossless fallback contract.
+    fn try_metal_resident_prefill_inner(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        if trace {
+            eprintln!(
+                "[resident-prefill] try_metal_resident_prefill ENTER n={}",
+                token_ids.len()
+            );
+        }
+        // Which of the two batched prefills this call will drive; the arming half of the
+        // same question lives in `metal_resident_prefill_shape_admits`, which documents
+        // both gates.
+        let gemma3_batched = self.gemma3_batched_prefill_armed();
+        // Position first, deliberately. `resident_decode_eligible` inside
+        // `metal_resident_prefill_shape_admits` emits `[resident-eligible]` trace lines,
+        // and the original `||` chain short-circuited at this clause before reaching it.
+        // Testing position first preserves that exactly: a resumed session at position>0
+        // declines here without ever probing eligibility, so CAMELID_RESIDENT_TRACE output
+        // is unchanged. Every other clause is a pure predicate, so their order is free.
+        if self.kv_cache.position != 0
+            || !self.metal_resident_prefill_shape_admits(token_ids.len())?
         {
-            {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 1");
-                }
-                return Ok(false);
+            if trace {
+                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 1");
             }
+            return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -305,12 +530,10 @@ impl super::LlamaInferenceSession {
         let kv_cap = self.config.context_length as usize;
         let n = token_ids.len();
         if n >= kv_cap {
-            {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 2");
-                }
-                return Ok(false);
+            if trace {
+                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 2");
             }
+            return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
@@ -328,11 +551,9 @@ impl super::LlamaInferenceSession {
             Some(t) => t,
             None => {
                 if trace {
-                    eprintln!(
-                        "[resident-prefill] try_metal_resident_prefill declined (match) site c1"
-                    );
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 3");
                 }
-                return Ok(false);
+                return Ok(None);
             }
         };
         let (cos_all, sin_all, split_half_pairing) =
@@ -386,28 +607,87 @@ impl super::LlamaInferenceSession {
                 .as_ref()
                 .is_some_and(|g| g.rope_neox_pairing);
         let schedule = self.gemma3_resident_schedule(0..n_layers);
-        let mut session = match metal::ResidentDecodeState::new(
+        // Prefix continuation: an engine parked by an earlier turn of this conversation may
+        // already hold the leading rows this prompt needs. Reclaim it only when the model
+        // identity AND the geometry both match, then reuse the run its recorded prompt
+        // shares with this one.
+        //
+        // The claim is bounded three ways, and all three carry weight: by the RECORD (rows
+        // whose tokens we know), by `filled()` (rows the engine still vouches for), and by
+        // `n - 1` so the prefill still ends by writing the last position, which is the state
+        // the decode lane expects. Capture mode opts out — it has no continuation entry
+        // point, and a diagnostic path is not worth a second one.
+        let geometry = ResidentMetalGeometry {
             n_layers,
             n_heads,
-            n_kv,
+            n_kv_heads: n_kv,
             head_dim,
-            dims.embedding_length,
-            dims.feed_forward_length,
-            initial_positions,
-            kv_cap,
-            rms_eps,
-            split_half_pairing,
-            schedule,
-        ) {
-            Some(s) => s,
-            None => {
-                if trace {
-                    eprintln!(
-                        "[resident-prefill] try_metal_resident_prefill declined (match) site c2"
-                    );
+            hidden: dims.embedding_length,
+            ffn_dim: dims.feed_forward_length,
+        };
+        let reclaimed = self
+            .resident_cache_key
+            .and_then(|key| reclaim_resident_metal(key, geometry))
+            .and_then(|(mut state, parked)| {
+                // Decide the claim BEFORE committing to the engine. A reclaimed engine is
+                // only safe for a CONTINUATION: it carries the previous turn's KV, and a
+                // from-scratch prefill driven through one produced corrupt output where a
+                // fresh (zero-filled) engine was correct. So with nothing to reuse, drop it
+                // and take the ordinary build path.
+                let reuse = if capture_layer_ids.is_empty() && !metal::resident_kv_primary_is_half()
+                {
+                    common_prefix_len(&parked, token_ids)
+                        .min(state.filled())
+                        .min(n.saturating_sub(1))
+                } else {
+                    0
+                };
+                // Reuse has to be worth what it costs. A parked engine was sized for the
+                // prompt that built it, so continuing a much longer one through it forces a
+                // KV growth realloc — and growth reallocates, zero-fills and blits the
+                // whole cache behind a blocking wait. Measured: the server's own 10-token
+                // warm-up parked an engine whose 2 shared positions turn 1 then "reused",
+                // paying that growth to save two rows — 6.8 s against 2.1 s for simply
+                // building at the right size. A fresh engine is allocated for the prompt it
+                // will actually hold, so below this floor that is strictly better.
+                const MIN_REUSE_POSITIONS: usize = 256;
+                if reuse < MIN_REUSE_POSITIONS {
+                    return None;
                 }
-                return Ok(false);
+                // Drop the watermark to exactly the reused span BEFORE prefilling the rest,
+                // so a failure below leaves no claim on rows this prefill never wrote.
+                state.set_filled(reuse);
+                Some((state, reuse))
+            });
+        let mut reused = 0usize;
+        let mut session = match reclaimed {
+            Some((state, reuse)) => {
+                reused = reuse;
+                state
             }
+            None => match metal::ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                dims.embedding_length,
+                dims.feed_forward_length,
+                initial_positions,
+                kv_cap,
+                rms_eps,
+                split_half_pairing,
+                schedule,
+            ) {
+                Some(s) => s,
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[resident-prefill] try_metal_resident_prefill declined at site 4"
+                        );
+                    }
+                    return Ok(None);
+                }
+            },
         };
 
         let session_us = session_started.elapsed().as_micros();
@@ -450,7 +730,13 @@ impl super::LlamaInferenceSession {
 
         let embed_us = embed_started.elapsed().as_micros();
         let gpu_started = Instant::now();
-        let prefilled = if gemma3_batched {
+        let layer_inputs = if gemma3_batched {
+            if !capture_layer_ids.is_empty() {
+                if trace {
+                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 5");
+                }
+                return Ok(None);
+            }
             // Tier A: batched weight streaming, bit-identical to `n` token-by-token
             // resident forwards (gate G1). Attention stays per row — the windowed
             // attention-as-matmul kernel is Tier B.
@@ -467,31 +753,101 @@ impl super::LlamaInferenceSession {
                     scale,
                     metal::gemma3_batch_prefill_rows(),
                 )
-                .is_some()
-        } else {
-            session
-                .prefill_tokens(&embeddings.data, n, &layer_views, &cos_all, &sin_all, scale)
-                .is_some()
-        };
-        if !prefilled {
-            {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 3");
+                .map(|_| Vec::new())
+        } else if reused > 0 {
+            // Continue over the reused rows. The RoPE tables are indexed by batch row, so
+            // they are sliced to `[reused, n)` exactly as the embeddings are.
+            let hidden = dims.embedding_length;
+            let half_rope = cos_all.len() / n;
+            let continued = session
+                .prefill_tokens_from(
+                    &embeddings.data[reused * hidden..],
+                    n - reused,
+                    &layer_views,
+                    &cos_all[reused * half_rope..],
+                    &sin_all[reused * half_rope..],
+                    scale,
+                    reused,
+                )
+                .map(|_| Vec::new());
+            match continued {
+                Some(v) => Some(v),
+                // Continuation is refused off the attention-as-matmul lane. That is a
+                // correctness gate, not a failure: fall back to a cold full prefill of the
+                // whole prompt rather than dropping the request to the CPU. The rewind
+                // below is what makes the retry legitimate — the engine must claim nothing
+                // before a prefill that starts from empty.
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[resident-prefill] continuation declined (reuse={reused}); \
+                             rebuilding for a full prefill"
+                        );
+                    }
+                    reused = 0;
+                    // REBUILD rather than rewind. A reclaimed engine is only safe on the
+                    // path prefix continuation was proven on; driving a from-scratch
+                    // prefill through one produced corrupt output (measured: turns 2+ of a
+                    // 3B-Q4_K_M chat degenerated to "!!!!" where a fresh engine was
+                    // correct, and a fresh engine differs exactly in carrying no prior KV).
+                    // `ResidentDecodeState::new` zero-fills, so a fresh engine restores the
+                    // from-empty precondition every non-continuation prefill assumes.
+                    let schedule = self.gemma3_resident_schedule(0..n_layers);
+                    match metal::ResidentDecodeState::new(
+                        n_layers,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        dims.embedding_length,
+                        dims.feed_forward_length,
+                        initial_positions,
+                        kv_cap,
+                        rms_eps,
+                        split_half_pairing,
+                        schedule,
+                    ) {
+                        Some(fresh) => {
+                            session = fresh;
+                            session.prefill_tokens_with_layer_inputs(
+                                &embeddings.data,
+                                n,
+                                &layer_views,
+                                &cos_all,
+                                &sin_all,
+                                scale,
+                                capture_layer_ids,
+                            )
+                        }
+                        None => None,
+                    }
                 }
-                return Ok(false);
             }
-        }
+        } else {
+            session.prefill_tokens_with_layer_inputs(
+                &embeddings.data,
+                n,
+                &layer_views,
+                &cos_all,
+                &sin_all,
+                scale,
+                capture_layer_ids,
+            )
+        };
+        let Some(layer_inputs) = layer_inputs else {
+            if trace {
+                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 6");
+            }
+            return Ok(None);
+        };
         // G11, asserted rather than assumed: the resident decode's rebuild predicate is
         // `filled() != position`, and a short `filled` re-seeds from a CPU KV cache this
         // lane leaves hollow — which then declines at `history_materialized` and silently
         // drops the whole prompt onto a CPU path that fails closed for windowed archs.
         if session.filled() != n {
-            {
-                if trace {
-                    eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 4");
-                }
-                return Ok(false);
+            if trace {
+                eprintln!("[resident-prefill] try_metal_resident_prefill declined at site 7");
             }
+            return Ok(None);
         }
         if time_edges {
             eprintln!(
@@ -506,12 +862,166 @@ impl super::LlamaInferenceSession {
         // GPU cache now holds positions 0..n; the resident decode continues this sequence.
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
-        {
-            if trace {
-                eprintln!("[resident-prefill] try_metal_resident_prefill OK");
-            }
-            Ok(true)
+        // Record the sequence those rows hold, so a later turn of this conversation can
+        // continue from it. Only a prefill that actually wrote them may set this.
+        self.resident_tokens = token_ids.to_vec();
+        if trace && reused > 0 {
+            eprintln!(
+                "[resident-prefill] prefix continuation: reused {reused} of {n} positions, \
+                 prefilled {}",
+                n - reused
+            );
         }
+        if trace {
+            eprintln!("[resident-prefill] try_metal_resident_prefill OK");
+        }
+        Ok(Some(layer_inputs))
+    }
+
+    /// Resident prompt prefill that also returns the three (or any caller-selected) target
+    /// decoder layer inputs needed by a learned speculative head. The prompt prefix is streamed
+    /// once through the resident prefill; its final token is then executed by the byte-identical
+    /// one-row resident verifier to obtain both the missing activation row and the first greedy
+    /// prediction. On success the target's resident KV is live at the full prompt length.
+    #[cfg(target_os = "macos")]
+    pub fn forward_greedy_resident_prefill_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        // The batched capture prefill requires at least two rows, and the final prompt
+        // token is deliberately reserved for the one-row verifier bootstrap.
+        if token_ids.len() < 3 || !resident_decode_metal_enabled() {
+            return Ok(None);
+        }
+        // Check the logits-stage admission before mutating the session into GPU-authoritative
+        // prompt state. A decline after prefill would leave no lossless CPU fallback on this
+        // same session because the resident prompt KV intentionally has no host twin.
+        if !self.resident_decode_eligible(true)? {
+            return Ok(None);
+        }
+
+        let prefix_len = token_ids.len() - 1;
+        let Some(mut prefix_inputs) =
+            self.try_metal_resident_prefill_inner(&token_ids[..prefix_len], capture_layer_ids)?
+        else {
+            return Ok(None);
+        };
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let last_token = token_ids[prefix_len];
+        let mut embedding = weights
+            .token_embedding
+            .embedding_lookup(&[last_token], "token_embedding_resident_capture_last")?;
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for value in &mut embedding.data {
+                *value *= g.embed_scale;
+            }
+        }
+        let tables = match rope::resident_decode_rope_tables(
+            prefix_len,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(tables) => tables,
+            None => return Ok(None),
+        };
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|layer| metal::ResidentLayerWeights {
+                attn_norm: &layer.attention_norm.data,
+                ffn_norm: &layer.ffn_norm.data,
+                q_norm: layer.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: layer.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|t| t.data.as_slice()),
+                post_ffw_norm: layer.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&layer.attention_q),
+                k_weight_blocks: resident_weight_bytes(&layer.attention_k),
+                v_weight_blocks: resident_weight_bytes(&layer.attention_v),
+                o_weight_blocks: resident_weight_bytes(&layer.attention_output),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(layer).2),
+                moe: resident_moe_view(&self.config, layer),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: dims.vocab_size,
+        };
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident prompt session installed by successful prefill");
+        let Some((predictions, last_inputs)) = session.verify_batch_with_layer_inputs(
+            &embedding.data,
+            &tables.cos,
+            &tables.sin,
+            &layer_views,
+            &logits_stage,
+            prefix_len,
+            1,
+            scale,
+            capture_layer_ids,
+        ) else {
+            return Ok(None);
+        };
+        if prefix_inputs.len() != last_inputs.len() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident prompt capture count changed between prefix ({}) and final row ({})",
+                prefix_inputs.len(),
+                last_inputs.len()
+            )));
+        }
+        let mut layer_inputs = Vec::with_capacity(prefix_inputs.len());
+        for (slot, (mut prefix, last)) in prefix_inputs.drain(..).zip(last_inputs).enumerate() {
+            let expected_prefix = prefix_len * dims.embedding_length;
+            if prefix.len() != expected_prefix || last.len() != dims.embedding_length {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "resident prompt layer-input capture {} has prefix/final sizes {}/{}, expected {}/{}",
+                    capture_layer_ids[slot],
+                    prefix.len(),
+                    last.len(),
+                    expected_prefix,
+                    dims.embedding_length
+                )));
+            }
+            prefix.extend_from_slice(&last);
+            layer_inputs.push(CpuTensor::from_f32(
+                format!("resident_prompt_layer_{}_input", capture_layer_ids[slot]),
+                vec![token_ids.len(), dims.embedding_length],
+                prefix,
+            )?);
+        }
+        session.set_filled(token_ids.len());
+        self.kv_cache.position = token_ids.len();
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
+    }
+
+    /// Non-macOS build: resident Metal prompt capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward_greedy_resident_prefill_with_layer_inputs(
+        &mut self,
+        _token_ids: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
     }
 
     /// Make the CPU KV cache hold this sequence's real history before a CPU forward reads it.
@@ -925,6 +1435,11 @@ impl super::LlamaInferenceSession {
             }
             session.set_filled(position);
             self.resident_decode = Some(session);
+            // These rows were RESEEDED from the CPU KV cache, which stores f16-rounded
+            // values — not bit-identical to what a GPU prefill would have written. A later
+            // turn must not treat them as a known-good prefix, which is the whole reason
+            // prefix continuation never round-trips through the host. Stop vouching.
+            self.resident_tokens.clear();
         }
 
         // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
@@ -1094,6 +1609,65 @@ impl super::LlamaInferenceSession {
         }
     }
 
+    /// Resolve + upload this session's full resident weight set into the process-global
+    /// Metal cache and fault its pages in (`metal::prewarm_resident_weights_cache`).
+    ///
+    /// Built for the speculative DRAFT model: its engine otherwise resolves weights
+    /// lazily inside the FIRST `draft()` call, landing the whole convert/upload/page-in
+    /// cost (multi-second for a 1B draft) as a stall in the middle of the user-visible
+    /// decode — which the per-step draft profile then smears into a uniform-looking
+    /// slowdown. Calling this at drafter construction moves that one-time cost to
+    /// configure time, the same place the CUDA lane pays its coexistence reserve.
+    ///
+    /// Lossless and idempotent: it only populates the caches the first encode would
+    /// populate anyway. Returns false (warming nothing) when the resident Metal lane is
+    /// off or this session/model is ineligible for it — the lazy path is unchanged.
+    #[cfg(target_os = "macos")]
+    pub fn prewarm_resident_weights(&self) -> bool {
+        if !resident_decode_metal_enabled() || !self.resident_decode_eligible(true).unwrap_or(false)
+        {
+            return false;
+        }
+        let weights = &self.weights;
+        // A pipeline-sharded node owns a layer subrange with no logits stage; the
+        // single-node drafter this serves never shards, so skip rather than special-case.
+        if weights.layer_range.is_some() {
+            return false;
+        }
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).0),
+                up_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).1),
+                down_weight_blocks: resident_weight_bytes(resident_dense_ffn(l).2),
+                moe: resident_moe_view(&self.config, l),
+                qk_l2_norm_after_rope: self.config.architecture == "mobilemoe",
+            })
+            .collect();
+        let output = resident_weight_bytes(weights.output_projection());
+        let embedding = resident_weight_bytes(&weights.token_embedding);
+        metal::prewarm_resident_weights_cache(&layer_views, Some(&output), Some(&embedding))
+    }
+
+    /// Non-macOS stub: there is no resident Metal engine to warm.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prewarm_resident_weights(&self) -> bool {
+        false
+    }
+
     /// macOS speculative-verify seam: verify a batch of draft tokens against the resident
     /// Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch`,
     /// bit-identical to `k` single-token decodes) and return the accepted prefix (the longest
@@ -1108,6 +1682,29 @@ impl super::LlamaInferenceSession {
         last_token: u32,
         drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        let Some(verified) = self.verify_drafts_metal_with_layer_inputs(last_token, drafts, &[])?
+        else {
+            return Ok(None);
+        };
+        let accepted = crate::inference::speculative::accepted_draft_prefix(
+            drafts,
+            &verified.predictions[..drafts.len()],
+        );
+        Ok(Some(verified.predictions[..=accepted].to_vec()))
+    }
+
+    /// EAGLE-3 target seam: the ordinary resident batch verify plus snapshots of selected
+    /// decoder-layer inputs. The target remains authoritative and this method applies the same
+    /// longest-prefix acceptance and resident-KV commit as [`Self::verify_drafts_metal`].
+    /// `predictions` retains all verify rows so callers can receipt acceptance independently;
+    /// only the accepted prefix plus bonus row advances the logical cache position.
+    #[cfg(target_os = "macos")]
+    pub fn verify_drafts_metal_with_layer_inputs(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         if drafts.is_empty() || self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
         }
@@ -1209,7 +1806,7 @@ impl super::LlamaInferenceSession {
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        let predicted = match session.verify_batch(
+        let (predicted, raw_layer_inputs) = match session.verify_batch_with_layer_inputs(
             &embeddings.data,
             &cos_all,
             &sin_all,
@@ -1218,6 +1815,7 @@ impl super::LlamaInferenceSession {
             position,
             k,
             scale,
+            capture_layer_ids,
         ) {
             Some(p) => p,
             None => return Ok(None),
@@ -1239,7 +1837,22 @@ impl super::LlamaInferenceSession {
                 emitted.len()
             );
         }
-        Ok(Some(emitted))
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!("resident_verify_layer_{}_input", capture_layer_ids[slot]),
+                    vec![k, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions: predicted,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
     }
 
     /// macOS speculative-verify seam (TREE variant): verify a draft TOKEN TREE against the
@@ -1255,6 +1868,32 @@ impl super::LlamaInferenceSession {
         &mut self,
         tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, &[])?
+            .map(|(emitted, _capture)| emitted))
+    }
+
+    /// EAGLE-3 tree target seam: the ordinary target-authoritative tree verify plus snapshots
+    /// of selected decoder-layer inputs in BFS verifier-row order. The target's longest greedy
+    /// path is accepted and compacted before this returns, exactly as in [`Self::verify_tree_metal`].
+    /// The caller must gather only that accepted path before updating the learned head.
+    #[cfg(target_os = "macos")]
+    pub fn verify_tree_metal_with_layer_inputs(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(self
+            .verify_tree_metal_inner(tree, capture_layer_ids)?
+            .map(|(_emitted, capture)| capture))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_tree_metal_inner(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<(Vec<u32>, LlamaGreedyVerifyCapture)>> {
         use spec_tree::TREE_MAX_NODES;
         if self.resident_paths_disabled || !resident_decode_metal_enabled() {
             return Ok(None);
@@ -1361,21 +2000,43 @@ impl super::LlamaInferenceSession {
             .resident_decode
             .as_mut()
             .expect("resident session present (readiness checked above)");
-        let predicted = match session.verify_batch_tree(
-            &embeddings.data,
-            &cos_all,
-            &sin_all,
-            &layer_views,
-            &logits_stage,
-            &node_kvslot,
-            &ancestor_bits,
-            words,
-            position,
-            n,
-            scale,
-        ) {
-            Some(p) => p,
-            None => return Ok(None),
+        // Keep the existing no-capture entry point byte-for-byte on its original Metal API.
+        // Only the new EAGLE seam asks verify_batch_inner to retain layer-input buffers.
+        let (predicted, raw_layer_inputs) = if capture_layer_ids.is_empty() {
+            let Some(predicted) = session.verify_batch_tree(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+            ) else {
+                return Ok(None);
+            };
+            (predicted, Vec::new())
+        } else {
+            let Some(captured) = session.verify_batch_tree_with_layer_inputs(
+                &embeddings.data,
+                &cos_all,
+                &sin_all,
+                &layer_views,
+                &logits_stage,
+                &node_kvslot,
+                &ancestor_bits,
+                words,
+                position,
+                n,
+                scale,
+                capture_layer_ids,
+            ) else {
+                return Ok(None);
+            };
+            captured
         };
 
         // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
@@ -1404,7 +2065,28 @@ impl super::LlamaInferenceSession {
                 emitted.len()
             );
         }
-        Ok(Some(emitted))
+        let layer_inputs = raw_layer_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(slot, values)| {
+                CpuTensor::from_f32(
+                    format!(
+                        "resident_tree_verify_layer_{}_input",
+                        capture_layer_ids[slot]
+                    ),
+                    vec![n, dims.embedding_length],
+                    values,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((
+            emitted,
+            LlamaGreedyVerifyCapture {
+                predictions: predicted,
+                layer_inputs,
+                timings: LlamaForwardTimings::default(),
+            },
+        )))
     }
 
     /// Non-macOS build: the Metal resident speculative-verify path is unavailable, so return
@@ -1419,6 +2101,18 @@ impl super::LlamaInferenceSession {
         Ok(None)
     }
 
+    /// Non-macOS build: Metal layer-input capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_drafts_metal_with_layer_inputs(
+        &mut self,
+        _last_token: u32,
+        _drafts: &[u32],
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
+    }
+
     /// Non-macOS build: the Metal resident tree-verify path is unavailable — return `Ok(None)`
     /// so the caller takes a normal step (lossless either way).
     #[cfg(not(target_os = "macos"))]
@@ -1428,5 +2122,112 @@ impl super::LlamaInferenceSession {
         _tree: &spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
+    }
+
+    /// Non-macOS build: tree layer-input capture is unavailable.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    pub fn verify_tree_metal_with_layer_inputs(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+        _capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        Ok(None)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod parking_tests {
+    use super::*;
+
+    /// A minimal engine. `None` on a host with no Metal device, which skips the test.
+    fn tiny_state(hidden: usize) -> Option<ResidentDecodeState> {
+        metal::ResidentDecodeState::new(1, 1, 1, 32, hidden, 64, 8, 8, 1.0e-5, false, None)
+    }
+
+    /// The slot has exactly one writer in the test binary: this module. A session parks
+    /// only when `resident_cache_key` is set, and only the API sets it, so no other test
+    /// can leave an engine here or take this one.
+    #[test]
+    fn a_parked_engine_is_reclaimed_only_by_an_exact_key_and_geometry_match() {
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            eprintln!("SKIP: no Metal device");
+            return;
+        };
+        state.set_filled(3);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+
+        assert!(
+            reclaim_resident_metal(0xBEEF, geometry).is_none(),
+            "another model's key must not take this engine"
+        );
+        let mut other = geometry;
+        other.hidden += 128;
+        assert!(
+            reclaim_resident_metal(0xD00D, other).is_none(),
+            "a geometry mismatch must rebuild, never reuse another shape's strides"
+        );
+
+        let (state, tokens) =
+            reclaim_resident_metal(0xD00D, geometry).expect("an exact match reclaims");
+        assert_eq!(tokens, vec![7, 8, 9], "the record must survive parking");
+        assert_eq!(
+            state.filled(),
+            3,
+            "the watermark must survive parking, or the next turn cannot bound its claim"
+        );
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "reclaiming takes the engine: the slot must not hand the same one out twice"
+        );
+    }
+
+    /// Parking is refused when the record and the watermark disagree, because that is
+    /// exactly the state a failed prefill or a rewind leaves behind — rows the record
+    /// claims but the engine does not hold, or rows it holds but cannot name. Reusing
+    /// either as a known prefix is silently wrong output.
+    #[test]
+    fn an_engine_whose_record_disagrees_with_its_watermark_is_not_parked() {
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            eprintln!("SKIP: no Metal device");
+            return;
+        };
+        state.set_filled(2);
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "filled=2 against a 3-token record claims rows never written: drop, do not park"
+        );
+
+        // The opposite direction is ordinary, not an error: decode leaves the watermark
+        // past the prompt, and parking rewinds it to the record rather than refusing.
+        clear_parked_resident_metal();
+        let Some(mut state) = tiny_state(32) else {
+            return;
+        };
+        state.set_filled(6); // prompt of 3, then 3 generated tokens
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, vec![7, 8, 9]);
+        let (state, tokens) = reclaim_resident_metal(0xD00D, geometry)
+            .expect("a decoded-past engine must still park: this is every real request");
+        assert_eq!(tokens, vec![7, 8, 9]);
+        assert_eq!(
+            state.filled(),
+            3,
+            "the watermark must be rewound to the record, so the next turn cannot claim              generated rows the record does not name"
+        );
+
+        clear_parked_resident_metal();
+        let Some(state) = tiny_state(32) else { return };
+        let geometry = ResidentMetalGeometry::of(&state);
+        park_resident_metal(0xD00D, geometry, state, Vec::new());
+        assert!(
+            reclaim_resident_metal(0xD00D, geometry).is_none(),
+            "an empty record vouches for nothing and must not park"
+        );
     }
 }

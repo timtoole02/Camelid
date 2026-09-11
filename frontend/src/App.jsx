@@ -85,13 +85,22 @@ function App() {
     dashboard, authRequired, tab, setTab, selectedConversationId, setSelectedConversationId,
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
+    inspectMode, setInspectMode, tokenInspections, inspectionSupported,
+    structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
+    structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
+    toolsEnabled, setToolsEnabled, toolsText, setToolsText, toolContract, toolCapability, toolsReadiness, toolCallSignatures,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage,
+    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
+    conversationTags, archivedConversationCount, conversationTagFilter, toggleConversationTagFilter,
+    clearConversationTagFilter, showArchivedConversations, setShowArchivedConversations,
+    setConversationPinned, setConversationArchived, addConversationTag, removeConversationTag,
+    importConversationsFromText,
     activateModel, unloadCurrentModel,
     registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -345,6 +354,17 @@ function App() {
           onSelectConversation={selectConversation}
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
+          conversationTags={conversationTags}
+          tagFilter={conversationTagFilter}
+          onToggleTagFilter={toggleConversationTagFilter}
+          onClearTagFilter={clearConversationTagFilter}
+          archivedCount={archivedConversationCount}
+          showArchived={showArchivedConversations}
+          onToggleShowArchived={setShowArchivedConversations}
+          onTogglePin={setConversationPinned}
+          onToggleArchive={setConversationArchived}
+          onAddTag={addConversationTag}
+          onRemoveTag={removeConversationTag}
           runtime={runtime}
           apiSurface={apiSurface}
           themePreference={preference}
@@ -417,10 +437,34 @@ function App() {
               saveToMemory={saveToMemory}
               sendMessage={sendMessage}
               resendFromMessage={resendFromMessage}
+              continueFromMessage={continueFromMessage}
+              regenerateAsVariant={regenerateAsVariant}
+              selectMessageVariant={selectMessageVariant}
+              discardMessageVariant={discardMessageVariant}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}
               setReceiptMode={setReceiptMode}
+              inspectMode={inspectMode}
+              setInspectMode={setInspectMode}
+              tokenInspections={tokenInspections}
+              inspectionSupported={inspectionSupported}
+              structuredMode={structuredMode}
+              setStructuredMode={setStructuredMode}
+              structuredSchema={structuredSchema}
+              setStructuredSchema={setStructuredSchema}
+              structuredGrammar={structuredGrammar}
+              setStructuredGrammar={setStructuredGrammar}
+              structuredRecords={structuredRecords}
+              structuredSupported={structuredSupported}
+              structuredReadiness={structuredReadiness}
+              toolsEnabled={toolsEnabled}
+              setToolsEnabled={setToolsEnabled}
+              toolsText={toolsText}
+              setToolsText={setToolsText}
+              toolCapability={toolCapability}
+              toolsReadiness={toolsReadiness}
+              toolCallSignatures={toolCallSignatures}
               thinkingMode={thinkingMode}
               setThinkingMode={setThinkingMode}
               webResearchEnabled={webResearchEnabled}
@@ -463,6 +507,7 @@ function App() {
           {tab === 'history' && (
             <HistoryView
               filteredConversations={filteredConversations}
+              importConversationsFromText={importConversationsFromText}
               setSelectedConversationId={selectConversation}
               setTab={navigateTab}
               deleteConversation={requestDeleteConversation}
@@ -522,7 +567,7 @@ function App() {
             />
           )}
 
-          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+          {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} metricsApiBase={apiBase} />}
 
           {tab === 'settings' && (
             <SettingsView

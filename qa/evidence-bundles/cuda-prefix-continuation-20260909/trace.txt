@@ -1,0 +1,20 @@
+# resident-cuda trace, ON arm (arm on-1)
+[resident-cuda] GPU prefill 10 tokens in 2060 ms
+[resident-cuda] prefix continuation: reused 2 of 1436 positions, prefilled 1434
+[resident-cuda] GPU prefill 1436 tokens in 10113 ms
+[resident-cuda] prefix continuation: reused 1436 of 1473 positions, prefilled 37
+[resident-cuda] GPU prefill 1473 tokens in 706 ms
+[resident-cuda] prefix continuation: reused 1473 of 1511 positions, prefilled 38
+[resident-cuda] GPU prefill 1511 tokens in 731 ms
+[resident-cuda] prefix continuation: reused 1511 of 1549 positions, prefilled 38
+[resident-cuda] GPU prefill 1549 tokens in 721 ms
+[resident-cuda] prefix continuation: reused 1549 of 1589 positions, prefilled 40
+[resident-cuda] GPU prefill 1589 tokens in 782 ms
+
+# resident-cuda trace, OFF arm (arm off-1) - no continuation lines by construction
+[resident-cuda] GPU prefill 10 tokens in 2847 ms
+[resident-cuda] GPU prefill 1436 tokens in 10030 ms
+[resident-cuda] GPU prefill 1473 tokens in 10453 ms
+[resident-cuda] GPU prefill 1511 tokens in 10876 ms
+[resident-cuda] GPU prefill 1549 tokens in 11112 ms
+[resident-cuda] GPU prefill 1589 tokens in 11497 ms

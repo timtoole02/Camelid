@@ -8,7 +8,13 @@
    the retirement list with reasons lives in the re-baseline commit message.
    From that commit onward this smoke is part of the standing I6 gate set. */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { createServer } from 'vite'
 
 import {
   NEW_CHAT_SENTINEL,
@@ -210,7 +216,8 @@ assert.match(messageTurnSource, /\{message\.role === 'assistant' && <MessageMeta
 assert.match(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must label the post-first-content browser timing as decode rate')
 assert.match(diagnosticsSource, /Decode Rate/, 'developer diagnostics must use the same decode-rate label')
 assert.match(messageTurnSource, /tokens est\.[\s\S]*in \{usage\.prompt_tokens\}[\s\S]*out \{usage\.completion_tokens/, 'the streaming footer should label live input and output token counts explicitly')
-assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: 0,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and zero output tokens before the first streamed token')
+assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: continuedCompletionTokens,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and its already-generated output count before the first streamed token')
+assert.match(dashboardHookSource, /const continuedCompletionTokens = continuedMessage[\s\S]{0,200}?:\s*0/, 'a reply that is NOT a continuation still seeds zero output tokens — the seed above is non-zero only when resuming a reply that already produced text')
 assert.match(dashboardHookSource, /completion_tokens: realTokens,[\s\S]*total_tokens: promptTokenEstimate \+ realTokens/, 'live assistant patches should advance output token usage during generation')
 assert.match(dashboardHookSource, /sendGate\.chatMode !== 'experimental' && sendGate\.hint\?\.target/, 'an experimental artifact must not persist a verified reference-row chip')
 assert.match(messageTurnSource, /message\.support_row && !message\.experimental_lane/, 'legacy experimental replies must hide contradictory verified reference-row chips')
@@ -239,7 +246,11 @@ assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
 assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
-assert.match(dashboardHookSource, /const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the first generated token and exclude its baseline count')
+// The window opens at the first GENERATED token and subtracts the token count
+// already delivered at that instant, so research and TTFT are excluded from the
+// rate. It is expressed with firstTokenAt/decodeStartTokens, which the
+// web-research smoke pins from the other side.
+assert.match(dashboardHookSource, /const decodedTokens = firstTokenAt === null \? 0 : Math\.max\(0, realTokens - decodeStartTokens\)[\s\S]*const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the active generated-token window and exclude its baseline count')
 assert.match(dashboardHookSource, /effectiveGenerationTokenLimit\([\s\S]*runtime\?\.max_generation_tokens/, 'the outgoing max_tokens value must obey the same live server ceiling used by research budgeting')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
@@ -421,8 +432,11 @@ assert.doesNotMatch(catalogBrowseSource, /pendingCatalogId|acquisitionLocked/, '
 assert.match(catalogBrowseSource, /setPendingItems[\s\S]*current\.filter/, 'parallel acquisitions must preserve every independently pending row')
 assert.match(modelsViewSource, /loadQueueRef\.current\.then\(run, run\)/, 'parallel downloads must queue only their model-transition step instead of rejecting overlapping starts')
 // The refusal set must stay the FULL one. Testing `fit !== 'wont_fit'` alone was a
-// real defect: an `insufficient_free_memory` row would chain into a load that the
-// 422 preload guard refuses, since that guard blocks on both negative verdicts.
+// real defect. Its original reason has since gone stale — the 422 preload guard no
+// longer refuses `insufficient_free_memory`, it loads and warns — but the gate has
+// not: an UNATTENDED download-and-start must not be launched at a host the advisory
+// already calls short of memory. Such a row still downloads; the user then starts it
+// deliberately from the Models page, which is where the warning and the override are.
 assert.match(catalogBrowseSource, /const refusedByFit = isRefusingFit\(item\.fit\)/, 'auto-start must gate on every load-refusing verdict, not just wont_fit')
 assert.match(modelActivationSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: CHECKING, message, code, blocker/, 'automatic activation must fail closed on an HTTP-level inspect failure')
 assert.match(modelActivationSource, /activeFilename !== filename[\s\S]*did not confirm/, 'automatic navigation must wait for current-model confirmation')
@@ -628,10 +642,28 @@ const {
   const complete = paceDrain(state, received)
   assert.equal(paceHasPendingText(complete, received), false, 'a caught-up display must stop requesting pacing frames')
 }
+{
+  const state = createPacerState({ steadyCharsPerSecond: 240 })
+  const received = 'x'.repeat(1000)
+  let shown = paceFirstVisiblePrefix(state, received, 0)
+  const firstLength = shown.length
+  for (let now = 16; now <= 1000; now += 16) shown = paceStep(state, received, now)
+  const advanced = shown.length - firstLength
+  assert.ok(advanced >= 235 && advanced <= 245, `steady reservoir advanced ${advanced} chars instead of ~240 in one second`)
+  assert.ok(shown.length < received.length, 'steady reservoir must not teleport to the received tail')
+  assert.equal(paceDrain(state, received), received, 'steady reservoir still drains byte-identical on abort/fallback')
+}
 assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
 assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
 assert.match(dashboardHookSource, /if \(paced !== lastPacedContent\)/, 'pacing ticks must not re-commit unchanged content')
-assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) startPacing\(\)/, 'the pacing loop must stop once displayed text catches the received stream')
+assert.match(dashboardHookSource, /if \(paceHasPendingText\(paced, fullContent\)\) \{\s*startPacing\(\)\s*\} else \{[\s\S]*if \(pacingSettle\)/, 'the pacing loop must stop or resolve its terminal wait once displayed text catches the received stream')
+assert.match(dashboardHookSource, /createPacerState\(smoothSegmentedPacing[\s\S]*steadyCharsPerSecond: 240/, 'the private segmented lane must opt into the visible-50 received-text reservoir')
+assert.match(dashboardHookSource, /completedVerifiedSegments >= 2/, 'visible-50 pacing must hold two exact sections before revealing the reservoir')
+assert.match(dashboardHookSource, /await waitForPacingToSettle\(\)[\s\S]*const streamedContent = paceDrain\(pacer, streamed\.content/, 'steady completion must settle visibly before the byte-identical final message replaces it')
+assert.match(dashboardHookSource, /content: continuedMessage\s*\n\s*\? joinContinuation\(continuationPrefix, streamedContent\)\s*\n\s*: streamedContent,/, 'the terminal write must use that same drained text — a continuation joins it onto the kept reply, everything else writes it unchanged')
+assert.match(dashboardHookSource, /smoothSegmentedPacing && !streamTransportComplete && lastPacedContent[\s\S]*streaming_phase: 'thinking'/, 'an exhausted segmented reservoir must surface the stock thinking state instead of looking frozen')
+assert.match(streamingIndicatorSource, /THINKING_STREAMING_LABEL\s*=\s*'Thinking…'/, 'the exhausted-reservoir fallback must visibly say Thinking')
+assert.match(streamingIndicatorSource, /phase === 'thinking'\) return THINKING_STREAMING_LABEL/, 'the thinking phase must route through the stock streaming status component')
 
 /* ---- Streaming feel: paced by elapsed time, and scroll is never stolen ---- */
 // The pacer must advance on its own animation frame loop, not only when a
@@ -641,6 +673,7 @@ assert.match(dashboardHookSource, /stopPacing\(\)/, 'the pacing loop must be hal
 // Frame-rate independence: the advance comes from elapsed time, so 120Hz gets
 // smaller, more frequent steps rather than running twice as fast.
 assert.match(streamPacingSource, /Math\.exp\(-elapsed \/ CATCH_UP_TAU_MS\)/, 'the pacer must advance from elapsed time so motion is frame-rate independent')
+assert.match(streamPacingSource, /elapsed \* state\.steadyCharsPerMs/, 'a received-text reservoir must also use frame-time, never callback count')
 // Auto-follow must release on the user's gesture. Keying it to a distance
 // threshold is what made the view fight a small trackpad scroll.
 assert.match(chatWorkspaceSource, /releaseOnUpwardIntent/, 'auto-follow must release on upward scroll intent, not on a distance threshold')
@@ -804,6 +837,25 @@ for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)
 }
 
+/* ---- No UI surface may hand the user an environment variable ----
+   The pre-load fit guard used to close its refusal with "set CAMELID_SKIP_FIT_CHECK=1
+   to attempt the load anyway", and that sentence reached the WebUI verbatim through
+   the blocker's message. It is unperformable by the audience reading it: the desktop
+   sidecar is spawned args-only, so a GUI user has no process to set it on. The
+   performable form is the "Load anyway" control asserted further down.
+
+   Scanned over the whole shipped tree rather than a curated list, because the copy
+   that caused this could have landed in any of these files — and because the next
+   such string will not be this one. */
+const shippedUiRoot = fileURLToPath(new URL('../src/', import.meta.url))
+const shippedUiFiles = readdirSync(shippedUiRoot, { recursive: true }).filter((entry) => /\.(jsx?|css)$/.test(entry))
+assert.ok(shippedUiFiles.length > 50, 'the environment-variable scan must actually be walking the shipped tree')
+for (const relative of shippedUiFiles) {
+  const source = readFileSync(join(shippedUiRoot, relative), 'utf8')
+  assert.doesNotMatch(source, /CAMELID_SKIP_FIT_CHECK/, `src/${relative} must not tell a user to set CAMELID_SKIP_FIT_CHECK`)
+  assert.doesNotMatch(source, /\bset [A-Z][A-Z0-9]*_[A-Z0-9_]+=/, `src/${relative} must not instruct a user to set an environment variable`)
+}
+
 /* ---- Streaming visuals (current chat.css/ui.css truth) ---- */
 assert.match(chatCss, /\.streaming-loader\s*\{[^}]*display:\s*inline-flex/s, 'streaming assistant rows should keep a dedicated loader')
 assert.match(chatCss, /\.streaming-loader-label\s*\{[^}]*color:\s*var\(--color-text-muted\)[^}]*font-size:\s*var\(--text-xs\)/s, 'the visible pre-token status should use readable secondary text styling')
@@ -823,6 +875,148 @@ assert.match(tokensCss, /@keyframes camelidDotBounce/, 'the streaming dot bounce
    Imported here rather than added to the workflow because that is the frontend
    suite CI already gates; a behavioural module with no gate is a regression
    waiting to happen. The module asserts at import time and throws on failure. */
+/* ---- The pre-load fit advisor is advisory ----
+   `InsufficientFreeMemory` says "this machine is big enough, it is just busy right
+   now", and it was bucketed with `WontFit` into one terminal 422. On an 8 GiB machine
+   that turned away an ordinary 2.0 GB Q4_K_M and closed with a remedy — an
+   environment variable — that the desktop app has no way to set. The transient case
+   now loads and reports `warnings`; only capacity refusals stay 422, and those carry
+   an override the reader can actually press.
+
+   The wire half (a 200 carrying `warnings`, a 422 `host_memory_exhausted`, and
+   `force: true` on the retry) is proven by execution in
+   frontend/scripts/first-run-activation-smoke.mjs. Pinned here is the wiring the
+   source owns: an advisory must never reach the fail-closed blocker state, and a
+   refusal must carry its override into the surface that renders it. */
+const unsupportedBlockerSource = read('../src/components/models/UnsupportedBlocker.jsx')
+assert.match(modelsViewSource, /setLoadWarnings\(result\.warnings \|\| \[\]\)/, 'a load that succeeded must surface the engine advisory instead of dropping it')
+assert.equal(
+  (modelsViewSource.match(/setBlocker\((?:null|result\.blocker)\)/g) || []).length,
+  (modelsViewSource.match(/setBlocker\(/g) || []).length,
+  'the blocker may only be cleared or raised from a typed refusal — an advisory must never reach it',
+)
+assert.match(modelsViewSource, /loadWarnings\.map\(\(warning, index\) => \([\s\S]{0,200}<Notice/, 'advisories must render as page notices, never through the fail-closed blocker')
+assert.match(modelsViewSource, /tone=\{warning\?\.severity === 'info' \? 'info' : 'warning'\}/, 'an advisory keeps the severity the engine gave it and never escalates to the error tone')
+assert.match(modelsViewSource, /onDismiss=\{\(\) => dismissLoadWarning\(index\)\}/, 'a notice over a model that loaded fine must be dismissable')
+/* The override is the fix itself: the engine's escape hatch is an environment
+   variable and the desktop sidecar is spawned args-only, so this control is the only
+   form of that retry a GUI user can reach. */
+assert.match(modelsViewSource, /onForceLoad=\{blockedRequest \? forceLoadBlockedModel : null\}/, 'a refusal must carry its override into the blocker surface')
+assert.match(modelsViewSource, /loadModelForChat\(blockedRequest\.filename, \{ model: blockedRequest\.model, force: true \}\)/, '"Load anyway" must re-issue the refused load through the same queued protocol, changed only by force')
+assert.match(modelActivationSource, /\.\.\.\(force \? \{ force: true \} : \{\}\)/, 'force must be omitted rather than sent as false, so an ordinary load stays the request every existing server already accepts')
+assert.match(modelActivationSource, /Array\.isArray\(loaded\?\.warnings\) && loaded\.warnings\.length \? loaded\.warnings : null/, 'an absent or empty warnings field is silence, not a rendered empty notice')
+const forceableSet = unsupportedBlockerSource.match(/const FORCEABLE_REFUSALS = new Set\(\[([\s\S]*?)\]\)/)
+assert.ok(forceableSet, 'the overridable refusals must stay one explicit list rather than a predicate')
+assert.deepEqual(
+  forceableSet[1].match(/'[a-z_]+'/g),
+  ["'host_memory_exhausted'", "'host_memory_unavailable'", "'model_too_large_for_host'"],
+  'only the memory-ESTIMATE refusals may be overridden: forcing there re-runs the identical load on the identical path, which is nothing like forcing past a missing implementation',
+)
+
+/* ---- The two surfaces, compiled ----
+   Rendered rather than pinned by regex: an override only counts if it reaches the DOM
+   attached to a live handler, and a "non-blocking" notice only counts if it actually
+   announces politely. Same vite SSR route the markdown and integration smokes use. */
+const ssr = await createServer({
+  root: fileURLToPath(new URL('../', import.meta.url)),
+  appType: 'custom',
+  logLevel: 'silent',
+  server: { middlewareMode: true },
+})
+try {
+  const { UnsupportedBlocker, blockerIsForceable } = await ssr.ssrLoadModule('/src/components/models/UnsupportedBlocker.jsx')
+  const { Notice } = await ssr.ssrLoadModule('/src/components/ui/Notice.jsx')
+  const { loadLocalModelForChat } = await ssr.ssrLoadModule('/src/lib/modelActivation.js')
+
+  const exhausted = {
+    code: 'host_memory_exhausted',
+    message: 'This model’s ~2.3 GB estimated footprint cannot be satisfied on this machine right now.',
+  }
+  const refusalMarkup = renderToStaticMarkup(React.createElement(UnsupportedBlocker, { blocker: exhausted, onForceLoad: () => {} }))
+  assert.match(refusalMarkup, /unsupported-blocker__code">host_memory_exhausted</, 'the new refusal code must render like every other typed blocker')
+  assert.match(refusalMarkup, /Load anyway/, 'a capacity refusal must offer the override in the DOM')
+  assert.match(refusalMarkup, /class="unsupported-blocker__risk"/, 'and must state what overriding costs before offering it')
+  assert.doesNotMatch(refusalMarkup, /CAMELID_|environment variable/, 'the rendered remedy must be the button, never a variable the reader cannot set')
+
+  // The affordance is gated twice and each gate has to hold on its own.
+  assert.doesNotMatch(
+    renderToStaticMarkup(React.createElement(UnsupportedBlocker, { blocker: exhausted })),
+    /Load anyway/,
+    'a caller with no override handler must not be shown a dead button',
+  )
+  assert.doesNotMatch(
+    renderToStaticMarkup(React.createElement(UnsupportedBlocker, {
+      blocker: { code: 'unsupported_model_architecture', message: 'Camelid does not implement mamba.' },
+      onForceLoad: () => {},
+    })),
+    /Load anyway/,
+    'an unimplemented architecture must stay fail-closed however the caller is wired',
+  )
+  assert.equal(blockerIsForceable({ code: 'model_requires_unload' }), false, 'a resident-model conflict is fixed by unloading the other model, not by forcing past an estimate')
+
+  /* "Working" means the button's own handler reaches the load endpoint with the
+     preflight skipped — the affordance and the wire contract joined, so neither can
+     drift into a control that looks right and posts the same refused request. */
+  const findOverride = (node) => {
+    if (!node || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = findOverride(child)
+        if (found) return found
+      }
+      return null
+    }
+    if (node.props?.children === 'Load anyway' && typeof node.props?.onClick === 'function') return node
+    return findOverride(node.props?.children)
+  }
+
+  const loadBodies = []
+  const fetchImpl = async (url, options) => {
+    if (url.endsWith('/api/models/inspect')) return { ok: true, status: 200, json: async () => ({}) }
+    if (url.endsWith('/api/models/load')) {
+      loadBodies.push(JSON.parse(options.body))
+      return { ok: true, status: 200, json: async () => ({ id: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf' }) }
+    }
+    if (url.endsWith('/api/models/current')) return { ok: true, status: 200, json: async () => ({ path: 'models/Llama-3.2-3B-Instruct-Q4_K_M.gguf' }) }
+    return { ok: true, status: 200, json: async () => ({ loaded_now: true, generation_ready: true, active_model_id: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf' }) }
+  }
+  const override = findOverride(UnsupportedBlocker({
+    blocker: exhausted,
+    onForceLoad: () => loadLocalModelForChat({
+      apiBase: 'http://camelid.test',
+      filename: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+      force: true,
+      fetchImpl,
+    }),
+  }))
+  assert.ok(override, 'the override must be a real button in the rendered tree, not decoration')
+  assert.equal(override.props.disabled, false)
+  await override.props.onClick()
+  assert.equal(loadBodies.length, 1, 'pressing the override must issue exactly one load')
+  assert.equal(loadBodies[0].force, true, 'and that load must be the same request carrying force: true')
+  assert.equal(loadBodies[0].path, 'models/Llama-3.2-3B-Instruct-Q4_K_M.gguf')
+
+  const busyOverride = findOverride(UnsupportedBlocker({ blocker: exhausted, onForceLoad: () => {}, forceBusy: true }))
+  assert.equal(busyOverride.props.disabled, true, 'the override must not be pressable again while its load is in flight')
+
+  /* The 200-with-warnings half. The engine's advisory is a notice: it announces
+     politely, it can be dismissed, and — the part that regressed — it leaves no
+     fail-closed blocker on a page whose model is loaded and usable. */
+  const advisory = 'Only ~1.6 GB of ~8.6 GB memory is free right now; Camelid loaded the model anyway.'
+  const noticeMarkup = renderToStaticMarkup(React.createElement(Notice, { notice: advisory, tone: 'warning', onDismiss: () => {} }))
+  assert.match(noticeMarkup, /class="cx-notice cx-notice--warning"/, 'an advisory renders in the warning tone, not the error tone')
+  assert.match(noticeMarkup, /role="status"/, 'a load that succeeded must not announce itself as an alert')
+  assert.match(noticeMarkup, /aria-live="polite"/, 'nor interrupt a screen reader for a model that is already usable')
+  assert.match(noticeMarkup, /aria-label="Dismiss"/, 'and it must be dismissable, because the model works behind it')
+  assert.equal(
+    renderToStaticMarkup(React.createElement(UnsupportedBlocker, { blocker: null, onForceLoad: () => {} })),
+    '',
+    'a warning must leave no blocker on the page at all',
+  )
+} finally {
+  await ssr.close()
+}
+
 await import('./catalog-browse-smoke.mjs')
 await import('./catalog-companion-smoke.mjs')
 

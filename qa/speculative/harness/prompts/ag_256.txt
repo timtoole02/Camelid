@@ -1,0 +1,24 @@
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a coding agent in a Rust repository.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Speculative decoding never fires on streamed requests. Find why and fix it.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Reading src/inference/speculative.rs.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/speculative.rs"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's
+49	/// own greedy predictions position by position.
+50	pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usize {
+51	    drafts
+52	        .iter()
+53	        .zip(target_predictions.iter())
+54	        .take_while(|(draft, <|start_header_id|>assistant<|end_header_id|>
+

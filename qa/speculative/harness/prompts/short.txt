@@ -1,0 +1,1 @@
+Explain in one paragraph why memory bandwidth, not arithmetic throughput, is the limiting factor when decoding tokens from a large language model on a laptop-class GPU.

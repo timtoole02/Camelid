@@ -1,0 +1,1 @@
+Generate a sequence of 60 unrelated, unpredictable words, each on its own line, drawn from wildly different domains (physics, cooking, mythology, finance, marine biology). Do not let any word predict the next.

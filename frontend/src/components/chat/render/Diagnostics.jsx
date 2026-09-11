@@ -44,7 +44,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
               </div>
             )}
             {outputRate && (
-              <div className="summary-card">
+              <div className="summary-card" data-native-rate={message.tokens_out_per_sec ?? undefined}>
                 <span className="card-label">Decode Rate</span>
                 <strong className="card-value">{outputRate}</strong>
               </div>

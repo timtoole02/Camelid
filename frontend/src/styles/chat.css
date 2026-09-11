@@ -120,12 +120,41 @@
 .cxturn__avatar { flex: none; }
 .cxturn__body { flex: 1; min-width: 0; padding-top: 3px; }
 .cxturn__warning {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
   margin-top: var(--space-3);
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: var(--color-text-muted);
   font-size: var(--text-sm);
+}
+/* Continue sits inside the budget warning rather than with Copy/Regenerate:
+   it is the answer to THAT sentence, and pairing it with Regenerate is how a
+   reader loses the text they were trying to keep. */
+.cxturn__warning-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+.cxturn__warning-action:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.cxturn__warning-action:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
 }
 .cxturn__warning--error { color: var(--color-error); }
 .cxturn__warning--interrupted { color: var(--color-warning); }
@@ -1356,3 +1385,42 @@
   border-top: 1px solid var(--color-border-soft, #2a333f);
 }
 
+
+/* ---- Regenerated-reply siblings -----------------------------------------
+   Sits at the head of the actions row. Kept quiet: on a reply with one
+   version it is not rendered at all, so this must never make an ordinary
+   thread look busier than it did before regenerating became safe. */
+.cxturn__variants {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-right: var(--space-1);
+  padding: 1px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+}
+.cxturn__variant-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 2px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+.cxturn__variant-step:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.cxturn__variant-step:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.cxturn__variant-discard:hover { color: var(--color-error); }
+.cxturn__variant-count {
+  padding: 0 var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-faint);
+  font-variant-numeric: tabular-nums;
+}

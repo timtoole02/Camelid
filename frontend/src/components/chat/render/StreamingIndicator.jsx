@@ -7,10 +7,12 @@ export const FIRST_TOKEN_STREAMING_LABEL = 'Generating response'
 export const LONG_FIRST_TOKEN_STREAMING_LABEL = 'Local response is taking a while'
 export const ACTIVE_STREAMING_LABEL = 'Streaming response'
 export const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
+export const THINKING_STREAMING_LABEL = 'Thinking…'
 
 export const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   if (phase === 'preparing') return PREPARING_STREAMING_LABEL
-  if (phase === 'streaming') return isOpenCode ? OPEN_CODE_STREAMING_LABEL : ACTIVE_STREAMING_LABEL
+  if (phase === 'thinking') return THINKING_STREAMING_LABEL
+  if (phase === 'streaming' || phase === 'streaming_segments') return isOpenCode ? OPEN_CODE_STREAMING_LABEL : ACTIVE_STREAMING_LABEL
   if (elapsedSeconds >= 20) return LONG_FIRST_TOKEN_STREAMING_LABEL
   return FIRST_TOKEN_STREAMING_LABEL
 }
@@ -39,15 +41,19 @@ const formatLiveRate = (value) => {
 
 /* Per-second values (elapsed time, live tok/s) are aria-hidden so the polite
    live region announces only phase-label changes, never the ticking counters. */
-export function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, tokensPerSec = null }) {
-  const liveRate = formatLiveRate(tokensPerSec)
+export function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, tokensPerSec = null, nativeSegmentRate = null, waitForNativeRate = false }) {
+  const hasNativeRate = Number.isFinite(Number(nativeSegmentRate)) && Number(nativeSegmentRate) > 0
+  const displayedRate = waitForNativeRate
+    ? (hasNativeRate ? nativeSegmentRate : null)
+    : (hasNativeRate ? nativeSegmentRate : tokensPerSec)
+  const liveRate = formatLiveRate(displayedRate)
   return (
     <div className="message-live-generation-badge" role="status" aria-live="polite" data-live-status="active">
       <span className="message-live-dot" aria-hidden="true" />
       <span>{label}</span>
       <span aria-hidden="true">{elapsedSeconds}s</span>
       {liveRate && (
-        <span className="message-live-tps" aria-hidden="true">
+        <span className="message-live-tps" aria-hidden="true" data-live-rate={Number(displayedRate)} data-rate-source={hasNativeRate ? 'backend-native' : 'browser'}>
           <span className="message-live-tps__value">{liveRate}</span>
           <span className="message-live-tps__unit">tok/s</span>
         </span>

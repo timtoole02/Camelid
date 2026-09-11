@@ -1,0 +1,5 @@
+{"probe": "hello", "oracle_text": ", I am a ", "camelid_text": ", I am interested in", "match": false, "err": null}
+{"probe": "hello", "oracle_text": ", I am a ", "camelid_text": ", I am interested in", "match": false, "err": null}
+{"probe": "france", "oracle_text": " a city of romance,", "camelid_text": " a city of romance,", "match": true, "err": null}
+{"probe": "france", "oracle_text": " a city of romance,", "camelid_text": " a city of romance,", "match": true, "err": null}
+{"probe": "once", "oracle_text": ", in a small village", "camelid_text": ", in a small village", "match": true, "err": null}

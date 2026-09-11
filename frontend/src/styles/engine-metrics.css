@@ -1,0 +1,101 @@
+/* Engine metrics and active configuration.
+
+   COLOR POSTURE. No new colour tokens. The lane badge is the only place a status
+   colour appears, and the choice is deliberate: an EVIDENCED lane is a claim about
+   parity evidence, which is exactly what copper (--color-verified) is reserved
+   for — this is one of the few surfaces entitled to it. A lane without an evidence
+   claim is NOT an error and never uses red; it takes the calm muted slate the
+   token file reserves for "unsupported", which the doctrine says is never styled
+   as an alarm. */
+
+.engmetrics { display: flex; flex-direction: column; gap: var(--space-6); }
+.engmetrics__section { display: flex; flex-direction: column; gap: var(--space-3); }
+.engmetrics__section h2 { margin: 0; font-size: var(--text-md); color: var(--color-text); }
+
+.engmetrics__intro,
+.engmetrics__note {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+.engmetrics__error { margin: 0; font-size: var(--text-2xs); color: var(--color-warning); }
+
+.engmetrics__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-3);
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
+}
+
+.engmetrics__stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.engmetrics__stat dt {
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-faint);
+}
+.engmetrics__stat dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.engmetrics__stats--muted { background: none; padding: 0 var(--space-3); }
+.engmetrics__stats--muted .engmetrics__stat dd { font-size: var(--text-sm); color: var(--color-text-muted); }
+
+.engmetrics__lane {
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.engmetrics__lane-label {
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  font-weight: 600;
+  color: var(--color-text-faint);
+}
+
+.engmetrics__lane-detail {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+/* Copper is earned here: this row states that the active lane carries parity
+   evidence, which is precisely the claim copper is reserved for. */
+.engmetrics__lane--evidenced {
+  border-color: color-mix(in srgb, var(--color-verified) 40%, transparent);
+}
+.engmetrics__lane--evidenced .engmetrics__lane-label { color: var(--color-verified); }
+
+/* Not an alarm. The doctrine keeps 'unsupported' calm and muted. */
+.engmetrics__lane--unevidenced .engmetrics__lane-label,
+.engmetrics__lane--unknown .engmetrics__lane-label { color: var(--color-unsupported); }
+
+.engmetrics__table { font-size: var(--text-2xs); width: 100%; }
+.engmetrics__value { font-family: var(--font-mono); color: var(--color-text); word-break: break-word; }
+.engmetrics__change { color: var(--color-text-faint); white-space: nowrap; }
+
+.engmetrics__row-note {
+  display: block;
+  font-size: var(--text-micro);
+  color: var(--color-text-faint);
+  margin-top: 2px;
+}
+
+.engmetrics__reasons { font-size: var(--text-2xs); color: var(--color-text-muted); }
+.engmetrics__reasons summary { cursor: pointer; color: var(--color-text-faint); }
+.engmetrics__reasons ul { margin: var(--space-2) 0 0; padding-left: var(--space-4); display: flex; flex-direction: column; gap: 3px; }

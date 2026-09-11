@@ -1,0 +1,157 @@
+{
+  "schema": "camelid.gemma4_mini2_head_ab.v1",
+  "date": "2026-08-29",
+  "claim_scope": "Dense Gemma 4 12B QAT Q4_0 decode with the tied Q6_K output projection moved from CPU to the strict ordered, file-backed Metal kernel. This receipt does not claim speculative decoding throughput.",
+  "host": {
+    "name": "mini2",
+    "model_name": "Mac mini",
+    "model_identifier": "Mac16,10",
+    "model_number": "MU9D3LL/A",
+    "chip": "Apple M4",
+    "cores": "10 (4 performance, 6 efficiency)",
+    "memory_bytes": 17179869184,
+    "macos_version": "26.5.2",
+    "macos_build": "25F84"
+  },
+  "source": {
+    "branch": "campaign/gemma4-12b-mini2",
+    "base_commit": "e3ba4ce72c0462f8e38ca2af1ee271ee2dbbfb4f",
+    "tested_diff_sha256": "8197d7b6ec08799f3e7113643e39b92b5bde2a57c7aa109ae1804c0288726926",
+    "binary_sha256": "5bc92299d681affd4522efd1b1113b4f30b666428277ce56a9d244b458f7150f"
+  },
+  "target": {
+    "file": "gemma-4-12b-it-qat-q4_0.gguf",
+    "bytes": 6975879296,
+    "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    "huggingface_commit": "29d097773436b69ff9feafd636ab4cf873786537"
+  },
+  "policy": {
+    "environment_variable": "CAMELID_GEMMA4_DENSE_METAL_Q6K_HEAD",
+    "control_value": "0",
+    "treatment_value": "1",
+    "default": "enabled outside deterministic mode",
+    "invalid_value": "disabled",
+    "deterministic_mode": "disabled",
+    "construction_or_dispatch_failure": "exact established CPU projection fallback",
+    "ghost_turbo_allowed": false,
+    "resident_weight_copy": false
+  },
+  "raw_recurrence_prompt": {
+    "text": "Write a detailed technical explanation of speculative decoding and its performance tradeoffs.",
+    "sha256": "a342b95cc70f2120a785e8b5796ae81ebf887b857b7335bf5272261da657e9c7",
+    "max_tokens": 96,
+    "forwards": 110,
+    "token_ids_sha256_all_runs": "f18da32ad98042c39e40ed2ace2f90a23ce4d278bb80f6d00489822c5f53bb55",
+    "first_divergent_generated_token_index": -1,
+    "control_runs": [
+      {
+        "id": "off-r1",
+        "tok_s": 9.60,
+        "gpu_us_per_forward": 90509,
+        "cpu_prep_us_per_forward": 45,
+        "real_s": 14.03,
+        "peak_memory_footprint_bytes": 6858205600,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "d97dc257e942c8cdccead06d0d7c0b62ec93f8969921a9f329b838738c1b2065"
+      },
+      {
+        "id": "off-r2",
+        "tok_s": 9.62,
+        "gpu_us_per_forward": 90378,
+        "cpu_prep_us_per_forward": 43,
+        "real_s": 13.11,
+        "peak_memory_footprint_bytes": 6857828864,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "398ed69ecc7b400e6c5d9437c4c27ddc756450ea6239ac4a6de920365abd8a9e"
+      },
+      {
+        "id": "off-r3",
+        "tok_s": 9.67,
+        "gpu_us_per_forward": 89888,
+        "cpu_prep_us_per_forward": 45,
+        "real_s": 13.24,
+        "peak_memory_footprint_bytes": 6863530424,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "ecd731aee8858fcaa20a6a5a612b1f2a91d8b057f71cb359e81703c2bb49aaec"
+      }
+    ],
+    "treatment_runs": [
+      {
+        "id": "on-r1",
+        "tok_s": 10.16,
+        "gpu_us_per_forward": 85611,
+        "cpu_prep_us_per_forward": 37,
+        "real_s": 12.85,
+        "peak_memory_footprint_bytes": 6863153616,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "47a3b09b76e1b51c0ad33bb9f949ed5a041ebcd2c9244c7ed0c7acaadd260e4a"
+      },
+      {
+        "id": "on-r2",
+        "tok_s": 10.14,
+        "gpu_us_per_forward": 85733,
+        "cpu_prep_us_per_forward": 37,
+        "real_s": 12.63,
+        "peak_memory_footprint_bytes": 6848604624,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "e0f2f08283c3975a2e87e7dcdb381ceeaa653a6fa390089b09d7688402506a8c"
+      },
+      {
+        "id": "on-r3",
+        "tok_s": 10.00,
+        "gpu_us_per_forward": 86938,
+        "cpu_prep_us_per_forward": 38,
+        "real_s": 12.51,
+        "peak_memory_footprint_bytes": 6849276392,
+        "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+        "stderr_sha256": "9b72ab104237574b3db48b281e429ab19775b80a3c6384c33da273c43af3179a"
+      }
+    ],
+    "aggregate": {
+      "control_mean_tok_s": 9.63,
+      "treatment_mean_tok_s": 10.10,
+      "throughput_gain_percent": 4.88,
+      "control_mean_gpu_us_per_forward": 90258.33,
+      "treatment_mean_gpu_us_per_forward": 86094.0,
+      "gpu_forward_reduction_percent": 4.61
+    }
+  },
+  "chat_prompt": {
+    "text": "<|turn>user\nGive three concrete techniques for speeding up neural network inference on Apple silicon, with tradeoffs.<turn|>\n<|turn>model\n",
+    "sha256": "411a64f7b01ee87e508b3062281e2b63aed8a99febacd91e37a4feb64d84e354",
+    "max_tokens": 64,
+    "forwards": 90,
+    "token_ids_sha256_both_runs": "b267077eb8a87254c77d2880fe71ccbad0e5e1780d4639fd6b127551a754b307",
+    "first_divergent_generated_token_index": -1,
+    "control": {
+      "tok_s": 7.71,
+      "gpu_us_per_forward": 91868,
+      "cpu_prep_us_per_forward": 45,
+      "real_s": 11.67,
+      "peak_memory_footprint_bytes": 6857845200,
+      "stdout_sha256": "9f3a376e79405a4ca2aff89bf43ead0cecf50717d8d5de0778682da7aba8c76a",
+      "stderr_sha256": "dc48a521668c610d7be80720644b694111ef50604d24221cecf096b0709147d3"
+    },
+    "treatment": {
+      "tok_s": 8.06,
+      "gpu_us_per_forward": 87987,
+      "cpu_prep_us_per_forward": 42,
+      "real_s": 11.09,
+      "peak_memory_footprint_bytes": 6862989800,
+      "stdout_sha256": "9f3a376e79405a4ca2aff89bf43ead0cecf50717d8d5de0778682da7aba8c76a",
+      "stderr_sha256": "be064564ae8350f0898f5cb7d83f4c190ce75fca4d1f9546559066110dab346a"
+    },
+    "throughput_gain_percent": 4.54,
+    "gpu_forward_reduction_percent": 4.23,
+    "output_prefix": "To speed up neural network inference on Apple Silicon (M1/M2/M3 chips), you must optimize for the Unified Memory Architecture (UMA) and the Apple Neural Engine (ANE)."
+  },
+  "validation": {
+    "cargo_check_lib": "pass",
+    "dense_q6k_head_policy_defaults_on_and_fails_closed": "pass",
+    "metal_q6k_ordered_is_bit_exact_for_adversarial_superblocks": "pass, including the 12B n_superblocks=15 geometry",
+    "git_diff_check": "pass",
+    "swap_events": 0,
+    "verdict": "PASS"
+  },
+  "remote_receipt_directory": "~/gemma4-12b-speed/receipts"
+}

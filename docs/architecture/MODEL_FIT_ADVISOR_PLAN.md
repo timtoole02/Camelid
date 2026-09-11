@@ -70,11 +70,48 @@ Every item below was read in-tree on branch `feat/model-fit-advisor` at
 - **Advisory, not authoritative.** The estimate is a heuristic. The existing
   `VramShortfall` (mid-load) and `KvCacheBudgetExceeded` (mid-gen) guards remain
   the hard safety net and are the source of truth.
+- **Split refusals by permanence, not by severity.** A host that is *busy right
+  now* and a host that is *too small* are different facts with different
+  remedies. Only the second may refuse a load; the first warns and proceeds.
+  §9 is the binding mapping.
 - **Degrade to silence on unknowns.** When `host_ram_total_bytes == 0` or
   VRAM is unknown, the verdict is `Unknown` and the UI shows nothing scary — it
   **never blocks** a download on an unknown.
 - **Pure and testable.** All math lives in a GPU-free, unit-tested function, in
   the `src/cuda_vram.rs::evaluate` style.
+
+### 5.1 Platform note — the macOS probe, and how it turned an advisory into a gate
+
+macOS was an *unprobed* host until `587d415e` "Add macOS desktop sidecar support
+(#527)" (2026-07-28): `host_ram_bytes()` fell through to the `(0, 0)` arm, every
+Mac reported `Unknown`, and the load guard could not fire there by construction.
+That commit wired `crate::gait::host_ram_status()` into `HardwareProfile` and
+silently converted every macOS host from never-blocked to blockable — without
+revisiting whether the verdicts behind the gate were all permanent facts. They
+were not, and the busy-host verdict then began refusing ordinary models on
+8 GB machines. Recorded here because the mechanism generalizes: **giving a
+platform a probe changes what every gate downstream of that probe does.**
+
+The probe is also conservative in a way that matters. `macos_ram_stats`
+(`src/gait/mod.rs`) computes `available` as `(free_count + inactive_count) ×
+page_size` — free plus cold-but-resident pages only. It counts none of the other
+memory the kernel can reclaim under pressure, and reads roughly **half** of what
+`memory_pressure -Q` reports as free on the same host at the same moment. That
+makes every consumer of the number pessimistic by roughly 2×.
+
+Correcting the probe is **deliberately out of scope here** and belongs in its own
+change: the same figure feeds four independent consumers with different failure
+modes, and none of them are exercised by this document's tests —
+
+- the KV auto-budget (`src/inference/kv_cache.rs::kv_cache_budget_from`),
+- the resident-MoE expert preflight (`src/inference.rs::preflight_resident_moe_experts`),
+- this advisor's `usable_host_ram_bytes`,
+- and the content-addressed GAIT receipt's `HostSafety::ram_headroom_gib`, whose
+  self-digest makes the number part of a receipt's identity.
+
+Widening `available` would relax a safety budget and change a receipt's bytes in
+one commit. Splitting the load guard by permanence (§9) fixes the user-visible
+dead end without touching any of them.
 
 ## 6. Data model
 
@@ -85,6 +122,7 @@ enum FitVerdict {
     FitsResident,      // weights + KV fit in VRAM within headroom (GPU) OR in RAM (CPU host)
     FitsWithOffload,   // weights exceed VRAM but fit VRAM+host-RAM offload split (CUDA lane)
     CpuOnlyOk,         // no usable GPU, but fits host RAM
+    InsufficientFreeMemory, // an idle host would hold it; this one is busy — transient
     WontFit,           // exceeds every available budget
     Unknown,           // hardware unknown or unavailable — advisory-blind
 }
@@ -135,11 +173,21 @@ Decision order (host-honest):
    weight+kv, headroom)`. Ok → `FitsResident`. Shortfall but
    `weight+kv <= vram_free + usable_host_ram` → `FitsWithOffload` (mirrors the
    documented VRAM+host-RAM offload split). Else fall through.
-3. No usable GPU: if `weight+kv <= usable_host_ram` → `CpuOnlyOk`, else
-   `WontFit`.
+3. No usable GPU: if `weight+kv <= usable_host_ram` → `CpuOnlyOk`, else a
+   negative verdict.
 
-`usable_host_ram` reuses the `kv_cache` budget shape (`max(80% avail, 25%
-total)`), so the advisor and the runtime guard agree.
+Negative verdicts are split by permanence: a footprint an *idle* host would have
+held (`80%` of **total** RAM, plus total VRAM on the offload branch) is
+`InsufficientFreeMemory`; anything larger is `WontFit`. The gate itself still
+reads only what is free, so the split cannot make the advisor optimistic — it
+changes the explanation and, at the load boundary, the remedy (§9).
+
+`usable_host_ram` is `80%` of **available** RAM with **no total-RAM floor** —
+deliberately stricter than the `kv_cache` budget, which floors the same figure at
+25% of total. The KV guard can afford that floor because the weights are already
+resident when it runs; a pre-load advisor cannot, since flooring here would claim
+a model "fits" on a genuinely starved host. `src/fit.rs::usable_host_ram_bytes`
+is the contract.
 
 ## 8. Slices (end-to-end)
 
@@ -208,6 +256,8 @@ total)`), so the advisor and the runtime guard agree.
   host; `Unknown`/`Fits*` and a `CAMELID_SKIP_FIT_CHECK=1` override proceed
   unchanged, so it is a fail-fast convenience, not a new hard gate. Pure decision
   split into testable `fit_preload_message` + `best_fitting_catalog_suggestion`.
+  *(The refusal set widened past `WontFit` after this slice and was corrected in
+  Slice 9; §9 is the current mapping.)*
 - Tests: 4 new (`preload_message_*`, `best_fitting_suggestion_*`) → 9 in
   `catalog_fit_tests`. Gates: `cargo fmt` ✅ · `cargo clippy --lib` ✅ ·
   `cargo test --lib` → **688 passed, 0 failed** ✅ · frontend `vite build` ✅.
@@ -350,9 +400,12 @@ tree):
   read + `HardwareProfile::detect`, which inits a CUDA context on GPU hosts) now
   runs under `spawn_blocking`, consistent with the header fetches; a panic in the
   probe is non-fatal (falls through to the load).
-- **Honest RAM-budget docs (`fit.rs`).** The advisor's `max(80% available, 25% of
-  total)` mirrors the *values* of the KV-cache budget constants but is an
-  independent reimplementation over `HardwareProfile`. Documented the two real,
+- **Honest RAM-budget docs (`fit.rs`).** The advisor's `80% of available` mirrors
+  the *value* of the KV-cache budget's available-RAM constant but is an
+  independent reimplementation over `HardwareProfile`. (This bullet said `max(80%
+  available, 25% of total)` until the total-RAM floor was dropped in `e2f51ffa`
+  — flooring a *pre-load* budget at a quarter of total RAM overcommits a starved
+  host, which the KV guard can afford and this one cannot.) Documented the two real,
   intentional divergences from the KV runtime guard: (1) the advisor additionally
   probes Linux, where the KV guard is unprobed; (2) on unprobed RAM the KV guard
   fails open (unbounded) while the advisor abstains (`Unknown`). On macOS both
@@ -364,19 +417,104 @@ tree):
   authoritative. Re-probing per GET would re-init CUDA on every catalog request.
 
 **Compatibility note (`POST /api/models/load`).** The advisor adds a fail-fast
-path: a request that previously always attempted the load can now return
-`422 model_too_large_for_host` on a `WontFit` verdict from a *probed* host. This
-is a behavior change on a stable endpoint. It is overridable — `CAMELID_SKIP_FIT_CHECK=1`
-restores the unconditional load-attempt behavior (covered by
-`skip_fit_check_override_matches_only_the_exact_flag`). It never fires on an
-unprobed host (`Unknown` is never `WontFit`), and the authoritative
-`VramShortfall`/`KvCache` guards remain the hard net after the load begins.
+path: a request that previously always attempted the load can now return a
+`422` on a refusing verdict from a *probed* host. This is a behavior change on a
+stable endpoint. It never fires on an unprobed host (`Unknown` never refuses),
+the authoritative `VramShortfall`/`KvCache` guards remain the hard net after the
+load begins, and two overrides restore the unconditional load-attempt behavior:
+`"force": true` on the request body and `CAMELID_SKIP_FIT_CHECK=1` in the
+environment. §9 is the current verdict → code → status mapping; it narrowed the
+refusal set this slice shipped.
 
 - Gates: `cargo test --lib` → **710 passed, 0 failed**;
   `cargo clippy --all-targets --all-features -- -D warnings` clean;
   `cargo fmt --all -- --check` clean.
 
-## 9. UX placement decision (locked)
+### Slice 9 — warn on a busy host; refuse only what the machine cannot hold
+
+Slice 3 bucketed **both** negative verdicts into one refusal, and Slice 8's
+compatibility note inherited the same conflation. `InsufficientFreeMemory` means
+"this machine is big enough, it is just busy right now" — so a 2.0 GB
+Llama-3.2-3B Q4_K_M was refused `422` on an 8 GB Mac whenever ~1.3 GB of
+post-reserve headroom was short of its ~2.3 GB estimated footprint. Two things
+made that a dead end rather than an inconvenience:
+
+- **The remedy was unperformable by its own audience.** The refusal told the user
+  to set `CAMELID_SKIP_FIT_CHECK=1`, but the desktop sidecar is spawned
+  args-only (`camelid-desktop/src/engine.rs` sets no `.env()`/`.envs()`), so a
+  GUI user has nowhere to put that variable.
+- **It was a false statement about the machine.** A host with 1.5 GB free
+  reported every row down to 1 GB as too big for it, which reads as "this
+  product does not work here".
+
+The fix keeps the advisor's arithmetic and changes only what a refusal *means*:
+
+- `LoadModelRequest` gains `force: bool` (`#[serde(default)]`) — the per-request
+  equivalent of the env var, checked before any probe or file read so it works
+  even on a path that does not exist. It is the override a UI can put on a
+  button; the env var stays for operators.
+- `fit_preload_message` returns a three-way `FitPreflight`
+  (`Proceed`/`Warn`/`Refuse`) instead of an `Option<refusal>`. `Warn` is carried
+  to the client as `warnings: [{code, severity, message}]` on the **200** body,
+  omitted entirely when empty so an existing client's parse is unchanged.
+- `host_memory_exhausted` is the new floor that keeps the downgrade safe:
+  `fit::hard_floor_bytes` = total RAM − wired pages, i.e. the largest allocation
+  the machine could satisfy *after evicting everything evictable*. Unlike free
+  memory this cannot be improved by closing an application, and on Metal hosts
+  nothing downstream would catch an oversized weight allocation (`VramShortfall`
+  is CUDA-only; the KV budget guards cache growth, not weights). An unprobed
+  wired figure (`0`, meaning "no claim") never manufactures a refusal.
+- Every remaining `422` message now names `"force": true` as the retry, except
+  `model_requires_unload`, whose better remedy is `"replace": true` (one step,
+  no override) — see §9.
+
+`FitVerdict::refuses_load()` is deliberately **unchanged**: a catalog row on a
+busy host should still render as unavailable. The load boundary asks the separate
+question `FitVerdict::is_transient()`, so the two surfaces can disagree honestly.
+
+## 9. Load-time contract — which verdicts warn, which refuse
+
+The binding mapping for `POST /api/models/load`. A verdict alone does not decide
+the outcome: `fit_preload_message` also weighs whether releasing a model of ours
+would help and whether the allocation is physically satisfiable at all.
+
+| `FitVerdict` | Additional condition | Preflight | HTTP | Code | Remedy offered |
+| --- | --- | --- | --- | --- | --- |
+| `fits_resident` / `fits_with_offload` / `cpu_only_ok` | — | proceed | 200 | — | — |
+| `unknown` | host unprobed, or the advisor abstained | proceed | 200 | — | — |
+| `insufficient_free_memory` | another model of ours is resident | **refuse** | 422 | `model_requires_unload` | `"replace": true`, or `POST /api/models/unload` first |
+| `insufficient_free_memory` | footprint > total RAM − wired RAM | **refuse** | 422 | `host_memory_exhausted` | `"force": true` (closing apps cannot help) |
+| `insufficient_free_memory` | otherwise — the host is merely busy | **warn** | 200 | `host_memory_unavailable` | none needed; it loads |
+| `wont_fit` | another model of ours is resident | **refuse** | 422 | `model_requires_unload` | `"replace": true`, or unload first |
+| `wont_fit` | otherwise | **refuse** | 422 | `model_too_large_for_host` | a smaller catalog row, named; or `"force": true` |
+
+Reading rules:
+
+- **`model_requires_unload` is checked first**, ahead of both other refusals and
+  ahead of the warn path. It is the most specific, and the only one a caller can
+  clear without overriding the check at all, so it must not be masked by the
+  generic wording.
+- **Warnings ride the success body.** A `Warn` is emitted as a top-level
+  `warnings` array on the normal `200` `LoadedModel` response — `[{ "code":
+  "host_memory_unavailable", "severity": "warning", "message": … }]` — and the
+  key is **omitted entirely** when there is nothing to report (never `null`,
+  never `[]`).
+- **Refusals keep their existing shape:** `422` with the error envelope
+  `{ "error": { "code", "message", "field": "path" } }`.
+- **Two overrides skip the preflight entirely**, before any hardware probe or
+  file read: `"force": true` on the request body (per-request; the only one the
+  desktop app can reach, since its sidecar is spawned args-only) and
+  `CAMELID_SKIP_FIT_CHECK=1` in the environment (process-wide; operator-only).
+  Both leave `VramShortfall`/`KvCacheBudgetExceeded` as the only gates.
+- **`refuses_load()` ≠ this table.** `FitVerdict::refuses_load()` answers the
+  *catalog* question (should this row render as unavailable?) and returns true
+  for both negative verdicts. The load guard additionally asks
+  `FitVerdict::is_transient()`. Keeping them separate is intentional: a busy host
+  should grey out a row *and* still honor a deliberate load.
+- The guard does not run at all for an idempotent re-load of an
+  already-resident model — nothing new is allocated.
+
+## 10. UX placement decision (locked)
 
 The verdict is most valuable **at model-selection time**, embedded in the
 existing `CatalogLaneBrowse` picker (which already consumes `/api/capabilities`
@@ -385,7 +523,7 @@ so every front-end (CLI, WebUI, desktop sidecar) inherits it. **No** separate
 "advisor screen." Rationale: one source of truth, mirrors how the support
 contract already flows to every surface, lowest friction.
 
-## 10. Testing strategy
+## 11. Testing strategy
 
 - **Unit (Slice 1):** table-driven `assess()` cases; deterministic, no GPU.
 - **API (Slice 2):** extend the `capabilities_*` / catalog serialization tests.
@@ -394,7 +532,7 @@ contract already flows to every surface, lowest friction.
 - **Regression:** existing `VramShortfall` and `KvCacheBudgetExceeded` behavior
   unchanged (they remain the hard net).
 
-## 11. Non-goals / guardrails
+## 12. Non-goals / guardrails
 
 - No support-claim widening; a fit verdict is never parity/validation.
 - No download gating on hardware (informed choice, not enforcement).
@@ -402,7 +540,7 @@ contract already flows to every surface, lowest friction.
 - No throughput/tokens-per-sec prediction (out of scope; footprint only).
 - Estimation is advisory; runtime guards are authoritative.
 
-## 12. Open questions (resolve before/within Slice 1)
+## 13. Open questions (resolve before/within Slice 1)
 
 1. KV term: add per-row dims to `CatalogItem` (§6.2a, precise) vs conservative
    per-arch bound (§6.2b, no schema change)? Leaning 6.2b for Slice 1 to stay

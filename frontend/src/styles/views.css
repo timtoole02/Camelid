@@ -513,6 +513,10 @@
   border-color: color-mix(in srgb, var(--color-ready) 44%, var(--color-border-soft));
   box-shadow: inset 3px 0 0 var(--color-ready), var(--shadow-1);
 }
+.downloaded-model--loading {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-border-soft));
+  box-shadow: inset 3px 0 0 var(--color-accent), var(--shadow-1);
+}
 .downloaded-model__tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
 .downloaded-model .cxv-card__foot {
   align-items: stretch;
@@ -527,6 +531,9 @@
   justify-content: flex-end;
 }
 .downloaded-model .cxv-card__actions .cx-btn { width: 100%; }
+/* Tracks are minmax(0, 160px) and shrink freely, so a bare 140px floor
+   overflows into the delete button on narrow cards. */
+.downloaded-model .cxv-card__actions .cx-btn.is-loading-bar { min-width: min(140px, 100%); }
 .downloaded-model .cxv-card__actions .cxv-danger { grid-column: 2; }
 .downloaded-empty {
   display: flex;
@@ -1400,6 +1407,8 @@
 .unsupported-blocker__note { margin: 0 0 var(--space-2); font-size: var(--text-xs); color: var(--color-text-muted); }
 .unsupported-blocker__redirect { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .unsupported-blocker__redirect code { font-family: var(--font-mono); overflow-wrap: anywhere; word-break: break-word; }
+.unsupported-blocker__override { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--color-border-soft); }
+.unsupported-blocker__risk { margin: 0; font-size: var(--text-xs); color: var(--color-text-muted); }
 .catalog-group { margin-top: var(--space-3); }
 .catalog-group-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-2); }
 .catalog-group-head h3 { margin: 0; font-size: var(--text-sm); text-transform: uppercase; letter-spacing: var(--tracking-label); color: var(--color-text-muted); }

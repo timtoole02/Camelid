@@ -1,0 +1,608 @@
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a coding agent working in a Rust repository. Use tools to read and edit files.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Speculative decoding never fires on streamed requests. Find why and fix it.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/speculative.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/speculative.rs","offset":40,"limit":55}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's
+49	/// own greedy predictions position by position.
+50	pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usize {
+51	    drafts
+52	        .iter()
+53	        .zip(target_predictions.iter())
+54	        .take_while(|(draft, prediction)| draft == prediction)
+55	        .count()
+56	}
+57	
+58	/// Result of lossless speculative rejection sampling for a single verification round.
+59	#[derive(Debug, Clone, PartialEq, Eq)]
+60	pub struct SpeculativeRejectionResult {
+61	    /// Emitted tokens for this round: accepted prefix of draft tokens, followed by the
+62	    /// corrective or terminal bonus token from the target distribution.
+63	    pub emitted_tokens: Vec<u32>,
+64	    /// Number of draft tokens accepted before a rejection or full draft acceptance.
+65	    pub accepted_draft_count: usize,
+66	}
+67	
+68	/// Sample a token index from a discrete probability distribution given a uniform random value in [0, 1).
+69	pub fn sample_from_probs(probs: &[f32], uniform_r: f32) -> u32 {
+70	    let mut cumsum = 0.0f32;
+71	    let u = uniform_r.clamp(0.0, 0.9999999);
+72	    for (idx, &p) in probs.iter().enumerate() {
+73	        if p > 0.0 {
+74	            cumsum += p;
+75	            if cumsum > u {
+76	                return idx as u32;
+77	            }
+78	        }
+79	    }
+80	    // Fallback if sum of probabilities < 1 due to floating point rounding
+81	    probs
+82	        .iter()
+83	        .enumerate()
+84	        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+85	        .map(|(idx, _)| idx as u32)
+86	        .unwrap_or(0)
+87	}
+88	
+89	/// Deterministic random stream for one stochastic speculative-verification round.
+90	///
+91	/// Each committed token position owns a disjoint block of draws, so repeated runs with the same
+92	/// seed are reproducible even though a round may consume a variable number of random values.
+93	pub fn seeded_rejection_rng(seed: u64, committed_tokens: u64) -> impl FnMut() -> f32 {
+94	    let stream_base = committed_tokens.wrapping_mul(64);
+95	    let mut draw_index = 0u64;<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/speculative.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/speculative.rs","old_string":"41	pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+42	
+43	/// Default drafted tokens per round for the draft-model drafter. Each draft
+44	/// token costs a sequential forward through the draft model, so the window
+45	/// stays shorter.
+46	pub const DEFAULT_MODEL_DRAFT_TOKENS: usize = 5;
+47	
+48	/// Count the longest accepted prefix: drafted tokens that equal the target's"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/spec_tree.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/spec_tree.rs","offset":100,"limit":50}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+101	    pub fn node_depth(&self) -> Vec<i32> {
+102	        self.depth.iter().map(|&d| d as i32).collect()
+103	    }
+104	
+105	    /// Per-node KV slot relative to `base` (the current KV position). Every
+106	    /// node gets a UNIQUE slot = `base + BFS index`, so the batched verify can
+107	    /// scatter each node's K/V into its own cache row without collision. The
+108	    /// per-node attention mask (which earlier slots a node may read) is the
+109	    /// ancestor bitset, not the slot itself.
+110	    pub fn node_kvslot(&self, base: usize) -> Vec<i32> {
+111	        (0..self.nodes()).map(|i| (base + i) as i32).collect()
+112	    }
+113	
+114	    /// Ancestor bitset: `ceil(N/32)` u32 words per node. For node `i`, bit `j`
+115	    /// (word `j/32`, bit `j%32`) is set iff node `j` is an ancestor of `i` or
+116	    /// `i` itself. This is the causal attention mask for tree verify — a node
+117	    /// attends only to the tokens on its own root-to-node path. Returns the
+118	    /// flat bitset and the stride (words per node).
+119	    pub fn ancestor_bitset(&self) -> (Vec<u32>, usize) {
+120	        let n = self.nodes();
+121	        let words = n.div_ceil(32);
+122	        let mut bits = vec![0u32; n * words];
+123	        for i in 0..n {
+124	            // Walk i and all its ancestors, setting the corresponding bits.
+125	            let mut cur = i as i32;
+126	            while cur >= 0 {
+127	                let c = cur as usize;
+128	                bits[i * words + c / 32] |= 1u32 << (c % 32);
+129	                cur = self.parent[c];
+130	            }
+131	        }
+132	        (bits, words)
+133	    }
+134	
+135	    /// Lossless greedy-exact tree accept.
+136	    ///
+137	    /// `predicted[i]` is the target model's greedy argmax for node `i` (i.e.
+138	    /// the token that should follow node `i` along its path). The root is
+139	    /// always accepted: `predicted[0]` is the guaranteed +1 bonus. At an
+140	    /// accepted node `c` we look for the child `ch` whose token equals
+141	    /// `predicted[c]` (the model's own next token); if one exists we accept and
+142	    /// emit it and recurse from `ch`. When no child matches we stop and emit
+143	    /// `predicted[c]` as the final bonus token (the model's greedy next token,
+144	    /// which no draft branch covered).
+145	    ///
+146	    /// Returns `(emitted_tokens, leaf_node)` where `leaf_node` is the last
+147	    /// accepted DRAFT node (its KV is committed by the caller advancing the
+148	    /// position). For an anchor-only tree the leaf is the root (0).
+149	    ///
+150	    /// Every emitted token is `predicted[c]` for some accepted node `c`, i.e.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/spec_tree.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/spec_tree.rs","old_string":"101	    pub fn node_depth(&self) -> Vec<i32> {
+102	        self.depth.iter().map(|&d| d as i32).collect()
+103	    }
+104	
+105	    /// Per-node KV slot relative to `base` (the current KV position). Every
+106	    /// node gets a UNIQUE slot = `base + BFS index`, so the batched verify can
+107	    /// scatter each node's K/V into its own cache row without collision. The
+108	    /// per-node attention m"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/api/mod.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/api/mod.rs","offset":17150,"limit":45}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+17151	    max_tokens > 1
+17152	        && moe.is_some_and(|metadata| metadata.family_label == "Mixtral")
+17153	        && !explicitly_enabled
+17154	}
+17155	
+17156	/// Whether lossless greedy or distribution-preserving stochastic speculation may engage.
+17157	///
+17158	/// Per-step logit consumers and pipeline-sharded verify remain unsupported.
+17159	///
+17160	/// The windowed-arch disqualifier is Phase 3c finding F4. `serve --spec-decode`
+17161	/// (CPU speculation) pins the target off the resident paths so the chunk-verify
+17162	/// rollback has CPU-authoritative KV — which for gemma3 means every request
+17163	/// lands on the CPU dense forward and H4-errors. GPU speculation is no better:
+17164	/// `encode_attention`, the attention the batched verify encodes, takes no
+17165	/// `window_start` at all and reads `[0, position_count)` full-causal (it is
+17166	/// shared with the gemma4 lane and was never threaded with the window; §9a
+17167	/// records this as an open residual). Neither verify lane can express the
+17168	/// sliding window, so speculation is declined for the ARCH rather than gated
+17169	/// per speculation mode.
+17170	///
+17171	/// Declining here — rather than teaching routing about spec mode — keeps
+17172	/// routing spec-blind and leaves `serve --spec-decode` SERVING gemma3 on the
+17173	/// plain resident lane, instead of failing every request. Lossless speculation
+17174	/// only ever adds throughput, so dropping it costs correctness nothing.
+17175	fn speculation_admissible(
+17176	    sampling: &SamplingConfig,
+17177	    collect_dense_diagnostics: bool,
+17178	    has_logit_diagnostics: bool,
+17179	    pipeline_sharded: bool,
+17180	    config: &LlamaModelConfig,
+17181	) -> bool {
+17182	    // Sampled requests decline speculation outright. Their verify has no GPU
+17183	    // lane — the batched verifier returns argmax rows, not distributions — so a
+17184	    // stochastic round takes `forward_sampling_verify_chunk`: a k-row CPU
+17185	    // forward of the whole model plus a resident->CPU KV mirror-back, against a
+17186	    // resident step it is trying to beat. Below near-perfect acceptance that is
+17187	    // a net loss, and chat defaults are temperature>0, so leaving the lane
+17188	    // reachable made "speculation enabled" a regression for ordinary traffic.
+17189	    // The exact rejection sampler stays in the tree for the future GPU
+17190	    // distribution verifier; this gate only stops the lane engaging today.
+17191	    sampling == &SamplingConfig::default()
+17192	        && !collect_dense_diagnostics
+17193	        && !has_logit_diagnostics
+17194	        && !pipeline_sharded
+17195	        && !crate::model::arch_has_windowed_attention(config)<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/api/mod.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/api/mod.rs","old_string":"17151	    max_tokens > 1
+17152	        && moe.is_some_and(|metadata| metadata.family_label == "Mixtral")
+17153	        && !explicitly_enabled
+17154	}
+17155	
+17156	/// Whether lossless greedy or distribution-preserving stochastic speculation may engage.
+17157	///
+17158	/// Per-step logit consumers and pipeline-sharded verify remain unsupported."}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/suffix_decoding.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/suffix_decoding.rs","offset":1,"limit":50}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+2	//!
+3	//! Drafts a tree of likely continuations from the *observed* token stream
+4	//! (prompt + generated history) alone — no model forward. The idea (Suffix
+5	//! Decoding, Oliaro et al. 2024): find where the current suffix recurred
+6	//! earlier and propose the tokens that followed those earlier occurrences,
+7	//! preferring the most frequent continuation. Where the n-gram drafter takes a
+8	//! single most-recent match, suffix decoding aggregates *all* matches into a
+9	//! frequency-weighted tree and follows the most-frequent path(s) to adaptive
+10	//! depth.
+11	//!
+12	//! All-Rust, GPU-free, lossless: the target verify is authoritative, so a
+13	//! wrong draft only costs a wasted verify row, never a wrong emission.
+14	//!
+15	//! Memory is bounded: we scan the (bounded) history window for matches and
+16	//! build a small frequency map keyed by the matched continuation tokens; the
+17	//! emitted tree is capped by `max_nodes`/`max_depth`. We do not retain a
+18	//! persistent automaton across calls (the history is rescanned each draft), so
+19	//! peak memory is O(history_window) and the tree is O(max_nodes).
+20	
+21	use std::collections::HashMap;
+22	
+23	use crate::inference::spec_tree::{TokenTree, TreeDrafter};
+24	
+25	/// Model-free suffix-decoding tree drafter.
+26	#[derive(Debug, Clone)]
+27	pub struct SuffixDecodingDrafter {
+28	    /// Longest suffix length to try matching (descending). A longer match is
+29	    /// higher precision.
+30	    pub max_match: usize,
+31	    /// Shortest suffix length worth matching.
+32	    pub min_match: usize,
+33	    /// Cap on the history window scanned for matches (most recent tokens).
+34	    pub window: usize,
+35	    /// Branching factor: at each tree node, expand at most this many distinct
+36	    /// most-frequent successor tokens.
+37	    pub branch: usize,
+38	}
+39	
+40	impl Default for SuffixDecodingDrafter {
+41	    fn default() -> Self {
+42	        Self {
+43	            max_match: 4,
+44	            min_match: 2,
+45	            // Recent context carries essentially all the recurrence signal and
+46	            // keeps the per-draft scan O(window) cheap. Bounded by design.
+47	            window: 512,
+48	            branch: 2,
+49	        }
+50	    }
+51	}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/suffix_decoding.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/suffix_decoding.rs","old_string":"2	//!
+3	//! Drafts a tree of likely continuations from the *observed* token stream
+4	//! (prompt + generated history) alone — no model forward. The idea (Suffix
+5	//! Decoding, Oliaro et al. 2024): find where the current suffix recurred
+6	//! earlier and propose the tokens that followed those earlier occurrences,
+7	//! preferring the most frequent continuation. Where the n-gram drafter takes a
+8	/"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/token_recycling.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/token_recycling.rs","offset":1,"limit":45}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+2	//!
+3	//! Maintains a sparse per-vocabulary adjacency map — for each token, the
+4	//! top-`k` tokens most often observed to follow it — and BFS-expands the
+5	//! anchor's adjacency into a draft tree. The name (Token Recycling, Luo et al.
+6	//! 2024) is from reusing the model's own observed/accepted token transitions
+7	//! as the draft source: no separate draft model, no model forward.
+8	//!
+9	//! Model-free, all-Rust, GPU-free, lossless (the target verify is
+10	//! authoritative). The adjacency is sparse (a `HashMap<u32, ...>` keyed on the
+11	//! tokens actually seen), so memory is O(distinct tokens × k), not O(vocab²).
+12	//!
+13	//! Learning scope: the full Token-Recycling method updates the adjacency from
+14	//! the target model's top-k predictions at every verified position, which needs
+15	//! the GPU verify kernel's full logits (deferred to Lane A's GPU phase). For
+16	//! now we learn from the *accepted token stream* alone — `observe`/`learn` feed
+17	//! the realized (history) transitions, which is a strict subset of the eventual
+18	//! signal but already a useful, lossless drafter. This limitation is
+19	//! documented so the GPU phase knows to wire top-k learning in later.
+20	
+21	use std::collections::HashMap;
+22	
+23	use crate::inference::spec_tree::{TokenTree, TreeDrafter};
+24	
+25	/// Per-token successor counts: `succ[token]` maps a following token to how
+26	/// often it has been observed in that position.
+27	#[derive(Debug, Clone)]
+28	pub struct TokenRecyclingDrafter {
+29	    /// token -> (successor token -> count).
+30	    succ: HashMap<u32, HashMap<u32, u32>>,
+31	    /// Successors kept per token when building a tree.
+32	    pub topk: usize,
+33	    /// Branching factor at each tree node (≤ topk).
+34	    pub branch: usize,
+35	    /// Cap on distinct successors retained per token (bounds memory).
+36	    pub max_succ_per_token: usize,
+37	}
+38	
+39	impl TokenRecyclingDrafter {
+40	    pub fn new() -> Self {
+41	        Self {
+42	            succ: HashMap::new(),
+43	            topk: 4,
+44	            branch: 2,
+45	            max_succ_per_token: 16,
+46	        }<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/token_recycling.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/token_recycling.rs","old_string":"2	//!
+3	//! Maintains a sparse per-vocabulary adjacency map — for each token, the
+4	//! top-`k` tokens most often observed to follow it — and BFS-expands the
+5	//! anchor's adjacency into a draft tree. The name (Token Recycling, Luo et al.
+6	//! 2024) is from reusing the model's own observed/accepted token transitions
+7	//! as the draft source: no separate draft model, no model forward.
+8	//!
+9	//"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/draft_merge.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/draft_merge.rs","offset":20,"limit":45}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+21	
+22	use crate::inference::spec_tree::{TokenTree, TreeDrafter, TREE_MAX_NODES};
+23	
+24	/// Merge `trees` into one bounded tree. All inputs must share the same root
+25	/// anchor token (the last committed token); the merged tree keeps that anchor
+26	/// as node 0. The merge is breadth-first so the result stays in BFS order
+27	/// (`parent[i] < i`) and respects `max_nodes` (≤ [`TREE_MAX_NODES`]).
+28	///
+29	/// Dedup key: the full root-to-node token path. The first tree to contribute a
+30	/// given path wins; later trees proposing the same path are folded in (their
+31	/// subtrees still get a chance to extend that shared node).
+32	pub fn merge_trees(trees: &[TokenTree], max_nodes: usize) -> TokenTree {
+33	    let cap = max_nodes.clamp(1, TREE_MAX_NODES);
+34	    // Determine the anchor. Empty input or empty trees ⇒ a 1-node placeholder
+35	    // is impossible without a token, so require at least one non-empty tree;
+36	    // callers always pass the anchor tree.
+37	    let anchor = trees
+38	        .iter()
+39	        .find(|t| !t.tokens.is_empty())
+40	        .map(|t| t.tokens[0])
+41	        .unwrap_or(0);
+42	
+43	    let mut out = TokenTree::linear(anchor, &[]);
+44	    // Map from a node's token-path (Vec<u32>, excluding the anchor) to its
+45	    // index in `out`. The root's path is the empty vec.
+46	    let mut path_to_idx: HashMap<Vec<u32>, usize> = HashMap::new();
+47	    path_to_idx.insert(Vec::new(), 0);
+48	
+49	    // Insert source nodes in increasing depth so parents always exist first.
+50	    // Each source node carries its own token-path; we look up (or create) the
+51	    // corresponding node in `out`.
+52	    let mut by_depth: Vec<(u16, Vec<u32>, usize)> = Vec::new(); // (depth, parent_path, token)
+53	    for tree in trees {
+54	        // Precompute each node's token-path within this tree.
+55	        let mut node_path: Vec<Vec<u32>> = Vec::with_capacity(tree.nodes());
+56	        for i in 0..tree.nodes() {
+57	            if i == 0 {
+58	                node_path.push(Vec::new());
+59	            } else {
+60	                let p = tree.parent[i] as usize;
+61	                let mut path = node_path[p].clone();
+62	                path.push(tree.tokens[i]);
+63	                node_path.push(path);
+64	            }
+65	        }<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/draft_merge.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/draft_merge.rs","old_string":"21	
+22	use crate::inference::spec_tree::{TokenTree, TreeDrafter, TREE_MAX_NODES};
+23	
+24	/// Merge `trees` into one bounded tree. All inputs must share the same root
+25	/// anchor token (the last committed token); the merged tree keeps that anchor
+26	/// as node 0. The merge is breadth-first so the result stays in BFS order
+27	/// (`parent[i] < i`) and respects `max_nodes` (≤ [`TREE_MAX_NODES`]).
+"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/speculative.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/speculative.rs","offset":40,"limit":55}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+101	}
+102	
+103	/// Lossless speculative rejection sampling for stochastic generation (Leviathan et al., 2023).
+104	///
+105	/// For draft candidate tokens $x_1, \dots, x_K$:
+106	/// - Drafter proposed probability distributions: $q_0, \dots, q_{K-1}$ (where $q_i(t) = q(t \mid x_{<i})$).
+107	/// - Target model probability distributions: $p_0, \dots, p_K$ (where $p_i(t) = p(t \mid x_{<i})$).
+108	///
+109	/// At each step $i \in [0, K-1]$:
+110	/// - Candidate is $t = \text{drafts}[i]$.
+111	/// - Draw uniform random number $r \in [0, 1)$.
+112	/// - If $r < \min(1, \frac{p_i(t)}{q_i(t)})$, accept $t$.
+113	/// - If rejected, sample bonus token $t'$ from normalized residual distribution
+114	///   $p'_i(x) = \frac{\max(0, p_i(x) - q_i(x))}{\sum_y \max(0, p_i(y) - q_i(y))}$
+115	///   and terminate the round.
+116	/// - If all $K$ drafts are accepted, sample a terminal bonus token from $p_K$.
+117	#[allow(clippy::needless_range_loop)]
+118	pub fn speculative_rejection_sample<R: FnMut() -> f32>(
+119	    drafts: &[u32],
+120	    draft_probs: &[&[f32]],
+121	    target_probs: &[&[f32]],
+122	    mut rng: R,
+123	) -> SpeculativeRejectionResult {
+124	    let k = drafts.len();
+125	    assert!(
+126	        draft_probs.len() >= k,
+127	        "draft_probs length must be at least drafts length"
+128	    );
+129	    assert!(
+130	        target_probs.len() > k,
+131	        "target_probs length must be at least drafts.len() + 1"
+132	    );
+133	
+134	    let mut emitted = Vec::with_capacity(k + 1);
+135	    let mut accepted_count = 0;
+136	
+137	    for i in 0..k {
+138	        let draft_token = drafts[i];
+139	        let tok_idx = draft_token as usize;
+140	        let q = draft_probs[i].get(tok_idx).copied().unwrap_or(0.0);
+141	        let p = target_probs[i].get(tok_idx).copied().unwrap_or(0.0);
+142	
+143	        let accept_prob = if q <= 0.0 { 0.0 } else { (p / q).min(1.0) };
+144	
+145	        let r = rng();
+146	        if r < accept_prob {
+147	            // Draft accepted
+148	            emitted.push(draft_token);
+149	            accepted_count += 1;
+150	        } else {
+151	            // Draft rejected. Sample from residual distribution (p - q)+
+152	            let vocab_size = target_probs[i].len();
+153	            let mut residual_sum = 0.0f32;
+154	            for v in 0..vocab_size {
+155	                let pv = target_probs[i][v];<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/speculative.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/speculative.rs","old_string":"101	}
+102	
+103	/// Lossless speculative rejection sampling for stochastic generation (Leviathan et al., 2023).
+104	///
+105	/// For draft candidate tokens $x_1, \dots, x_K$:
+106	/// - Drafter proposed probability distributions: $q_0, \dots, q_{K-1}$ (where $q_i(t) = q(t \mid x_{<i})$).
+107	/// - Target model probability distributions: $p_0, \dots, p_K$ (where $p_i(t) = p(t \mid x_{<i})$).
+108	///"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/spec_tree.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/spec_tree.rs","offset":100,"limit":50}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+161	            // predicted[c] is the model's greedy next token after node c.
+162	            let next = predicted[c];
+163	            // Find a child of c whose token == next. Children of c are the
+164	            // nodes whose parent is c; BFS order is not required here.
+165	            let mut matched: Option<usize> = None;
+166	            for ch in (c + 1)..self.nodes() {
+167	                if self.parent[ch] == c as i32 && self.tokens[ch] == next {
+168	                    matched = Some(ch);
+169	                    break;
+170	                }
+171	            }
+172	            match matched {
+173	                Some(ch) => {
+174	                    // Accept and emit the model's token (== the child's token),
+175	                    // then continue verifying from the child.
+176	                    emitted.push(next);
+177	                    c = ch;
+178	                }
+179	                None => {
+180	                    // No draft branch covered the model's next token: emit it
+181	                    // as the final bonus and stop. `c` is the last accepted
+182	                    // draft node (root if nothing was accepted).
+183	                    emitted.push(next);
+184	                    return (emitted, c);
+185	                }
+186	            }
+187	        }
+188	    }
+189	}
+190	
+191	/// A drafter that proposes a tree of candidate continuations.
+192	///
+193	/// `history` is the full token sequence so far (prompt + generated, including
+194	/// the trailing committed token). `anchor` is that trailing token (the tree
+195	/// root). `max_nodes` and `max_depth` bound the returned tree. Implementations
+196	/// must return a tree with node 0's token == `anchor`.
+197	pub trait TreeDrafter {
+198	    fn draft_tree(
+199	        &mut self,
+200	        history: &[u32],
+201	        anchor: u32,
+202	        max_nodes: usize,
+203	        max_depth: usize,
+204	    ) -> TokenTree;
+205	}
+206	
+207	/// Adapts the existing [`NGramDrafter`](crate::inference::speculative::NGramDrafter)
+208	/// as a degenerate single-branch tree drafter. The tree is exactly
+209	/// [`TokenTree::linear`] of the n-gram chain, so wrapping it changes no
+210	/// behavior — the linear accept and the tree accept coincide (proven in<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/inference/spec_tree.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/inference/spec_tree.rs","old_string":"161	            // predicted[c] is the model's greedy next token after node c.
+162	            let next = predicted[c];
+163	            // Find a child of c whose token == next. Children of c are the
+164	            // nodes whose parent is c; BFS order is not required here.
+165	            let mut matched: Option<usize> = None;
+166	            for ch in (c + 1)..self.nodes() {
+167	               "}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/api/mod.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/api/mod.rs","offset":17150,"limit":45}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+17211	/// Greedy requests accept the longest exact-match prefix, so the emitted stream
+17212	/// is the target's own argmax either way — a drafter can only change how fast
+17213	/// tokens arrive, never which ones. Sampling requests never reach here
+17214	/// (`speculation_admissible` declines them); the exact rejection sampler below
+17215	/// stays for the future GPU distribution verifier.
+17216	///
+17217	/// This is shared by all three decode loops — the non-streaming loop and both
+17218	/// streaming jobs (cooperative and exclusive). Streaming used to skip
+17219	/// speculation entirely, which meant the lane never fired for the streaming
+17220	/// clients that make up real agent traffic; keeping one body is what stops that
+17221	/// divergence coming back.
+17222	#[allow(clippy::too_many_arguments)]
+17223	fn run_speculative_round(
+17224	    prepared: &mut PreparedGeneration,
+17225	    sampler: &LlamaSampler,
+17226	    input: &[u32],
+17227	    eligible: bool,
+17228	    generated: &mut Vec<u32>,
+17229	    history: &mut Vec<u32>,
+17230	    finish_reason: &mut &'static str,
+17231	    forward_timings: &mut LlamaForwardTimings,
+17232	) -> std::result::Result<SpeculativeRound, Box<Response>> {
+17233	    // Engages only on a single-token continuation and never alongside a
+17234	    // per-step logit consumer.
+17235	    if !eligible || input.len() != 1 {
+17236	        return Ok(SpeculativeRound::Declined);
+17237	    }
+17238	    let Some(spec) = prepared.speculative.as_mut() else {
+17239	        return Ok(SpeculativeRound::Declined);
+17240	    };
+17241	    if !spec.latch.should_speculate() {
+17242	        spec.latch.note_skip();
+17243	        return Ok(SpeculativeRound::Declined);
+17244	    }
+17245	    let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
+17246	    let context_room = prepared.session.remaining_context();
+17247	    let drafts = if remaining > 0 && context_room > 0 {
+17248	        let draft_budget = spec
+17249	            .draft_tokens
+17250	            .min(remaining.saturating_sub(1))
+17251	            .min(context_room.saturating_sub(1));
+17252	        spec.drafter
+17253	            .draft(history.as_slice(), draft_budget)
+17254	            .map_err(|err| {
+17255	                Box::new(api_error(<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+The seam is here. Applying the edit to src/api/mod.rs.
+<tool_call>{"name":"Edit","args":{"file_path":"src/api/mod.rs","old_string":"17211	/// Greedy requests accept the longest exact-match prefix, so the emitted stream
+17212	/// is the target's own argmax either way — a drafter can only change how fast
+17213	/// tokens arrive, never which ones. Sampling requests never reach here
+17214	/// (`speculation_admissible` declines them); the exact rejection sampler below
+17215	/// stays for the future GPU distribution verifier.
+17216	"}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+Edit applied successfully.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Let me read src/inference/suffix_decoding.rs around the drafter seam.
+<tool_call>{"name":"Read","args":{"file_path":"src/inference/suffix_decoding.rs","offset":1,"limit":50}}</tool_call><|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+62	        if n == 0 || hist.len() <= n {
+63	            return freq;
+64	        }
+65	        let limit = hist.len() - n; // exclude the trailing occurrence (the suffix)
+66	        for start in 0..limit {
+67	            if &hist[start..start + n] == pattern {
+68	                let follow = start + n;
+69	                if follow < hist.len() {
+70	                    *freq.entry(hist[follow]).or_insert(0) += 1;
+71	                }
+72	            }
+73	        }
+74	        freq
+75	    }
+76	
+77	    /// Pick up to `branch` most-frequent successors (ties broken by lower token
+78	    /// id, for determinism). Returns successors that occurred at least once.
+79	    fn top_successors(freq<|start_header_id|>assistant<|end_header_id|>
+

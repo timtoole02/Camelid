@@ -49,6 +49,63 @@ target/release/camelid serve --model /path/to/model.gguf
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
 
+### Prompt-prefix cache: partial hits on the Metal lane
+
+A partial prompt-prefix-cache hit resumes a cached session at a non-zero KV position, and
+the batched Metal prefill only builds a cache from empty — so the divergent suffix would
+fall to the CPU dense forward. Measured on an M4 / 16 GiB with
+Llama-3.2-3B-Instruct-Q4_K_M and a ~500-token prompt, taking that hit cost 20.79 s against
+1.33 s for a cold miss, and returned different tokens than a cold prefill of the same
+prompt. Camelid therefore declines a partial resume when the batched Metal prefill would
+otherwise have applied, and prefills the whole prompt on the GPU instead. Exact hits, and
+every non-Metal session, are unaffected.
+
+`CAMELID_METAL_PREFIX_PARTIAL_RESUME=1` restores the old unconditional resume. It exists
+so the measurement can be reproduced against a single binary
+(`qa/evidence-bundles/metal-partial-prefix-hit-20260909/`), not as a tuning knob.
+
+### Trading prefill speed for exactness on K-quant models (macOS/Metal)
+
+`CAMELID_METAL_KQUANT_ATTN_MM=1` admits a K-quant model's attention to the
+attention-as-matmul prefill. It is **off by default, deliberately** — this is a choice
+about output, not a feature waiting on qualification, so it is documented here rather than
+left to be discovered.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q4_K_M and a 2351-token prompt
+(hardware GPU-busy per stage): prefill attention **5519 ms → 381 ms**, total prefill
+**9511 ms → 4372 ms** — a **2.18x** cut in time to first token. Every non-attention stage
+matches within 1 ms, so the flag moves attention and nothing else.
+
+The cost is that attention-as-matmul stages K/Q scores as half, and on a K-quant model's
+flatter logits that can move greedy output. Across five prompt shapes at greedy/128
+tokens, run twice: four token-identical, one divergent (prose at 595 prompt tokens, first
+differing at generated character 238, reproducing byte-for-byte). Divergence is occasional
+and content-dependent, and deterministic rather than flaky.
+
+Set it when time to first token on long prompts matters more than matching the exact lane
+token for token; leave it unset when it does not. It additionally requires
+`CAMELID_METAL_KQUANT_MM` (already on by default), and does nothing on its own.
+Receipts: `qa/evidence-bundles/metal-kquant-attn-mm-20260909/`.
+
+### Trading prefill for KV memory on Q8_0 models (macOS/Metal)
+
+A Q8_0 model keeps an F32 resident KV cache by default. `CAMELID_METAL_KV_DTYPE=f16`
+switches it to a half primary, which halves the KV footprint.
+
+Measured on an M4 / 16 GiB with Llama-3.2-3B-Instruct-Q8_0: **597 MB saved** at ~4200
+positions (6554 MB → 5957 MB physical footprint), against **~11% slower prefill** on a
+2900-token prompt (4.53 s → 5.03 s). Decode is unchanged (29.9 vs 30.0 tok/s) and
+generated text was identical on every prompt compared.
+
+The saving scales with context and layer count, so it matters most where memory is the
+binding constraint — a long-context 8B on a 16 GiB machine — and least on short prompts,
+where there is little KV to halve and the prefill cost still applies.
+
+This is off by default. Prior to the `all_q8` admission in `use_attn_mm` it was a much
+worse deal (2.24x prefill, because an F16 primary silently lost the attention-as-matmul
+lane); the numbers above are on a tree that has it. Receipts:
+`qa/evidence-bundles/metal-q8-f16-kv-primary-20260909/`.
+
 ## Production HTTP policy
 
 Anonymous loopback serving remains the default. A non-loopback address has to answer two separate
@@ -714,9 +771,15 @@ Backend runtime knobs used during performance work:
 
 - `CAMELID_GPU_TEMP_SAMPLING` controls the CUDA-resident Gumbel-max path for plain temperature sampling. It defaults to enabled after seeded device/reference and streaming validation, avoiding a full-vocabulary device-to-host copy and CPU sort on each sampled token. Set it to `0`, `false`, `off`, or `no` to force the CPU sampling fallback for diagnosis.
 - `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED` overrides the resident CUDA prefill policy. Q8_0 uses batched prefill by default; Q4_K/Q6_K keep the sustained-throughput winner (serial prefill) by default on the Windows/WDDM reference host. Set it to `1`, `true`, or `on` to exercise the parity-checked Q4_K/Q6_K batched kernels, or `0`, `false`, or `off` to force serial prefill for any quant lane.
+- `CAMELID_CUDA_PREFIX_CONTINUATION` controls whether a CUDA-resident prefill reuses the KV rows a previous prefill already built for the same leading tokens. Default: enabled. Every turn of a conversation re-sends the whole history, and a KV row is a pure function of the token prefix that produced it, so rows the engine already holds for an identical prefix are exactly the rows the new prompt needs; the prefill starts after them instead of rebuilding from position 0. This is bit-identical, not an approximation, and it never leaves the GPU — unlike the prompt-prefix cache, which is bypassed on this lane because it reseeds GPU KV from f16-rounded host history. The reuse claim is dropped whenever anything else writes the cache (a reseed from host history, a tree compaction, a layer's cache being dropped, an SSM state reset), so those paths pay one cold prefill rather than continuing from rows the engine can no longer vouch for. Set it to `0`, `false`, or `off` to force a full prefill on every request, which is how the saving is A/B'd against the same binary. `CAMELID_RESIDENT_TRACE` prints how many positions each request reused.
+- `CAMELID_CUDA_EAGER_KV_MIRROR` restores the eager GPU→host KV mirror that used to run after every CUDA-resident prefill. Default: off, meaning the CPU-side KV cache is mirrored back lazily by `ensure_cpu_kv_materialized` at the moment a CPU reader actually needs the history. The eager copy scales with the whole context rather than with the new tokens (`n_layers × n_kv × positions × head_dim × 2` elements, plus a host-side expansion), so once prefix continuation reduced prefill to the newly appended tokens it became the dominant cost of a follow-up turn — 62–74% of the reported prefill time on the RTX 3060 Laptop reference. Every consumer of the CPU KV history materializes on demand (the three CPU forward readers and `rollback_to_position`), so on the common path — GPU prefill, GPU decode, no fallback — the copy is never paid. Set it to `1`, `true`, or `on` to force the eager copy for A/B measurement or as an escape hatch. Output is identical either way; only when the work happens changes.
 - `CAMELID_CUDA_KQUANT_BATCH_TOKENS` selects the requested Q4_K/Q6_K CUDA prefill tile size from `1` through `4` when batched K-quant prefill is explicitly enabled. Default: `2`; the runtime clamps it to the model dimensions and portable shared-memory budget. This remains a diagnostic tuning knob until a target GPU shows a sustained gain.
 - `CAMELID_CUDA_PREFILL_BATCH_TOKENS` requests how many prompt tokens the CUDA-resident batched prefill processes per chunk. Unset, prefill uses the same chunk the batched layer stack uses for speculative verify, so the shipped path is unchanged. Any requested value is clamped to the largest chunk this model's batched GEMMs can stage inside the portable 46 KiB shared-memory budget, so it cannot produce a launch the driver refuses. This is a diagnostic tuning knob; chunk size is a separate lever from the flash attention kernel below and must be measured separately.
-- `CAMELID_FLASH_PREFILL` enables the fused tiled flash prefill attention kernel for CUDA-resident prompt ingestion. Default: off. Set it to `1` (or any value other than `0`, `false`, or `off`) to enable it. This path uses an online-softmax reassociation, so it is token-parity rather than bit-identical to the serial forward pass; the default path and speculative verify keep the bit-identity contract and never take it. Opt-in only, prefill only.
+- `CAMELID_FLASH_PREFILL` enables the fused tiled flash prefill attention kernel for CUDA-resident prompt ingestion. Default: off, and **measurement says leave it off** on Ampere. Set it to `1` (or any value other than `0`, `false`, or `off`) to enable it. Opt-in only, prefill only; the default path and speculative verify keep the bit-identity contract and never take it.
+
+  Measured on an RTX 3060 Laptop (sm_86) with Llama-3.2-3B-Instruct-Q8_0, one binary, ABBA-ordered with a thermal gate: prefill is **1.11x / 1.17x / 1.22x SLOWER** at 1424 / 3025 / 6024 prompt tokens — the penalty grows with context, which is the opposite of the point. The kernel was developed and reported on sm_89, and the register-vs-occupancy tradeoff behind this is architecture-sensitive, so it may behave differently there; but no committed evidence isolates this flag on any device. (The "20.95x" and "TTFT 2,140 ms → 70.8 ms" figures in `improvements.md` are GPU-resident vs CPU, not flash-on vs flash-off.)
+
+  The online-softmax reassociation is applied **per layer**, so it is not token-parity in general, despite earlier wording here that said it was. Same host, greedy, three distinct prompts: token-identical 3/3 at 1429 tokens, but only **1/3 at 6029 tokens**. Divergence is deterministic, not flaky. Treat it as an approximation whose error grows with context, not as a parity-preserving path. Receipts: `qa/evidence-bundles/cuda-flash-prefill-ab-20260910/`.
 - `CAMELID_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `256`, matching the current long-prefill performance lane while keeping the global lazy Q8 file cache disabled outside explicit/scoped reuse. Set it to `1` to force the older sequential prefill path while debugging; invalid/zero values fall back to the default. This is a runtime/performance knob only; it is not support evidence for any model row by itself; the separate published source/runtime-head PASS bundle and synchronized docs/API/frontend updates are what close exact Llama 3 8B checked 1024/2048 packs; the knob itself is not evidence for today's checkout.
 - `CAMELID_PREFILL_LAYER_MAJOR` controls the long-context prefill schedule that processes all prefill chunks one layer at a time, reusing file-backed Q8_0 weights across chunks before moving to the next layer. By default it is enabled only when lazy Q8_0 file-backed weights are present. Set it to `0`, `false`, `off`, or `disabled` to force the older chunk-major schedule while debugging.
 - `CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS` controls the per-layer prompt chunk size only for the layer-major schedule. Default: `512`, unless `CAMELID_PREFILL_CHUNK_TOKENS` is explicitly set, in which case the shared chunk setting is reused for comparability. It also accepts `all`, `full`, `prompt`, or `unbounded` for one diagnostic full-prompt prefill chunk. This is a runtime/performance knob only and does not promote any 8B 1024/2048 support bucket by itself.

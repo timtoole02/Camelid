@@ -1,0 +1,45 @@
+=========================================================================
+Physical footprint (`footprint -p <pid>`) across a model-switch sequence.
+Each model is EXERCISED with a real generation after loading, because the
+weights are page-aligned wire pages the GPU reads in place and an untouched
+model never faults them in -- `ps -o rss` reported 189 MiB for a 3.4 GB model,
+which is why RSS is the wrong instrument here.
+-------------------------------------------------------------------------
+step                          STOCK run1   STOCK run2   FIXED run1   FIXED run2
+0 empty server                   8049 KB      8033 KB      8193 KB      8097 KB
+1 3B-Q8_0 loaded + used           3660 MB      3690 MB      3661 MB      3689 MB
+2 after unload                    3660 MB      3690 MB      3661 MB      3689 MB
+3 1B-Q8_0 loaded + used           4801 MB      4812 MB      3661 MB      3689 MB
+4 back to 3B-Q8_0 + used          8234 MB      8237 MB      4106 MB      4159 MB
+5 after final unload              8234 MB      8237 MB      4106 MB      4159 MB
+
+  => after two switches the stock build holds ~8.2 GB for ONE live model on a
+     16 GiB machine; the fixed build holds ~4.1 GB. About 4.1 GB recovered,
+     reproducing across two independent runs of each arm.
+
+  Stock step 4 decomposes as 3660 (first 3B) + 1141 (1B) + 3433 (a SECOND copy
+  of the 3B, mapped at a new address) -- nothing is ever released, and a reload
+  is a fresh copy rather than a re-use.
+
+=========================================================================
+WHERE THE RECLAIM HAPPENS
+   CAMELID_RESIDENT_TRACE=1 on the fixed build, same sequence:
+
+     [resident-cache] evicted 3.18 GiB of unreferenced resident weights   <- step 2, unload
+     [resident-cache] evicted 1.22 GiB of unreferenced resident weights   <- step 4, replace-load
+     [resident-cache] evicted 3.18 GiB of unreferenced resident weights   <- step 5, final unload
+
+   So eviction fires at the unload itself. `phys_footprint` does not drop on the
+   same line because the released pages are FILE-BACKED: freeing them returns
+   them to the page cache, which macOS keeps charging to the process until it is
+   reclaimed. The recovery is therefore visible as the NEXT load reusing that
+   memory instead of adding to it -- steps 3 and 4 -- rather than as an immediate
+   fall at step 2. Both readings describe the same 4.1 GB.
+
+=========================================================================
+WHAT IS NOT CLAIMED
+   * Zero effect in a one-model process. Nothing is reclaimable while the only
+     model is live, and every published throughput number uses that shape.
+   * No decode tok/s change. This is a residency fix, not a speed fix.
+   * The four copy-based weight caches are untouched; only the no-copy map has
+     an owner handle to test. See the note on `evict_unreferenced_nocopy`.

@@ -53,10 +53,16 @@ async fn gemma4_supported_rows_are_exactly_the_committed_set() {
     assert_eq!(
         supported,
         vec![
-            // 12B and 26B A4B QAT are supported ONLY through the two-Mac
-            // distributed serve lane (parity packs + distributed-serve smoke
-            // bundles committed); E2B/E4B are single-node supported rows.
+            // The 12B Q8 and 26B A4B QAT rows are supported only through their
+            // committed, lane-scoped evidence. The downloadable 12B QAT Q4_0
+            // single-Mac row remains active validation and must not appear here.
             "gemma4_12b_it_q8_0",
+            // The MTP12 serve lane's own row. Distinct from the downloadable
+            // 12B QAT Q4_0 single-Mac row above, which stays active-validation:
+            // this one is pinned to one target SHA plus one assistant SHA on
+            // Apple Metal behind the explicit MTP12 opt-in, and its scope string
+            // says so.
+            "gemma4_12b_it_qat_q4_0_mtp12",
             "gemma4_26b_a4b_it_q4_0",
             "gemma4_e2b_it_q8_0",
             // GABBRO support promotion: the NVFP4 pilot row is oracle-parity-anchored
@@ -85,6 +91,10 @@ async fn gemma4_rows_scope_stays_exact_row_and_text_only() {
                 // scope; still exact-row + smoke-bounded wording, no family claim.
                 || scope == "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only"
                 || scope == "active_validation_only"
+                // The MTP12 serve lane pins its own host/OS/artefact tuple; the
+                // wording stays exact-row and smoke-bounded.
+                || scope
+                    == "exact_row_single_node_base_m4_mini_mac16_10_macos_26_5_metal_lossless_mtp12_performance_smoke_only"
                 || scope.starts_with("blocked"),
             "{id}: scope must stay exact-row bounded, got {scope}"
         );
@@ -145,7 +155,7 @@ async fn gemma4_e2b_row_records_pack_parity_oracle() {
 }
 
 #[tokio::test]
-async fn gemma4_models_catalog_lists_both_exact_rows() {
+async fn gemma4_models_catalog_lists_supported_and_single_mac_downloads() {
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -165,5 +175,8 @@ async fn gemma4_models_catalog_lists_both_exact_rows() {
         let text = body.to_string();
         assert!(text.contains("gemma4_e4b_it_q8_0"));
         assert!(text.contains("gemma4_e2b_it_q8_0"));
+        assert!(text.contains("gemma4_12b_it_qat_q4_0"));
+        assert!(text.contains("google/gemma-4-12B-it-qat-q4_0-gguf"));
+        assert!(text.contains("gemma-4-12b-it-qat-q4_0.gguf"));
     }
 }

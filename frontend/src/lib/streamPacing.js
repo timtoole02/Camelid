@@ -1,9 +1,9 @@
 /* Display pacing (Phase 8B): smooths bursty token arrival into a steady visual
-   cadence under hard honesty bounds — the displayed text may never lag the
-   truly received stream by more than MAX_LAG_MS, drains instantly on stream
-   end/abort, and the final rendered text is byte-identical to the received
-   text. Metrics (TTFT/tok-s tiles, telemetry, Flow Bench) always use real
-   arrival data, never the paced view (I4). Pure functions; smoke-tested. */
+   cadence. Ordinary streams use a MAX_LAG_MS honesty bound. An explicit steady
+   mode may retain a longer reservoir, but still reveals only text that has
+   truly arrived and settles byte-identically before normal completion. Metrics
+   (TTFT/tok-s tiles, telemetry, Flow Bench) always use real arrival data, never
+   the paced view (I4). Pure functions; smoke-tested. */
 
 export const MAX_LAG_MS = 150
 export const FIRST_VISIBLE_PREFIX_CHARS = 32
@@ -20,8 +20,16 @@ const MIN_CHARS_PER_MS = 0.05
    the text; the lag bound below still guarantees honesty. */
 const MAX_FRAME_MS = 100
 
-export function createPacerState() {
-  return { shownChars: 0, arrivals: [], lastStepAt: null }
+export function createPacerState({ steadyCharsPerSecond = null } = {}) {
+  const parsedSteadyRate = Number(steadyCharsPerSecond)
+  return {
+    shownChars: 0,
+    arrivals: [],
+    lastStepAt: null,
+    steadyCharsPerMs: Number.isFinite(parsedSteadyRate) && parsedSteadyRate > 0
+      ? parsedSteadyRate / 1000
+      : null,
+  }
 }
 
 /* Record what has truly arrived; returns the text that may be shown at `now`:
@@ -29,6 +37,22 @@ export function createPacerState() {
    smoothly toward the freshest text. */
 export function paceStep(state, receivedText, nowMs) {
   const received = receivedText.length
+  const elapsed = state.lastStepAt == null ? 0 : Math.min(Math.max(nowMs - state.lastStepAt, 0), MAX_FRAME_MS)
+  state.lastStepAt = nowMs
+
+  // A caller may deliberately begin with a received-text reservoir and reveal
+  // it at a fixed frame-timed cadence. This never renders ahead of bytes that
+  // actually arrived and is useful when a stream has known compute gaps (for
+  // example, sequential bounded-context sections). Ordinary streams keep the
+  // low-lag exponential path below.
+  if (state.steadyCharsPerMs !== null) {
+    const advance = elapsed * state.steadyCharsPerMs
+    let shown = Math.min(received, state.shownChars + advance)
+    if (received - shown < 1) shown = received
+    state.shownChars = Math.max(state.shownChars, shown)
+    return receivedText.slice(0, Math.floor(state.shownChars))
+  }
+
   const last = state.arrivals[state.arrivals.length - 1]
   if (!last || last.chars < received) state.arrivals.push({ chars: received, at: nowMs })
   while (state.arrivals.length > 2 && state.arrivals[1].at <= nowMs - MAX_LAG_MS) state.arrivals.shift()
@@ -40,8 +64,6 @@ export function paceStep(state, receivedText, nowMs) {
   // Smooth, time-based advance: close the remaining gap on an exponential
   // curve so bursty arrivals become steady motion. Frame-rate independent, and
   // fast enough that the tail converges well inside the lag bound on its own.
-  const elapsed = state.lastStepAt == null ? 0 : Math.min(Math.max(nowMs - state.lastStepAt, 0), MAX_FRAME_MS)
-  state.lastStepAt = nowMs
   const gap = received - state.shownChars
   const eased = gap * (1 - Math.exp(-elapsed / CATCH_UP_TAU_MS))
   const advance = Math.min(gap, Math.max(eased, elapsed * MIN_CHARS_PER_MS))
@@ -73,7 +95,8 @@ export function paceHasPendingText(displayedText, receivedText) {
   return String(displayedText || '').length < String(receivedText || '').length
 }
 
-/* Stream ended or aborted: drain instantly, byte-identical. */
+/* Abort/fallback escape hatch: drain instantly, byte-identical. Normal steady
+   completion waits for paceHasPendingText() to become false before calling. */
 export function paceDrain(state, receivedText) {
   state.shownChars = receivedText.length
   state.arrivals = []

@@ -59,6 +59,8 @@ const MAX_CONCURRENT_RESEARCH: usize = 2;
 const MAX_CONCURRENT_DNS_LOOKUPS: usize = 4;
 const FETCH_CACHE_CAPACITY: usize = 96;
 const FETCH_CACHE_TTL: Duration = Duration::from_secs(90);
+const FETCH_CACHE_TTL_ENV: &str = "CAMELID_WEB_RESEARCH_CACHE_TTL_SECS";
+const MAX_FETCH_CACHE_TTL_SECS: u64 = 900;
 const RESEARCH_ADMISSION_TIMEOUT: Duration = Duration::from_millis(750);
 const RESEARCH_TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 const GITHUB_TOKEN_ENV: &str = "CAMELID_WEB_GITHUB_TOKEN";
@@ -403,10 +405,41 @@ fn research_semaphore() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+fn fetch_cache_ttl_from_value(value: Option<&str>) -> Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(FETCH_CACHE_TTL);
+    };
+    let seconds = value.trim().parse::<u64>().map_err(|_| {
+        format!(
+            "{FETCH_CACHE_TTL_ENV} must be an integer in 1..={MAX_FETCH_CACHE_TTL_SECS}, got {value:?}"
+        )
+    })?;
+    if !(1..=MAX_FETCH_CACHE_TTL_SECS).contains(&seconds) {
+        return Err(format!(
+            "{FETCH_CACHE_TTL_ENV} must be in 1..={MAX_FETCH_CACHE_TTL_SECS}, got {seconds}"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(super) fn default_transport() -> Arc<dyn WebTransport> {
+    let configured_ttl = std::env::var(FETCH_CACHE_TTL_ENV).ok();
+    let ttl = match fetch_cache_ttl_from_value(configured_ttl.as_deref()) {
+        Ok(ttl) => ttl,
+        Err(error) => {
+            tracing::warn!(%error, "invalid Web Auto cache TTL; using the safe default");
+            FETCH_CACHE_TTL
+        }
+    };
+    if ttl != FETCH_CACHE_TTL {
+        tracing::info!(
+            ttl_seconds = ttl.as_secs(),
+            "Web Auto source cache TTL explicitly configured"
+        );
+    }
     Arc::new(CachedWebTransport::new(
         Arc::new(CurlWebTransport::default()),
-        FETCH_CACHE_TTL,
+        ttl,
         FETCH_CACHE_CAPACITY,
     ))
 }
@@ -4283,6 +4316,19 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn fetch_cache_ttl_override_is_explicit_and_bounded() {
+        assert_eq!(fetch_cache_ttl_from_value(None).unwrap(), FETCH_CACHE_TTL);
+        assert_eq!(
+            fetch_cache_ttl_from_value(Some("600")).unwrap(),
+            Duration::from_secs(600)
+        );
+        for invalid in ["0", "901", "many", ""] {
+            let error = fetch_cache_ttl_from_value(Some(invalid)).unwrap_err();
+            assert!(error.contains(FETCH_CACHE_TTL_ENV), "{error}");
+        }
+    }
 
     #[test]
     fn dual_stack_answers_pin_only_the_reachable_family() {

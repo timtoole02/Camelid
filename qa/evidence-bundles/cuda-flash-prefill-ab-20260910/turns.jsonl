@@ -1,0 +1,12 @@
+{"tag":"off-1","words":1400,"ms":10658,"prompt_tokens":1425,"reply":"I've taken note of the provided text"}
+{"tag":"off-1","words":3000,"ms":26019,"prompt_tokens":3026,"reply":"I acknowledge that you've provided a lengthy"}
+{"tag":"off-1","words":6000,"ms":70845,"prompt_tokens":6025,"reply":"It seems like you've provided a lengthy"}
+{"tag":"on-1","words":1400,"ms":11799,"prompt_tokens":1425,"reply":"I've taken note of the provided text"}
+{"tag":"on-1","words":3000,"ms":30663,"prompt_tokens":3026,"reply":"I acknowledge that you've provided a lengthy"}
+{"tag":"on-1","words":6000,"ms":88664,"prompt_tokens":6025,"reply":"It appears that you've provided a lengthy"}
+{"tag":"on-2","words":1400,"ms":11795,"prompt_tokens":1425,"reply":"I've taken note of the provided text"}
+{"tag":"on-2","words":3000,"ms":30655,"prompt_tokens":3026,"reply":"I acknowledge that you've provided a lengthy"}
+{"tag":"on-2","words":6000,"ms":88603,"prompt_tokens":6025,"reply":"It appears that you've provided a lengthy"}
+{"tag":"off-2","words":1400,"ms":10727,"prompt_tokens":1425,"reply":"I've taken note of the provided text"}
+{"tag":"off-2","words":3000,"ms":26573,"prompt_tokens":3026,"reply":"I acknowledge that you've provided a lengthy"}
+{"tag":"off-2","words":6000,"ms":74131,"prompt_tokens":6025,"reply":"It seems like you've provided a lengthy"}

@@ -1,0 +1,62 @@
+{
+  "schema": "camelid.gemma4_ordered_q4_k1_qualification.v1",
+  "date": "2026-08-29",
+  "claim_scope": "Single qualification run of the exact ordered Q4_0 x Q8_0 K=1 arithmetic universe that the K<=8 target verifier uses. This is a whole-output identity and cost gate, not a speculative-throughput claim.",
+  "host": {
+    "name": "mini2",
+    "model_identifier": "Mac16,10",
+    "chip": "Apple M4",
+    "cores": "10 (4 performance, 6 efficiency)",
+    "memory_bytes": 17179869184,
+    "macos_version": "26.5.2",
+    "macos_build": "25F84"
+  },
+  "source": {
+    "branch": "campaign/gemma4-12b-mini2",
+    "commit": "e6c14bfe720350de61cb1269b3b021678602b1ff",
+    "binary_version": "camelid v0.6.1-320-ge6c14bfe",
+    "binary_sha256": "f5a5abfb476c7c19fdcd8ee29f0cb327347ab30fa4c8b1e233bddd5790eafebf"
+  },
+  "target": {
+    "file": "gemma-4-12b-it-qat-q4_0.gguf",
+    "bytes": 6975879296,
+    "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
+  },
+  "policy": {
+    "CAMELID_GEMMA4_DENSE_ORDERED_Q4": "1",
+    "ghost_turbo_allowed": false,
+    "q4_k1_kernel": "strict ordered one-SIMDgroup-per-output-row",
+    "q6_head": "strict ordered file-backed Metal with established Rust softcap"
+  },
+  "request": {
+    "prompt": "Write a detailed technical explanation of speculative decoding and its performance tradeoffs.",
+    "prompt_sha256": "a342b95cc70f2120a785e8b5796ae81ebf887b857b7335bf5272261da657e9c7",
+    "prompt_tokens": 14,
+    "max_tokens": 96,
+    "forwards": 110
+  },
+  "result": {
+    "emitted_tokens": 96,
+    "displayed_end_to_end_tok_s": 6.57,
+    "note_on_displayed_rate": "The legacy CLI timer includes prompt prefill and divides by emitted tokens; it is not a decode-only rate.",
+    "gpu_us_per_forward": 132608,
+    "cpu_prep_us_per_forward": 37,
+    "generation_wall_s": 14.6,
+    "process_real_s": 17.12,
+    "maximum_resident_set_size_bytes": 11075141632,
+    "peak_memory_footprint_bytes": 6865463760,
+    "swap_events": 0,
+    "stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+    "stderr_sha256": "dae70c54153f06be5c27a11e296348288ebe4dea83a7e84431f71705e7df7396",
+    "established_stdout_sha256": "205ebf1edf34203d28432dd0ab9c88a1c3d68daf3631931eadbce6406e97666f",
+    "first_divergent_generated_token_index": -1,
+    "established_camelid_mean_tok_s": 10.10,
+    "established_camelid_mean_gpu_us_per_forward": 86094,
+    "ordered_k1_slowdown_ratio": 1.538812367472633
+  },
+  "remote_receipts": {
+    "stdout": "~/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stdout",
+    "stderr": "~/gemma4-12b-speed/receipts/orderedsimd-e6c14bfe-raw-r1.stderr"
+  },
+  "verdict": "PASS_K1_IDENTITY_ONLY"
+}

@@ -1,0 +1,285 @@
+/* Token Inspector — per-token probability record attached to one reply.
+
+   COLOR POSTURE. This sheet introduces NO new color tokens. Copper
+   (--color-verified) and amber (--color-evidence) are claim colors reserved for
+   support and evidence statements, and red (--color-error) means an error — a
+   low-probability token is a normal state, not a failure. So the only ink used for
+   the encoding is --color-accent, the informational accent.
+
+   ENCODING. Probability is carried by an UNDERLINE WEIGHT in three bands, never by
+   text color and never by a text background. Two consequences, both deliberate:
+   the token text stays at --color-text so its contrast is the audited body-text
+   pair and cannot be regressed by this feature, and the encoding survives
+   greyscale, since band weight is a size channel rather than a hue channel. The
+   exact value is always available as text in the detail panel — color is never the
+   only carrier of a number here. */
+
+.tokinsp {
+  margin-top: var(--space-3);
+  border-top: 1px solid var(--color-border-soft);
+  padding-top: var(--space-3);
+}
+
+.tokinsp__trigger {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+}
+
+.tokinsp__trigger:hover { color: var(--color-text); }
+.tokinsp__trigger:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+.tokinsp__trigger-label {
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  font-size: var(--text-micro);
+}
+
+.tokinsp__trigger-summary { color: var(--color-text-faint); }
+
+.tokinsp__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.tokinsp__provenance {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+/* Token strip. Wraps rather than scrolls: the chat column is capped at
+   --content-max, and a horizontally scrolling strip would hide most of a reply
+   behind a gesture. Reading order is the natural order of the text. */
+.tokinsp__strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 0;
+  padding: var(--space-2);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-md);
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.tokinsp__tok {
+  position: relative;
+  padding: 1px 1px 2px;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+  cursor: pointer;
+  white-space: pre-wrap;
+}
+
+/* The three bands. `settled` is intentionally unmarked: in a greedy reply it is
+   the overwhelming majority, and marking it would spend the whole salience budget
+   on the part with nothing to say. */
+.tokinsp__tok--settled { border-bottom-color: transparent; }
+.tokinsp__tok--leading { border-bottom-color: color-mix(in srgb, var(--color-accent) 35%, transparent); }
+.tokinsp__tok--contested { border-bottom-color: var(--color-accent); }
+.tokinsp__tok--unknown { border-bottom-style: dotted; border-bottom-color: var(--color-text-faint); }
+
+.tokinsp__tok:hover { background: var(--color-surface-hover); }
+.tokinsp__tok.is-active {
+  outline: 1px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.tokinsp__tok:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* Emitted-token-was-not-top marker. A shape, not a color. */
+.tokinsp__tok-rank {
+  font-size: var(--text-micro);
+  color: var(--color-text-faint);
+  vertical-align: super;
+  margin-left: 1px;
+}
+
+.tokinsp__truncation,
+.tokinsp__finding,
+.tokinsp__detail-note {
+  margin: 0;
+  font-size: var(--text-micro);
+  color: var(--color-text-muted);
+}
+
+.tokinsp__detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
+}
+
+.tokinsp__detail-head {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--color-text);
+}
+
+.tokinsp__detail-token {
+  font-family: var(--font-mono);
+  background: var(--color-code-bg);
+  border-radius: 2px;
+  padding: 0 3px;
+}
+
+.tokinsp__alts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* The token column is sized for the longest fixed label this list can contain —
+   the residual row's "rest of the vocabulary" — so the one entry that must always
+   be readable never ellipsizes. Model tokens are short; they truncate instead. */
+.tokinsp__alt {
+  display: grid;
+  grid-template-columns: 1.25rem minmax(4rem, 10.5rem) 1fr 3.5rem auto;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-micro);
+  color: var(--color-text-muted);
+}
+
+.tokinsp__alt.is-chosen { color: var(--color-text); font-weight: 600; }
+
+.tokinsp__alt--residual {
+  border-top: 1px dashed var(--color-border-soft);
+  padding-top: 3px;
+  font-style: italic;
+}
+
+.tokinsp__alt-rank { color: var(--color-text-faint); text-align: right; }
+
+.tokinsp__alt-token {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tokinsp__alt-bar {
+  display: block;
+  height: 4px;
+  background: var(--color-surface-strong);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+
+.tokinsp__alt-bar-fill {
+  display: block;
+  height: 100%;
+  background: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  border-radius: var(--radius-pill);
+}
+
+.tokinsp__alt.is-chosen .tokinsp__alt-bar-fill { background: var(--color-accent); }
+
+.tokinsp__alt-value { text-align: right; font-variant-numeric: tabular-nums; }
+
+.tokinsp__alt-tie {
+  font-size: var(--text-micro);
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+}
+
+.tokinsp__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+  font-size: var(--text-micro);
+}
+
+.tokinsp__stats div { display: flex; flex-direction: column; gap: 1px; }
+.tokinsp__stats dt { color: var(--color-text-faint); text-transform: uppercase; letter-spacing: var(--tracking-label); }
+.tokinsp__stats dd { margin: 0; color: var(--color-text); font-variant-numeric: tabular-nums; }
+
+.tokinsp__guarded {
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+}
+
+.tokinsp__guarded-title {
+  margin: 0 0 2px;
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-faint);
+}
+
+.tokinsp__guarded-detail {
+  margin: 0;
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+  color: var(--color-text-muted);
+}
+
+.tokinsp__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.tokinsp__action {
+  padding: 3px var(--space-2);
+  font-size: var(--text-micro);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.tokinsp__action:hover { color: var(--color-text); border-color: var(--color-border-strong); }
+.tokinsp__action:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.tokinsp__retention { font-size: var(--text-micro); color: var(--color-text-faint); }
+
+/* Absence. Styled as an ordinary informational state — never as an alarm, because
+   a lane that does not report probabilities is not an error and must not be
+   confused with a model that scored its tokens flat. */
+.tokinsp--absent { color: var(--color-text-muted); }
+.tokinsp__absent-title {
+  margin: 0 0 2px;
+  font-size: var(--text-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-label);
+  color: var(--color-text-faint);
+}
+.tokinsp__absent-detail {
+  margin: 0;
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tokinsp__tok { transition: background var(--dur-fast) var(--ease-standard); }
+}

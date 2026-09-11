@@ -48,10 +48,65 @@ const checks = [
     file: 'src/inference.rs',
     label: 'server routes GPU prefill through the batched path',
     needs: [
-      'prefill_batched(&embeddings.data',
+      // `_from` is the resume-capable entry (prefix continuation); the zero-start
+      // wrapper `prefill_batched` is the same code path with start = 0.
+      'prefill_batched_from(',
       // The serial path stays as an A/B escape hatch for parity bisection.
       'CAMELID_CUDA_RESIDENT_PREFILL_BATCHED',
     ],
+  },
+  {
+    file: 'src/cuda_resident.rs',
+    label: 'prefix continuation stops vouching for KV written by any other route',
+    // Continuation lets a prefill SKIP rows it believes already hold this prompt's
+    // tokens. That belief is only as good as its invalidation: a stale record does
+    // not fail loudly, it answers from the wrong KV. Every path that writes the KV
+    // cache by a route other than a prefill must therefore drop the record, and a
+    // reviewer adding the next such path needs to be told. These markers are the
+    // structural half; `resident_prefix_len_is_bounded_by_the_record_and_the_watermark`
+    // is the behavioural half.
+    needs: [
+      'fn invalidate_resident_tokens',
+      // One call for each non-prefill KV writer: seed_layer (reseeds from f16-rounded
+      // host history — NOT bit-identical to a fresh prefill, the exact hazard that
+      // keeps the prompt-prefix cache off this lane), compact_tree_kv_path (relocates
+      // rows), sparsify_kv (drops a layer's cache), reset_qwen35_state (zeroes it).
+      // Adding a fifth writer without invalidating is the silent-wrong-output bug this
+      // count exists to catch.
+      { token: 'self.invalidate_resident_tokens();', atLeast: 4 },
+      // A rewind must shorten the record; `set_filled` is the single choke point.
+      'self.resident_tokens.truncate(filled)',
+    ],
+  },
+  {
+    file: 'src/inference.rs',
+    label: 'every CPU KV-history reader materializes the GPU mirror on demand',
+    // A CUDA-resident prefill no longer mirrors its KV back eagerly (except for
+    // speculating sessions), so the CPU history exists only when someone asks for it.
+    // Each reader must ask BEFORE touching `kv_cache`, or it silently attends over a
+    // zero-filled prefix — degraded output with one stderr warning, not a failure.
+    //
+    // Four callers today: the three CPU forward readers
+    // (forward_layer_range_from_hidden, forward_single_token_timed_internal, the verify
+    // path) plus rollback_to_position, which gates on cpu_kv_authoritative().
+    //
+    // HONEST LIMIT: this pins the count, so DELETING a call fails the gate. It cannot
+    // detect a NEW reader added without one — grep cannot know what reads the history.
+    // If you are adding a CPU path that attends over `kv_cache`, call
+    // `ensure_cpu_kv_materialized()` first and raise this number.
+    needs: [
+      { token: 'self.ensure_cpu_kv_materialized()', atLeast: 4 },
+      // The safe default: sessions start eager, and only an audited caller opts out.
+      'cpu_kv_mirror_eager: true',
+      'fn set_cpu_kv_mirror_eager',
+    ],
+  },
+  {
+    file: 'src/api/mod.rs',
+    label: 'only non-speculating requests opt into the lazy KV mirror',
+    // Speculation reaches rollback_to_position, which the lazy recovery cannot always
+    // satisfy. Widening this to unconditional lazy re-opens speculative_rollback_failed.
+    needs: ['session.set_cpu_kv_mirror_eager(speculative.is_some())'],
   },
   {
     file: 'src/cuda_resident/tests.rs',
@@ -76,9 +131,17 @@ for (const { file, label, needs } of checks) {
     failed = true
     continue
   }
-  for (const token of needs) {
-    if (!src.includes(token)) {
-      console.error(`FAIL [${file}] ${label}: missing required marker:\n        ${token}`)
+  for (const need of needs) {
+    // A marker is either a string that must appear, or `{ token, atLeast }` when the
+    // point is that it appears at EVERY site it has to (presence alone would pass
+    // with three of four call sites deleted).
+    const token = typeof need === 'string' ? need : need.token
+    const atLeast = typeof need === 'string' ? 1 : need.atLeast
+    const count = src.split(token).length - 1
+    if (count < atLeast) {
+      console.error(
+        `FAIL [${file}] ${label}: required marker appears ${count}x, need >=${atLeast}:\n        ${token}`,
+      )
       failed = true
     }
   }

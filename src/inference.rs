@@ -1517,6 +1517,20 @@ pub struct LlamaForwardOutput {
     pub output_norm_state: CpuTensor,
 }
 
+/// Greedy batched target verification plus exact transformer-layer input captures.
+///
+/// EAGLE-3 consumes three target activations from inside the decoder rather than the
+/// final hidden state. Keeping this as a generic layer-input capture seam makes the
+/// target forward authoritative and leaves the learned drafter out of the core Llama
+/// implementation. `layer_inputs[i]` corresponds to `capture_layer_ids[i]` supplied
+/// to [`LlamaInferenceSession::forward_greedy_verify_chunk_with_layer_inputs`].
+#[derive(Debug, Clone)]
+pub struct LlamaGreedyVerifyCapture {
+    pub predictions: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub timings: LlamaForwardTimings,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaTensorCheckpoint {
     pub shape: Vec<usize>,
@@ -2491,12 +2505,36 @@ pub struct LlamaInferenceSession {
     /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
     /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
     resident_decode: Option<metal_resident::ResidentDecodeState>,
+    /// The exact prompt whose KV rows `resident_decode` holds in `[0, len)`, or empty when
+    /// nothing is vouched for.
+    ///
+    /// This is the record prefix continuation needs: a KV row is a pure function of the
+    /// token prefix that produced it, so the next turn can reuse the leading run its prompt
+    /// shares with THIS one. Over-claiming is not a slow path, it is silently wrong output,
+    /// so the record is set only by a prefill that actually wrote those rows and is cleared
+    /// by anything that writes the cache another way. Skipped by Clone/PartialEq/Debug for
+    /// the same reason `resident_decode` is: a clone gets no engine, so it vouches for
+    /// nothing.
+    resident_tokens: Vec<u32>,
     /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
     /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
+    /// Whether a CUDA-resident prefill mirrors its KV back to the host EAGERLY.
+    ///
+    /// Defaults to `true`, which is the historical behaviour, so any caller this was not
+    /// audited against keeps it. `prepare_generation` clears it for requests that cannot
+    /// reach `rollback_to_position` — that is, requests with no speculation — and those get
+    /// the lazy mirror instead.
+    ///
+    /// The direction of the default is the point. `rollback_to_position` needs
+    /// CPU-authoritative KV, and the lazy recovery can only supply it while
+    /// `filled == position`; a speculative rollback may run with drafts written past
+    /// `position`, where it cannot. Rather than argue about whether that is reachable,
+    /// speculating sessions simply keep the eager copy.
+    cpu_kv_mirror_eager: bool,
     /// Whether Metal resident decode may pre-commit the next token graph. Continuous-batch
     /// jobs disable this because another session can run before this one is scheduled again:
     /// a session-local graph waiting at the head of Metal's shared serial queue would
@@ -2521,6 +2559,21 @@ pub struct LlamaInferenceSession {
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
+}
+
+/// Park the resident Metal engine instead of dropping it.
+///
+/// The API builds a fresh `LlamaInferenceSession` per request and lets it fall out of
+/// scope, so `Drop` is the only hook that catches every way a request can end — including
+/// the error paths, where dropping the engine is exactly what we want and parking refuses
+/// on its own (a failed prefill leaves the record and the watermark disagreeing).
+///
+/// A hollow placeholder from `take_for_step`, and every `clone()`, carry no engine, so this
+/// is a no-op for them.
+impl Drop for LlamaInferenceSession {
+    fn drop(&mut self) {
+        self.park_resident_metal_engine();
+    }
 }
 
 impl LlamaInferenceSession {
@@ -2589,7 +2642,9 @@ impl LlamaInferenceSession {
                 },
             ),
             resident_decode: self.resident_decode.take(),
+            resident_tokens: std::mem::take(&mut self.resident_tokens),
             resident_paths_disabled: self.resident_paths_disabled,
+            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: self.execution_trace.take(),
             resident_cache_key: self.resident_cache_key,
@@ -2680,7 +2735,9 @@ impl Clone for LlamaInferenceSession {
             weights: self.weights.clone(),
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
+            resident_tokens: Vec::new(),
             resident_paths_disabled: self.resident_paths_disabled,
+            cpu_kv_mirror_eager: self.cpu_kv_mirror_eager,
             resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: None,
             resident_cache_key: self.resident_cache_key,
@@ -2721,7 +2778,9 @@ impl LlamaInferenceSession {
             weights,
             kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
+            resident_tokens: Vec::new(),
             resident_paths_disabled: false,
+            cpu_kv_mirror_eager: true,
             resident_encode_ahead_enabled: true,
             execution_trace: None,
             resident_cache_key: None,
@@ -2754,6 +2813,16 @@ impl LlamaInferenceSession {
     /// pins sessions to CPU because KV rollback only exists for CPU state.
     pub fn set_resident_paths_disabled(&mut self, disabled: bool) {
         self.resident_paths_disabled = disabled;
+    }
+
+    /// Allow a CUDA-resident prefill to skip the eager GPU->host KV mirror.
+    ///
+    /// Only safe for a request that cannot reach `rollback_to_position`, because that is
+    /// the one CPU-KV consumer the lazy path cannot always satisfy (it needs
+    /// `filled == position`, and a speculative rollback may run with drafts written past
+    /// `position`). Callers that do not know pass nothing and keep the eager default.
+    pub fn set_cpu_kv_mirror_eager(&mut self, eager: bool) {
+        self.cpu_kv_mirror_eager = eager;
     }
 
     /// Enable or disable Metal's single-session next-token encode-ahead pipeline.
@@ -2804,6 +2873,12 @@ impl LlamaInferenceSession {
     /// rollback, so any resident session is dropped and reseeds from CPU on
     /// next use.
     pub fn rollback_to_position(&mut self, position: usize) -> Result<()> {
+        // Materialize on demand, exactly as the three CPU forward readers do. A
+        // GPU-resident prefill no longer mirrors its KV back eagerly, so on that lane
+        // the history this rollback needs lives only on the device until something
+        // asks for it — and this is one of the things that asks. Never returns Err for
+        // a failed recovery, so the authority check below still decides.
+        self.ensure_cpu_kv_materialized()?;
         if !self.cpu_kv_authoritative() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "KV rollback requires CPU-authoritative KV state; the GPU-resident prefill \
@@ -2812,6 +2887,9 @@ impl LlamaInferenceSession {
             ));
         }
         self.resident_decode = None;
+        // The engine is gone, so nothing vouches for those rows any more. Leaving the
+        // record behind would let a later turn claim a prefix no engine holds.
+        self.resident_tokens.clear();
         self.kv_cache.rollback_to_position(position)
     }
 
@@ -3344,34 +3422,126 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
+        // Prefix continuation: every turn of a conversation re-sends the whole
+        // history, so the leading positions of this prompt are usually the exact
+        // positions the resident engine just built for the previous turn. A KV row
+        // is a pure function of the token prefix that produced it, so those rows
+        // ARE the rows this prompt needs — reusing them is not an approximation and
+        // needs no host mirror. (That distinction is what makes this safe on a lane
+        // where the prompt-prefix cache is deliberately bypassed: the cache reseeds
+        // GPU KV from f16-rounded host history, which is NOT bit-identical to a
+        // fresh prefill. Continuation never leaves the GPU.)
+        //
+        // The last shared token is always recomputed (`.min(n - 1)`) so the prefill
+        // still ends by writing position n-1, which is the state the decode lane
+        // expects. `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces a full prefill so the
+        // saving can be A/B'd against the same binary.
+        let continuation_enabled = !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false);
+        let reuse = if continuation_enabled {
+            slot.engine
+                .resident_prefix_len(token_ids)
+                .min(n.saturating_sub(1))
+        } else {
+            0
+        };
+        // Drop the watermark to the reused span before prefilling the rest, so a
+        // failure below leaves no claim on rows this prefill never wrote.
+        slot.engine.set_filled(reuse);
         let prefill_result = if serial_prefill {
             slot.engine
-                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+                .prefill_from(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
         } else {
-            slot.engine
-                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+            slot.engine.prefill_batched_from(
+                &embeddings.data,
+                &tables.cos,
+                &tables.sin,
+                n,
+                scale,
+                reuse,
+            )
         };
         if prefill_result.is_err() {
             // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);
+            slot.engine.set_resident_tokens(&[]);
             return Ok(false);
         }
         slot.engine.set_filled(n);
-        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
-        // KV cache is authoritative too: otherwise any later forward that takes the
-        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
-        // an all-zero history and generation degenerates. The copy is a few MB of
-        // device->host transfer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â negligible next to the prefill compute it follows,
-        // and it keeps both backends in lockstep.
-        if let Err(e) =
-            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-        {
-            if trace {
-                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+        // Record the sequence these rows now hold, so the NEXT turn can continue
+        // from it. Ordered after `set_filled(n)`, which truncates the record to the
+        // watermark.
+        slot.engine.set_resident_tokens(token_ids);
+        if trace && reuse > 0 {
+            eprintln!(
+                "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, \
+                 prefilled {}",
+                n - reuse
+            );
+        }
+        // The GPU prefill fills only the GPU KV cache. The CPU-side cache is mirrored
+        // back LAZILY, by `ensure_cpu_kv_materialized`, at the moment a CPU reader
+        // actually needs the history — not here.
+        //
+        // This used to mirror eagerly on every request, justified by a comment saying
+        // the copy was "a few MB of device->host transfer, negligible next to the
+        // prefill compute it follows". Both halves stopped being true. The copy is
+        // `n_layers * n_kv * n * head_dim * 2` elements, so it scales with the WHOLE
+        // context (~170 MiB on the wire for a 3B at 1.5k positions, plus a scalar
+        // host-side expansion loop); and once prefix continuation cut the prefill down
+        // to the newly appended tokens, there was no longer a large compute for it to
+        // be negligible next to. Measured on the RTX 3060 Laptop reference, the mirror
+        // was 62-74% of a follow-up turn's reported prefill time.
+        //
+        // Lazy is safe for the readers that can always be satisfied on demand: the three
+        // CPU forward readers (`forward_layer_range_from_hidden`,
+        // `forward_single_token_timed_internal`, and the verify path) call
+        // `ensure_cpu_kv_materialized` before touching the history, and they do so while
+        // `filled == position` still holds, which is what the recovery requires. On the
+        // common path — GPU prefill, GPU decode, no fallback — nothing reads it at all.
+        //
+        // `rollback_to_position` is the one that CANNOT always be satisfied that way: a
+        // speculative rollback may run with drafts written past `position`, and the
+        // recovery declines whenever `filled != position`. So rather than reason about
+        // whether that is reachable, sessions that speculate keep the eager copy
+        // (`cpu_kv_mirror_eager`, default true, cleared only by `prepare_generation` for
+        // requests with no speculation).
+        //
+        // REMAINING EXPOSURE, stated rather than argued away: if the resident engine is
+        // rebuilt or evicted BETWEEN this prefill and a later decode of the same request,
+        // a reseed is needed (`filled != position`) at exactly the moment the recovery
+        // declines for the same reason, and that forward attends over a zero-filled
+        // prefix — degraded output with only a one-shot stderr warning. The eager copy
+        // left a host copy that covered this. It needs the engine displaced DURING a
+        // request, which run-to-completion scheduling on this lane makes very hard to
+        // reach, but it is not proven unreachable.
+        // `CAMELID_CUDA_EAGER_KV_MIRROR=1` restores the eager copy everywhere.
+        if self.cpu_kv_mirror_eager || eager_kv_mirror_enabled() {
+            let mirror_started = Instant::now();
+            if let Err(e) =
+                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+            {
+                if trace {
+                    eprintln!(
+                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
+                    );
+                }
+                slot.engine.set_filled(0);
+                slot.engine.set_resident_tokens(&[]);
+                return Ok(false);
             }
-            slot.engine.set_filled(0);
-            return Ok(false);
+            if trace {
+                eprintln!(
+                    "[resident-cuda] KV mirror to host: {n} positions in {} ms",
+                    mirror_started.elapsed().as_millis()
+                );
+            }
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -4752,6 +4922,48 @@ impl LlamaInferenceSession {
         Ok((greedy_sample_rows(&logits)?, timings))
     }
 
+    /// Run the authoritative batched verify while retaining the input to a small,
+    /// caller-selected set of transformer layers for every row.
+    ///
+    /// Layer ids are absolute, unique, and returned in caller order. Like the
+    /// ordinary verify call, KV is appended for every row and the caller must roll
+    /// rejected rows back.
+    pub fn forward_greedy_verify_chunk_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        let (logits, timings, layer_inputs) = self.forward_verify_chunk_logits_with_layer_inputs(
+            token_ids,
+            capture_layer_ids,
+            false,
+        )?;
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: greedy_sample_rows(&logits)?,
+            layer_inputs,
+            timings,
+        })
+    }
+
+    /// Prompt-prefill sibling of
+    /// [`Self::forward_greedy_verify_chunk_with_layer_inputs`]. It appends KV and captures
+    /// every input row, but applies the final norm/output projection to the last row only.
+    /// This avoids materializing `[prompt_tokens, vocab]` logits merely to obtain the first
+    /// generated token (about 2 GiB at a 4k Llama-3.2 prompt).
+    pub fn forward_greedy_prefill_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        let (logits, timings, layer_inputs) =
+            self.forward_verify_chunk_logits_with_layer_inputs(token_ids, capture_layer_ids, true)?;
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: greedy_sample_rows(&logits)?,
+            layer_inputs,
+            timings,
+        })
+    }
+
     /// Stochastic speculative-verification forward. Returns the fully filtered target
     /// distribution for each row under the same sampling configuration and history semantics
     /// used by ordinary one-token generation.
@@ -4797,6 +5009,18 @@ impl LlamaInferenceSession {
         &mut self,
         token_ids: &[u32],
     ) -> Result<(CpuTensor, LlamaForwardTimings)> {
+        let (logits, timings, captures) =
+            self.forward_verify_chunk_logits_with_layer_inputs(token_ids, &[], false)?;
+        debug_assert!(captures.is_empty());
+        Ok((logits, timings))
+    }
+
+    fn forward_verify_chunk_logits_with_layer_inputs(
+        &mut self,
+        token_ids: &[u32],
+        capture_layer_ids: &[usize],
+        logits_last_row_only: bool,
+    ) -> Result<(CpuTensor, LlamaForwardTimings, Vec<CpuTensor>)> {
         if token_ids.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(
                 "speculative verify chunk requires at least one token".to_string(),
@@ -4812,6 +5036,19 @@ impl LlamaInferenceSession {
                 "speculative verify chunk of {} token(s) exceeds remaining context capacity {}",
                 token_ids.len(),
                 self.remaining_context()
+            )));
+        }
+        let n_layers = self.weights.layers.len();
+        let mut sorted_capture_ids = capture_layer_ids.to_vec();
+        sorted_capture_ids.sort_unstable();
+        if sorted_capture_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "verify layer-input capture ids must be unique".to_string(),
+            ));
+        }
+        if let Some(&bad) = sorted_capture_ids.iter().find(|&&id| id >= n_layers) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "verify layer-input capture id {bad} is outside target layer range 0..{n_layers}"
             )));
         }
 
@@ -4849,11 +5086,19 @@ impl LlamaInferenceSession {
         let config = &self.config;
         let weights = &self.weights;
         let kv_cache = &mut self.kv_cache;
-        let layer_results =
-            run_on_prefill_pool(|| -> Result<(CpuTensor, Vec<LlamaLayerTimings>)> {
+        let layer_results = run_on_prefill_pool(
+            || -> Result<(CpuTensor, Vec<LlamaLayerTimings>, Vec<CpuTensor>)> {
                 let mut layer_timings = Vec::with_capacity(weights.layers.len());
                 let mut hidden_inner = hidden;
+                let mut captures: Vec<Option<CpuTensor>> = vec![None; capture_layer_ids.len()];
                 for (layer_idx, layer) in weights.layers.iter().enumerate() {
+                    if let Some(capture_slot) =
+                        capture_layer_ids.iter().position(|&id| id == layer_idx)
+                    {
+                        let mut captured = hidden_inner.clone();
+                        captured.name = format!("verify_layer_{layer_idx}_input");
+                        captures[capture_slot] = Some(captured);
+                    }
                     let timed = forward_prefill_layer_chunk_timed(
                         &hidden_inner,
                         layer,
@@ -4871,17 +5116,41 @@ impl LlamaInferenceSession {
                     hidden_inner = timed.output;
                     layer_timings.push(timed.timings);
                 }
-                Ok((hidden_inner, layer_timings))
-            })?;
-        let (hidden, layer_timings) = layer_results;
+                let captures = captures
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, captured)| {
+                        captured.ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(format!(
+                                "verify did not reach requested layer-input capture {}",
+                                capture_layer_ids[slot]
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((hidden_inner, layer_timings, captures))
+            },
+        )?;
+        let (hidden, layer_timings, layer_inputs) = layer_results;
         timings.layers = layer_timings;
         timings.layers_total = layers_started.elapsed().as_micros();
 
         let final_norm_started = Instant::now();
-        let norm = if self.weights.output_norm.shape.dims[0] == 0 {
-            hidden
+        let hidden_for_logits = if logits_last_row_only {
+            let width = hidden.dim(1)?;
+            let start = (token_ids.len() - 1) * width;
+            CpuTensor::from_f32(
+                "verify_chunk_last_hidden",
+                vec![1, width],
+                hidden.data[start..start + width].to_vec(),
+            )?
         } else {
-            hidden.rms_norm(
+            hidden
+        };
+        let norm = if self.weights.output_norm.shape.dims[0] == 0 {
+            hidden_for_logits
+        } else {
+            hidden_for_logits.rms_norm(
                 &self.weights.output_norm,
                 rms_norm_epsilon,
                 "output_norm_verify_chunk",
@@ -4901,7 +5170,7 @@ impl LlamaInferenceSession {
         self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
         metal_seam::end_inference_session();
-        Ok((logits, timings))
+        Ok((logits, timings, layer_inputs))
     }
 
     fn forward_prefill_layer_major_timed_fast(
@@ -13293,8 +13562,32 @@ pub fn reset_resident_caches() {
     // unload path exists to prevent).
     crate::cuda::release_async_pool();
 }
+/// Non-CUDA hosts have no resident CUDA engine to drop, but macOS still holds resident
+/// weights: the process-global Metal buffer cache pins each model's page-aligned wire
+/// allocation, and on the default `serve` path (`CAMELID_METAL_NOCOPY`) that allocation IS
+/// the weights. This arm was an empty stub, so `release_model` freed the registries and
+/// none of the memory — the outgoing model stayed resident for the life of the process,
+/// a reload took a second full copy at a new address, and the fit advisor's "releasing it
+/// frees ~N GB" was false on this platform. Evicting only what no live model still owns
+/// makes the existing call site do on macOS what it already did on CUDA.
 #[cfg(not(feature = "cuda"))]
-pub fn reset_resident_caches() {}
+pub fn reset_resident_caches() {
+    #[cfg(target_os = "macos")]
+    {
+        // Drop the parked resident engine FIRST. It holds this model's GPU KV cache and,
+        // more to the point, it is the thing standing between the weight buffers and the
+        // eviction sweep below — a parked engine outliving its model would keep its
+        // allocation referenced and make the sweep a no-op.
+        metal_resident::clear_parked_resident_metal();
+        let freed = crate::metal::evict_unreferenced_resident_weights();
+        if freed > 0 && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cache] evicted {:.2} GiB of unreferenced resident weights",
+                freed as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
+}
 
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
@@ -13939,6 +14232,25 @@ fn resident_cuda_max_context() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v >= 256)
         .unwrap_or(usize::MAX)
+}
+
+/// Restore the eager GPU->host KV mirror after a CUDA-resident prefill.
+///
+/// Default OFF: the mirror is lazy, performed by `ensure_cpu_kv_materialized` when a
+/// CPU reader actually needs the history. This exists so the saving can be A/B'd
+/// against the same binary, and as an escape hatch if a host turns out to reach the
+/// CPU KV through a path that does not materialize on demand.
+#[cfg(feature = "cuda")]
+fn eager_kv_mirror_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CAMELID_CUDA_EAGER_KV_MIRROR")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
 }
 
 #[allow(dead_code)]
