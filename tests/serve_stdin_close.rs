@@ -129,6 +129,42 @@ fn serve_exits_when_its_stdin_closes_under_the_flag() {
     assert!(!health_ok(port), "something still answers on the port");
 }
 
+/// The desktop also reads the sidecar's stderr, so a desktop crash takes the stderr reader
+/// down with the stdin writer. Measured on a 0.7.3 macOS bundle: the watcher's "stdin closed"
+/// message then failed, `eprintln!` panicked the watcher thread, and the engine kept serving
+/// as an orphan. The test above hands the server a null stderr, so it could not see that.
+#[cfg(unix)]
+#[test]
+fn serve_exits_when_its_stdin_closes_after_its_stderr_reader_died() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let port = free_port();
+    let mut command = serve_command(port, scratch.path());
+    command
+        .arg("--exit-when-stdin-closes")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut server = Server(command.spawn().expect("start camelid serve"));
+    // A separate process holds the only read end, as the desktop's drain thread does, and
+    // keeps the pipe from filling before the server answers.
+    let stderr = server.0.stderr.take().expect("the server's stderr pipe");
+    let mut reader = Command::new("cat")
+        .stdin(Stdio::from(stderr))
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("start the stderr reader");
+    wait_for_health(&mut server, port);
+
+    // What the OS does when the desktop dies: the reader and the writer go together.
+    let _ = reader.kill();
+    let _ = reader.wait();
+    drop(server.0.stdin.take());
+
+    let status = wait_for_exit(&mut server, Duration::from_secs(5))
+        .expect("the server kept running after its stdin closed and its stderr reader died");
+    assert!(status.success(), "expected a clean exit, got {status}");
+    assert!(!health_ok(port), "something still answers on the port");
+}
+
 #[test]
 fn serve_without_the_flag_survives_a_closed_stdin() {
     let scratch = tempfile::tempdir().expect("scratch directory");

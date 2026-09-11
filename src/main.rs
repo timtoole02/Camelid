@@ -11813,8 +11813,17 @@ fn spawn_stdin_close_watcher() -> anyhow::Result<()> {
                     Err(_) => break,
                 }
             }
-            eprintln!("  stdin closed; exiting (--exit-when-stdin-closes)");
-            camelid::diagnostics::record_session_exit("stdin_closed", None);
+            // The desktop that held our stdin also read our stderr, so when it dies this
+            // write fails. `eprintln!` would panic, end only this thread, and leave running
+            // the very orphan this flag exists to prevent: nothing may stand between
+            // end-of-file and the exit.
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"  stdin closed; exiting (--exit-when-stdin-closes)\n",
+            );
+            let _ = std::panic::catch_unwind(|| {
+                camelid::diagnostics::record_session_exit("stdin_closed", None)
+            });
             std::process::exit(0);
         })
         .map(|_| ())

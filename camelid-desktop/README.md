@@ -147,7 +147,7 @@ The sidecar stays bound to `127.0.0.1`. Serving other devices is not offered her
 - **A single instance on macOS outside LaunchServices.** Starting the executable directly,
   `open -n`, or a second copy of the app at another path starts a second desktop with its
   own engine and model load. `tauri-plugin-single-instance` would cover that, but on macOS
-  its socket is a fixed path in the shared `/tmp` (`/tmp/app_camelid_desktop_si.sock`). On a
+  its socket is a fixed path in the shared `/tmp` (`/tmp/app.camelid.desktop_si.sock`). On a
   Mac with several accounts, another user's socket there makes a launch skip the check
   silently, and a socket someone else binds first swallows every launch before a window
   appears. So it is registered on Windows only.
