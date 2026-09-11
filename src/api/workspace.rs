@@ -1604,15 +1604,24 @@ pub(super) async fn session_status(
         .lock()
         .map(|state| state.as_str())
         .unwrap_or("error");
+    let resident_cuda = state
+        .loaded_models
+        .read()
+        .await
+        .get(&session.model_id)
+        .and_then(|model| {
+            crate::inference::resident_cuda_status(super::model_resident_cache_key(
+                &model.id,
+                &model.lane.gguf_sha256,
+            ))
+        });
     Json(WorkspaceSessionStatusResponse {
         id: session.id.clone(),
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
         context_budget_tokens: session.context_budget_tokens,
-        resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
-            &session.model_id,
-        )),
+        resident_cuda,
         allow_writes: session.allow_writes,
         semantic_retrieval: session.semantic_retriever.is_some(),
         embedding_model_id: session

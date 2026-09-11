@@ -397,6 +397,38 @@ impl ServerMetrics {
             "Paged CUDA KV pages reclaimed from completed, cancelled, or aborted sequences.",
             crate::inference::cuda_paged_kv::reclaimed_pages_total(),
         );
+        let resident_arena = crate::inference::resident_cuda_arena_status();
+        for (name, help, value) in [
+            (
+                "camelid_cuda_resident_model_capacity",
+                "Maximum main-model CUDA resident engines retained by the bounded arena.",
+                resident_arena.capacity_models as u64,
+            ),
+            (
+                "camelid_cuda_resident_models",
+                "Main-model CUDA resident engines currently retained by the arena.",
+                resident_arena.resident_models as u64,
+            ),
+            (
+                "camelid_cuda_resident_active_models",
+                "Resident main models with at least one active sequence lease.",
+                resident_arena.active_models as u64,
+            ),
+        ] {
+            metric_gauge(&mut out, name, help, value);
+        }
+        metric_counter(
+            &mut out,
+            "camelid_cuda_resident_model_evictions_total",
+            "Idle main-model CUDA resident engines evicted by deterministic LRU.",
+            resident_arena.evictions,
+        );
+        metric_counter(
+            &mut out,
+            "camelid_cuda_resident_model_admission_failures_total",
+            "Resident model admissions refused because every arena entry was active.",
+            resident_arena.admission_failures,
+        );
         let paged =
             crate::inference::active_resident_cuda_status().and_then(|status| status.paged_kv);
         for (name, help, value) in [
@@ -679,5 +711,27 @@ mod tests {
         assert!(text.contains("# TYPE camelid_cuda_paged_kv_fragmented_pages gauge"));
         assert!(text.contains("# TYPE camelid_cuda_paged_kv_device_allocated_bytes gauge"));
         assert!(!text.contains('{'));
+    }
+
+    #[test]
+    fn phase8_resident_arena_metrics_are_exposed_without_model_labels() {
+        let state = AppState::default();
+        let text = state.metrics.render(&state);
+        for (name, kind) in [
+            ("camelid_cuda_resident_model_capacity", "gauge"),
+            ("camelid_cuda_resident_models", "gauge"),
+            ("camelid_cuda_resident_active_models", "gauge"),
+            ("camelid_cuda_resident_model_evictions_total", "counter"),
+            (
+                "camelid_cuda_resident_model_admission_failures_total",
+                "counter",
+            ),
+        ] {
+            assert!(text.contains(&format!("# TYPE {name} {kind}")));
+            assert!(text
+                .lines()
+                .any(|line| line.starts_with(&format!("{name} "))));
+        }
+        assert!(!text.contains("camelid_cuda_resident_models{"));
     }
 }

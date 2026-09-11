@@ -9,6 +9,17 @@ fn assert_close(actual: f32, expected: f32) {
     );
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn phase8_resident_model_capacity_accepts_only_one_or_two() {
+    assert_eq!(resident_cuda_model_capacity_from_value(None), 1);
+    assert_eq!(resident_cuda_model_capacity_from_value(Some("1")), 1);
+    assert_eq!(resident_cuda_model_capacity_from_value(Some(" 2 ")), 2);
+    for invalid in ["", "0", "3", "8", "two"] {
+        assert_eq!(resident_cuda_model_capacity_from_value(Some(invalid)), 1);
+    }
+}
+
 #[test]
 fn sampling_probabilities_match_the_normal_sampler_candidate_weights() {
     let logits =

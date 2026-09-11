@@ -31,6 +31,8 @@ mod cpu_neon;
 #[allow(dead_code)] // Phase 6 metadata contract; serving ownership is wired next.
 pub(crate) mod cuda_paged_kv;
 #[cfg(feature = "cuda")]
+mod cuda_resident_arena;
+#[cfg(feature = "cuda")]
 mod cuda_sequence;
 mod decode_scratch;
 mod diagnostic_config;
@@ -2691,14 +2693,16 @@ pub struct LlamaInferenceSession {
     /// across separately-loaded `Arc<LlamaLoadedWeights>` for the same model (e.g. a
     /// prompt-prefix-cache-restored session vs a freshly loaded one). When two such
     /// Arcs alternate, the single-slot engine cache thrashes ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a multi-second 3.4 GB
-    /// re-upload on every request. The API sets this from the model id; when unset
-    /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
+    /// re-upload on every request. The API sets this from the model id plus exact
+    /// GGUF digest; when unset (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
     /// copied by Clone/take_for_step so restored sessions keep the same key.
     resident_cache_key: Option<u64>,
     #[cfg(feature = "cuda")]
     cuda_sequence_id: cuda_sequence::CudaSequenceId,
     #[cfg(feature = "cuda")]
     cuda_sequence_lease: Option<cuda_sequence::CudaSequenceLease>,
+    #[cfg(feature = "cuda")]
+    cuda_resident_pin: Option<ResidentCudaIdentity>,
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
@@ -2718,15 +2722,21 @@ impl Drop for LlamaInferenceSession {
         self.park_resident_metal_engine();
         #[cfg(feature = "cuda")]
         if let Some(lease) = self.cuda_sequence_lease.take() {
-            let cache = self.resident_cache();
-            release_resident_cuda_sequence(cache, lease);
+            if let Some(cache) = self.existing_resident_cache() {
+                release_resident_cuda_sequence(cache.as_ref(), lease);
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(identity) = self.cuda_resident_pin.take() {
+            resident_cuda_unpin(identity);
         }
     }
 }
 
 impl LlamaInferenceSession {
     /// Set the stable resident-engine cache key (see field docs). The API derives it
-    /// from the model id so every session for one model shares an engine.
+    /// from the model id plus exact GGUF digest so every session for one artifact
+    /// shares an engine without aliasing same-id replacement bytes.
     pub fn set_resident_cache_key(&mut self, key: u64) {
         self.resident_cache_key = Some(key);
     }
@@ -2840,13 +2850,83 @@ impl LlamaInferenceSession {
     }
 
     /// The resident-engine cache this session's GPU decode uses: the drafter cache
-    /// for a draft-model session, the main cache otherwise.
+    /// for a draft-model session, an exact-identity cell in the main arena otherwise.
     #[cfg(feature = "cuda")]
-    fn resident_cache(&self) -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+    fn resident_cache(&mut self) -> Result<ResidentCudaCacheCell> {
         if self.is_drafter {
-            resident_cuda_drafter_cache()
+            Ok(resident_cuda_drafter_cache())
         } else {
-            resident_cuda_cache()
+            let identity = self.resident_cuda_identity();
+            if let Some(pinned) = self.cuda_resident_pin {
+                if pinned != identity {
+                    return Err(BackendError::RuntimeShapeMismatch(
+                        "resident CUDA model identity changed while the session was active"
+                            .to_string(),
+                    ));
+                }
+                return resident_cuda_existing_cache(identity).ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch(
+                        "active resident CUDA model disappeared from its arena".to_string(),
+                    )
+                });
+            }
+            let cell = resident_cuda_cache_for(identity)?;
+            self.cuda_resident_pin = Some(identity);
+            Ok(cell)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn existing_resident_cache(&self) -> Option<ResidentCudaCacheCell> {
+        if self.is_drafter {
+            Some(resident_cuda_drafter_cache())
+        } else {
+            resident_cuda_existing_cache(self.resident_cuda_identity())
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn discard_empty_resident_cache(&mut self, cache: &ResidentCudaCacheCell) {
+        if self.is_drafter {
+            return;
+        }
+        let Some(identity) = self.cuda_resident_pin.take() else {
+            return;
+        };
+        let empty = cache.lock().map(|slot| slot.is_none()).unwrap_or(false);
+        let mut arena = resident_cuda_arena()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = arena.unpin(identity);
+        if empty {
+            let _ = arena.remove(identity);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn resident_cuda_identity(&self) -> ResidentCudaIdentity {
+        let range = self
+            .weights
+            .layer_range
+            .clone()
+            .unwrap_or(0..self.weights.layers.len());
+        ResidentCudaIdentity {
+            model_key: self
+                .resident_cache_key
+                .map(|key| key as usize)
+                .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize),
+            range_start: range.start,
+            range_end: range.end,
+            kv_quant: self.config.kv_quant,
+            paged_kv: self.cuda_paged_kv_enabled(),
+            sequence_capacity: self.resident_cuda_kv_slot_count(),
+            context_capacity: (self.config.context_length as usize)
+                .min(self.kv_cache.plan.max_sequence_length)
+                .min(self.resident_cuda_context_cap()),
+            embedding_length: self.config.embedding_length as usize,
+            attention_heads: self.config.attention_head_count as usize,
+            kv_heads: self.config.attention_head_count_kv as usize,
+            windowed: self.config.gemma3.is_some(),
         }
     }
 
@@ -2902,6 +2982,8 @@ impl LlamaInferenceSession {
             cuda_sequence_id: self.cuda_sequence_id,
             #[cfg(feature = "cuda")]
             cuda_sequence_lease: self.cuda_sequence_lease.take(),
+            #[cfg(feature = "cuda")]
+            cuda_resident_pin: self.cuda_resident_pin.take(),
             is_drafter: self.is_drafter,
         }
     }
@@ -2999,6 +3081,8 @@ impl Clone for LlamaInferenceSession {
             cuda_sequence_id: cuda_sequence::CudaSequenceId::next(),
             #[cfg(feature = "cuda")]
             cuda_sequence_lease: None,
+            #[cfg(feature = "cuda")]
+            cuda_resident_pin: None,
             is_drafter: self.is_drafter,
         }
     }
@@ -3046,6 +3130,8 @@ impl LlamaInferenceSession {
             cuda_sequence_id: cuda_sequence::CudaSequenceId::next(),
             #[cfg(feature = "cuda")]
             cuda_sequence_lease: None,
+            #[cfg(feature = "cuda")]
+            cuda_resident_pin: None,
             is_drafter: false,
         })
     }
@@ -3166,7 +3252,10 @@ impl LlamaInferenceSession {
         self.kv_cache.rollback_to_position(position)?;
         #[cfg(feature = "cuda")]
         {
-            if let Ok(mut guard) = self.resident_cache().lock() {
+            if let Some(cache) = self.existing_resident_cache() {
+                let mut guard = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if select_resident_cuda_sequence_or_teardown(
                     &mut guard,
                     self.cuda_sequence_id,
@@ -3668,7 +3757,7 @@ impl LlamaInferenceSession {
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
         let kv_slot_count = self.resident_cuda_kv_slot_count();
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3742,10 +3831,12 @@ impl LlamaInferenceSession {
                     })
                 }
                 None => {
+                    drop(guard);
+                    self.discard_empty_resident_cache(&cache);
                     return cuda_prefill_chunk_unsupported(
                         continuing,
                         "resident engine construction failed",
-                    )
+                    );
                 }
             }
         }
@@ -3918,7 +4009,7 @@ impl LlamaInferenceSession {
                 "resident paged prefill cannot be finalized in this session state".to_string(),
             ));
         }
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3966,7 +4057,7 @@ impl LlamaInferenceSession {
             .resident_cache_key
             .map(|key| key as usize)
             .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4108,7 +4199,7 @@ impl LlamaInferenceSession {
             .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
         // `resident_cache()` hands back a `'static` handle, so this guard borrows the global
         // cache and NOT the session — the stores below can take `&mut self.kv_cache` under it.
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4351,7 +4442,7 @@ impl LlamaInferenceSession {
             .resident_cache_key
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4468,7 +4559,7 @@ impl LlamaInferenceSession {
             .resident_cache_key
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4725,7 +4816,7 @@ impl LlamaInferenceSession {
             .map(|k| k as usize)
             .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
         let kv_slot_count = self.resident_cuda_kv_slot_count();
-        let cache = self.resident_cache();
+        let cache = self.resident_cache()?;
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4831,6 +4922,8 @@ impl LlamaInferenceSession {
                     if trace {
                         eprintln!("[resident-cuda] engine build failed (unsupported weights?)");
                     }
+                    drop(guard);
+                    self.discard_empty_resident_cache(&cache);
                     return Ok(None);
                 }
             }
@@ -6538,7 +6631,9 @@ pub(crate) fn execute_cuda_true_paged_prefill_step(
         sin.extend_from_slice(&tables.sin);
     }
 
-    let cache = sessions[0].resident_cache();
+    let cache = sessions[0]
+        .resident_cache()
+        .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?;
     let internal_sequence_ids = sessions
         .iter()
         .map(|session| session.cuda_sequence_id)
@@ -6705,7 +6800,9 @@ pub(crate) fn execute_cuda_true_paged_batch(
         sin.extend_from_slice(&tables.sin);
     }
 
-    let cache = sessions[0].resident_cache();
+    let cache = sessions[0]
+        .resident_cache()
+        .map_err(|error| CudaTruePagedBatchContractError::Backend(error.to_string()))?;
     let internal_sequence_ids = sessions
         .iter()
         .map(|session| session.cuda_sequence_id)
@@ -6933,7 +7030,9 @@ pub(crate) fn execute_cuda_true_batch2(
         sin.extend_from_slice(&tables.sin);
     }
 
-    let cache = sessions[0].resident_cache();
+    let cache = sessions[0]
+        .resident_cache()
+        .map_err(|error| CudaTrueBatch2ContractError::Backend(error.to_string()))?;
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -14451,6 +14550,25 @@ fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) ->
 /// API server clones a fresh session per request, so this can't live in the
 /// session). The mutex is held only for a single token's forward.
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentCudaIdentity {
+    model_key: usize,
+    range_start: usize,
+    range_end: usize,
+    kv_quant: crate::model::KvCacheQuantization,
+    paged_kv: bool,
+    sequence_capacity: usize,
+    context_capacity: usize,
+    embedding_length: usize,
+    attention_heads: usize,
+    kv_heads: usize,
+    windowed: bool,
+}
+
+#[cfg(feature = "cuda")]
+type ResidentCudaCacheCell = Arc<std::sync::Mutex<Option<ResidentCudaSlot>>>;
+
+#[cfg(feature = "cuda")]
 struct ResidentCudaSlot {
     key: usize,
     engine: crate::cuda_resident::CudaResidentDecode,
@@ -14973,7 +15091,7 @@ fn select_resident_cuda_sequence_or_teardown(
 
 #[cfg(feature = "cuda")]
 fn release_resident_cuda_sequence(
-    cache: &'static std::sync::Mutex<Option<ResidentCudaSlot>>,
+    cache: &std::sync::Mutex<Option<ResidentCudaSlot>>,
     lease: cuda_sequence::CudaSequenceLease,
 ) {
     let mut guard = cache
@@ -15065,7 +15183,11 @@ pub enum ResidentCudaExecutionMode {
 
 #[cfg(feature = "cuda")]
 pub fn resident_cuda_status(model_cache_key: u64) -> Option<ResidentCudaStatus> {
-    let cache = resident_cuda_cache().try_lock().ok()?;
+    let cell = resident_cuda_arena()
+        .try_lock()
+        .ok()?
+        .peek_matching(|identity| identity.model_key == model_cache_key as usize)?;
+    let cache = cell.try_lock().ok()?;
     let slot = cache.as_ref()?;
     let sequence_snapshot = slot.sequence_slots.as_ref().map(|slots| slots.snapshot());
     let paged_kv = slot.paged_kv.as_ref().and_then(|paged| {
@@ -15108,7 +15230,11 @@ pub fn resident_cuda_status(model_cache_key: u64) -> Option<ResidentCudaStatus> 
 
 #[cfg(feature = "cuda")]
 pub(crate) fn active_resident_cuda_status() -> Option<ResidentCudaStatus> {
-    let cache = resident_cuda_cache().try_lock().ok()?;
+    let cell = resident_cuda_arena()
+        .try_lock()
+        .ok()?
+        .peek_matching(|_| true)?;
+    let cache = cell.try_lock().ok()?;
     let slot = cache.as_ref()?;
     let key = slot.key as u64;
     drop(cache);
@@ -15125,7 +15251,180 @@ pub fn resident_cuda_status(_model_cache_key: u64) -> Option<ResidentCudaStatus>
     None
 }
 
+pub const CUDA_RESIDENT_MODELS_ENV: &str = "CAMELID_CUDA_RESIDENT_MODELS";
+
 #[cfg(feature = "cuda")]
+fn resident_cuda_model_capacity() -> usize {
+    resident_cuda_model_capacity_from_value(std::env::var(CUDA_RESIDENT_MODELS_ENV).ok().as_deref())
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_model_capacity_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|capacity| matches!(capacity, 1 | 2))
+        .unwrap_or(1)
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_arena() -> &'static std::sync::Mutex<
+    cuda_resident_arena::ResidentModelArena<ResidentCudaIdentity, ResidentCudaCacheCell>,
+> {
+    static ARENA: std::sync::OnceLock<
+        std::sync::Mutex<
+            cuda_resident_arena::ResidentModelArena<ResidentCudaIdentity, ResidentCudaCacheCell>,
+        >,
+    > = std::sync::OnceLock::new();
+    ARENA.get_or_init(|| {
+        std::sync::Mutex::new(cuda_resident_arena::ResidentModelArena::new(
+            resident_cuda_model_capacity(),
+        ))
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_cell_idle(cell: &ResidentCudaCacheCell) -> bool {
+    cell.try_lock().ok().is_some_and(|slot| {
+        slot.as_ref().is_none_or(|slot| {
+            slot.sequence_slots
+                .as_ref()
+                .is_none_or(|slots| slots.snapshot().occupied == 0)
+        })
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_cache_for(identity: ResidentCudaIdentity) -> Result<ResidentCudaCacheCell> {
+    let mut arena = resident_cuda_arena()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (cell, disposition) = arena
+        .acquire(
+            identity,
+            || Arc::new(std::sync::Mutex::new(None)),
+            resident_cuda_cell_idle,
+        )
+        .map_err(|error| BackendError::RuntimeShapeMismatch(error.to_string()))?;
+    let pinned = arena.pin(identity).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(
+            "resident CUDA model disappeared during arena admission".to_string(),
+        )
+    })?;
+    debug_assert!(Arc::ptr_eq(&cell, &pinned));
+    drop(arena);
+    if matches!(
+        disposition,
+        cuda_resident_arena::ResidentArenaDisposition::Inserted { evicted: Some(_) }
+    ) {
+        crate::cuda::release_async_pool();
+    }
+    Ok(cell)
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_existing_cache(identity: ResidentCudaIdentity) -> Option<ResidentCudaCacheCell> {
+    resident_cuda_arena()
+        .lock()
+        .ok()
+        .and_then(|arena| arena.peek_matching(|candidate| *candidate == identity))
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_unpin(identity: ResidentCudaIdentity) {
+    if let Ok(mut arena) = resident_cuda_arena().lock() {
+        let _ = arena.unpin(identity);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResidentCudaArenaStatus {
+    pub capacity_models: usize,
+    pub resident_models: usize,
+    pub active_models: usize,
+    pub evictions: u64,
+    pub admission_failures: u64,
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_arena_status() -> ResidentCudaArenaStatus {
+    let arena = resident_cuda_arena()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = arena.snapshot();
+    let cells = arena.matching_values(|_| true);
+    drop(arena);
+    let mut resident_models = 0;
+    let active_models = snapshot.active;
+    for cell in cells {
+        if let Ok(slot) = cell.try_lock() {
+            if slot.is_some() {
+                resident_models += 1;
+            }
+        }
+    }
+    ResidentCudaArenaStatus {
+        capacity_models: snapshot.capacity,
+        resident_models,
+        active_models,
+        evictions: snapshot.evictions,
+        admission_failures: snapshot.admission_failures,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_arena_status() -> ResidentCudaArenaStatus {
+    ResidentCudaArenaStatus {
+        capacity_models: 0,
+        resident_models: 0,
+        active_models: 0,
+        evictions: 0,
+        admission_failures: 0,
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_model_active(model_cache_key: u64) -> bool {
+    let arena = resident_cuda_arena()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if arena.active_matching(|identity| identity.model_key == model_cache_key as usize) > 0 {
+        return true;
+    }
+    let cells = arena.matching_values(|identity| identity.model_key == model_cache_key as usize);
+    drop(arena);
+    cells.iter().any(|cell| !resident_cuda_cell_idle(cell))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_model_active(_model_cache_key: u64) -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+pub fn release_resident_cuda_model(model_cache_key: u64) -> std::result::Result<(), String> {
+    let mut arena = resident_cuda_arena()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cells = arena.matching_values(|identity| identity.model_key == model_cache_key as usize);
+    if arena.active_matching(|identity| identity.model_key == model_cache_key as usize) > 0
+        || cells.iter().any(|cell| !resident_cuda_cell_idle(cell))
+    {
+        return Err("resident CUDA model still has active sequences".to_string());
+    }
+    let removed = arena.remove_matching(|identity| identity.model_key == model_cache_key as usize);
+    drop(arena);
+    drop(removed);
+    crate::cuda::release_async_pool();
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn release_resident_cuda_model(_model_cache_key: u64) -> std::result::Result<(), String> {
+    reset_resident_caches();
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", test))]
 fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
         std::sync::OnceLock::new();
@@ -15138,10 +15437,11 @@ fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> 
 /// slot would thrash (rebuild + 3.4 GB re-upload) every time control passed between
 /// drafter and target. Routed by `LlamaInferenceSession::is_drafter`.
 #[cfg(feature = "cuda")]
-fn resident_cuda_drafter_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+fn resident_cuda_drafter_cache() -> ResidentCudaCacheCell {
+    static CACHE: std::sync::OnceLock<ResidentCudaCacheCell> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(None)))
+        .clone()
 }
 
 /// Per-model verdict of the GPU-runnable-tier parity self-check, keyed by the model-id
@@ -15219,9 +15519,15 @@ fn run_greedy_probe(
 /// generation lock (the caller does) so no concurrent decode has evicted the slot.
 #[cfg(feature = "cuda")]
 fn resident_probe_engaged(probe_key: u64) -> bool {
-    resident_cuda_cache()
+    resident_cuda_arena()
         .lock()
-        .map(|guard| guard.as_ref().map(|slot| slot.key) == Some(probe_key as usize))
+        .ok()
+        .and_then(|arena| arena.peek_matching(|identity| identity.model_key == probe_key as usize))
+        .and_then(|cell| {
+            cell.lock()
+                .ok()
+                .map(|slot| slot.as_ref().map(|slot| slot.key) == Some(probe_key as usize))
+        })
         .unwrap_or(false)
 }
 
@@ -15371,12 +15677,19 @@ fn spec_draft_kv_context() -> usize {
 /// when the VRAM budget changes (entering/leaving speculative coexistence). No-op without CUDA.
 #[cfg(feature = "cuda")]
 pub fn reset_resident_caches() {
-    *resident_cuda_cache()
+    resident_cuda_arena()
         .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     *resident_cuda_drafter_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
+    #[cfg(test)]
+    {
+        *resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
     // The engines dropped above returned their VRAM to cudarc's stream-ordered async
     // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
     // the next model's resident fit decision measures the real free VRAM ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise a

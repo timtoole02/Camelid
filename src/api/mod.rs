@@ -16768,7 +16768,6 @@ async fn unload_model(
             None,
         );
     }
-    let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
         req.id
     } else {
@@ -16780,6 +16779,26 @@ async fn unload_model(
     } else {
         state.active_model_id.read().await.clone()
     };
+
+    #[cfg(feature = "cuda")]
+    if let Some(id) = target_id.as_deref() {
+        let resident_key = state
+            .loaded_models
+            .read()
+            .await
+            .get(id)
+            .map(|model| model_resident_cache_key(&model.id, &model.lane.gguf_sha256));
+        if resident_key.is_some_and(crate::inference::resident_cuda_model_active) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                "resident CUDA model still has active sequences".to_string(),
+                None,
+            );
+        }
+    }
+
+    let _exclusive = state.model_file_lifecycle.write().await;
 
     if let Err(resp) = release_model(&state, target_id).await {
         return *resp;
@@ -16801,6 +16820,50 @@ async fn unload_model(
 /// The caller must already hold the model-transition lock and an exclusive
 /// `model_file_lifecycle` guard. `Err` carries a ready-to-return response.
 async fn release_model(state: &AppState, target: Option<String>) -> Result<(), Box<Response>> {
+    #[cfg(feature = "cuda")]
+    {
+        let release_all = target.is_none();
+        let resident_key = match target.as_deref() {
+            Some(id) => state
+                .loaded_models
+                .read()
+                .await
+                .get(id)
+                .map(|model| model_resident_cache_key(&model.id, &model.lane.gguf_sha256)),
+            None => None,
+        };
+        if resident_key.is_some_and(crate::inference::resident_cuda_model_active) {
+            return Err(Box::new(api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                "resident CUDA model still has active sequences".to_string(),
+                None,
+            )));
+        }
+        let release = state
+            .engine
+            .run_exclusive(move || {
+                if release_all {
+                    crate::inference::reset_resident_caches();
+                    Ok(())
+                } else if let Some(key) = resident_key {
+                    crate::inference::release_resident_cuda_model(key)
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(engine_post_error_response)?;
+        if let Err(message) = release {
+            return Err(Box::new(api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                message,
+                None,
+            )));
+        }
+    }
+
     if let Some(id) = target {
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
@@ -16846,12 +16909,15 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     // The reset mutates engine-owned GPU state, so it runs as an ENGINE JOB —
     // it can never race a decode. A failed post is surfaced, never skipped
     // silently (a skipped reset is the 20x-slowdown VRAM leak all over again).
-    if let Err(err) = state
-        .engine
-        .run_exclusive(crate::inference::reset_resident_caches)
-        .await
+    #[cfg(not(feature = "cuda"))]
     {
-        return Err(engine_post_error_response(err));
+        if let Err(err) = state
+            .engine
+            .run_exclusive(crate::inference::reset_resident_caches)
+            .await
+        {
+            return Err(engine_post_error_response(err));
+        }
     }
     Ok(())
 }
@@ -20246,11 +20312,24 @@ fn enforce_context_budget(
     Ok(())
 }
 
-pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
+pub(super) fn model_resident_cache_key(model_id: &str, gguf_sha256: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     model_id.hash(&mut hasher);
+    gguf_sha256.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+#[test]
+fn phase8_resident_cache_key_is_stable_and_artifact_sensitive() {
+    let artifact_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let artifact_b = "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let first = model_resident_cache_key("model-a", artifact_a);
+    assert_eq!(first, model_resident_cache_key("model-a", artifact_a));
+    assert_ne!(first, model_resident_cache_key("model-a", artifact_b));
+    assert_ne!(first, model_resident_cache_key("model-b", artifact_a));
 }
 
 #[cfg(test)]
@@ -20952,7 +21031,7 @@ async fn prepare_generation(
     // Pin the GPU resident-decode engine cache to the model identity (not the
     // per-load weights Arc pointer), so every request for this model reuses the
     // uploaded weights instead of rebuilding the engine each time.
-    let resident_cache_key = model_resident_cache_key(&model.id);
+    let resident_cache_key = model_resident_cache_key(&model.id, &model.lane.gguf_sha256);
     session.set_resident_cache_key(resident_cache_key);
     timings.session_create = session_create_started.elapsed().as_millis();
 
