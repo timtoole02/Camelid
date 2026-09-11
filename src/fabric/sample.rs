@@ -1,0 +1,211 @@
+//! Running one prompt on one node, whatever engine it runs.
+//!
+//! This is the divergence view's counterpart to [`super::probe`]: the only
+//! place that knows which engine speaks which wire format when we are asking a
+//! question rather than reading a status. Placement stays entirely unaware of
+//! it, which is what lets a foreign engine be *measured* without being *routed
+//! to* — and measuring is exactly how a foreign engine could ever earn a
+//! `measured` capability provenance.
+
+use std::time::{Duration, Instant};
+
+use super::camelid;
+use super::divergence::{
+    stability_of, AppliedSampling, Sample, SamplingPlan, Side, TemplateEvidence,
+};
+use super::engine::NodeEngine;
+use super::lmstudio;
+use super::node::{NodeSpec, NodeStatus};
+use super::ollama;
+use super::probe::probe_node;
+use super::transport::NodeTransport;
+
+/// Why one side of a comparison could not be measured at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SampleError {
+    /// The node did not answer a status probe, so there is nothing to compare.
+    NotServing { label: String, reason: String },
+    /// The node is serving, but not the model the comparison is about.
+    ModelAbsent {
+        label: String,
+        model: String,
+        available: Vec<String>,
+    },
+    /// A generation request failed.
+    Failed { label: String, detail: String },
+}
+
+impl std::fmt::Display for SampleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotServing { label, reason } => {
+                write!(f, "{label} is not serving: {reason}")
+            }
+            Self::ModelAbsent {
+                label,
+                model,
+                available,
+            } => write!(
+                f,
+                "{label} does not hold {model}; it holds {}",
+                if available.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+            Self::Failed { label, detail } => write!(f, "{label} failed to answer: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SampleError {}
+
+/// Everything one side needs, gathered so the argument list stays honest about
+/// what a measurement depends on.
+pub(crate) struct SideRequest<'a> {
+    pub(crate) spec: &'a NodeSpec,
+    pub(crate) model: &'a str,
+    pub(crate) prompt: &'a str,
+    pub(crate) plan: &'a SamplingPlan,
+    pub(crate) bearer: Option<&'a str>,
+    pub(crate) timeout: Duration,
+}
+
+/// Probe the node, check it holds the model, run the prompt `plan.repetitions`
+/// times, and capture the template if the engine exposes one.
+pub(crate) fn measure(
+    request: &SideRequest<'_>,
+    transport: &NodeTransport,
+) -> Result<Side, SampleError> {
+    let label = request.spec.label.clone();
+    let snapshot = probe_node(request.spec, request.bearer, request.timeout);
+    let ready = match snapshot.status {
+        NodeStatus::Ready(ready) => ready,
+        NodeStatus::NotReady { reason } | NodeStatus::Unreachable { reason } => {
+            return Err(SampleError::NotServing { label, reason })
+        }
+    };
+
+    // Refusing here is the difference between measuring a divergence and
+    // measuring a typo: a node that does not hold the model would otherwise
+    // answer with whatever it does hold, or with an error we would then diff.
+    if !ready.models.iter().any(|held| held == request.model) {
+        return Err(SampleError::ModelAbsent {
+            label,
+            model: request.model.to_string(),
+            available: ready.models,
+        });
+    }
+
+    let engine = ready.engine;
+    let mut samples = Vec::with_capacity(request.plan.repetitions);
+    let mut runtime_note = None;
+    let ask = super::divergence::Ask {
+        model: request.model,
+        prompt: request.prompt,
+        temperature: request.plan.temperature,
+        seed: request.plan.seed,
+        max_tokens: request.plan.max_tokens,
+    };
+
+    for _ in 0..request.plan.repetitions.max(1) {
+        let started = Instant::now();
+        let text = match engine {
+            NodeEngine::Camelid => camelid::complete(
+                request.spec,
+                &ask,
+                request.bearer,
+                request.timeout,
+                transport,
+            ),
+            NodeEngine::Ollama => ollama::complete(request.spec, &ask, request.timeout, transport),
+            NodeEngine::LmStudio => {
+                lmstudio::complete(request.spec, &ask, request.timeout, transport).map(
+                    |completion| {
+                        runtime_note = completion.runtime;
+                        completion.text
+                    },
+                )
+            }
+        };
+        let text = text.map_err(|detail| SampleError::Failed {
+            label: label.clone(),
+            detail,
+        })?;
+        samples.push(Sample::new(text, started.elapsed()));
+    }
+
+    Ok(Side {
+        label,
+        engine,
+        engine_version: ready.version,
+        // Named separately from the version: LM Studio publishes no application
+        // version, and this is a llama.cpp build, not that.
+        runtime: runtime_note,
+        model: Some(request.model.to_string()),
+        applied_sampling: AppliedSampling::for_engine(engine),
+        stability: stability_of(&samples),
+        samples,
+        template: capture_template(request, engine, transport),
+    })
+}
+
+fn capture_template(
+    request: &SideRequest<'_>,
+    engine: NodeEngine,
+    transport: &NodeTransport,
+) -> TemplateEvidence {
+    let (source, captured) = match engine {
+        NodeEngine::Camelid => (
+            "GET /props",
+            camelid::template(request.spec, request.bearer, request.timeout, transport),
+        ),
+        NodeEngine::Ollama => (
+            "POST /api/show",
+            ollama::template(request.spec, request.model, request.timeout, transport),
+        ),
+        // Its documented API has no endpoint that returns a prompt template.
+        // Saying so is the honest answer; an empty string would read as "no
+        // template", which is a different and false claim.
+        NodeEngine::LmStudio => {
+            return TemplateEvidence::NotExposed {
+                detail: "LM Studio's documented API exposes no prompt template".to_string(),
+            }
+        }
+    };
+    match captured {
+        Ok(template) => TemplateEvidence::Captured {
+            source: source.to_string(),
+            template,
+        },
+        Err(detail) => TemplateEvidence::Unavailable { detail },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_model_names_what_the_node_does_hold() {
+        let error = SampleError::ModelAbsent {
+            label: "studio".to_string(),
+            model: "llama-3.2-1b".to_string(),
+            available: vec!["qwen3:8b".to_string(), "mistral:latest".to_string()],
+        };
+        let message = error.to_string();
+        assert!(message.contains("does not hold llama-3.2-1b"), "{message}");
+        assert!(message.contains("qwen3:8b"), "{message}");
+    }
+
+    #[test]
+    fn a_node_holding_nothing_says_so_rather_than_listing_an_empty_set() {
+        let error = SampleError::ModelAbsent {
+            label: "studio".to_string(),
+            model: "m".to_string(),
+            available: Vec::new(),
+        };
+        assert!(error.to_string().contains("it holds nothing"), "{error}");
+    }
+}

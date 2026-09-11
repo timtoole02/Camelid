@@ -42,6 +42,10 @@
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
     "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",
+    "smoke:fabric-model": "node scripts/fabric-model-smoke.mjs",
+    "smoke:fabric-view": "node scripts/fabric-view-smoke.mjs",
+    "smoke:divergence-model": "node scripts/divergence-model-smoke.mjs",
+    "smoke:divergence-view": "node scripts/divergence-view-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {

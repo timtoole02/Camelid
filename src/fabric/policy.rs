@@ -13,6 +13,7 @@
 //!   the node holding it dies the request still gets served, and the decision
 //!   records that affinity was lost rather than silently pretending it held.
 
+use super::engine::NodeEngine;
 use super::node::{NodeSnapshot, NodeStatus};
 
 /// Successful completions required from every candidate before learned
@@ -120,6 +121,10 @@ impl RouteReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDecision {
     pub label: String,
+    /// The engine on the chosen node. Reported on every answer so a client never
+    /// has to know which engines this fabric is willing to place on to find out
+    /// which one served it.
+    pub engine: NodeEngine,
     pub reason: RouteReason,
     /// Previous node's label when affinity was requested but could not be
     /// honoured. Reported so a caller can tell a warm hit from a cold re-prefill.
@@ -134,6 +139,10 @@ pub enum RouteError {
     AllNodesUnavailable {
         unreachable: usize,
         not_ready: usize,
+        /// Nodes that answered and are healthy, but run an engine this fabric
+        /// does not place on. Counted apart from `not_ready` because nothing an
+        /// operator does to those machines will make them eligible.
+        not_placeable: usize,
     },
     ModelUnavailable {
         model: String,
@@ -156,10 +165,24 @@ impl std::fmt::Display for RouteError {
             Self::AllNodesUnavailable {
                 unreachable,
                 not_ready,
-            } => write!(
-                f,
-                "no node can serve: {unreachable} unreachable, {not_ready} reachable but not ready"
-            ),
+                not_placeable,
+            } => {
+                write!(
+                    f,
+                    "no node can serve: {unreachable} unreachable, {not_ready} reachable but not ready"
+                )?;
+                match not_placeable {
+                    0 => Ok(()),
+                    1 => write!(
+                        f,
+                        ", 1 healthy node running an engine this fabric does not place on"
+                    ),
+                    many => write!(
+                        f,
+                        ", {many} healthy nodes running engines this fabric does not place on"
+                    ),
+                }
+            }
             Self::ModelUnavailable {
                 model,
                 serving,
@@ -232,8 +255,11 @@ impl Reservations {
 struct ServiceClass {
     label: String,
     authority: String,
-    backend: String,
-    version: String,
+    /// Both stay optional so that a node which stops reporting a lane or a
+    /// version invalidates its estimates rather than silently inheriting the
+    /// timings of the lane it used to run.
+    backend: Option<String>,
+    version: Option<String>,
     model: String,
     workload: String,
 }
@@ -415,6 +441,7 @@ impl ServiceTimeEstimates {
 /// One eligible node reduced to the fields selection actually uses.
 struct Candidate<'a> {
     label: &'a str,
+    engine: NodeEngine,
     load: usize,
     service_nanos: Option<u128>,
     last_selected: Option<std::time::Instant>,
@@ -491,7 +518,7 @@ fn route_reserved_with_estimates_at(
 
     let ready: Vec<&NodeSnapshot> = snapshots
         .iter()
-        .filter(|snapshot| snapshot.status.is_ready())
+        .filter(|snapshot| snapshot.is_placeable())
         .collect();
 
     if ready.is_empty() {
@@ -499,9 +526,17 @@ fn route_reserved_with_estimates_at(
             .iter()
             .filter(|s| matches!(s.status, NodeStatus::Unreachable { .. }))
             .count();
+        // A healthy node running an unplaceable engine is neither unreachable
+        // nor not-ready, and folding it into either would send an operator to
+        // fix a machine that is working perfectly.
+        let not_placeable = snapshots
+            .iter()
+            .filter(|s| s.status.is_ready() && !s.engine().is_placeable())
+            .count();
         return Err(RouteError::AllNodesUnavailable {
             unreachable,
-            not_ready: snapshots.len() - unreachable,
+            not_ready: snapshots.len() - unreachable - not_placeable,
+            not_placeable,
         });
     }
 
@@ -545,7 +580,14 @@ fn route_reserved_with_estimates_at(
                 });
                 Candidate {
                     label: snapshot.label(),
-                    load: load_of(ready.in_flight, reserved.get(snapshot.label())),
+                    engine: snapshot.engine(),
+                    // A placeable engine always reports load; `unwrap_or` here
+                    // would rank an unknown as idle, so the reservation count
+                    // stands alone instead.
+                    load: match ready.in_flight() {
+                        Some(observed) => load_of(observed, reserved.get(snapshot.label())),
+                        None => reserved.get(snapshot.label()),
+                    },
                     service_nanos: current
                         .filter(|estimate| estimate.samples >= MIN_SERVICE_TIME_SAMPLES)
                         .map(|estimate| estimate.mean_nanos),
@@ -559,6 +601,7 @@ fn route_reserved_with_estimates_at(
         return Err(RouteError::AllNodesUnavailable {
             unreachable: 0,
             not_ready: serving_model.len(),
+            not_placeable: 0,
         });
     }
 
@@ -567,6 +610,7 @@ fn route_reserved_with_estimates_at(
             if let Some(hit) = candidates.iter().find(|c| c.label == sticky) {
                 return Ok(RouteDecision {
                     label: hit.label.to_string(),
+                    engine: hit.engine,
                     reason: RouteReason::Affinity,
                     affinity_lost: None,
                 });
@@ -631,6 +675,7 @@ fn route_reserved_with_estimates_at(
 
     Ok(RouteDecision {
         label: chosen.label.to_string(),
+        engine: chosen.engine,
         reason,
         affinity_lost,
     })
@@ -639,25 +684,26 @@ fn route_reserved_with_estimates_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fabric::node::{NodeReady, NodeSpec, NodeStatus};
+    use crate::fabric::engine::NodeEngine;
+    use crate::fabric::node::{NodeLoad, NodeReady, NodeSpec, NodeStatus};
 
     fn spec(label: &str) -> NodeSpec {
-        NodeSpec {
-            label: label.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 8181,
-        }
+        NodeSpec::camelid(label, "127.0.0.1", 8181)
     }
 
     fn ready(label: &str, model: Option<&str>, in_flight: usize) -> NodeSnapshot {
         NodeSnapshot {
             spec: spec(label),
             status: NodeStatus::Ready(NodeReady {
+                engine: NodeEngine::Camelid,
                 active_model_id: model.map(str::to_string),
-                backend: "llama".to_string(),
-                version: "0.5.4".to_string(),
-                in_flight,
-                waiting: in_flight.saturating_sub(1),
+                models: model.map(str::to_string).into_iter().collect(),
+                backend: Some("llama".to_string()),
+                version: Some("0.5.4".to_string()),
+                load: Some(NodeLoad {
+                    in_flight,
+                    waiting: in_flight.saturating_sub(1),
+                }),
             }),
             latency: None,
         }
@@ -1155,6 +1201,7 @@ mod tests {
             Err(RouteError::AllNodesUnavailable {
                 unreachable: 2,
                 not_ready: 1,
+                not_placeable: 0,
             })
         );
     }

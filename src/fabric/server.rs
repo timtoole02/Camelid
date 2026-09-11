@@ -298,6 +298,7 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/models/:model", get(model))
         .route("/v1/health", get(health))
+        .route("/v1/fabric/compare", post(compare))
         // A client that reaches an address it was told is OpenAI-compatible has
         // to be able to tell "wrong route" from "wrong model", and axum's own
         // 404 carries no body at all.
@@ -760,6 +761,109 @@ async fn health(State(state): State<ServerState>) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Longest prompt this route will compare. A comparison is a diagnostic, not a
+/// serving path, and every byte here is generated against twice.
+const MAX_COMPARE_PROMPT_BYTES: usize = 8 * 1024;
+
+/// Ceiling on repetitions per side. Each one is a full generation on a real
+/// node, so an unbounded value would let one authenticated request occupy two
+/// machines indefinitely.
+const MAX_COMPARE_REPETITIONS: usize = 5;
+
+/// Ceiling on tokens generated per run, for the same reason.
+const MAX_COMPARE_MAX_TOKENS: u32 = 1024;
+
+#[derive(Debug, serde::Deserialize)]
+struct CompareRequest {
+    left: String,
+    right: String,
+    model: String,
+    #[serde(default)]
+    left_model: Option<String>,
+    #[serde(default)]
+    right_model: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    repetitions: Option<usize>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// Ask two named nodes the same question and report what differed.
+///
+/// Behind the client key like every other route on this proxy, because unlike
+/// `/v1/health` it *causes work*: it makes an authenticated caller generate on
+/// two machines. The bounds above exist for that reason rather than for
+/// correctness, and are clamped rather than rejected so a caller asking for
+/// more simply gets the maximum, described in the answer it gets back.
+async fn compare(
+    State(state): State<ServerState>,
+    payload: std::result::Result<Json<CompareRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("could not read the comparison request: {rejection}"),
+            )
+        }
+    };
+
+    if request.prompt.len() > MAX_COMPARE_PROMPT_BYTES {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!(
+                "prompt is {} bytes; this route compares at most {MAX_COMPARE_PROMPT_BYTES}",
+                request.prompt.len()
+            ),
+        );
+    }
+
+    let plan = fabric::SamplingPlan {
+        temperature: request.temperature.unwrap_or(0.0),
+        seed: request.seed,
+        max_tokens: request
+            .max_tokens
+            .unwrap_or(64)
+            .clamp(1, MAX_COMPARE_MAX_TOKENS),
+        repetitions: request
+            .repetitions
+            .unwrap_or(2)
+            .clamp(1, MAX_COMPARE_REPETITIONS),
+    };
+
+    let fabric_handle = Arc::clone(&state.fabric);
+    // Same reason as `health`: this is blocking socket I/O, and a long one.
+    let outcome = tokio::task::spawn_blocking(move || {
+        fabric_handle.compare(
+            &request.left,
+            &request.right,
+            request.left_model.as_deref().unwrap_or(&request.model),
+            request.right_model.as_deref().unwrap_or(&request.model),
+            &request.prompt,
+            plan,
+        )
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(comparison)) => (StatusCode::OK, Json(serde_json::json!(comparison))).into_response(),
+        // A comparison that could not be set up or run is a failed request, not
+        // a verdict. Returning 200 with an empty comparison would let a caller
+        // read "no difference" out of "we never asked".
+        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        Err(join_error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("the comparison did not complete: {join_error}"),
+        ),
+    }
+}
+
 /// Build the health answer.
 ///
 /// Ready means at least one node is ready, which is exactly what placement
@@ -791,7 +895,11 @@ async fn health(State(state): State<ServerState>) -> Response {
 /// server and guessing which branch ran.
 fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (StatusCode, Value) {
     let summary = fabric::FabricSummary::of(snapshots);
-    let ready = summary.ready > 0;
+    // Readiness is "a request placed now would find a node", which is not the
+    // same as "some node is healthy": a fabric whose only healthy node runs an
+    // engine this proxy does not place on can serve nothing, and reporting it
+    // ready would keep it in a load balancer's rotation while every request 503s.
+    let ready = snapshots.iter().any(fabric::NodeSnapshot::is_placeable);
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -816,10 +924,29 @@ fn health_report(snapshots: &[fabric::NodeSnapshot], disclose_detail: bool) -> (
                 "models".to_string(),
                 serde_json::json!(fabric::servable_models(snapshots)),
             );
-            // The shape `fabric status --json` already prints, so an operator
-            // reading both is not learning two vocabularies for one fact.
-            if let Ok(detail) = serde_json::to_value(snapshots) {
-                object.insert("node_detail".to_string(), detail);
+            // The shape `fabric status --json` already prints, plus two fields
+            // only a fabric can answer: whether *this* proxy would place work on
+            // that node, and what its engine can be asked. A node can be
+            // perfectly healthy and still not be somewhere work goes, and
+            // nothing on the node itself says so.
+            if let Ok(serde_json::Value::Array(mut detail)) = serde_json::to_value(snapshots) {
+                for (entry, snapshot) in detail.iter_mut().zip(snapshots) {
+                    if let Some(entry) = entry.as_object_mut() {
+                        entry.insert(
+                            "placeable".to_string(),
+                            serde_json::Value::Bool(snapshot.is_placeable()),
+                        );
+                        let capabilities = snapshot.capabilities();
+                        if let Ok(value) = serde_json::to_value(capabilities) {
+                            entry.insert("capabilities".to_string(), value);
+                        }
+                        entry.insert(
+                            "placement_blockers".to_string(),
+                            serde_json::json!(capabilities.placement_blockers()),
+                        );
+                    }
+                }
+                object.insert("node_detail".to_string(), serde_json::Value::Array(detail));
             }
         }
     }
@@ -1255,6 +1382,9 @@ async fn stream_completion(
 /// Record which node served a request and why, on any answer shape.
 fn tag(headers: &mut HeaderMap, decision: &RouteDecision, attempts: usize) {
     insert(headers, "x-camelid-fabric-node", &decision.label);
+    // Always sent, in every routing mode, so a client never has to know which
+    // engines this fabric is willing to place on to find out which one answered.
+    insert(headers, "x-camelid-fabric-engine", decision.engine.as_str());
     insert(headers, "x-camelid-fabric-reason", decision.reason.as_str());
     // Always sent, so a client reads a failover off the header rather than
     // inferring one from a header that is only there sometimes.
@@ -1409,11 +1539,7 @@ mod tests {
 
     fn snapshot(label: &str, status: NodeStatus) -> NodeSnapshot {
         NodeSnapshot {
-            spec: NodeSpec {
-                label: label.to_string(),
-                host: "192.0.2.10".to_string(),
-                port: 8181,
-            },
+            spec: NodeSpec::camelid(label, "192.0.2.10", 8181),
             status,
             latency: Some(Duration::from_millis(3)),
         }
@@ -1421,11 +1547,15 @@ mod tests {
 
     fn ready_status(model: &str) -> NodeStatus {
         NodeStatus::Ready(NodeReady {
+            engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: Some(model.to_string()),
-            backend: "llama".to_string(),
-            version: "0.6.1".to_string(),
-            in_flight: 0,
-            waiting: 0,
+            models: vec![model.to_string()],
+            backend: Some("llama".to_string()),
+            version: Some("0.6.1".to_string()),
+            load: Some(crate::fabric::node::NodeLoad {
+                in_flight: 0,
+                waiting: 0,
+            }),
         })
     }
 
@@ -1516,6 +1646,7 @@ mod tests {
                     if let Some(label) = node {
                         let decision = RouteDecision {
                             label: label.to_string(),
+                            engine: crate::fabric::engine::NodeEngine::Camelid,
                             reason: RouteReason::LeastLoaded,
                             affinity_lost: None,
                         };
@@ -1784,6 +1915,48 @@ mod tests {
         assert_eq!(body["models"], serde_json::json!([]));
     }
 
+    /// Readiness is "a request placed now would find a node", not "some node is
+    /// healthy". A load balancer that kept this proxy in rotation on the second
+    /// reading would send it traffic that can only 503.
+    #[test]
+    fn a_fabric_whose_only_healthy_node_is_unplaceable_is_not_ready() {
+        let mut spec = NodeSpec::camelid("studio", "192.0.2.10", 11434);
+        spec.engine = crate::fabric::engine::NodeEngine::Ollama;
+        let foreign = NodeSnapshot {
+            spec,
+            status: NodeStatus::Ready(NodeReady {
+                engine: crate::fabric::engine::NodeEngine::Ollama,
+                active_model_id: None,
+                models: vec!["mistral:latest".to_string()],
+                backend: None,
+                version: Some("0.33.3".to_string()),
+                load: None,
+            }),
+            latency: Some(Duration::from_millis(9)),
+        };
+
+        let (status, body) = health_report(std::slice::from_ref(&foreign), true);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], serde_json::json!(false));
+        // The node is still reported as the healthy machine it is...
+        assert_eq!(body["nodes"]["ready"], serde_json::json!(1));
+        assert_eq!(
+            body["node_detail"][0]["status"]["models"],
+            serde_json::json!(["mistral:latest"])
+        );
+        assert_eq!(
+            body["node_detail"][0]["placeable"],
+            serde_json::json!(false)
+        );
+        // ...but nothing it holds is advertised, because nothing would be routed.
+        assert_eq!(body["models"], serde_json::json!([]));
+        // And a load it never published stays absent rather than becoming zero.
+        assert!(
+            body["node_detail"][0]["status"].get("in_flight").is_none(),
+            "{body}"
+        );
+    }
+
     /// The verdict itself does not depend on who is asking; only the detail does.
     #[test]
     fn the_readiness_verdict_is_the_same_off_box() {
@@ -2029,11 +2202,7 @@ mod tests {
         let fabric = Fabric::new(vec![
             node.spec("up"),
             // Port 1 is closed, so this node is observed as unreachable.
-            NodeSpec {
-                label: "down".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 1,
-            },
+            NodeSpec::camelid("down", "127.0.0.1", 1),
         ])
         .with_timeout(Duration::from_millis(500));
         let response = proxy(fabric)
@@ -2084,11 +2253,7 @@ mod tests {
         let fabric = Fabric::new(vec![
             node.spec("up"),
             // Port 1 is closed, so this node is observed as unreachable.
-            NodeSpec {
-                label: "down".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 1,
-            },
+            NodeSpec::camelid("down", "127.0.0.1", 1),
         ])
         .with_timeout(Duration::from_millis(500));
 
@@ -2111,12 +2276,8 @@ mod tests {
     /// that refusal stays retryable.
     #[tokio::test]
     async fn an_unreachable_fabric_is_still_a_retryable_503() {
-        let fabric = Fabric::new(vec![NodeSpec {
-            label: "dead".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        }])
-        .with_timeout(Duration::from_millis(200));
+        let fabric = Fabric::new(vec![NodeSpec::camelid("dead", "127.0.0.1", 1)])
+            .with_timeout(Duration::from_millis(200));
         let response = proxy(fabric)
             .oneshot(request(serde_json::json!({ "model": "m", "messages": [] })))
             .await
@@ -2169,11 +2330,7 @@ mod tests {
         }
 
         fn spec(&self, label: &str) -> NodeSpec {
-            NodeSpec {
-                label: label.to_string(),
-                host: "127.0.0.1".to_string(),
-                port: self.port,
-            }
+            NodeSpec::camelid(label, "127.0.0.1", self.port)
         }
     }
 
@@ -2207,11 +2364,7 @@ mod tests {
         // The node is unreachable on purpose. A 503 — a placement failure —
         // proves the proxy tried to route the stream; the 400 this used to
         // answer would mean it had refused before looking at the fabric.
-        let fabric = Fabric::new(vec![NodeSpec {
-            label: "dead".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        }]);
+        let fabric = Fabric::new(vec![NodeSpec::camelid("dead", "127.0.0.1", 1)]);
         let router = router(fabric, open_config());
         let response = router
             .oneshot(request(serde_json::json!({ "model": "m", "stream": true })))

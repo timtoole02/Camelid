@@ -23,15 +23,23 @@
 //! * [`cancel`] — telling that send it is no longer wanted.
 //! * `transport` — authenticating or explicitly constraining the node hop.
 
+pub(crate) mod camelid;
 pub mod cancel;
+pub mod capability;
 pub(crate) mod client_keys;
+pub mod divergence;
+pub mod engine;
 pub mod forward;
 pub(crate) mod http;
+mod lmstudio;
 pub mod node;
 pub(crate) mod nodes;
+mod ollama;
 pub mod policy;
 pub mod probe;
+pub mod sample;
 pub mod server;
+pub mod textdiff;
 mod transport;
 pub(crate) mod watch;
 
@@ -41,12 +49,18 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 pub use cancel::Cancel;
+pub use capability::{Capabilities, Capability, Provenance};
+pub use divergence::{
+    conclude, sha256_hex, AppliedSampling, Comparison, Honoured, ModelIdentity, Sample,
+    SamplingPlan, Side, Stability, TemplateEvidence, Verdict,
+};
+pub use engine::NodeEngine;
 pub use forward::{
     wants_streaming, ForwardError, Forwarded, NodeAnswer, StreamOutcome, Streaming,
     DEFAULT_FORWARD_TIMEOUT, ENGINE_QUEUE_FULL_CODE,
 };
 pub use node::{
-    parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
+    parse_fabric, parse_node_spec, NodeLoad, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
 };
 use nodes::NodeSet;
@@ -56,7 +70,46 @@ pub use policy::{
     RouteRequest,
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
+pub use sample::SampleError;
+pub use textdiff::{diff_lines, Diff, DiffLine, Op};
 use transport::NodeTransport;
+
+/// Why a comparison could not be set up or completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareError {
+    NoSuchNode {
+        label: String,
+        known: Vec<String>,
+    },
+    /// Comparing a node with itself measures nothing about the engines.
+    SameNode {
+        label: String,
+    },
+    Side(SampleError),
+}
+
+impl std::fmt::Display for CompareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchNode { label, known } => write!(
+                f,
+                "no node named {label} in this fabric; it has {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
+            Self::SameNode { label } => write!(
+                f,
+                "{label} cannot be compared with itself; name two different nodes"
+            ),
+            Self::Side(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompareError {}
 
 /// How many nodes one request may be sent to before it fails.
 ///
@@ -222,6 +275,74 @@ impl Fabric {
         self.transport.description()
     }
 
+    /// Run one prompt on two of this fabric's nodes and report what differed.
+    ///
+    /// This is measurement, not placement: the two nodes are named, not chosen,
+    /// and nothing here fails over. A comparison that quietly moved to a third
+    /// node would be reporting about a machine the operator never asked about.
+    /// Foreign engines are therefore *comparable* even though they are not
+    /// placeable — reading a node was never the thing we refused.
+    ///
+    /// `left_model` and `right_model` may differ, which is an operator saying
+    /// two differently-named ids are the same weights. Engines do not agree on
+    /// naming, and none of them publishes a digest this fabric could check, so
+    /// that claim is recorded as unverified rather than inferred.
+    pub fn compare(
+        &self,
+        left: &str,
+        right: &str,
+        left_model: &str,
+        right_model: &str,
+        prompt: &str,
+        plan: SamplingPlan,
+    ) -> Result<Comparison, CompareError> {
+        if left == right {
+            return Err(CompareError::SameNode {
+                label: left.to_string(),
+            });
+        }
+        let specs = self.specs();
+        let find = |label: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.label == label)
+                .cloned()
+                .ok_or_else(|| CompareError::NoSuchNode {
+                    label: label.to_string(),
+                    known: specs.iter().map(|spec| spec.label.clone()).collect(),
+                })
+        };
+        let left_spec = find(left)?;
+        let right_spec = find(right)?;
+
+        let bearer = self.bearer.as_deref();
+        let measure_side = |spec: &NodeSpec, model: &str| {
+            sample::measure(
+                &sample::SideRequest {
+                    spec,
+                    model,
+                    prompt,
+                    plan: &plan,
+                    bearer,
+                    timeout: self.timeout,
+                },
+                &self.transport,
+            )
+            .map_err(CompareError::Side)
+        };
+
+        let left_side = measure_side(&left_spec, left_model)?;
+        let right_side = measure_side(&right_spec, right_model)?;
+        let identity = if left_model == right_model {
+            divergence::ModelIdentity::SameId
+        } else {
+            divergence::ModelIdentity::AssertedByOperator
+        };
+        Ok(divergence::conclude(
+            prompt, plan, left_side, right_side, identity,
+        ))
+    }
+
     /// Observe every node.
     ///
     /// Probes unless a previous observation is still inside
@@ -378,9 +499,14 @@ impl Fabric {
                 .iter()
                 .find(|snapshot| snapshot.label() == decision.label)
                 .expect("placement returns a label it was given");
-            let service_ahead = selected.status.ready().map_or(0, |ready| {
-                load_of(ready.in_flight, reserved.get(&decision.label))
-            });
+            let service_ahead =
+                selected
+                    .status
+                    .ready()
+                    .map_or(0, |ready| match ready.in_flight() {
+                        Some(observed) => load_of(observed, reserved.get(&decision.label)),
+                        None => reserved.get(&decision.label),
+                    });
             reserved.take(&decision.label);
             let service_model = request
                 .model
@@ -911,10 +1037,18 @@ impl FabricSummary {
 ///
 /// Kept pure so the listing is covered by a unit test rather than by starting a
 /// server, the same way [`render_status`] is.
+/// Every model the fabric would actually place a request on.
+///
+/// Deliberately not "every model any node holds": this list is what
+/// `GET /v1/models` answers with, and advertising a model the fabric would then
+/// refuse to route is worse than not advertising it. A node running an engine
+/// this fabric does not place on is therefore absent here, however healthy it
+/// is — its models are still visible per node in the status detail.
 pub fn servable_models(snapshots: &[NodeSnapshot]) -> Vec<String> {
     let mut models: Vec<String> = snapshots
         .iter()
-        .filter_map(|snapshot| snapshot.active_model_id().map(str::to_string))
+        .filter(|snapshot| snapshot.is_placeable())
+        .flat_map(|snapshot| snapshot.models().iter().cloned())
         .collect();
     models.sort();
     models.dedup();
@@ -961,10 +1095,17 @@ pub fn render_status(snapshots: &[NodeSnapshot]) -> String {
             NodeStatus::Ready(ready) => (
                 "ready",
                 ready.active_model_id.as_deref().unwrap_or("-").to_string(),
-                ready.in_flight.to_string(),
-                match snapshot.latency {
-                    Some(latency) => format!("{} · {} ms", ready.backend, latency.as_millis()),
-                    None => ready.backend.clone(),
+                // An engine that publishes no load reads as unknown. A zero
+                // here would put an idle machine in the table.
+                ready
+                    .in_flight()
+                    .map_or_else(|| "?".to_string(), |in_flight| in_flight.to_string()),
+                {
+                    let lane = ready.backend.as_deref().unwrap_or(ready.engine.as_str());
+                    match snapshot.latency {
+                        Some(latency) => format!("{} · {} ms", lane, latency.as_millis()),
+                        None => lane.to_string(),
+                    }
                 },
             ),
             NodeStatus::NotReady { reason } => (
@@ -1060,23 +1201,29 @@ mod tests {
 
     fn snapshot(label: &str, status: NodeStatus) -> NodeSnapshot {
         NodeSnapshot {
-            spec: NodeSpec {
-                label: label.to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 8181,
-            },
+            spec: NodeSpec::camelid(label, "127.0.0.1", 8181),
             status,
             latency: Some(Duration::from_millis(4)),
         }
     }
 
     fn ready_status(model: &str) -> NodeStatus {
+        ready_status_with_load(model, 1)
+    }
+
+    /// Load is a parameter because the service-time tests turn on it: a sample
+    /// taken while a node had work queued is not a measurement of that node.
+    fn ready_status_with_load(model: &str, in_flight: usize) -> NodeStatus {
         NodeStatus::Ready(NodeReady {
+            engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: Some(model.to_string()),
-            backend: "llama".to_string(),
-            version: "0.5.4".to_string(),
-            in_flight: 1,
-            waiting: 0,
+            models: vec![model.to_string()],
+            backend: Some("llama".to_string()),
+            version: Some("0.5.4".to_string()),
+            load: Some(crate::fabric::node::NodeLoad {
+                in_flight,
+                waiting: 0,
+            }),
         })
     }
 
@@ -1175,16 +1322,8 @@ mod tests {
             stream.flush().expect("flush authenticated answer");
         });
 
-        let bad = NodeSpec {
-            label: "a-impostor".to_string(),
-            host: "localhost".to_string(),
-            port: impostor_port,
-        };
-        let good = NodeSpec {
-            label: "b-trusted".to_string(),
-            host: "localhost".to_string(),
-            port: trusted_port,
-        };
+        let bad = NodeSpec::camelid("a-impostor", "localhost", impostor_port);
+        let good = NodeSpec::camelid("b-trusted", "localhost", trusted_port);
         let bearer = "must-not-cross-before-authentication-74d1";
         let fabric = Fabric::new(vec![bad.clone(), good.clone()])
             .with_bearer(Some(bearer))
@@ -1258,16 +1397,7 @@ mod tests {
 
     #[test]
     fn a_busy_completion_is_not_a_service_sample() {
-        let node = snapshot(
-            "a",
-            NodeStatus::Ready(NodeReady {
-                active_model_id: Some("m".to_string()),
-                backend: "llama".to_string(),
-                version: "0.5.4".to_string(),
-                in_flight: 0,
-                waiting: 0,
-            }),
-        );
+        let node = snapshot("a", ready_status("m"));
         let measured = node.clone();
         let fabric = Fabric::new(Vec::new());
         {
@@ -1299,16 +1429,7 @@ mod tests {
 
     #[test]
     fn a_queue_free_completion_records_its_observed_wall_time() {
-        let node = snapshot(
-            "a",
-            NodeStatus::Ready(NodeReady {
-                active_model_id: Some("m".to_string()),
-                backend: "llama".to_string(),
-                version: "0.5.4".to_string(),
-                in_flight: 0,
-                waiting: 0,
-            }),
-        );
+        let node = snapshot("a", ready_status_with_load("m", 0));
         let measured = node.clone();
         let fabric = Fabric::new(Vec::new());
         let request = RouteRequest::new(RouteMode::CompletionTime)
@@ -1353,11 +1474,15 @@ mod tests {
     #[test]
     fn a_node_that_cannot_serve_is_not_advertised() {
         let blank = NodeStatus::Ready(NodeReady {
+            engine: crate::fabric::engine::NodeEngine::Camelid,
             active_model_id: None,
-            backend: "llama".to_string(),
-            version: "0.5.4".to_string(),
-            in_flight: 0,
-            waiting: 0,
+            models: Vec::new(),
+            backend: Some("llama".to_string()),
+            version: Some("0.5.4".to_string()),
+            load: Some(crate::fabric::node::NodeLoad {
+                in_flight: 0,
+                waiting: 0,
+            }),
         });
         let snapshots = vec![
             snapshot("a", ready_status("alpha")),
@@ -1547,11 +1672,7 @@ mod tests {
     fn dispatch_refuses_a_streaming_request_before_probing_anything() {
         // The node here is unreachable on purpose: if dispatch probed first, this
         // would surface as a routing failure instead of the streaming refusal.
-        let fabric = Fabric::new(vec![NodeSpec {
-            label: "dead".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        }]);
+        let fabric = Fabric::new(vec![NodeSpec::camelid("dead", "127.0.0.1", 1)]);
         let body = serde_json::json!({ "model": "m", "stream": true });
         let error = fabric
             .dispatch(
@@ -1587,12 +1708,8 @@ mod tests {
     fn dispatch_reports_a_dead_node_as_a_placement_failure() {
         // Every node being unreachable is a routing outcome, not a forward error:
         // there was never a node to send to.
-        let fabric = Fabric::new(vec![NodeSpec {
-            label: "dead".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        }])
-        .with_timeout(Duration::from_millis(300));
+        let fabric = Fabric::new(vec![NodeSpec::camelid("dead", "127.0.0.1", 1)])
+            .with_timeout(Duration::from_millis(300));
         let error = fabric
             .dispatch(
                 "/v1/chat/completions",

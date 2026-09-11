@@ -263,6 +263,114 @@ target/release/camelid fabric serve \
   --addr 127.0.0.1:8282
 ```
 
+### Which engine a node runs
+
+A node is written `LABEL=[ENGINE://]HOST[:PORT]`. The engine is optional and defaults to `camelid`,
+so every specification written before the fabric could read more than one still means exactly what
+it did.
+
+| Engine | Scheme | Default port | Placed on |
+|---|---|---:|---|
+| Camelid | `camelid://` (or omitted) | 8181 | yes |
+| Ollama | `ollama://` | 11434 | **no — read and reported only** |
+| LM Studio | `lmstudio://` | 1234 | **no — read and reported only** |
+
+```bash
+target/release/camelid fabric status \
+  --node win=127.0.0.1:8181 \
+  --node studio=ollama://workstation.local \
+  --node desk=lmstudio://192.0.2.13
+```
+
+The engine is **declared, never detected**. Probing an address and inferring the engine from what
+answered would make a typo look like a different product, and would present this fabric's bearer
+token to whatever was listening. An unrecognised scheme is refused at parse time with the list of
+engines the build knows.
+
+A foreign node is reported — every model it holds, which one is loaded where that is knowable, and
+whether it answered — but the fabric will not send work to it. Placement ranks nodes on reported
+load, re-places a typed queue-full refusal on a sibling, and honours session affinity; neither
+foreign API answers those three, so routing to one would mean ranking a node whose load was never
+measured, relaying a refusal that might have been retried, and claiming a warm prefix nobody
+attested. Such a node therefore reports no load at all rather than a zero, `fabric status` prints
+`?` in that column, and the health payload omits the load fields entirely. Models only such a node
+holds are deliberately absent from `GET /v1/models`: advertising a model the fabric would then
+refuse to route is worse than not advertising it.
+
+LM Studio requires 0.3.6 or newer, which is where `GET /api/v0/models` — the only endpoint this
+fabric reads — was introduced. That listing is also the only thing it reads, so a node is described
+in one request. LM Studio publishes no version endpoint, so its version is reported as unknown
+rather than guessed from a runtime name that describes an inference backend instead of the
+application. A model it has downloaded but not loaded is still listed as something it holds, and
+`active_model_id` is filled in only when exactly one model is loaded; if any model reports a state
+this build does not recognise, residency becomes unknown rather than being narrowed to the states it
+did understand.
+
+### What an engine can be asked, and how we know
+
+Each node carries a `capabilities` block in `GET /v1/health`, and each entry carries the provenance
+of its own answer:
+
+| Provenance | Meaning |
+|---|---|
+| `measured` | Exercised against **this exact engine version** and recorded |
+| `declared` | Follows from the documented API surface — the endpoint that would carry it does not exist |
+| `not_probed` | Nobody has checked; `supported` is `null` |
+
+`not_probed` is never rendered as a no. A capability nobody measured is unknown, and a build that
+answered "unsupported" there would be inventing a result. A measurement is bound to the version
+string the node reported, so a neighbouring version inherits nothing from it — this is why an Ollama
+node reporting `0.33.3` shows `not_probed` for tool calls even though `0.33.1` was measured.
+
+`placement_blockers` lists, in the operator's words, the capabilities whose absence is why a node is
+not placed on. It is derived from the same capability entries that appear in the matrix, so the
+reason shown can never drift from the verdict it explains.
+
+Every answer carries `x-camelid-fabric-engine` alongside `x-camelid-fabric-node`, in every routing
+mode, so a client never has to know which engines a fabric places on to find out which one served it.
+
+### Comparing two nodes
+
+`fabric compare` asks two named nodes the same question and reports what differed. It is
+**measurement, not placement**: both nodes are named rather than chosen, nothing fails over, and a
+foreign engine may be compared even though the fabric will not route to it — reading a node was
+never the thing we refused.
+
+```bash
+target/release/camelid fabric compare \
+  --node win=127.0.0.1:8181 \
+  --node studio=ollama://127.0.0.1:11434 \
+  --left win --right studio \
+  --model llama-3.2-1b-instruct \
+  --prompt 'What is 7 plus 5?'
+```
+
+The same comparison is available to the WebUI as `POST /v1/fabric/compare` on the proxy. Unlike
+`/v1/health` that route *causes work* — it makes two machines generate — so it is behind the client
+key, the prompt is capped, and repetitions and token counts are clamped.
+
+**It never says which answer is correct.** It reports difference, provenance and reproducibility.
+Four rules decide what it is allowed to conclude:
+
+| Rule | Consequence |
+|---|---|
+| Each side is run more than once | A difference between two nodes means nothing until each node has been shown to agree with itself. A side that does not repeat its own answer makes the comparison `not_attributable`, **and the diff is withheld** — rendering one would invite exactly the reading the verdict refused. |
+| Model identity is checked first | Two nodes serving different models can differ for the most boring reason there is. That is `different_models`, never divergence. |
+| Asked is not applied | LM Studio's documented completion API has no seed parameter, so a comparison against it is unseeded however the flag was set. The plan and the per-side reality are reported separately, and the uncontrolled parameter is named. |
+| Correctness is not awarded | No verdict, reason or rendered line ranks the two sides. |
+
+`--repeat 1` is permitted and yields no attributable verdict, by design: one run per side never
+tested self-consistency, which is a different thing from having tested it and found none.
+
+Where the engine exposes it, the chat template each backend applied is captured too — usually the
+actual explanation for a divergence:
+
+| Engine | Template source |
+|---|---|
+| Camelid | `GET /props` → `chat_template` |
+| Ollama | `POST /api/show` → `template` |
+| LM Studio | **none** — its documented API exposes no prompt template, reported as such rather than as an empty one |
+
 An exposed proxy therefore looks like this:
 
 ```bash

@@ -276,11 +276,7 @@ impl StubNode {
     }
 
     fn spec(&self, label: &str) -> NodeSpec {
-        NodeSpec {
-            label: label.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: self.port,
-        }
+        NodeSpec::camelid(label, "127.0.0.1", self.port)
     }
 
     fn received(&self) -> Vec<Received> {
@@ -948,11 +944,7 @@ async fn no_eligible_node_answers_503_with_a_fabric_error_shape() {
 async fn a_streaming_request_is_routed_rather_than_refused() {
     // Port 9 is a dead node. A 503 (a placement failure) rather than a 400
     // proves the proxy tried to route the stream instead of rejecting it.
-    let fabric = fabric_of(vec![NodeSpec {
-        label: "dead".to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 9,
-    }]);
+    let fabric = fabric_of(vec![NodeSpec::camelid("dead", "127.0.0.1", 9)]);
     let addr = start_proxy(fabric, RouteMode::Throughput).await;
 
     let (status, body, _headers) = post_chat(
@@ -2489,11 +2481,7 @@ async fn closed_port_spec(label: &str) -> NodeSpec {
         .expect("bind a free port");
     let addr = listener.local_addr().expect("port");
     drop(listener);
-    NodeSpec {
-        label: label.to_string(),
-        host: addr.ip().to_string(),
-        port: addr.port(),
-    }
+    NodeSpec::camelid(label, addr.ip().to_string(), addr.port())
 }
 
 /// Ready is "some request can be served", not "every node is well". A fabric

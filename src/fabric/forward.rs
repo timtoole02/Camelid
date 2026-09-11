@@ -470,11 +470,7 @@ mod tests {
     use super::*;
 
     fn spec(label: &str, port: u16) -> NodeSpec {
-        NodeSpec {
-            label: label.to_string(),
-            host: "127.0.0.1".to_string(),
-            port,
-        }
+        NodeSpec::camelid(label, "127.0.0.1", port)
     }
 
     fn answered(status: u16, body: Value) -> Forwarded {

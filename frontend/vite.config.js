@@ -1,9 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { connect as netConnect } from 'node:net'
-import { hostname as osHostname, platform as osPlatform } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const DEV_API_TARGET = process.env.VITE_CAMELID_PROXY_TARGET || 'http://127.0.0.1:8181'
@@ -110,59 +108,6 @@ function camelidBackendLauncher() {
         killChild()
         child = null
         return json(res, 200, { available: true, running: false, pid: null, logTail: logs.slice(-60).join('') })
-      })
-
-      // ---- Cluster helpers (local-only, no cloud) ----
-      // TCP reachability + latency probe for a host:port.
-      server.middlewares.use('/__camelid/cluster/probe', async (req, res) => {
-        if (req.method !== 'POST') return json(res, 405, { error: 'POST only' })
-        let host = ''
-        let port = 22
-        try {
-          const body = JSON.parse((await readBody(req)) || '{}')
-          host = String(body.host || '').trim()
-          port = Number(body.port) || 22
-        } catch { /* noop */ }
-        if (!host) return json(res, 400, { error: 'missing host' })
-        const started = Date.now()
-        let done = false
-        const socket = netConnect({ host, port, timeout: 2500 })
-        const finish = (reachable) => {
-          if (done) return
-          done = true
-          try { socket.destroy() } catch { /* noop */ }
-          json(res, 200, { available: true, reachable, latencyMs: Date.now() - started, host, port })
-        }
-        socket.on('connect', () => finish(true))
-        socket.on('timeout', () => finish(false))
-        socket.on('error', () => finish(false))
-      })
-
-      // Safe local discovery: this machine + LAN neighbors from the ARP table. Review before adding.
-      server.middlewares.use('/__camelid/cluster/discover', (req, res) => {
-        const devices = []
-        const seen = new Set()
-        const add = (d) => { const key = d.ip || d.hostname; if (key && !seen.has(key)) { seen.add(key); devices.push(d) } }
-        const plat = osPlatform()
-        add({
-          hostname: osHostname(),
-          ip: '127.0.0.1',
-          os: plat === 'darwin' ? 'macOS' : plat === 'win32' ? 'Windows' : 'Linux',
-          node_type: plat === 'darwin' ? 'mac' : plat === 'win32' ? 'windows' : 'linux',
-          confidence: 'high',
-          service: 'this machine',
-        })
-        execFile('arp', ['-a'], { timeout: 4000 }, (err, stdout) => {
-          if (!err && stdout) {
-            stdout.split('\n').forEach((line) => {
-              const m = line.match(/^(\S+)?\s*\(?(\d+\.\d+\.\d+\.\d+)\)?\s+at\s+([0-9a-f:]+)/i)
-              if (m && m[2] !== '127.0.0.1') {
-                add({ hostname: m[1] && m[1] !== '?' ? m[1] : null, ip: m[2], os: null, node_type: 'other', confidence: 'low', service: 'LAN neighbor (ARP)' })
-              }
-            })
-          }
-          json(res, 200, { available: true, devices, method: err ? 'this-machine-only' : 'arp+this-machine' })
-        })
       })
     },
   }

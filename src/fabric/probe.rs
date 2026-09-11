@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::cancel::Cancel;
+use super::engine::NodeEngine;
 use super::http::{self, HttpError};
-use super::node::{NodeReady, NodeSnapshot, NodeSpec, NodeStatus};
+use super::node::{NodeLoad, NodeReady, NodeSnapshot, NodeSpec, NodeStatus};
 use super::transport::NodeTransport;
 
 /// Refuse a health body larger than this. A health response is a few KiB;
@@ -82,13 +83,18 @@ fn classify(payload: &HealthPayload) -> NodeStatus {
         return NodeStatus::NotReady { reason };
     }
     NodeStatus::Ready(NodeReady {
+        engine: NodeEngine::Camelid,
         active_model_id: payload.active_model_id.clone(),
-        backend: payload.backend.clone(),
-        version: payload.version.clone(),
-        // `engine_queue_depth` is a gauge of jobs in flight, not a bound; see
-        // the note on `NodeReady`.
-        in_flight: payload.engine_queue_depth,
-        waiting: payload.engine_queued_tasks,
+        // A Camelid node serves exactly the model it has loaded.
+        models: payload.active_model_id.clone().into_iter().collect(),
+        backend: (!payload.backend.is_empty()).then(|| payload.backend.clone()),
+        version: (!payload.version.is_empty()).then(|| payload.version.clone()),
+        load: Some(NodeLoad {
+            // `engine_queue_depth` is a gauge of jobs in flight, not a bound; see
+            // the note on `NodeReady`.
+            in_flight: payload.engine_queue_depth,
+            waiting: payload.engine_queued_tasks,
+        }),
     })
 }
 
@@ -149,19 +155,26 @@ pub(crate) fn probe_node_with_transport(
     transport: &NodeTransport,
 ) -> NodeSnapshot {
     let started = Instant::now();
-    match read_health(spec, bearer, timeout, transport) {
-        Ok(payload) => NodeSnapshot {
-            spec: spec.clone(),
-            status: classify(&payload),
-            latency: Some(started.elapsed()),
-        },
-        Err(error) => NodeSnapshot {
-            spec: spec.clone(),
-            status: NodeStatus::Unreachable {
+    let status = match spec.engine {
+        NodeEngine::Camelid => match read_health(spec, bearer, timeout, transport) {
+            Ok(payload) => classify(&payload),
+            Err(error) => NodeStatus::Unreachable {
                 reason: unreachable_reason(&error),
             },
-            latency: None,
         },
+        NodeEngine::Ollama => super::ollama::probe(spec, timeout, transport),
+        NodeEngine::LmStudio => super::lmstudio::probe(spec, timeout, transport),
+    };
+    // Timed for every outcome: a node that answered "not ready" still told us how
+    // long it took to say so, and that is the same fact for both engines.
+    let latency = match status {
+        NodeStatus::Unreachable { .. } => None,
+        _ => Some(started.elapsed()),
+    };
+    NodeSnapshot {
+        spec: spec.clone(),
+        status,
+        latency,
     }
 }
 
@@ -272,8 +285,10 @@ mod tests {
         let status = classify(&payload(true, true, Some("llama-3b")));
         let ready = status.ready().expect("ready");
         assert_eq!(ready.active_model_id.as_deref(), Some("llama-3b"));
-        assert_eq!(ready.in_flight, 4);
-        assert_eq!(ready.waiting, 1);
+        assert_eq!(ready.in_flight(), Some(4));
+        assert_eq!(ready.load.expect("camelid reports load").waiting, 1);
+        assert_eq!(ready.engine, NodeEngine::Camelid);
+        assert_eq!(ready.models, vec!["llama-3b".to_string()]);
     }
 
     #[test]
@@ -291,7 +306,7 @@ mod tests {
         };
         let status = classify(&idle);
         assert!(status.is_ready());
-        assert_eq!(status.ready().expect("ready").in_flight, 0);
+        assert_eq!(status.ready().expect("ready").in_flight(), Some(0));
     }
 
     #[test]
@@ -333,11 +348,7 @@ mod tests {
     #[test]
     fn an_unroutable_address_becomes_unreachable_not_an_error() {
         // Port 1 on loopback is closed; this exercises the real socket path.
-        let spec = NodeSpec {
-            label: "dead".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        };
+        let spec = NodeSpec::camelid("dead", "127.0.0.1", 1);
         let snapshot = probe_node(&spec, None, Duration::from_millis(500));
         assert!(matches!(snapshot.status, NodeStatus::Unreachable { .. }));
         assert_eq!(snapshot.label(), "dead");

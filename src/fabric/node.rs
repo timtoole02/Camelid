@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::{Serialize, Serializer};
 
+use super::engine::NodeEngine;
+
 /// Operator-supplied identity of one node.
 ///
 /// `host` stays a string rather than a resolved `SocketAddr` because fabric
@@ -21,12 +23,25 @@ pub struct NodeSpec {
     pub label: String,
     pub host: String,
     pub port: u16,
+    /// Declared, never inferred from what answers. See [`NodeEngine`].
+    pub engine: NodeEngine,
 }
 
 /// Default port for a `camelid serve` process.
 pub const DEFAULT_NODE_PORT: u16 = 8181;
 
 impl NodeSpec {
+    /// A node running the default engine, which is every specification written
+    /// before the fabric could read more than one.
+    pub fn camelid(label: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
+        Self {
+            label: label.into(),
+            host: host.into(),
+            port,
+            engine: NodeEngine::Camelid,
+        }
+    }
+
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -50,6 +65,7 @@ pub enum NodeSpecParseError {
     /// brackets are required rather than guessed at.
     UnbracketedIpv6(String),
     MalformedEndpoint(String),
+    UnknownEngine(String),
 }
 
 impl fmt::Display for NodeSpecParseError {
@@ -72,6 +88,11 @@ impl fmt::Display for NodeSpecParseError {
             Self::MalformedEndpoint(endpoint) => {
                 write!(f, "`{endpoint}` is not a valid host[:port]")
             }
+            Self::UnknownEngine(scheme) => write!(
+                f,
+                "`{scheme}` is not an engine this fabric can read; known engines are {}",
+                NodeEngine::known().join(", ")
+            ),
         }
     }
 }
@@ -85,11 +106,15 @@ fn parse_port(raw: &str) -> Result<u16, NodeSpecParseError> {
 
 impl std::error::Error for NodeSpecParseError {}
 
-/// Parse one `label=host[:port]` string.
+/// Parse one `label=[engine://]host[:port]` string.
 ///
 /// The label is mandatory and not derived from the host: routing decisions,
 /// affinity keys and receipts all quote it, and a host that changes address
 /// must not silently become a different node.
+///
+/// The engine scheme is optional and defaults to Camelid, so every
+/// specification written before other engines existed still means what it did.
+/// It is declared rather than detected — see [`NodeEngine`].
 pub fn parse_node_spec(raw: &str) -> Result<NodeSpec, NodeSpecParseError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -107,6 +132,20 @@ pub fn parse_node_spec(raw: &str) -> Result<NodeSpec, NodeSpecParseError> {
         return Err(NodeSpecParseError::MissingHost);
     }
 
+    // Split the scheme before anything else looks at colons: `ollama://[::1]`
+    // has to lose its scheme before the IPv6 bracket rules below apply.
+    let (engine, endpoint) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => {
+            let engine = NodeEngine::from_scheme(scheme)
+                .ok_or_else(|| NodeSpecParseError::UnknownEngine(scheme.to_string()))?;
+            (engine, rest.trim())
+        }
+        None => (NodeEngine::default(), endpoint),
+    };
+    if endpoint.is_empty() {
+        return Err(NodeSpecParseError::MissingHost);
+    }
+
     // A bracketed IPv6 literal owns every colon up to `]`; only a colon after the
     // bracket introduces a port. Splitting on the last colon instead would read
     // `[::1]` as host `[:` and port `1]`.
@@ -119,7 +158,7 @@ pub fn parse_node_spec(raw: &str) -> Result<NodeSpec, NodeSpecParseError> {
             return Err(NodeSpecParseError::MissingHost);
         }
         match &endpoint[close + 1..] {
-            "" => (host, DEFAULT_NODE_PORT),
+            "" => (host, engine.default_port()),
             rest => match rest.strip_prefix(':') {
                 Some(port) => (host, parse_port(port)?),
                 None => return Err(NodeSpecParseError::MalformedEndpoint(endpoint.to_string())),
@@ -133,7 +172,7 @@ pub fn parse_node_spec(raw: &str) -> Result<NodeSpec, NodeSpecParseError> {
                 }
                 (host, parse_port(port)?)
             }
-            None => (endpoint, DEFAULT_NODE_PORT),
+            None => (endpoint, engine.default_port()),
         }
     };
     if host.is_empty() {
@@ -144,6 +183,7 @@ pub fn parse_node_spec(raw: &str) -> Result<NodeSpec, NodeSpecParseError> {
         label: label.to_string(),
         host: host.to_string(),
         port,
+        engine,
     })
 }
 
@@ -164,7 +204,21 @@ pub fn parse_fabric(raws: &[String]) -> Result<Vec<NodeSpec>, NodeSpecParseError
     Ok(specs)
 }
 
-/// The generation-relevant subset of `/v1/health` from a node that can serve.
+/// What a node reported about its own load.
+///
+/// Separate from [`NodeReady`] so it can be absent as a whole: an engine either
+/// publishes both figures or neither, and a partial pair would invite reading
+/// the missing half as zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NodeLoad {
+    /// Jobs accepted and not yet finished, queued plus running
+    /// (`engine_queue_depth`). This is the load signal placement ranks on.
+    pub in_flight: usize,
+    /// Jobs queued but not yet running (`engine_queued_tasks`).
+    pub waiting: usize,
+}
+
+/// The generation-relevant subset of what a node says about itself.
 ///
 /// `/v1/health` reports current load but **not** the node's queue bound. The bound
 /// is `CAMELID_QUEUE_DEPTH`, read on the node itself and never serialised — the
@@ -172,16 +226,40 @@ pub fn parse_fabric(raws: &[String]) -> Result<Vec<NodeSpec>, NodeSpecParseError
 /// So the fabric ranks by observed load and never declares a node full: a node
 /// genuinely at its bound answers a typed 503, which is a retry concern rather
 /// than a placement one.
+///
+/// Every field an engine may not publish is an `Option`, and `None` means we
+/// were not told. Nothing here defaults to a plausible value: a node reporting
+/// no load must not be ranked as idle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeReady {
+    /// Which engine answered. Echoed from the spec, because a probe reads the
+    /// engine it was told to read.
+    pub engine: NodeEngine,
+    /// The single model this node is serving, when it serves exactly one.
+    ///
+    /// `None` for an engine that holds several at once, or none resident. Use
+    /// [`NodeReady::models`] to see everything it can serve.
     pub active_model_id: Option<String>,
-    pub backend: String,
-    pub version: String,
-    /// Jobs accepted and not yet finished, queued plus running
-    /// (`engine_queue_depth`). This is the load signal placement ranks on.
-    pub in_flight: usize,
-    /// Jobs queued but not yet running (`engine_queued_tasks`).
-    pub waiting: usize,
+    /// Every model this node can serve right now, sorted.
+    pub models: Vec<String>,
+    /// The execution lane the engine chose, when it names one.
+    pub backend: Option<String>,
+    /// The engine's own version string, when it publishes one.
+    pub version: Option<String>,
+    /// Load, or `None` when the engine publishes none.
+    ///
+    /// Flattened so a node that reports load keeps the wire shape it always
+    /// had, and a node that does not simply **omits the fields**. An absent key
+    /// reads as unknown to every consumer; a zero would not.
+    #[serde(flatten)]
+    pub load: Option<NodeLoad>,
+}
+
+impl NodeReady {
+    /// Jobs in flight, when the engine reported any. Never substitutes a zero.
+    pub fn in_flight(&self) -> Option<usize> {
+        self.load.map(|load| load.in_flight)
+    }
 }
 
 /// What a probe learned about a node.
@@ -238,11 +316,42 @@ impl NodeSnapshot {
         &self.spec.label
     }
 
+    /// The engine this node was declared to run.
+    pub fn engine(&self) -> NodeEngine {
+        self.spec.engine
+    }
+
+    /// Whether the fabric may place a request here. A node can be perfectly
+    /// healthy and still not be somewhere work goes — see
+    /// [`NodeEngine::is_placeable`].
+    pub fn is_placeable(&self) -> bool {
+        self.spec.engine.is_placeable() && self.status.is_ready()
+    }
+
+    /// What this node's engine can be asked, and how we know.
+    ///
+    /// Keyed on the version the node reported, so a measurement taken against a
+    /// different build of the same engine is not credited to this one.
+    pub fn capabilities(&self) -> super::capability::Capabilities {
+        self.spec.engine.capabilities(
+            self.status
+                .ready()
+                .and_then(|ready| ready.version.as_deref()),
+        )
+    }
+
     /// The model this node is currently serving, when it can serve at all.
     pub fn active_model_id(&self) -> Option<&str> {
         self.status
             .ready()
             .and_then(|ready| ready.active_model_id.as_deref())
+    }
+
+    /// Every model this node can serve right now.
+    pub fn models(&self) -> &[String] {
+        self.status
+            .ready()
+            .map_or(&[] as &[String], |ready| ready.models.as_slice())
     }
 }
 
@@ -256,6 +365,64 @@ mod tests {
         assert_eq!(spec.label, "mac");
         assert_eq!(spec.host, "workstation.local");
         assert_eq!(spec.port, DEFAULT_NODE_PORT);
+    }
+
+    #[test]
+    fn a_specification_without_a_scheme_is_still_a_camelid_node() {
+        // Every specification written before the fabric could read another
+        // engine has to keep meaning exactly what it meant.
+        let spec = parse_node_spec("win=127.0.0.1:8181").expect("parses");
+        assert_eq!(spec.engine, NodeEngine::Camelid);
+        assert_eq!(
+            parse_node_spec("win=camelid://127.0.0.1:8181").expect("parses"),
+            spec,
+            "naming the default engine explicitly must change nothing"
+        );
+    }
+
+    #[test]
+    fn a_declared_engine_brings_its_own_default_port() {
+        let spec = parse_node_spec("studio=ollama://workstation.local").expect("parses");
+        assert_eq!(spec.engine, NodeEngine::Ollama);
+        assert_eq!(spec.host, "workstation.local");
+        assert_eq!(spec.port, 11434, "an Ollama node defaults to Ollama's port");
+
+        let explicit = parse_node_spec("studio=ollama://workstation.local:9000").expect("parses");
+        assert_eq!(explicit.port, 9000, "an explicit port still wins");
+    }
+
+    #[test]
+    fn an_engine_is_declared_rather_than_detected() {
+        // A typo, not a product. Refused rather than silently treated as
+        // Camelid: sending this fabric's bearer to whatever answered would be
+        // the alternative.
+        assert_eq!(
+            parse_node_spec("x=olama://127.0.0.1:11434"),
+            Err(NodeSpecParseError::UnknownEngine("olama".to_string()))
+        );
+        let message = NodeSpecParseError::UnknownEngine("olama".to_string()).to_string();
+        for engine in NodeEngine::known() {
+            assert!(
+                message.contains(engine),
+                "the refusal must name every engine this build knows, and is missing {engine}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheme_is_stripped_before_ipv6_brackets_are_read() {
+        let spec = parse_node_spec("v6=ollama://[::1]:11434").expect("parses");
+        assert_eq!(spec.engine, NodeEngine::Ollama);
+        assert_eq!(spec.host, "[::1]");
+        assert_eq!(spec.port, 11434);
+    }
+
+    #[test]
+    fn a_scheme_with_no_host_is_refused() {
+        assert_eq!(
+            parse_node_spec("x=ollama://"),
+            Err(NodeSpecParseError::MissingHost)
+        );
     }
 
     #[test]
@@ -367,48 +534,76 @@ mod tests {
         // `engine_queue_depth` as a capacity bound and concluded a healthy idle
         // fabric was full, refusing every request.
         let idle = NodeReady {
+            engine: NodeEngine::Camelid,
             active_model_id: Some("llama-3b".to_string()),
-            backend: "llama".to_string(),
-            version: "0.5.4".to_string(),
-            in_flight: 0,
-            waiting: 0,
+            models: vec!["llama-3b".to_string()],
+            backend: Some("llama".to_string()),
+            version: Some("0.5.4".to_string()),
+            load: Some(NodeLoad {
+                in_flight: 0,
+                waiting: 0,
+            }),
         };
-        assert_eq!(idle.in_flight, 0);
+        assert_eq!(idle.in_flight(), Some(0));
+    }
+
+    #[test]
+    fn a_node_that_reports_no_load_is_not_reported_as_idle() {
+        // The distinction the whole engine seam exists to keep: an engine that
+        // publishes no queue depth must not be indistinguishable from one that
+        // published a zero.
+        let unknown = NodeReady {
+            engine: NodeEngine::Ollama,
+            active_model_id: None,
+            models: vec!["llama3.2:latest".to_string()],
+            backend: None,
+            version: Some("0.33.3".to_string()),
+            load: None,
+        };
+        assert_eq!(unknown.in_flight(), None);
+
+        let value = serde_json::to_value(NodeStatus::Ready(unknown)).expect("serializes");
+        assert!(
+            value.get("in_flight").is_none(),
+            "an unreported load must be absent from the wire, not zero: {value}"
+        );
+        assert!(value.get("waiting").is_none(), "{value}");
+        assert_eq!(value["engine"], "ollama");
+        assert_eq!(value["backend"], serde_json::Value::Null);
     }
 
     #[test]
     fn a_snapshot_serializes_with_a_flat_state_tag_and_millisecond_latency() {
         let snapshot = NodeSnapshot {
-            spec: NodeSpec {
-                label: "windows".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 8181,
-            },
+            spec: NodeSpec::camelid("windows", "127.0.0.1", 8181),
             status: NodeStatus::Ready(NodeReady {
+                engine: NodeEngine::Camelid,
                 active_model_id: Some("llama-3b".to_string()),
-                backend: "llama".to_string(),
-                version: "0.5.4".to_string(),
-                in_flight: 1,
-                waiting: 0,
+                models: vec!["llama-3b".to_string()],
+                backend: Some("llama".to_string()),
+                version: Some("0.5.4".to_string()),
+                load: Some(NodeLoad {
+                    in_flight: 1,
+                    waiting: 0,
+                }),
             }),
             latency: Some(Duration::from_millis(7)),
         };
         let value = serde_json::to_value(&snapshot).expect("serializes");
         assert_eq!(value["status"]["state"], "ready");
         assert_eq!(value["status"]["active_model_id"], "llama-3b");
+        // Load stays where every existing reader looks for it.
         assert_eq!(value["status"]["in_flight"], 1);
+        assert_eq!(value["status"]["engine"], "camelid");
         assert_eq!(value["latency_ms"], 7);
         assert_eq!(value["spec"]["label"], "windows");
+        assert_eq!(value["spec"]["engine"], "camelid");
     }
 
     #[test]
     fn an_offline_snapshot_serializes_its_reason_and_a_null_latency() {
         let snapshot = NodeSnapshot {
-            spec: NodeSpec {
-                label: "mac".to_string(),
-                host: "192.0.2.10".to_string(),
-                port: 8181,
-            },
+            spec: NodeSpec::camelid("mac", "192.0.2.10", 8181),
             status: NodeStatus::Unreachable {
                 reason: "cannot connect".to_string(),
             },
