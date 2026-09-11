@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::lifetime::{
-    parse_health_body, Containment, EngineSnapshot, ExitSummary, HealthObservation, ProbeResult,
+    parse_health_body, restart_transition, Containment, EngineSnapshot, EngineStatus, ExitSummary,
+    HealthObservation, ProbeResult, StatusStore,
 };
 
 /// Resolved engine binary stem. The crate/binary is `camelid`; the legacy
@@ -677,6 +678,12 @@ pub enum StartOutcome {
     Cancelled,
 }
 
+/// One supervisor pass: what was probed, if anything, and the slot as observed after it.
+pub struct Tick {
+    pub probed: Option<(u64, HealthObservation)>,
+    pub snapshot: Option<EngineSnapshot>,
+}
+
 /// What a shutdown found in the slot and reaped.
 #[derive(Debug)]
 pub struct Reaped {
@@ -717,8 +724,32 @@ impl EngineHost {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn begin_epoch(&self) -> u64 {
+    /// Private: the app opens a generation only through `begin_start` or `begin_restart`,
+    /// which move the tray's store to it in the same step.
+    fn begin_epoch(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Opens the first engine generation and publishes Starting for it in the same step, so
+    /// the tray's store follows the generation every later status is tagged with.
+    pub fn begin_start(&self, store: &mut StatusStore) -> u64 {
+        let epoch = self.begin_epoch();
+        store.begin(epoch, EngineStatus::Starting);
+        epoch
+    }
+
+    /// Opens the generation that replaces the current engine: publishes Restarting for it,
+    /// then reaps the old engine, pending or ready. The caller holds the tray's store for the
+    /// whole call, so nothing reads the old port as running in between, and the new engine's
+    /// statuses land in the generation the store now follows. `None` once quit has begun.
+    pub fn begin_restart(&self, store: &mut StatusStore) -> Option<u64> {
+        if self.is_quitting() {
+            return None;
+        }
+        let epoch = self.begin_epoch();
+        restart_transition(store, epoch);
+        self.reap();
+        Some(epoch)
     }
 
     pub fn is_current(&self, epoch: u64) -> bool {
@@ -737,23 +768,40 @@ impl EngineHost {
         models_dir: Option<&Path>,
         features: &EngineFeatures,
     ) -> StartOutcome {
+        self.start_with(
+            epoch,
+            |port| build_serve_command(engine_path, port, models_dir, features),
+            HEALTH_TIMEOUT,
+            HEALTH_POLL_INTERVAL,
+        )
+    }
+
+    /// `start` with the command and the gate's budget supplied, so tests drive the path the
+    /// app takes with a stand-in engine. The sidecar enters the slot as it is spawned, not
+    /// after its gate passes, so a shutdown during the gate reaps it.
+    fn start_with(
+        &self,
+        epoch: u64,
+        command_for: impl FnOnce(u16) -> Command,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> StartOutcome {
         let port = match pick_ephemeral_port() {
             Ok(port) => port,
             Err(err) => return StartOutcome::Failed(err),
         };
-        let command = build_serve_command(engine_path, port, models_dir, features);
-        match self.launch(epoch, command) {
+        match self.launch(epoch, command_for(port)) {
             Ok(true) => {}
             Ok(false) => return StartOutcome::Cancelled,
             Err(err) => return StartOutcome::Failed(err),
         }
-        self.gate_pending(epoch, port, HEALTH_TIMEOUT, HEALTH_POLL_INTERVAL)
+        self.gate_pending(epoch, port, timeout, poll_interval)
     }
 
     /// Spawns while holding the slot lock, after checking that this generation is still
     /// wanted, so a quit can never slip in between the spawn and the child being reapable.
     /// `Ok(false)` means the launch was superseded and nothing was spawned.
-    pub fn launch(&self, epoch: u64, command: Command) -> Result<bool, EngineError> {
+    fn launch(&self, epoch: u64, command: Command) -> Result<bool, EngineError> {
         let mut slot = self.lock_slot();
         if !self.is_current(epoch) {
             return Ok(false);
@@ -767,7 +815,7 @@ impl EngineHost {
 
     /// The health gate for the pending sidecar of `epoch`. The slot is locked only for each
     /// `try_wait`, never across the HTTP probe, so a shutdown is never blocked by the gate.
-    pub fn gate_pending(
+    fn gate_pending(
         &self,
         epoch: u64,
         port: u16,
@@ -835,6 +883,27 @@ impl EngineHost {
         }
     }
 
+    /// Probes `/v1/health` when `due` says so, then observes the slot. The snapshot returned
+    /// is taken after the probe, never before it: a probe can take seconds, and an engine
+    /// that died during it must not be published as the live engine it was when it began.
+    pub fn supervisor_tick(
+        &self,
+        due: impl FnOnce(&EngineSnapshot) -> bool,
+        probe: impl FnOnce(u16) -> HealthObservation,
+    ) -> Tick {
+        let before = self.observe();
+        let probed = before
+            .as_ref()
+            .filter(|engine| engine.exit.is_none() && due(engine))
+            .map(|engine| (engine.epoch, probe(engine.port)));
+        let snapshot = if probed.is_some() {
+            self.observe()
+        } else {
+            before
+        };
+        Tick { probed, snapshot }
+    }
+
     pub fn containment(&self) -> Option<Containment> {
         match &*self.lock_slot() {
             EngineSlot::Empty => None,
@@ -843,8 +912,9 @@ impl EngineHost {
         }
     }
 
-    /// Kills and waits on whatever the slot holds, pending or ready.
-    pub fn reap(&self) -> Option<Reaped> {
+    /// Kills and waits on whatever the slot holds, pending or ready. Private: the app reaps
+    /// only through `begin_restart` and `shutdown_for_exit`.
+    fn reap(&self) -> Option<Reaped> {
         let taken = std::mem::take(&mut *self.lock_slot());
         reap_slot(taken)
     }
@@ -1324,20 +1394,36 @@ mod lifetime_tests {
             std::fs::write(marker, b"started").unwrap();
         }
         if let Some(port) = mode.strip_prefix("healthy:") {
-            let listener = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind");
-            for mut stream in listener.incoming().flatten() {
-                let mut request = [0u8; 1024];
-                let _ = stream.read(&mut request);
-                let body = r#"{"generation_ready":false,"active_model_id":null}"#;
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
+            serve_health(port, None);
+        }
+        if let Some(spec) = mode.strip_prefix("answers:") {
+            let (count, port) = spec.split_once(':').expect("answers:<count>:<port>");
+            serve_health(port, Some(count.parse().expect("answer count")));
         }
         std::thread::sleep(Duration::from_secs(30));
         std::process::exit(0);
+    }
+
+    /// Answers `/v1/health` like an engine with no model ready. With `limit`, exits with code
+    /// 3 straight after the last answer: a crash the supervisor has to notice.
+    fn serve_health(port: &str, limit: Option<usize>) {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind");
+        let mut served = 0;
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = r#"{"generation_ready":false,"active_model_id":null}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            drop(stream);
+            served += 1;
+            if limit == Some(served) {
+                std::process::exit(3);
+            }
+        }
     }
 
     fn unused_loopback_port() -> u16 {
@@ -1392,31 +1478,32 @@ mod lifetime_tests {
         assert_eq!(exit_summary(&status), ExitSummary::Code(7));
     }
 
+    /// Through `start_with`, the path `EngineHost::start` takes, with a stand-in engine that
+    /// never becomes healthy: a quit mid-gate must find the sidecar in the slot and reap it.
     #[test]
     fn shutdown_during_the_health_gate_reaps_the_child() {
         let host = Arc::new(EngineHost::default());
-        let epoch = host.begin_epoch();
-        assert!(host
-            .launch(epoch, stand_in_engine("never-healthy"))
-            .expect("launch the stand-in engine"));
-        let port = unused_loopback_port();
+        let epoch = host.begin_start(&mut StatusStore::default());
 
         let gate_host = Arc::clone(&host);
         let gate = std::thread::spawn(move || {
             let started = Instant::now();
-            let outcome = gate_host.gate_pending(
+            let outcome = gate_host.start_with(
                 epoch,
-                port,
+                |_| stand_in_engine("never-healthy"),
                 Duration::from_secs(20),
                 Duration::from_millis(20),
             );
             (outcome, started.elapsed())
         });
-        std::thread::sleep(Duration::from_millis(300));
+        let in_slot = wait_until(Duration::from_secs(5), || host.containment().is_some());
 
-        let reaped = host
-            .shutdown_for_exit()
-            .expect("a sidecar inside its health gate must be reapable");
+        let reaped = host.shutdown_for_exit();
+        assert!(
+            in_slot,
+            "the starting sidecar never entered the engine slot, so a quit cannot reach it"
+        );
+        let reaped = reaped.expect("a sidecar inside its health gate must be reapable");
         assert!(reaped.was_pending);
         assert!(reaped.status.is_some(), "the child was not waited on");
 
@@ -1431,6 +1518,127 @@ mod lifetime_tests {
         );
         assert!(host.observe().is_none());
         assert!(host.reap().is_none());
+    }
+
+    /// The first start and every restart open the generation the tray's store follows, and a
+    /// restart reaps the old engine without the store ever showing its port again.
+    #[test]
+    fn a_restart_moves_the_tray_to_the_new_engine_and_reaps_the_old_one() {
+        let host = EngineHost::default();
+        let mut store = StatusStore::default();
+        let first = host.begin_start(&mut store);
+        assert_eq!(
+            (store.epoch(), store.status()),
+            (first, &EngineStatus::Starting),
+            "the first start must open the generation the tray follows"
+        );
+
+        let outcome = host.start_with(
+            first,
+            |port| stand_in_engine(&format!("healthy:{port}")),
+            Duration::from_secs(20),
+            Duration::from_millis(50),
+        );
+        let port = match outcome {
+            StartOutcome::Ready { port } => port,
+            other => panic!("{other:?}"),
+        };
+        let old = host.observe().expect("a ready engine is observed");
+        let old_running = EngineStatus::Running { port, pid: old.pid };
+        assert!(store.apply(first, old_running.clone()));
+
+        let second = host.begin_restart(&mut store).expect("not quitting");
+        assert!(second > first);
+        assert_eq!(
+            store.epoch(),
+            second,
+            "the tray still follows the replaced engine, so every status of the new one is dropped"
+        );
+        assert_eq!(store.status(), &EngineStatus::Restarting);
+        assert!(
+            host.observe().is_none(),
+            "the old engine is still in the slot"
+        );
+        assert_eq!(
+            fetch_health(port).result,
+            ProbeResult::Failed,
+            "the old engine still answers after the restart began"
+        );
+        // A late answer from the old engine is dropped; the new engine's statuses land.
+        assert!(!store.apply(first, old_running));
+        assert_eq!(store.status(), &EngineStatus::Restarting);
+        assert!(store.apply(second, EngineStatus::Starting));
+
+        host.shutdown_for_exit();
+        assert_eq!(host.begin_restart(&mut store), None, "a restart after quit");
+        assert_eq!(store.status(), &EngineStatus::Starting);
+    }
+
+    /// A probe can take seconds. An engine that died during it must be reported from what was
+    /// observed after the probe, not from what was observed before it.
+    #[test]
+    fn a_supervisor_tick_reports_an_exit_that_happened_during_its_probe() {
+        use crate::lifetime::{classify, ModelObservation, ProbeHistory};
+
+        let host = EngineHost::default();
+        let epoch = host.begin_start(&mut StatusStore::default());
+        // The health gate takes the first answer; the stand-in exits right after the second.
+        let outcome = host.start_with(
+            epoch,
+            |port| stand_in_engine(&format!("answers:2:{port}")),
+            Duration::from_secs(20),
+            Duration::from_millis(50),
+        );
+        let port = match outcome {
+            StartOutcome::Ready { port } => port,
+            other => panic!("{other:?}"),
+        };
+
+        let tick = host.supervisor_tick(
+            |_| true,
+            |probe_port| {
+                assert_eq!(probe_port, port);
+                let observation = fetch_health(probe_port);
+                assert!(
+                    wait_until(Duration::from_secs(5), || host
+                        .observe()
+                        .is_some_and(|engine| engine.exit.is_some())),
+                    "the stand-in engine never exited after its last answer"
+                );
+                observation
+            },
+        );
+        let (probed_epoch, observation) = tick.probed.expect("a due probe ran");
+        assert_eq!(probed_epoch, epoch);
+        assert_eq!(
+            observation.result,
+            ProbeResult::Answered(ModelObservation::NotReady)
+        );
+        let snapshot = tick
+            .snapshot
+            .expect("the exited engine is still in the slot");
+        assert_eq!(
+            snapshot.exit,
+            Some(ExitSummary::Code(3)),
+            "the tick returned the snapshot taken before its probe"
+        );
+        let mut history = ProbeHistory::default();
+        history.record(epoch, observation);
+        assert_eq!(
+            classify(Some(&snapshot), &history, Instant::now()),
+            Some(EngineStatus::Stopped {
+                exit: ExitSummary::Code(3)
+            })
+        );
+
+        // An engine already seen to exit is not probed again.
+        let next = host.supervisor_tick(|_| true, |_| panic!("an exited engine was probed"));
+        assert!(next.probed.is_none());
+        assert_eq!(
+            next.snapshot.and_then(|engine| engine.exit),
+            Some(ExitSummary::Code(3))
+        );
+        host.shutdown_for_exit();
     }
 
     #[test]

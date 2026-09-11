@@ -236,6 +236,70 @@ fn single_instance_plugin_is_windows_only() {
     );
 }
 
+/// Source-level. Each clickable tray item reaches the handler its label names. The ids are
+/// mapped in lifetime.rs, where they are unit-tested; this pins the last hop in main.rs.
+#[test]
+fn every_tray_menu_action_reaches_its_handler() {
+    let main = production_source("camelid-desktop/src/main.rs");
+    let arms = [
+        "Some(MenuAction::OpenMain) => show_main_window(app),",
+        "Some(MenuAction::ToggleSpotlight) => toggle_spotlight(app),",
+        "Some(MenuAction::RestartEngine) => restart_engine(app),",
+        "Some(MenuAction::ToggleKeepRunning) => toggle_keep_running(app),",
+        "Some(MenuAction::Quit) => app.exit(0),",
+    ];
+    for arm in arms {
+        assert!(
+            main.contains(arm),
+            "tray menu arm missing or rerouted: {arm}"
+        );
+    }
+    assert_eq!(
+        main.matches("Some(MenuAction::").count(),
+        arms.len(),
+        "a menu action is handled somewhere else too"
+    );
+}
+
+/// The lines of the top-level `fn` whose header contains `header`, up to its closing brace.
+fn fn_body<'a>(source: &'a str, header: &str) -> Vec<&'a str> {
+    let body: Vec<&str> = source
+        .lines()
+        .skip_while(|line| !line.contains(header))
+        .take_while(|line| *line != "}")
+        .collect();
+    assert!(!body.is_empty(), "no function matching {header}");
+    body
+}
+
+/// Source-level, beside the behavioural `a_restart_moves_the_tray_to_the_new_engine_and_reaps
+/// _the_old_one`. `begin_epoch` is private, so the app can only open a generation through
+/// `begin_start` or `begin_restart`; these pin which one each site uses, and that `start`
+/// keeps going through the slot-holding `start_with`.
+#[test]
+fn every_engine_generation_opens_through_the_host() {
+    let main = production_source("camelid-desktop/src/main.rs");
+    assert!(
+        fn_body(&main, "fn restart_engine(")
+            .iter()
+            .any(|line| line.contains(".begin_restart(")),
+        "restart_engine no longer opens its generation with begin_restart"
+    );
+    assert!(
+        main.contains(".begin_start("),
+        "setup no longer opens the first generation with begin_start"
+    );
+    assert!(
+        !main.contains("engine::spawn("),
+        "the app starts an engine outside the slot"
+    );
+    let engine = production_source("camelid-desktop/src/engine.rs");
+    assert!(
+        line_then(&engine, "    ) -> StartOutcome {", "self.start_with("),
+        "EngineHost::start no longer goes through start_with"
+    );
+}
+
 /// Source-level. Every exit reaches the one engine shutdown, and the tray's Quit asks for an
 /// exit rather than doing something narrower.
 #[test]

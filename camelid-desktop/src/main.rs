@@ -401,10 +401,9 @@ fn main() {
             }
             *lock(&app.state::<Lifetime>().tray) = presence;
 
-            let epoch = app.state::<EngineHost>().begin_epoch();
-            lock(&app.state::<Lifetime>().observed)
-                .store
-                .begin(epoch, EngineStatus::Starting);
+            let epoch = app
+                .state::<EngineHost>()
+                .begin_start(&mut lock(&app.state::<Lifetime>().observed).store);
             let handle = app.handle().clone();
             // Start the sidecar off the UI thread so the splash paints immediately.
             std::thread::spawn(move || start_engine(&handle, epoch));
@@ -618,22 +617,21 @@ mod app_nap {
     }
 }
 
-/// One restart at a time. Restarting is published before the old engine is reaped, so the
-/// tray can never show the old port as running in between.
+/// One restart at a time. `begin_restart` opens the new generation, publishes Restarting for
+/// it and reaps the old engine while this holds the tray's store, so the tray can never show
+/// the old port as running in between.
 fn restart_engine(app: &AppHandle) {
     let state = app.state::<Lifetime>();
     if state.restarting.swap(true, Ordering::SeqCst) {
         return;
     }
     let host = app.state::<EngineHost>();
-    if host.is_quitting() {
+    let begun = host.begin_restart(&mut lock(&state.observed).store);
+    let Some(epoch) = begun else {
         state.restarting.store(false, Ordering::SeqCst);
         return;
-    }
-    let epoch = host.begin_epoch();
-    lifetime::restart_transition(&mut lock(&state.observed).store, epoch);
+    };
     refresh_tray(app, false);
-    host.reap();
     let snapshot = StartupSnapshot::default();
     if let Some(startup) = app.try_state::<StartupState>() {
         startup.replace(snapshot.clone());
@@ -669,23 +667,25 @@ fn supervise(app: AppHandle) {
         if host.is_quitting() {
             return;
         }
-        let snapshot = host.observe();
-        if let Some(engine) = snapshot.as_ref().filter(|engine| engine.exit.is_none()) {
-            let requested =
-                std::mem::take(&mut lock(&app.state::<Lifetime>().observed).probe_requested);
-            let due = requested
-                || last_probe.is_none_or(|(epoch, at)| {
-                    epoch != engine.epoch || at.elapsed() >= lifetime::HEALTH_PROBE_EVERY
-                });
-            if due {
-                let observation = engine::fetch_health(engine.port);
-                last_probe = Some((engine.epoch, Instant::now()));
-                lock(&app.state::<Lifetime>().observed)
-                    .history
-                    .record(engine.epoch, observation);
-            }
+        // The snapshot published is taken after the probe: see EngineHost::supervisor_tick.
+        let tick = host.supervisor_tick(
+            |engine| {
+                let requested =
+                    std::mem::take(&mut lock(&app.state::<Lifetime>().observed).probe_requested);
+                requested
+                    || last_probe.is_none_or(|(epoch, at)| {
+                        epoch != engine.epoch || at.elapsed() >= lifetime::HEALTH_PROBE_EVERY
+                    })
+            },
+            engine::fetch_health,
+        );
+        if let Some((epoch, observation)) = tick.probed {
+            last_probe = Some((epoch, Instant::now()));
+            lock(&app.state::<Lifetime>().observed)
+                .history
+                .record(epoch, observation);
         }
-        publish_observed(&app, snapshot.as_ref());
+        publish_observed(&app, tick.snapshot.as_ref());
         std::thread::sleep(lifetime::SUPERVISOR_TICK);
     }
 }

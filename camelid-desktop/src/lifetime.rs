@@ -371,6 +371,16 @@ pub enum EngineStatus {
     },
 }
 
+impl EngineStatus {
+    /// Stopped and FailedToStart end a generation; only a new generation moves on from them.
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            EngineStatus::Stopped { .. } | EngineStatus::FailedToStart { .. }
+        )
+    }
+}
+
 /// Health results for one engine generation. A result for another generation resets it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeHistory {
@@ -474,9 +484,15 @@ impl StatusStore {
     }
 
     /// Publishes `status` for engine generation `epoch`. A result from a replaced engine is
-    /// discarded, so a late answer can never republish an old port.
+    /// discarded, so a late answer can never republish an old port. Within a generation an
+    /// ending is final: once Stopped or FailedToStart is published, no status describing a
+    /// live engine replaces it. The supervisor and the tray's refresh publish from separate
+    /// threads, and a snapshot taken before the exit can arrive after it.
     pub fn apply(&mut self, epoch: u64, status: EngineStatus) -> bool {
         if epoch != self.epoch {
+            return false;
+        }
+        if self.last.is_final() && !status.is_final() {
             return false;
         }
         let changed = self.last != status;
@@ -735,8 +751,10 @@ pub fn tray_click_action(button: PointerButton, state: PointerState) -> Option<T
     }
 }
 
-/// Pointing at or clicking the tray re-reads the child's exit status before the menu is
-/// read, so a stretched supervisor tick cannot leave a dead engine showing as running.
+/// Pointing at or clicking the tray requests a re-read of the child's exit status, so a
+/// stretched supervisor tick does not have to be waited out. Whether the re-read lands
+/// before the OS opens the menu is not established: the event and the menu rebuild both go
+/// through Tauri's event loop.
 pub fn tray_event_refresh(event: TrayPointerEvent) -> bool {
     matches!(
         event,
@@ -1130,6 +1148,54 @@ mod tests {
         assert!(!changed);
         assert_eq!(store.status(), &EngineStatus::Starting);
         assert_eq!(store.epoch(), 2);
+    }
+
+    /// The supervisor takes its snapshot, probes for up to 3 s and publishes; the tray's
+    /// refresh can observe the exit and publish in between. The late live snapshot must not
+    /// turn the stopped engine back into a running one.
+    #[test]
+    fn an_observed_exit_is_never_replaced_by_a_stale_live_snapshot() {
+        let t0 = Instant::now();
+        let mut store = StatusStore::default();
+        store.begin(1, EngineStatus::Starting);
+        let mut history = ProbeHistory::default();
+        history.record(1, answered(t0));
+        assert!(store.apply(
+            1,
+            classify(Some(&alive(1, 5000)), &history, at(t0, 1)).unwrap()
+        ));
+
+        let mut dead = alive(1, 5000);
+        dead.exit = Some(ExitSummary::Signal(9));
+        let stopped = classify(Some(&dead), &history, at(t0, 2)).unwrap();
+        assert!(store.apply(1, stopped.clone()));
+
+        // The supervisor's probe of the dying engine failed once; its snapshot predates the
+        // exit. On its own that snapshot still reads Running.
+        history.record(1, failed(at(t0, 3)));
+        let late = classify(Some(&alive(1, 5000)), &history, at(t0, 4)).unwrap();
+        assert_eq!(
+            late,
+            EngineStatus::Running {
+                port: 5000,
+                pid: 4242
+            }
+        );
+        assert!(!store.apply(1, late));
+        assert_eq!(store.status(), &stopped, "a dead engine was republished");
+        for live in [
+            EngineStatus::Starting,
+            EngineStatus::Restarting,
+            EngineStatus::Checking { port: 5000 },
+            EngineStatus::NotAnswering { port: 5000 },
+        ] {
+            assert!(!store.apply(1, live));
+        }
+        assert_eq!(store.status(), &stopped);
+
+        // A new generation moves on.
+        store.begin(2, EngineStatus::Restarting);
+        assert!(store.apply(2, EngineStatus::Running { port: 6000, pid: 7 }));
     }
 
     #[test]
