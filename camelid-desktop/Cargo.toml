@@ -24,11 +24,26 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
+# A relaunch while the app is backgrounded must focus the running instance, never start a
+# second sidecar and a second model load. Pinned exactly: 2.4.4 is the newest release whose
+# `tauri ^2.10` requirement the locked tauri satisfies, and a caret range could later pull
+# a Tauri upgrade in through this crate alone.
+tauri-plugin-single-instance = "=2.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Hiding every window is App Nap's trigger; the NSProcessInfo activity keeps the engine
+# supervisor's ticks on time while the app is backgrounded. Both are already in the lock.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSProcessInfo",
+    "NSString",
+] }
 
 [target.'cfg(windows)'.dependencies]
 # Job object with KILL_ON_JOB_CLOSE: ties the sidecar's lifetime to ours so a desktop

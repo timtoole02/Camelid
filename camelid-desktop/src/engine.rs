@@ -8,8 +8,14 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use crate::lifetime::{
+    parse_health_body, Containment, EngineSnapshot, ExitSummary, HealthObservation, ProbeResult,
+};
 
 /// Resolved engine binary stem. The crate/binary is `camelid`; the legacy
 /// `backendinference` name must never be reintroduced (DECISIONS.md D2). Everything that
@@ -30,6 +36,16 @@ pub fn engine_binary_file() -> String {
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(40);
 /// Backoff between health polls (model load can dominate; keep polls cheap and patient).
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(350);
+/// Connect and read budget for the tray's health probe of a running engine.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const HEALTH_RESPONSE_LIMIT: u64 = 64 * 1024;
+/// How much engine stderr is kept once the splash no longer owns the pipe.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+const FEATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Optional engine flag (D6). Passed only when the engine's own `serve --help` lists it, so
+/// an older engine, or one found on PATH, still starts exactly as before.
+pub const EXIT_WHEN_STDIN_CLOSES_FLAG: &str = "--exit-when-stdin-closes";
 
 /// Stable startup-failure classes rendered by the bundled splash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,26 +123,100 @@ impl EngineError {
     }
 }
 
+/// The loopback base URL the WebView navigates to. UI and API are same-origin.
+pub fn base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/")
+}
+
+/// A spawned sidecar that has not yet passed its health gate.
+pub struct Launched {
+    child: Child,
+    containment: Containment,
+    stdin: Option<ChildStdin>,
+    #[cfg(windows)]
+    job: Option<JobObject>,
+}
+
 /// A running sidecar plus the loopback port it bound. Dropping/`shutdown` kills the child.
 pub struct Engine {
     child: Child,
     port: u16,
+    containment: Containment,
+    // Never written. Holding it open is the whole point: the OS closes it when this process
+    // dies, and an engine started with --exit-when-stdin-closes then exits by itself.
+    _stdin: Option<ChildStdin>,
+    stderr: Option<ChildStderr>,
+    tail: Arc<StderrTail>,
     #[cfg(windows)]
     _job: Option<JobObject>,
 }
 
 impl Engine {
-    /// The loopback base URL the WebView should navigate to. UI and API are same-origin.
-    pub fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.port)
+    /// Promotes a sidecar that passed its health gate. From here on nothing else reads its
+    /// stderr, so the pipe is drained into a bounded tail.
+    fn adopt(launched: Launched, port: u16) -> Engine {
+        let Launched {
+            mut child,
+            containment,
+            stdin,
+            #[cfg(windows)]
+            job,
+        } = launched;
+        let stderr = child.stderr.take();
+        let mut engine = Engine {
+            child,
+            port,
+            containment,
+            _stdin: stdin,
+            stderr,
+            tail: Arc::new(StderrTail::default()),
+            #[cfg(windows)]
+            _job: job,
+        };
+        engine.attach_stderr_drain();
+        engine
+    }
+
+    /// An engine that logs more than one pipe buffer (~64 KiB) of stderr would otherwise
+    /// block inside its next write, mid-request, for as long as the app stays open.
+    fn attach_stderr_drain(&mut self) {
+        let Some(stderr) = self.stderr.take() else {
+            return;
+        };
+        let tail = Arc::clone(&self.tail);
+        let spawned = std::thread::Builder::new()
+            .name("engine-stderr".into())
+            .spawn(move || tail.drain(stderr));
+        if let Err(err) = spawned {
+            eprintln!("[desktop] could not start the engine stderr reader: {err}");
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Non-blocking: `try_wait` never waits on a live child.
+    pub fn poll_exit(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// The last non-empty line the engine wrote to stderr, if any.
+    pub fn stderr_tail(&self) -> Option<String> {
+        self.tail.last_line()
     }
 
     /// Graceful-ish shutdown. On Windows there is no SIGTERM; the child is loopback-only and
     /// holds no external state, so `TerminateProcess` (via `Child::kill`) is the clean stop.
-    /// The kill-on-close job object (set in `spawn`) is the backstop if the parent crashes.
+    /// The kill-on-close job object (set in `launch_contained`) is the backstop if the
+    /// parent crashes.
     pub fn shutdown(&mut self) {
+        let _ = self.stop();
+    }
+
+    fn stop(&mut self) -> Option<ExitStatus> {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.wait().ok()
     }
 }
 
@@ -134,6 +224,62 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+#[derive(Default)]
+struct StderrTail(Mutex<Vec<u8>>);
+
+impl StderrTail {
+    fn drain(&self, mut stderr: ChildStderr) {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => self.push(&chunk[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut buf = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buf.extend_from_slice(bytes);
+        if buf.len() > STDERR_TAIL_BYTES {
+            let excess = buf.len() - STDERR_TAIL_BYTES;
+            buf.drain(..excess);
+        }
+    }
+
+    fn last_line(&self) -> Option<String> {
+        let buf = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    }
+}
+
+pub fn exit_summary(status: &ExitStatus) -> ExitSummary {
+    if let Some(code) = status.code() {
+        return ExitSummary::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return ExitSummary::Signal(signal);
+        }
+    }
+    ExitSummary::Unknown
 }
 
 /// Locate the `camelid` engine binary. Resolution order:
@@ -217,20 +363,118 @@ pub fn pick_ephemeral_port() -> Result<u16, EngineError> {
     Ok(port)
 }
 
-/// Spawn `camelid serve --addr 127.0.0.1:<port> --no-open --models-dir <abs>`, bound to
-/// loopback only, and health-gate it. An explicit models directory lets packaged platforms
-/// keep mutable model data outside the signed application bundle; Windows retains its
-/// existing engine-adjacent directory when no override is supplied.
-pub fn spawn(engine_path: &Path, models_dir: Option<&Path>) -> Result<Engine, EngineError> {
-    let port = pick_ephemeral_port()?;
-    spawn_on_port(engine_path, models_dir, port)
+/// Optional flags the resolved engine advertises in `serve --help`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineFeatures {
+    pub exit_when_stdin_closes: bool,
 }
 
-fn spawn_on_port(
+impl EngineFeatures {
+    /// Stdin is piped only together with the flag that makes the engine watch it, so a held
+    /// pipe always means a crash backstop.
+    pub fn pipes_stdin(&self) -> bool {
+        self.exit_when_stdin_closes
+    }
+}
+
+/// A flag counts only as a whole token, so a longer flag that merely starts with the same
+/// text is not mistaken for it.
+pub fn parse_advertised_flags(help: &str) -> EngineFeatures {
+    let advertised = |flag: &str| {
+        help.split(|c: char| c.is_whitespace() || matches!(c, ',' | '[' | ']' | '=' | '<' | '>'))
+            .any(|token| token == flag)
+    };
+    EngineFeatures {
+        exit_when_stdin_closes: advertised(EXIT_WHEN_STDIN_CLOSES_FLAG),
+    }
+}
+
+/// Runs `<engine> serve --help`. Clap answers before the engine does any real work, so this
+/// costs one short process start.
+pub fn probe_engine_features(engine_path: &Path) -> Result<EngineFeatures, String> {
+    let mut command = Command::new(engine_path);
+    command.arg("serve").arg("--help");
+    probe_features_with(command, FEATURE_PROBE_TIMEOUT)
+}
+
+fn probe_features_with(mut command: Command, timeout: Duration) -> Result<EngineFeatures, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    no_console_window(&mut command);
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("could not run `serve --help`: {err}"))?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(stdout) = stdout {
+            let _ = stdout.take(256 * 1024).read_to_end(&mut text);
+        }
+        text
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`serve --help` did not finish within {:.1} s",
+                    timeout.as_secs_f32()
+                ));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for `serve --help`: {err}"));
+            }
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("`serve --help` exited with {status}"));
+    }
+    Ok(parse_advertised_flags(&String::from_utf8_lossy(&text)))
+}
+
+/// A failed or slow probe starts the engine with no optional flags: an unknown flag would
+/// make clap reject every launch.
+pub fn features_or_none(probe: Result<EngineFeatures, String>) -> (EngineFeatures, String) {
+    match probe {
+        Ok(features) => (
+            features,
+            format!(
+                "[desktop] engine probe: exit-when-stdin-closes {}",
+                if features.exit_when_stdin_closes {
+                    "advertised"
+                } else {
+                    "not advertised"
+                }
+            ),
+        ),
+        Err(reason) => (
+            EngineFeatures::default(),
+            format!("[desktop] engine probe: {reason}; starting without optional flags"),
+        ),
+    }
+}
+
+/// `camelid serve --addr 127.0.0.1:<port> --no-open --models-dir <abs>`, bound to loopback
+/// only, plus the optional flags the engine advertised. An explicit models directory lets
+/// packaged platforms keep mutable model data outside the signed application bundle; Windows
+/// retains its existing engine-adjacent directory when no override is supplied.
+pub fn build_serve_command(
     engine_path: &Path,
-    models_dir: Option<&Path>,
     port: u16,
-) -> Result<Engine, EngineError> {
+    models_dir: Option<&Path>,
+    features: &EngineFeatures,
+) -> Command {
     let addr = format!("127.0.0.1:{port}");
 
     let mut command = Command::new(engine_path);
@@ -251,12 +495,25 @@ fn spawn_on_port(
     if let Some(models_dir) = models_dir {
         command.arg("--models-dir").arg(models_dir);
     }
+    if features.exit_when_stdin_closes {
+        command.arg(EXIT_WHEN_STDIN_CLOSES_FLAG);
+    }
     command
-        .stdin(Stdio::null())
+        .stdin(if features.pipes_stdin() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     no_console_window(&mut command);
+    command
+}
 
+/// Spawns the sidecar and reports how it is contained. On Windows it goes into a
+/// kill-on-close job, so a desktop crash takes it down too; a failed assignment is reported
+/// as uncontained rather than assumed.
+pub fn launch_contained(mut command: Command) -> Result<Launched, EngineError> {
     let mut child = command.spawn().map_err(|e| {
         let kind = if e.kind() == std::io::ErrorKind::NotFound {
             EngineErrorKind::MissingBinary
@@ -267,24 +524,59 @@ fn spawn_on_port(
             kind,
             format!(
                 "failed to launch the camelid engine at {}: {e}",
-                engine_path.display()
+                Path::new(command.get_program()).display()
             ),
         )
     })?;
+    let stdin = child.stdin.take();
 
-    // Tie the child's lifetime to ours: if the desktop process dies (even crashes), the OS
-    // terminates the sidecar too, so no orphaned `camelid` process can survive.
     #[cfg(windows)]
-    let job = JobObject::assign(&child).ok();
+    let job = match JobObject::assign(&child) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            eprintln!("[desktop] lifetime: the engine is not in a kill-on-close job: {err}");
+            None
+        }
+    };
+    #[cfg(windows)]
+    let containment = if job.is_some() {
+        Containment::JobObject
+    } else if stdin.is_some() {
+        Containment::StdinPipe
+    } else {
+        Containment::Uncontained
+    };
+    #[cfg(not(windows))]
+    let containment = if stdin.is_some() {
+        Containment::StdinPipe
+    } else {
+        Containment::Uncontained
+    };
 
-    match wait_for_health(port, &mut child) {
-        Ok(()) => Ok(Engine {
-            child,
-            port,
-            #[cfg(windows)]
-            _job: job,
-        }),
-        Err(err) => Err(finish_startup_failure(&mut child, err)),
+    Ok(Launched {
+        child,
+        containment,
+        stdin,
+        #[cfg(windows)]
+        job,
+    })
+}
+
+/// One-shot startup outside the engine slot: the path the splash-contract tests exercise.
+/// The app starts through [`EngineHost::start`], which shares every step below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn spawn(engine_path: &Path, models_dir: Option<&Path>) -> Result<Engine, EngineError> {
+    let port = pick_ephemeral_port()?;
+    let command = build_serve_command(engine_path, port, models_dir, &EngineFeatures::default());
+    let mut launched = launch_contained(command)?;
+    match wait_for_health_with_timeout(
+        port,
+        &mut launched.child,
+        HEALTH_TIMEOUT,
+        HEALTH_POLL_INTERVAL,
+    ) {
+        Ok(()) => Ok(Engine::adopt(launched, port)),
+        Err(err) => Err(finish_startup_failure(&mut launched.child, err)),
     }
 }
 
@@ -305,39 +597,291 @@ fn sidecar_models_dir(engine_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Poll `/v1/health` until it returns 200, the engine exits, or the budget elapses.
-fn wait_for_health(port: u16, child: &mut Child) -> Result<(), EngineError> {
-    wait_for_health_with_timeout(port, child, HEALTH_TIMEOUT, HEALTH_POLL_INTERVAL)
+enum ChildPoll {
+    Alive,
+    Exited(ExitStatus),
+    /// The sidecar is no longer this gate's to wait for: it was reaped or replaced.
+    Cancelled,
 }
 
+enum GateStop {
+    Failed(EngineError),
+    Cancelled,
+}
+
+/// Poll `/v1/health` until it returns 200, the engine exits, or the budget elapses.
+fn health_gate(
+    port: u16,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut poll_child: impl FnMut() -> ChildPoll,
+) -> Result<(), GateStop> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // If the engine already exited, fail immediately with its status (stderr added later).
+        match poll_child() {
+            ChildPoll::Alive => {}
+            ChildPoll::Cancelled => return Err(GateStop::Cancelled),
+            ChildPoll::Exited(status) => {
+                return Err(GateStop::Failed(EngineError::new(
+                    EngineErrorKind::StartupFailed,
+                    format!("the camelid engine exited before becoming healthy (status: {status})"),
+                )))
+            }
+        }
+        if http_health_ok(port) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(GateStop::Failed(EngineError::new(
+                EngineErrorKind::StartupTimeout,
+                format!(
+                    "the camelid engine did not report healthy on 127.0.0.1:{port} within {}s",
+                    HEALTH_TIMEOUT.as_secs()
+                ),
+            )));
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// The gate over a child owned by the caller rather than by the engine slot.
+#[cfg_attr(not(test), allow(dead_code))]
 fn wait_for_health_with_timeout(
     port: u16,
     child: &mut Child,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<(), EngineError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // If the engine already exited, fail immediately with its status (stderr added later).
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(EngineError::new(
-                EngineErrorKind::StartupFailed,
-                format!("the camelid engine exited before becoming healthy (status: {status})"),
-            ));
+    health_gate(port, timeout, poll_interval, || match child.try_wait() {
+        Ok(Some(status)) => ChildPoll::Exited(status),
+        _ => ChildPoll::Alive,
+    })
+    .map_err(|stop| match stop {
+        GateStop::Failed(err) => err,
+        GateStop::Cancelled => EngineError::new(
+            EngineErrorKind::StartupFailed,
+            "the engine start was cancelled",
+        ),
+    })
+}
+
+/// Outcome of starting one engine generation.
+#[derive(Debug)]
+pub enum StartOutcome {
+    Ready {
+        port: u16,
+    },
+    Failed(EngineError),
+    /// A newer generation, or quit, took over. Nothing is reported for this one.
+    Cancelled,
+}
+
+/// What a shutdown found in the slot and reaped.
+#[derive(Debug)]
+pub struct Reaped {
+    pub pid: u32,
+    pub status: Option<ExitStatus>,
+    pub was_pending: bool,
+}
+
+#[derive(Default)]
+enum EngineSlot {
+    #[default]
+    Empty,
+    Pending {
+        epoch: u64,
+        launched: Launched,
+    },
+    Ready {
+        epoch: u64,
+        engine: Engine,
+    },
+}
+
+/// The one place a sidecar lives, from the moment it is spawned. A sidecar still inside its
+/// 40 s health gate is in the slot too, so every shutdown can reap it; before this, a quit
+/// during a restart left the half-started engine running on macOS.
+#[derive(Default)]
+pub struct EngineHost {
+    slot: Mutex<EngineSlot>,
+    /// Bumped by every start, restart and quit. Work tagged with an older epoch is stale.
+    epoch: AtomicU64,
+    quitting: AtomicBool,
+}
+
+impl EngineHost {
+    fn lock_slot(&self) -> MutexGuard<'_, EngineSlot> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn begin_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn is_current(&self, epoch: u64) -> bool {
+        !self.quitting.load(Ordering::SeqCst) && self.epoch.load(Ordering::SeqCst) == epoch
+    }
+
+    pub fn is_quitting(&self) -> bool {
+        self.quitting.load(Ordering::SeqCst)
+    }
+
+    /// Resolve nothing, assume nothing: spawn on a fresh ephemeral port and health-gate.
+    pub fn start(
+        &self,
+        epoch: u64,
+        engine_path: &Path,
+        models_dir: Option<&Path>,
+        features: &EngineFeatures,
+    ) -> StartOutcome {
+        let port = match pick_ephemeral_port() {
+            Ok(port) => port,
+            Err(err) => return StartOutcome::Failed(err),
+        };
+        let command = build_serve_command(engine_path, port, models_dir, features);
+        match self.launch(epoch, command) {
+            Ok(true) => {}
+            Ok(false) => return StartOutcome::Cancelled,
+            Err(err) => return StartOutcome::Failed(err),
         }
-        if http_health_ok(port) {
-            return Ok(());
+        self.gate_pending(epoch, port, HEALTH_TIMEOUT, HEALTH_POLL_INTERVAL)
+    }
+
+    /// Spawns while holding the slot lock, after checking that this generation is still
+    /// wanted, so a quit can never slip in between the spawn and the child being reapable.
+    /// `Ok(false)` means the launch was superseded and nothing was spawned.
+    pub fn launch(&self, epoch: u64, command: Command) -> Result<bool, EngineError> {
+        let mut slot = self.lock_slot();
+        if !self.is_current(epoch) {
+            return Ok(false);
         }
-        if Instant::now() >= deadline {
-            return Err(EngineError::new(
-                EngineErrorKind::StartupTimeout,
-                format!(
-                    "the camelid engine did not report healthy on 127.0.0.1:{port} within {}s",
-                    HEALTH_TIMEOUT.as_secs()
-                ),
-            ));
+        let launched = launch_contained(command)?;
+        let previous = std::mem::replace(&mut *slot, EngineSlot::Pending { epoch, launched });
+        drop(slot);
+        reap_slot(previous);
+        Ok(true)
+    }
+
+    /// The health gate for the pending sidecar of `epoch`. The slot is locked only for each
+    /// `try_wait`, never across the HTTP probe, so a shutdown is never blocked by the gate.
+    pub fn gate_pending(
+        &self,
+        epoch: u64,
+        port: u16,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> StartOutcome {
+        let gate = health_gate(port, timeout, poll_interval, || {
+            let mut slot = self.lock_slot();
+            match &mut *slot {
+                EngineSlot::Pending {
+                    epoch: pending,
+                    launched,
+                } if *pending == epoch => match launched.child.try_wait() {
+                    Ok(Some(status)) => ChildPoll::Exited(status),
+                    _ => ChildPoll::Alive,
+                },
+                _ => ChildPoll::Cancelled,
+            }
+        });
+
+        let mut slot = self.lock_slot();
+        let mut launched = match std::mem::take(&mut *slot) {
+            EngineSlot::Pending {
+                epoch: pending,
+                launched,
+            } if pending == epoch => launched,
+            other => {
+                *slot = other;
+                return StartOutcome::Cancelled;
+            }
+        };
+        match gate {
+            Ok(()) => {
+                *slot = EngineSlot::Ready {
+                    epoch,
+                    engine: Engine::adopt(launched, port),
+                };
+                StartOutcome::Ready { port }
+            }
+            Err(GateStop::Failed(err)) => {
+                drop(slot);
+                StartOutcome::Failed(finish_startup_failure(&mut launched.child, err))
+            }
+            Err(GateStop::Cancelled) => {
+                drop(slot);
+                reap_launched(launched);
+                StartOutcome::Cancelled
+            }
         }
-        std::thread::sleep(poll_interval);
+    }
+
+    /// The running engine, observed without blocking. A sidecar still in its health gate is
+    /// not reported: the start path owns its status until it passes or fails.
+    pub fn observe(&self) -> Option<EngineSnapshot> {
+        let mut slot = self.lock_slot();
+        match &mut *slot {
+            EngineSlot::Ready { epoch, engine } => Some(EngineSnapshot {
+                epoch: *epoch,
+                port: engine.port,
+                pid: engine.pid(),
+                exit: engine.poll_exit().map(|status| exit_summary(&status)),
+                last_stderr_line: engine.stderr_tail(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn containment(&self) -> Option<Containment> {
+        match &*self.lock_slot() {
+            EngineSlot::Empty => None,
+            EngineSlot::Pending { launched, .. } => Some(launched.containment),
+            EngineSlot::Ready { engine, .. } => Some(engine.containment),
+        }
+    }
+
+    /// Kills and waits on whatever the slot holds, pending or ready.
+    pub fn reap(&self) -> Option<Reaped> {
+        let taken = std::mem::take(&mut *self.lock_slot());
+        reap_slot(taken)
+    }
+
+    /// The exit path. After this no engine can start, and any gate still running is
+    /// cancelled.
+    pub fn shutdown_for_exit(&self) -> Option<Reaped> {
+        self.quitting.store(true, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.reap()
+    }
+}
+
+fn reap_launched(mut launched: Launched) -> Reaped {
+    let pid = launched.child.id();
+    let _ = launched.child.kill();
+    let status = launched.child.wait().ok();
+    Reaped {
+        pid,
+        status,
+        was_pending: true,
+    }
+}
+
+fn reap_slot(slot: EngineSlot) -> Option<Reaped> {
+    match slot {
+        EngineSlot::Empty => None,
+        EngineSlot::Pending { launched, .. } => Some(reap_launched(launched)),
+        EngineSlot::Ready { mut engine, .. } => {
+            let pid = engine.pid();
+            let status = engine.stop();
+            Some(Reaped {
+                pid,
+                status,
+                was_pending: false,
+            })
+        }
     }
 }
 
@@ -381,6 +925,38 @@ fn http_health_ok(port: u16) -> bool {
         }
         _ => false,
     }
+}
+
+/// The tray's probe of a running engine: a 200 with its body read as a model observation,
+/// or a failure. Any non-200, timeout or I/O error is a failure, never an answer.
+pub fn fetch_health(port: u16) -> HealthObservation {
+    let result = match http_get_health(port) {
+        Some((200, body)) => ProbeResult::Answered(parse_health_body(&body)),
+        _ => ProbeResult::Failed,
+    };
+    HealthObservation {
+        at: Instant::now(),
+        result,
+    }
+}
+
+fn http_get_health(port: u16) -> Option<(u16, String)> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    let request =
+        format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    stream
+        .take(HEALTH_RESPONSE_LIMIT)
+        .read_to_end(&mut response)
+        .ok()?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let code = head.split_whitespace().nth(1)?.parse().ok()?;
+    Some((code, body.to_string()))
 }
 
 /// Best-effort read of engine stderr after the child has been reaped.
@@ -444,7 +1020,7 @@ unsafe impl Send for JobObject {}
 
 #[cfg(windows)]
 impl JobObject {
-    fn assign(child: &Child) -> Result<Self, ()> {
+    fn assign(child: &Child) -> Result<Self, std::io::Error> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::{
@@ -456,7 +1032,7 @@ impl JobObject {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
-                return Err(());
+                return Err(std::io::Error::last_os_error());
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -467,13 +1043,15 @@ impl JobObject {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
             if ok == 0 {
+                let err = std::io::Error::last_os_error();
                 windows_sys::Win32::Foundation::CloseHandle(job);
-                return Err(());
+                return Err(err);
             }
             let proc_handle = child.as_raw_handle() as HANDLE;
             if AssignProcessToJobObject(job, proc_handle) == 0 {
+                let err = std::io::Error::last_os_error();
                 windows_sys::Win32::Foundation::CloseHandle(job);
-                return Err(());
+                return Err(err);
             }
             Ok(JobObject { handle: job })
         }
@@ -692,5 +1270,338 @@ mod tests {
         use super::simplify_extended_path;
         let plain = PathBuf::from(r"C:\Apps\Camelid\camelid.exe");
         assert_eq!(simplify_extended_path(plain.clone()), plain);
+    }
+}
+
+/// Background-lifetime tests (P7). A separate module so the splash-contract tests above stay
+/// exactly as they were.
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    const HELPER_ENV: &str = "CAMELID_DESKTOP_ENGINE_TEST_HELPER";
+
+    /// Re-runs this test binary as a stand-in engine. `mode` picks the behaviour; see
+    /// `stand_in_engine_process`.
+    fn stand_in_engine(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test binary path"));
+        command
+            .args([
+                "--exact",
+                "engine::lifetime_tests::stand_in_engine_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HELPER_ENV, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Not a test: the body of the stand-in engine. Returns at once unless re-executed by
+    /// `stand_in_engine`.
+    #[test]
+    fn stand_in_engine_process() {
+        let Ok(mode) = std::env::var(HELPER_ENV) else {
+            return;
+        };
+        if let Some(code) = mode.strip_prefix("exit:") {
+            std::process::exit(code.parse().expect("exit code"));
+        }
+        if let Some(marker) = mode.strip_prefix("chatty:") {
+            let mut stderr = std::io::stderr().lock();
+            let line = [b'x'; 1023];
+            for _ in 0..1024 {
+                stderr.write_all(&line).unwrap();
+                stderr.write_all(b"\n").unwrap();
+            }
+            stderr.write_all(b"stand-in engine final line\n").unwrap();
+            stderr.flush().unwrap();
+            std::fs::write(marker, b"wrote 1 MiB").unwrap();
+        }
+        if let Some(marker) = mode.strip_prefix("touch:") {
+            std::fs::write(marker, b"started").unwrap();
+        }
+        if let Some(port) = mode.strip_prefix("healthy:") {
+            let listener = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind");
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = r#"{"generation_ready":false,"active_model_id":null}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_secs(30));
+        std::process::exit(0);
+    }
+
+    fn unused_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+        listener.local_addr().expect("read reserved port").port()
+    }
+
+    fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    #[test]
+    fn a_chatty_sidecar_never_blocks_on_a_full_stderr_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("wrote-everything");
+        let launched = launch_contained(stand_in_engine(&format!("chatty:{}", marker.display())))
+            .expect("launch the stand-in engine");
+        let mut engine = Engine::adopt(launched, 0);
+
+        let finished_writing = wait_until(Duration::from_secs(5), || marker.exists());
+        let tail_caught_up = wait_until(Duration::from_secs(2), || {
+            engine.stderr_tail().as_deref() == Some("stand-in engine final line")
+        });
+        let tail = engine.stderr_tail();
+        engine.shutdown();
+
+        assert!(
+            finished_writing,
+            "the engine blocked writing 1 MiB of stderr: nothing drains the pipe"
+        );
+        assert!(tail_caught_up, "unexpected stderr tail: {tail:?}");
+    }
+
+    #[test]
+    fn an_exited_sidecar_is_observed_by_poll_exit() {
+        let launched = launch_contained(stand_in_engine("exit:7")).expect("launch");
+        let mut engine = Engine::adopt(launched, 0);
+        let mut status = None;
+        wait_until(Duration::from_secs(3), || {
+            status = engine.poll_exit();
+            status.is_some()
+        });
+        let status = status.expect("the exit was never observed");
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(exit_summary(&status), ExitSummary::Code(7));
+    }
+
+    #[test]
+    fn shutdown_during_the_health_gate_reaps_the_child() {
+        let host = Arc::new(EngineHost::default());
+        let epoch = host.begin_epoch();
+        assert!(host
+            .launch(epoch, stand_in_engine("never-healthy"))
+            .expect("launch the stand-in engine"));
+        let port = unused_loopback_port();
+
+        let gate_host = Arc::clone(&host);
+        let gate = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = gate_host.gate_pending(
+                epoch,
+                port,
+                Duration::from_secs(20),
+                Duration::from_millis(20),
+            );
+            (outcome, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let reaped = host
+            .shutdown_for_exit()
+            .expect("a sidecar inside its health gate must be reapable");
+        assert!(reaped.was_pending);
+        assert!(reaped.status.is_some(), "the child was not waited on");
+
+        let (outcome, elapsed) = gate.join().expect("gate thread");
+        assert!(
+            matches!(outcome, StartOutcome::Cancelled),
+            "a cancelled gate must not surface an error: {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the gate outlived the quit"
+        );
+        assert!(host.observe().is_none());
+        assert!(host.reap().is_none());
+    }
+
+    #[test]
+    fn quit_reaps_a_running_engine_and_refuses_new_starts() {
+        use crate::lifetime::ModelObservation;
+
+        let host = EngineHost::default();
+        let epoch = host.begin_epoch();
+        let port = unused_loopback_port();
+        assert!(host
+            .launch(epoch, stand_in_engine(&format!("healthy:{port}")))
+            .expect("launch the stand-in engine"));
+        let outcome = host.gate_pending(
+            epoch,
+            port,
+            Duration::from_secs(20),
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(outcome, StartOutcome::Ready { port: ready } if ready == port),
+            "{outcome:?}"
+        );
+
+        let snapshot = host.observe().expect("a ready engine is observed");
+        assert_eq!(
+            (snapshot.epoch, snapshot.port, snapshot.exit),
+            (epoch, port, None)
+        );
+        assert_eq!(
+            fetch_health(port).result,
+            ProbeResult::Answered(ModelObservation::NotReady)
+        );
+
+        let reaped = host
+            .shutdown_for_exit()
+            .expect("quit must stop a running engine");
+        assert!(!reaped.was_pending);
+        assert!(reaped.status.is_some(), "the engine was not waited on");
+        assert_eq!(reaped.pid, snapshot.pid);
+        assert!(host.observe().is_none());
+        assert_eq!(
+            fetch_health(port).result,
+            ProbeResult::Failed,
+            "something still answers after quit"
+        );
+        // After quit nothing may start, not even for the epoch that was current.
+        let latest = host.epoch.load(Ordering::SeqCst);
+        assert!(!host
+            .launch(latest, stand_in_engine("never-healthy"))
+            .expect("a refused launch is not an error"));
+    }
+
+    #[test]
+    fn a_launch_racing_quit_never_leaves_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Quit already under way: nothing may spawn.
+        let marker = dir.path().join("spawned-after-quit");
+        let host = EngineHost::default();
+        let epoch = host.begin_epoch();
+        host.quitting.store(true, Ordering::SeqCst);
+        let launched = host
+            .launch(
+                epoch,
+                stand_in_engine(&format!("touch:{}", marker.display())),
+            )
+            .expect("a refused launch is not an error");
+        assert!(!launched, "a launch after quit must be refused");
+        assert!(host.containment().is_none());
+
+        // A newer generation superseded this one: nothing may spawn either.
+        let stale_marker = dir.path().join("spawned-for-a-stale-epoch");
+        let host = EngineHost::default();
+        let stale = host.begin_epoch();
+        host.begin_epoch();
+        assert!(!host
+            .launch(
+                stale,
+                stand_in_engine(&format!("touch:{}", stale_marker.display()))
+            )
+            .expect("a refused launch is not an error"));
+        assert!(host.containment().is_none());
+
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "a process was spawned after quit");
+        assert!(
+            !stale_marker.exists(),
+            "a process was spawned for a stale epoch"
+        );
+    }
+
+    #[test]
+    fn optional_flags_are_passed_only_when_advertised() {
+        let engine = if cfg!(windows) {
+            PathBuf::from(r"C:\Apps\Camelid\camelid.exe")
+        } else {
+            PathBuf::from("/opt/camelid/camelid")
+        };
+        let args = |features: &EngineFeatures| -> Vec<String> {
+            build_serve_command(&engine, 5000, None, features)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let old_help = "Usage: camelid serve [OPTIONS]\n      --no-open\n  -h, --help";
+        let old = parse_advertised_flags(old_help);
+        assert_eq!(old, EngineFeatures::default());
+        assert!(!old.pipes_stdin());
+        let plain = args(&old);
+        assert_eq!(
+            &plain[..4],
+            ["serve", "--addr", "127.0.0.1:5000", "--no-open"]
+        );
+        assert!(!plain.iter().any(|arg| arg == EXIT_WHEN_STDIN_CLOSES_FLAG));
+
+        // A longer flag that merely starts with the literal is not the flag.
+        assert!(
+            !parse_advertised_flags("      --exit-when-stdin-closes-later").exit_when_stdin_closes
+        );
+
+        let new_help = "      --no-open\n      --exit-when-stdin-closes\n          Exit as soon";
+        let new = parse_advertised_flags(new_help);
+        assert!(new.exit_when_stdin_closes);
+        assert!(new.pipes_stdin());
+        let flagged = args(&new);
+        assert_eq!(flagged[2], "127.0.0.1:5000");
+        assert!(flagged.iter().any(|arg| arg == EXIT_WHEN_STDIN_CLOSES_FLAG));
+
+        // A failed or slow probe passes nothing, and says why.
+        let missing = std::env::temp_dir().join(format!(
+            "camelid-desktop-missing-engine-{}",
+            std::process::id()
+        ));
+        let reason = probe_engine_features(&missing).expect_err("no engine to probe");
+        let (features, log) = features_or_none(Err(reason.clone()));
+        assert_eq!(features, EngineFeatures::default());
+        assert!(log.contains(&reason) && log.contains("without optional flags"));
+
+        let timed_out =
+            probe_features_with(stand_in_engine("never-exits"), Duration::from_millis(300))
+                .expect_err("a probe that never finishes must fail");
+        assert!(timed_out.contains("did not finish"), "{timed_out}");
+        let (features, _) = features_or_none(Err(timed_out));
+        assert_eq!(features, EngineFeatures::default());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_kills_the_sidecar_when_its_last_handle_closes() {
+        let mut command = Command::new("ping");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut launched = launch_contained(command).expect("launch ping");
+        assert_eq!(launched.containment, Containment::JobObject);
+
+        // What the OS does to the handle when the desktop process dies.
+        drop(launched.job.take());
+
+        let exited = wait_until(Duration::from_secs(3), || {
+            matches!(launched.child.try_wait(), Ok(Some(_)))
+        });
+        if !exited {
+            let _ = launched.child.kill();
+        }
+        assert!(
+            exited,
+            "closing the job's last handle did not kill the sidecar"
+        );
     }
 }
