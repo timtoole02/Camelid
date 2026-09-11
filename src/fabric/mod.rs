@@ -75,7 +75,7 @@ pub use policy::{
 };
 pub use probe::{probe_fabric, probe_node, Observation, ProbeError, DEFAULT_PROBE_TIMEOUT};
 pub use sample::SampleError;
-pub use textdiff::{diff_lines, Diff, DiffLine, Op};
+pub use textdiff::{diff_lines, Diff, DiffLine, Eol, Op};
 use transport::NodeTransport;
 
 /// Why a comparison could not be set up or completed.
