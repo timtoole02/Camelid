@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::aliases::{parse_model_aliases, ModelAliases, ALIAS_PREFIX};
 use super::node::{parse_fabric, NodeSpec};
 use super::watch::{Change, WatchedFile};
 
@@ -175,12 +176,46 @@ fn load_specs(path: &Path) -> Result<Arc<[NodeSpec]>> {
     load_node_file(path).map(Arc::from)
 }
 
+fn meaningful_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// Read the `alias` lines from a node file.
+///
+/// Read once, when the fabric is built, rather than on the node file's reload
+/// schedule: an alias is a claim about what weights are, and a claim that
+/// changed under a running comparison would make its receipt unreproducible.
+pub(crate) fn load_model_aliases(path: &Path) -> Result<ModelAliases> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("could not read node file {}: {error}", path.display()),
+        )
+    })?;
+
+    let lines: Vec<String> = meaningful_lines(&text)
+        .filter(|line| line.starts_with(ALIAS_PREFIX))
+        .map(str::to_string)
+        .collect();
+
+    parse_model_aliases(&lines).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("node file {}: {error}", path.display()),
+        )
+    })
+}
+
 /// Read and validate a node file.
 ///
 /// Blank lines and whole-line `#` comments are skipped, so an operator can
 /// take a machine out by commenting it rather than deleting what they wrote.
-/// Everything else is a spec in `--node` syntax, and duplicate labels are
-/// refused by [`parse_fabric`] exactly as they are on the command line.
+/// `alias` lines declare model identity and are read separately by
+/// [`load_model_aliases`]. Everything else is a spec in `--node` syntax, and
+/// duplicate labels are refused by [`parse_fabric`] exactly as they are on the
+/// command line.
 fn load_node_file(path: &Path) -> Result<Vec<NodeSpec>> {
     let text = fs::read_to_string(path).map_err(|error| {
         Error::new(
@@ -189,10 +224,8 @@ fn load_node_file(path: &Path) -> Result<Vec<NodeSpec>> {
         )
     })?;
 
-    let lines: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    let lines: Vec<String> = meaningful_lines(&text)
+        .filter(|line| !line.starts_with(ALIAS_PREFIX))
         .map(str::to_string)
         .collect();
 
@@ -256,6 +289,50 @@ mod tests {
 
     fn labels(specs: &[NodeSpec]) -> Vec<String> {
         specs.iter().map(|spec| spec.label.clone()).collect()
+    }
+
+    #[test]
+    fn alias_lines_share_the_file_with_node_lines_without_either_reading_the_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(
+            &dir,
+            "# the machines\n\
+             studio=ollama://127.0.0.1:11434\n\
+             desk=lmstudio://127.0.0.1:1234\n\
+             \n\
+             # what each of them calls the same weights\n\
+             alias llama-3.2-1b-instruct=studio:llama-3.2-1b-instruct:latest\n\
+             alias llama-3.2-1b-instruct=desk:llama-3.2-1b-instruct\n",
+        );
+
+        let specs = load_node_file(&path).expect("nodes parse, ignoring alias lines");
+        assert_eq!(labels(&specs), ["studio", "desk"]);
+
+        let aliases = load_model_aliases(&path).expect("aliases parse, ignoring node lines");
+        assert_eq!(
+            aliases.resolve("studio", "llama-3.2-1b-instruct"),
+            "llama-3.2-1b-instruct:latest"
+        );
+        assert_eq!(
+            aliases.resolve("desk", "llama-3.2-1b-instruct"),
+            "llama-3.2-1b-instruct"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_alias_lines_yields_no_declarations_rather_than_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(&dir, TWO);
+        assert!(load_model_aliases(&path).expect("parses").is_empty());
+    }
+
+    #[test]
+    fn a_malformed_alias_line_names_the_file_it_is_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(&dir, "a=127.0.0.1:8181\nalias nonsense\n");
+        let message = load_model_aliases(&path).expect_err("refused").to_string();
+        assert!(message.contains("node file"), "{message}");
+        assert!(message.contains("alias CANONICAL=LABEL:LOCAL"), "{message}");
     }
 
     #[test]

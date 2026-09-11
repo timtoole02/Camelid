@@ -1826,6 +1826,11 @@ enum FabricAction {
         left_model: Option<String>,
         #[arg(long, value_name = "MODEL")]
         right_model: Option<String>,
+        /// Declare what one node calls a model, so `--model` can be the same
+        /// everywhere. Repeatable, and the same syntax an `alias` line in the
+        /// nodes file uses, which is where it belongs once it is settled.
+        #[arg(long = "model-alias", value_name = "CANONICAL=LABEL:LOCAL")]
+        model_alias: Vec<String>,
         /// The user message to send to both.
         #[arg(long)]
         prompt: String,
@@ -4648,6 +4653,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 left_model,
                 right_model,
+                model_alias,
                 prompt,
                 repeat,
                 temperature,
@@ -4658,25 +4664,35 @@ async fn main() -> anyhow::Result<()> {
                 timeout_s,
                 json,
             } => {
-                let fabric = configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
-                    .with_bearer(fabric_bearer(bearer).as_deref())
-                    .with_timeout(std::time::Duration::from_secs(timeout_s));
+                let declared = camelid::fabric::parse_model_aliases(&model_alias)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let mut fabric =
+                    configure_node_transport(fabric_from(nodes, nodes_file)?, &transport)?
+                        .with_bearer(fabric_bearer(bearer).as_deref())
+                        .with_timeout(std::time::Duration::from_secs(timeout_s));
+                if !declared.is_empty() {
+                    fabric = fabric.with_model_aliases(declared);
+                }
                 let plan = camelid::fabric::SamplingPlan {
                     temperature,
                     seed,
                     max_tokens,
                     repetitions: repeat,
                 };
-                let comparison = fabric
-                    .compare(
+                // An explicit per-side id wins over anything declared, because
+                // it is the more specific statement of the same claim.
+                let comparison = match (&left_model, &right_model) {
+                    (None, None) => fabric.compare_model(&left, &right, &model, &prompt, plan),
+                    _ => fabric.compare(
                         &left,
                         &right,
                         left_model.as_deref().unwrap_or(&model),
                         right_model.as_deref().unwrap_or(&model),
                         &prompt,
                         plan,
-                    )
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    ),
+                }
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&comparison)?);

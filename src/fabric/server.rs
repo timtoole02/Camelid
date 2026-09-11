@@ -840,14 +840,27 @@ async fn compare(
     let fabric_handle = Arc::clone(&state.fabric);
     // Same reason as `health`: this is blocking socket I/O, and a long one.
     let outcome = tokio::task::spawn_blocking(move || {
-        fabric_handle.compare(
-            &request.left,
-            &request.right,
-            request.left_model.as_deref().unwrap_or(&request.model),
-            request.right_model.as_deref().unwrap_or(&request.model),
-            &request.prompt,
-            plan,
-        )
+        // An explicit per-side id wins; otherwise the operator's declared
+        // aliases apply, so this route and the CLI resolve a model the same
+        // way. A UI that quietly skipped the alias table would ask a node for
+        // a name it does not know and be refused for no visible reason.
+        match (&request.left_model, &request.right_model) {
+            (None, None) => fabric_handle.compare_model(
+                &request.left,
+                &request.right,
+                &request.model,
+                &request.prompt,
+                plan,
+            ),
+            _ => fabric_handle.compare(
+                &request.left,
+                &request.right,
+                request.left_model.as_deref().unwrap_or(&request.model),
+                request.right_model.as_deref().unwrap_or(&request.model),
+                &request.prompt,
+                plan,
+            ),
+        }
     })
     .await;
 

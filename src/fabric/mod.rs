@@ -23,6 +23,7 @@
 //! * [`cancel`] — telling that send it is no longer wanted.
 //! * `transport` — authenticating or explicitly constraining the node hop.
 
+pub mod aliases;
 pub(crate) mod camelid;
 pub mod cancel;
 pub mod capability;
@@ -48,6 +49,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+pub use aliases::{
+    parse_model_alias, parse_model_aliases, AliasParseError, ModelAlias, ModelAliases,
+};
 pub use cancel::Cancel;
 pub use capability::{Capabilities, Capability, Provenance};
 pub use divergence::{
@@ -131,6 +135,12 @@ pub struct Fabric {
     timeout: Duration,
     bearer: Option<String>,
     transport: NodeTransport,
+    /// What each node calls a model, where an operator has said so.
+    ///
+    /// Empty for every fabric that never declared one, and the resolution
+    /// falls through to the id as given, so this changes nothing until it is
+    /// used.
+    aliases: Arc<ModelAliases>,
     /// Requests this fabric has placed and not yet finished.
     ///
     /// Shared across clones on purpose: the resident proxy hands a `Fabric` to
@@ -181,7 +191,8 @@ impl Fabric {
     /// ignored an unreadable node file would refuse every request while
     /// looking as though it had started correctly.
     pub fn from_node_file(path: std::path::PathBuf) -> std::io::Result<Self> {
-        Ok(Self::over(NodeSet::from_file(path)?))
+        let aliases = nodes::load_model_aliases(&path)?;
+        Ok(Self::over(NodeSet::from_file(path)?).with_model_aliases(aliases))
     }
 
     /// [`Self::from_node_file`] with the staleness bound supplied, so a test
@@ -197,6 +208,7 @@ impl Fabric {
             timeout: DEFAULT_PROBE_TIMEOUT,
             bearer: None,
             transport: NodeTransport::default(),
+            aliases: Arc::new(ModelAliases::default()),
             reserved: Arc::new(Mutex::new(Reservations::none())),
             service_times: Arc::new(Mutex::new(ServiceTimeEstimates::default())),
             observed: Arc::new(Mutex::new(None)),
@@ -208,6 +220,18 @@ impl Fabric {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Adopt an operator's declarations about what each node calls a model.
+    pub fn with_model_aliases(mut self, aliases: ModelAliases) -> Self {
+        self.aliases = Arc::new(aliases);
+        self
+    }
+
+    /// What `label` calls `model`, which is `model` itself unless somebody said
+    /// otherwise.
+    pub fn local_model_id<'a>(&'a self, label: &str, model: &'a str) -> &'a str {
+        self.aliases.resolve(label, model)
     }
 
     /// Reuse an observation for up to `max_age` instead of probing again.
@@ -341,6 +365,21 @@ impl Fabric {
         Ok(divergence::conclude(
             prompt, plan, left_side, right_side, identity,
         ))
+    }
+
+    /// [`Self::compare`] with each side's model id resolved through the alias
+    /// table, so an operator who declared the names once does not retype them.
+    pub fn compare_model(
+        &self,
+        left: &str,
+        right: &str,
+        model: &str,
+        prompt: &str,
+        plan: SamplingPlan,
+    ) -> Result<Comparison, CompareError> {
+        let left_model = self.aliases.resolve(left, model).to_string();
+        let right_model = self.aliases.resolve(right, model).to_string();
+        self.compare(left, right, &left_model, &right_model, prompt, plan)
     }
 
     /// Observe every node.

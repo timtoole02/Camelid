@@ -419,6 +419,55 @@ Four rules decide what it is allowed to conclude:
 `--repeat 1` is permitted and yields no attributable verdict, by design: one run per side never
 tested self-consistency, which is a different thing from having tested it and found none.
 
+### Telling the fabric that two names are the same model
+
+Engines do not agree on what to call the same weights. Ollama suffixes `:latest`, LM Studio does
+not, Camelid uses its catalog id — and none of them publishes a digest this fabric could compare
+(Ollama's `/api/tags` carries a *manifest* digest, not the GGUF's). Exact-match identity therefore
+refuses a cross-engine comparison even when the two nodes really are serving the same file.
+
+This build will not guess. Stripping a `:latest` suffix to make two ids match is an inference, and
+it would be wrong the first time somebody has two genuinely different builds under similar names.
+Instead an operator declares it, and the claim travels with every result that rests on it.
+
+Declare it once, in the nodes file:
+
+```
+studio=ollama://127.0.0.1:11434
+desk=lmstudio://127.0.0.1:1234
+
+# what each of them calls the same weights
+alias llama-3.2-1b-instruct=studio:llama-3.2-1b-instruct:latest
+alias llama-3.2-1b-instruct=desk:llama-3.2-1b-instruct
+```
+
+Then one id works everywhere:
+
+```bash
+target/release/camelid fabric compare --nodes-file fabric.nodes \
+  --left studio --right desk \
+  --model llama-3.2-1b-instruct \
+  --prompt 'What is 7 plus 5?'
+```
+
+`--model-alias CANONICAL=LABEL:LOCAL` takes the same declaration on the command line, repeatably,
+for a one-off. `--left-model` / `--right-model` still override a single side and win over anything
+declared, being the more specific statement of the same claim.
+
+Details that matter:
+
+| | |
+|---|---|
+| `LOCAL` is everything after the **first** colon | A model id may contain colons — `llama-3.2-1b-instruct:latest` is the case this exists for. A node label may not. |
+| No alias means no change | Resolution falls through to the id as given, so an existing fabric behaves exactly as it did and only the names that genuinely differ need declaring. |
+| One node, one name per model | A second declaration for the same pair is refused rather than silently overwriting the first. |
+| Aliases are read **once, at startup** | Nodes hot-reload; aliases do not. An alias is a claim about what weights *are*, and one that changed underneath a running comparison would make its receipt unreproducible. |
+
+Whenever a declaration is used and the two sides end up asking for different names, the result
+carries `model_identity: asserted_by_operator`, lists `model identity` among the uncontrolled
+variables, and prints `MODEL IDENTITY ASSERTED, NOT VERIFIED`. Nothing here checks that the weights
+match, and the output never pretends otherwise.
+
 Where the engine exposes it, the chat template each backend applied is captured too — usually the
 actual explanation for a divergence:
 
