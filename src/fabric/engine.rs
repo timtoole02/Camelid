@@ -14,6 +14,8 @@ use std::fmt;
 
 use serde::{Serialize, Serializer};
 
+use super::identify::{Answers, EngineVerdict};
+
 /// An inference engine the fabric knows how to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NodeEngine {
@@ -53,6 +55,46 @@ impl NodeEngine {
     /// Every engine an operator may name, for error messages.
     pub fn known() -> &'static [&'static str] {
         &["camelid", "ollama", "lmstudio"]
+    }
+
+    /// Every engine this build knows, in the order they are reported.
+    ///
+    /// Discovery iterates this rather than listing engines of its own, which is
+    /// what keeps a fourth engine a new file plus a row here (S6).
+    pub const ALL: [NodeEngine; 3] = [Self::Camelid, Self::Ollama, Self::LmStudio];
+
+    /// The paths that identify this engine, asked of a machine nobody has
+    /// declared yet.
+    ///
+    /// Separate from what [`super::probe`] reads, and answered by a stricter
+    /// signature: a probe reads a node an operator already named and may be
+    /// lenient, while this decides *which* engine an address is, where the
+    /// same leniency would match everything at once.
+    pub(crate) fn identification_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::Camelid => super::camelid::IDENTIFICATION_PATHS,
+            Self::Ollama => super::ollama::IDENTIFICATION_PATHS,
+            Self::LmStudio => super::lmstudio::IDENTIFICATION_PATHS,
+        }
+    }
+
+    /// Whether the answers from one address match this engine's signature.
+    pub(crate) fn identify(self, answers: &Answers<'_>) -> EngineVerdict {
+        match self {
+            Self::Camelid => super::camelid::identify(answers),
+            Self::Ollama => super::ollama::identify(answers),
+            Self::LmStudio => super::lmstudio::identify(answers),
+        }
+    }
+
+    /// Whether a node declared as this engine is ever shown the fabric's
+    /// bearer, once it is in the file.
+    ///
+    /// The same answer [`Self::fabric_bearer`] gives, as a fact rather than a
+    /// token: discovery holds no credential at all, and still has to be able to
+    /// warn a person what joining a machine will mean.
+    pub(crate) fn receives_fabric_bearer(self) -> bool {
+        self.fabric_bearer(Some("")).is_some()
     }
 
     /// The port to assume when a specification names no port.
@@ -95,6 +137,23 @@ impl NodeEngine {
     /// configured and whichever path the request took.
     pub(crate) fn fabric_bearer(self, bearer: Option<&str>) -> Option<&str> {
         bearer.filter(|_| matches!(self, Self::Camelid))
+    }
+
+    /// Which bearer-receiving warning a proposal for this engine carries, given
+    /// whether the proxy that would probe it holds a bearer at all.
+    ///
+    /// Both halves are facts: one about the engine, one about the process. A
+    /// warning from either alone would be a claim about the other.
+    pub(crate) fn bearer_warning(self, bearer_configured: Option<bool>) -> Option<&'static str> {
+        if !self.receives_fabric_bearer() {
+            return None;
+        }
+        match bearer_configured {
+            Some(true) => Some("bearer_will_be_sent"),
+            Some(false) => None,
+            // The CLI never reads a key, so it cannot know. It says so.
+            None => Some("bearer_sent_if_configured"),
+        }
     }
 }
 
@@ -145,6 +204,43 @@ mod tests {
         assert_eq!(NodeEngine::Camelid.fabric_bearer(None), None);
         for foreign in [NodeEngine::Ollama, NodeEngine::LmStudio] {
             assert_eq!(foreign.fabric_bearer(Some("k")), None, "{foreign}");
+        }
+    }
+
+    /// `ALL` is what discovery iterates. If it ever falls behind `known()`, a
+    /// scan silently stops looking for one of this build's own engines.
+    #[test]
+    fn every_engine_this_build_knows_is_one_discovery_looks_for() {
+        let named: Vec<&str> = NodeEngine::ALL.iter().map(|engine| engine.as_str()).collect();
+        assert_eq!(named, NodeEngine::known());
+        for engine in NodeEngine::ALL {
+            assert!(
+                !engine.identification_paths().is_empty(),
+                "{engine} has no way to be recognised"
+            );
+        }
+    }
+
+    /// The warning a person is shown before joining a machine has to follow the
+    /// same rule the probe follows afterwards, or it becomes false the moment
+    /// one of them changes.
+    #[test]
+    fn only_the_engine_that_is_shown_the_bearer_warns_about_it() {
+        assert_eq!(
+            NodeEngine::Camelid.bearer_warning(Some(true)),
+            Some("bearer_will_be_sent")
+        );
+        assert_eq!(NodeEngine::Camelid.bearer_warning(Some(false)), None);
+        assert_eq!(
+            NodeEngine::Camelid.bearer_warning(None),
+            Some("bearer_sent_if_configured"),
+            "a caller that never reads a key must not claim one is configured"
+        );
+        for foreign in [NodeEngine::Ollama, NodeEngine::LmStudio] {
+            assert!(!foreign.receives_fabric_bearer(), "{foreign}");
+            for configured in [Some(true), Some(false), None] {
+                assert_eq!(foreign.bearer_warning(configured), None, "{foreign}");
+            }
         }
     }
 

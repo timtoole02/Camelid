@@ -12,7 +12,8 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,10 +21,11 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::aliases::{parse_model_aliases, ModelAliases, ALIAS_PREFIX};
+use super::aliases::{parse_model_aliases, AliasParseError, ModelAliases, ALIAS_PREFIX};
 use super::capability::capabilities_of;
+use super::divergence::sha256_hex;
 use super::engine::NodeEngine;
-use super::node::{parse_fabric, NodeSpec};
+use super::node::{parse_fabric, NodeSpec, NodeSpecParseError};
 use super::watch::{Change, WatchedFile};
 
 /// How long a loaded set is trusted before the file is looked at again.
@@ -297,6 +299,392 @@ fn meaningful_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// The node lines of a node file's text. The text-level half of
+/// [`load_node_file`], factored out so a file and a *would-be* file are read by
+/// exactly the same rule.
+fn parse_specs_text(text: &str) -> std::result::Result<Vec<NodeSpec>, NodeSpecParseError> {
+    let lines: Vec<String> = meaningful_lines(text)
+        .filter(|line| !line.starts_with(ALIAS_PREFIX))
+        .map(str::to_string)
+        .collect();
+    parse_fabric(&lines)
+}
+
+/// The alias lines of the same text, by the same argument.
+fn parse_aliases_text(text: &str) -> std::result::Result<ModelAliases, AliasParseError> {
+    let lines: Vec<String> = meaningful_lines(text)
+        .filter(|line| line.starts_with(ALIAS_PREFIX))
+        .map(str::to_string)
+        .collect();
+    parse_model_aliases(&lines)
+}
+
+/// The SHA-256 of a node file as it stands, or `None` if there is no file.
+///
+/// What a caller shows a person is what they are agreeing to add a line to, so
+/// the write checks the file is still that one.
+pub(crate) fn file_sha256(path: &Path) -> Option<String> {
+    fs::read(path).ok().map(|bytes| sha256_hex(&bytes))
+}
+
+/// What the caller believed the file was when a person confirmed the addition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Base {
+    Sha256(String),
+    /// The caller believes there is no file yet. CLI only: the proxy's own
+    /// startup already requires a loadable one.
+    Absent,
+}
+
+/// A node file that gained exactly one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Appended {
+    pub(crate) path: String,
+    /// The exact text added, so a person can be shown what was written rather
+    /// than a description of it.
+    pub(crate) appended: String,
+    pub(crate) line: String,
+    pub(crate) sha256_before: Option<String>,
+    pub(crate) sha256_after: String,
+}
+
+/// Why nothing was written. Every one of these leaves the file untouched.
+///
+/// Public because a join carries one outward: the code is what a page branches
+/// on, and the message is what a person is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendRefusal {
+    /// The file is not what it was when the person was shown it.
+    FileChanged,
+    FileDoesNotParse(String),
+    DuplicateLabel(String),
+    /// The bytes we composed would have meant more than the one node asked for.
+    /// The backstop: even a sanitizer bug cannot get past this.
+    WouldChangeMoreThanTheNode(String),
+    WriteFailed(String),
+}
+
+impl std::fmt::Display for AppendRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileChanged => write!(
+                f,
+                "the nodes file changed since it was read; nothing was written. Scan again so \
+                 the line is added to the file as it stands now"
+            ),
+            Self::FileDoesNotParse(detail) => write!(
+                f,
+                "{detail}. A line added to a file the proxy cannot read would never take effect, \
+                 so nothing was written"
+            ),
+            Self::DuplicateLabel(label) => {
+                write!(f, "node label `{label}` is used more than once")
+            }
+            Self::WouldChangeMoreThanTheNode(detail) => write!(
+                f,
+                "writing that would have changed more than the one node asked for ({detail}); \
+                 nothing was written"
+            ),
+            Self::WriteFailed(detail) => write!(f, "the nodes file could not be written: {detail}"),
+        }
+    }
+}
+
+impl AppendRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::FileChanged => "file_changed",
+            Self::FileDoesNotParse(_) => "file_does_not_parse",
+            Self::DuplicateLabel(_) => "duplicate_label",
+            Self::WouldChangeMoreThanTheNode(_) => "invalid_spec",
+            Self::WriteFailed(_) => "write_failed",
+        }
+    }
+}
+
+/// Serializes every write to a node file from inside this process.
+///
+/// A re-read of the hash cannot close a lost update between two threads of one
+/// process: both read the same bytes, both find them unchanged, and one line
+/// wins. Only a lock held across read, compose and rename can.
+static NODES_FILE_WRITE: Mutex<()> = Mutex::new(());
+
+/// Add exactly one node to a node file, preserving every existing byte.
+///
+/// The file is the operator's: their comments, their commented-out machines,
+/// their alias lines, their line endings. So this appends to the bytes rather
+/// than re-serializing what was parsed out of them — a round trip through
+/// `NodeSpec` would silently delete everything that is not a node.
+///
+/// Six things have to hold, and any one of them failing writes nothing:
+///
+/// 1. the file is still the one whose hash the caller was shown;
+/// 2. what is there now parses, allowing zero nodes so a comments-only file can
+///    take its first;
+/// 3. the label is not already used;
+/// 4. the would-be text parses under the *loader's* own rules;
+/// 5. its node list is the old list plus exactly this spec, and its alias list
+///    is unchanged — the backstop against anything smuggled in through a
+///    string, however it got there;
+/// 6. the write lands whole, via a temp file in the same directory and a
+///    rename, so a reader sees the old file or the new one and never half a
+///    line.
+pub(crate) fn append_node(
+    path: &Path,
+    spec: &NodeSpec,
+    base: &Base,
+    comment: &str,
+) -> std::result::Result<Appended, AppendRefusal> {
+    if !comment.starts_with('#') || comment.chars().any(char::is_control) {
+        return Err(AppendRefusal::WouldChangeMoreThanTheNode(
+            "the provenance comment is not a single comment line".to_string(),
+        ));
+    }
+
+    let _serialized = NODES_FILE_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let real = canonical_target(path)?;
+    let directory = real
+        .parent()
+        .ok_or_else(|| AppendRefusal::WriteFailed("the nodes file has no directory".to_string()))?
+        .to_path_buf();
+
+    // Held for the rest of this function on unix, so another process editing
+    // the same file waits rather than racing. No lock file is ever created:
+    // the lock is on the target itself.
+    let _across_processes = lock_target(&real)?;
+
+    let existing = match fs::read(&real) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(AppendRefusal::WriteFailed(error.to_string())),
+    };
+    let sha256_before = existing.as_deref().map(sha256_hex);
+    match (base, &sha256_before) {
+        (Base::Sha256(expected), Some(found)) if expected == found => {}
+        (Base::Absent, None) => {}
+        _ => return Err(AppendRefusal::FileChanged),
+    }
+
+    let old = match &existing {
+        Some(bytes) => String::from_utf8(bytes.clone()).map_err(|_| {
+            AppendRefusal::FileDoesNotParse(format!(
+                "node file {} is not UTF-8",
+                real.display()
+            ))
+        })?,
+        None => String::new(),
+    };
+
+    // Pre-state: zero nodes is allowed on purpose. The loader refuses an empty
+    // fabric, which is right for serving and wrong here — it would make a file
+    // of nothing but comments the one file a person could never add to.
+    let before_specs = parse_specs_text(&old).map_err(|error| {
+        AppendRefusal::FileDoesNotParse(format!("node file {}: {error}", real.display()))
+    })?;
+    let before_aliases = parse_aliases_text(&old).map_err(|error| {
+        AppendRefusal::FileDoesNotParse(format!("node file {}: {error}", real.display()))
+    })?;
+    if before_specs
+        .iter()
+        .any(|existing| existing.label == spec.label)
+    {
+        return Err(AppendRefusal::DuplicateLabel(spec.label.clone()));
+    }
+
+    let eol = if old.contains("\r\n") { "\r\n" } else { "\n" };
+    let line = spec.to_line();
+    let mut appended = String::new();
+    if !old.is_empty() && !old.ends_with('\n') {
+        appended.push_str(eol);
+    }
+    appended.push_str(comment);
+    appended.push_str(eol);
+    appended.push_str(&line);
+    appended.push_str(eol);
+    let new = format!("{old}{appended}");
+
+    // Post-state, under the loader's own rules, including its non-empty one.
+    let after_specs = parse_specs_text(&new).map_err(|error| {
+        AppendRefusal::WouldChangeMoreThanTheNode(format!("the result would not load: {error}"))
+    })?;
+    let after_aliases = parse_aliases_text(&new).map_err(|error| {
+        AppendRefusal::WouldChangeMoreThanTheNode(format!("the result would not load: {error}"))
+    })?;
+    if after_specs.is_empty() {
+        return Err(AppendRefusal::WouldChangeMoreThanTheNode(
+            "the result would name no nodes".to_string(),
+        ));
+    }
+    let mut expected = before_specs.clone();
+    expected.push(spec.clone());
+    if after_specs != expected {
+        return Err(AppendRefusal::WouldChangeMoreThanTheNode(format!(
+            "it would leave {} nodes where {} were asked for",
+            after_specs.len(),
+            expected.len()
+        )));
+    }
+    if after_aliases != before_aliases {
+        return Err(AppendRefusal::WouldChangeMoreThanTheNode(
+            "it would change the model aliases".to_string(),
+        ));
+    }
+
+    write_atomically(&directory, &real, new.as_bytes(), existing.is_none())?;
+
+    Ok(Appended {
+        path: real.display().to_string(),
+        appended,
+        line,
+        sha256_before,
+        sha256_after: sha256_hex(new.as_bytes()),
+    })
+}
+
+/// Resolve the path a write should land on, following a symlink to its target.
+///
+/// A renamed file replaces whatever the name pointed at, so writing to the link
+/// would turn an operator's symlink into a regular file and orphan the thing it
+/// pointed at.
+fn canonical_target(path: &Path) -> std::result::Result<PathBuf, AppendRefusal> {
+    match path.canonicalize() {
+        Ok(real) => Ok(real),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+            let directory = match parent {
+                Some(parent) => parent
+                    .canonicalize()
+                    .map_err(|error| AppendRefusal::WriteFailed(error.to_string()))?,
+                None => std::env::current_dir()
+                    .map_err(|error| AppendRefusal::WriteFailed(error.to_string()))?,
+            };
+            let name = path.file_name().ok_or_else(|| {
+                AppendRefusal::WriteFailed("the nodes file has no name".to_string())
+            })?;
+            Ok(directory.join(name))
+        }
+        Err(error) => Err(AppendRefusal::WriteFailed(error.to_string())),
+    }
+}
+
+/// Take an exclusive lock on the node file itself, for as long as the returned
+/// handle lives.
+///
+/// The inode is re-checked after locking: another process could have renamed a
+/// new file into place between the open and the lock, and a lock on the file
+/// that used to be there protects nothing.
+#[cfg(unix)]
+fn lock_target(path: &Path) -> std::result::Result<Option<fs::File>, AppendRefusal> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    for _ in 0..3 {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(AppendRefusal::WriteFailed(error.to_string())),
+        };
+        // SAFETY: the descriptor is owned by `file` and outlives the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(AppendRefusal::WriteFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        let locked = file
+            .metadata()
+            .map_err(|error| AppendRefusal::WriteFailed(error.to_string()))?;
+        match fs::metadata(path) {
+            Ok(current) if current.ino() == locked.ino() => return Ok(Some(file)),
+            // Somebody renamed a new file in. Drop this lock and take one on
+            // the file that is actually there now.
+            Ok(_) => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(AppendRefusal::WriteFailed(error.to_string())),
+        }
+    }
+    Err(AppendRefusal::WriteFailed(
+        "the nodes file was replaced repeatedly while waiting for a lock".to_string(),
+    ))
+}
+
+/// No cross-process file lock is taken here, so concurrent safety on this
+/// platform rests on the hash check alone. Documented rather than implied.
+#[cfg(not(unix))]
+fn lock_target(_path: &Path) -> std::result::Result<Option<fs::File>, AppendRefusal> {
+    Ok(None)
+}
+
+/// Replace the file's contents whole: temp file in the same directory, then
+/// rename. A reader sees one or the other, never half a line.
+fn write_atomically(
+    directory: &Path,
+    real: &Path,
+    bytes: &[u8],
+    creating: bool,
+) -> std::result::Result<(), AppendRefusal> {
+    let mut temp = tempfile::Builder::new()
+        .prefix(".nodes.discover-")
+        .tempfile_in(directory)
+        .map_err(|error| AppendRefusal::WriteFailed(error.to_string()))?;
+    temp.write_all(bytes)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|error| AppendRefusal::WriteFailed(error.to_string()))?;
+    if let Ok(existing) = fs::metadata(real) {
+        // The operator's own mode, not the temp file's private default.
+        let _ = fs::set_permissions(temp.path(), existing.permissions());
+    }
+
+    // Creating uses no-clobber, so a file that appeared while we were composing
+    // is reported rather than overwritten.
+    let persisted = if creating {
+        temp.persist_noclobber(real).map_err(|error| {
+            if error.error.kind() == ErrorKind::AlreadyExists {
+                AppendRefusal::FileChanged
+            } else {
+                AppendRefusal::WriteFailed(error.error.to_string())
+            }
+        })
+    } else {
+        temp.persist(real)
+            .map_err(|error| AppendRefusal::WriteFailed(error.error.to_string()))
+    };
+    persisted?;
+
+    // The rename itself has to reach the disk, or a crash leaves the directory
+    // pointing at a file that is no longer there.
+    #[cfg(unix)]
+    if let Ok(handle) = fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// The label of an existing node that already occupies this endpoint, if one
+/// does. Pure, over addresses that have already been resolved.
+///
+/// Matching on resolved addresses rather than on how a host was spelled is the
+/// point: `localhost:11434` and `127.0.0.1:11434` are one server, and adding it
+/// twice makes the fabric believe it has two machines and re-place a failed
+/// request onto the one that just failed.
+pub(crate) fn endpoint_conflict(
+    existing: &[(NodeSpec, Vec<IpAddr>)],
+    port: u16,
+    addresses: &[IpAddr],
+) -> Option<String> {
+    existing
+        .iter()
+        .find(|(spec, resolved)| {
+            spec.port == port
+                && resolved
+                    .iter()
+                    .any(|address| addresses.contains(address))
+        })
+        .map(|(spec, _)| spec.label.clone())
 }
 
 /// Read the `alias` lines from a node file.
@@ -677,6 +1065,327 @@ mod tests {
         let announced = set.foreign_added_since_start();
         assert_eq!(announced.len(), 1, "{announced:?}");
         assert_eq!(announced[0].engine, NodeEngine::LmStudio);
+    }
+
+    // ---- adding one node to an operator's file -------------------------------
+
+    fn found(label: &str, host: &str, port: u16, engine: NodeEngine) -> NodeSpec {
+        NodeSpec {
+            label: label.to_string(),
+            host: host.to_string(),
+            port,
+            engine,
+        }
+    }
+
+    const COMMENT: &str = "# joined by fabric discover 2026-09-12T10:04:11Z: \
+                           127.0.0.1:11434 answered like ollama 0.33.2";
+
+    fn base_of(path: &Path) -> Base {
+        Base::Sha256(file_sha256(path).expect("the file exists"))
+    }
+
+    fn temp_files(dir: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The file belongs to the operator. Everything in it that is not a node —
+    /// comments, a machine they commented out, blank lines, aliases — has to
+    /// come back byte for byte.
+    #[test]
+    fn joining_appends_and_leaves_every_existing_byte_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Deliberately no trailing newline: the append has to add one.
+        let original = "# my fabric\n\
+                        \n\
+                        local=127.0.0.1:8181\n\
+                        #retired=192.0.2.9:8181\n\
+                        alias llama=local:llama-3.2-1b";
+        let path = write(&dir, original);
+        let before = base_of(&path);
+
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        let appended = append_node(&path, &spec, &before, COMMENT).expect("appends");
+
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.starts_with(original),
+            "every existing byte has to survive verbatim:\n{after}"
+        );
+        assert_eq!(
+            after,
+            format!("{original}\n{COMMENT}\nstudio=ollama://127.0.0.1:11434\n")
+        );
+        assert_eq!(appended.line, "studio=ollama://127.0.0.1:11434");
+        assert_eq!(
+            appended.appended,
+            format!("\n{COMMENT}\nstudio=ollama://127.0.0.1:11434\n")
+        );
+        assert_eq!(appended.sha256_after, file_sha256(&path).expect("hashes"));
+
+        assert_eq!(labels(&load_node_file(&path).expect("loads")), ["local", "studio"]);
+        assert_eq!(
+            load_model_aliases(&path).expect("aliases").resolve("local", "llama"),
+            "llama-3.2-1b",
+            "the alias lines have to mean exactly what they meant"
+        );
+    }
+
+    #[test]
+    fn a_crlf_file_gets_crlf_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "# windows\r\nlocal=127.0.0.1:8181\r\n");
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        append_node(&path, &spec, &base_of(&path), COMMENT).expect("appends");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(after.ends_with("\r\nstudio=ollama://127.0.0.1:11434\r\n"), "{after:?}");
+        assert!(!after.contains("\n\n"), "no bare LF may be introduced: {after:?}");
+
+        let lf_dir = tempfile::tempdir().expect("temp dir");
+        let lf = write(&lf_dir, "local=127.0.0.1:8181\n");
+        append_node(&lf, &spec, &base_of(&lf), COMMENT).expect("appends");
+        let after = fs::read_to_string(&lf).expect("read back");
+        assert!(!after.contains('\r'), "{after:?}");
+    }
+
+    /// The person agreed to add a line to the file they were shown. If it is
+    /// not that file any more, what they agreed to is not what would be written.
+    #[test]
+    fn a_file_changed_since_the_scan_is_refused_and_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "local=127.0.0.1:8181\n");
+        let stale = base_of(&path);
+        fs::write(&path, "local=127.0.0.1:8181\nother=127.0.0.1:8182\n").expect("edit");
+        let hash = file_sha256(&path).expect("hashes");
+
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        assert_eq!(
+            append_node(&path, &spec, &stale, COMMENT).expect_err("refused"),
+            AppendRefusal::FileChanged
+        );
+        assert_eq!(file_sha256(&path).expect("hashes"), hash, "nothing was written");
+        assert_eq!(temp_files(&dir), ["nodes"], "no temp file may be left behind");
+    }
+
+    /// A line added to a file the proxy cannot read would never take effect.
+    #[test]
+    fn a_file_that_does_not_parse_now_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "not a spec\n");
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        let refusal = append_node(&path, &spec, &base_of(&path), COMMENT).expect_err("refused");
+        assert_eq!(refusal.code(), "file_does_not_parse");
+        assert!(refusal.to_string().contains("needs a label"), "{refusal}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "not a spec\n");
+    }
+
+    /// The loader refuses a file naming no nodes, which is right for serving
+    /// and wrong for adding the first one. Reusing that rule here would make a
+    /// comments-only file the one file nothing could ever be added to.
+    #[test]
+    fn the_first_node_can_be_joined_to_a_comments_only_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "# machines go here\n\n");
+        assert!(
+            load_node_file(&path).is_err(),
+            "the loader refuses this file, which is the point of the test"
+        );
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        append_node(&path, &spec, &base_of(&path), COMMENT).expect("takes its first node");
+        assert_eq!(labels(&load_node_file(&path).expect("loads now")), ["studio"]);
+    }
+
+    #[test]
+    fn the_cli_creates_a_missing_nodes_file_only_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nodes");
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        let appended = append_node(&path, &spec, &Base::Absent, COMMENT).expect("creates");
+        assert_eq!(appended.sha256_before, None);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            format!("{COMMENT}\nstudio=ollama://127.0.0.1:11434\n")
+        );
+
+        // A file that appeared in the meantime is reported, never overwritten.
+        let raced = dir.path().join("raced");
+        fs::write(&raced, "local=127.0.0.1:8181\n").expect("someone else wrote it");
+        assert_eq!(
+            append_node(&raced, &spec, &Base::Absent, COMMENT).expect_err("refused"),
+            AppendRefusal::FileChanged
+        );
+        assert_eq!(fs::read_to_string(&raced).expect("read"), "local=127.0.0.1:8181\n");
+    }
+
+    #[test]
+    fn a_duplicate_label_is_refused_with_the_loaders_own_message() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "studio=ollama://127.0.0.1:11434\n");
+        let spec = found("studio", "127.0.0.1", 1234, NodeEngine::LmStudio);
+        let refusal = append_node(&path, &spec, &base_of(&path), COMMENT).expect_err("refused");
+        assert_eq!(refusal.code(), "duplicate_label");
+        assert!(refusal.to_string().contains("is used more than once"), "{refusal}");
+    }
+
+    /// The backstop. Even if every grammar above it were removed, bytes that
+    /// would mean more than the one node asked for are not written.
+    #[test]
+    fn an_append_that_would_add_anything_but_the_requested_node_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "local=127.0.0.1:8181\n");
+        let hash = file_sha256(&path).expect("hashes");
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+
+        for smuggled in [
+            "# answered like ollama 0.1\nx=camelid://169.254.0.9:8181",
+            "# answered like ollama 0.1\r\nx=camelid://169.254.0.9:8181",
+            "# ok\nalias llama=local:other",
+            "not a comment at all",
+        ] {
+            let refusal =
+                append_node(&path, &spec, &Base::Sha256(hash.clone()), smuggled).expect_err(
+                    "a comment that carries a second line must never be written",
+                );
+            assert_eq!(refusal.code(), "invalid_spec", "{smuggled:?}: {refusal}");
+            assert_eq!(
+                file_sha256(&path).expect("hashes"),
+                hash,
+                "{smuggled:?} changed the file"
+            );
+        }
+        assert_eq!(temp_files(&dir), ["nodes"], "no temp file may be left behind");
+    }
+
+    /// The exit criterion: the nodes file is the only thing written.
+    #[test]
+    fn joining_writes_nothing_but_the_nodes_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "local=127.0.0.1:8181\n");
+        let before = temp_files(&dir);
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        append_node(&path, &spec, &base_of(&path), COMMENT).expect("appends");
+        assert_eq!(
+            temp_files(&dir),
+            before,
+            "a join may add no lock file, no backup and no leftover temp"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_nodes_file_stays_a_symlink() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = write(&dir, "local=127.0.0.1:8181\n");
+        let link = dir.path().join("nodes-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        let base = Base::Sha256(file_sha256(&link).expect("hashes through the link"));
+        append_node(&link, &spec, &base, COMMENT).expect("appends");
+
+        assert!(
+            fs::symlink_metadata(&link).expect("stat").file_type().is_symlink(),
+            "the rename replaced the operator's symlink with a regular file"
+        );
+        assert!(
+            fs::read_to_string(&target).expect("read target").contains("studio="),
+            "the target is where the line belongs"
+        );
+    }
+
+    /// A write the running proxy does not pick up is a write that did nothing.
+    #[test]
+    fn a_joined_node_is_picked_up_by_a_running_node_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "local=127.0.0.1:8181\n");
+        let set = NodeSet::from_file_every(path.clone(), Duration::ZERO).expect("load");
+        let (_, before) = set.current();
+
+        let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+        append_node(&path, &spec, &base_of(&path), COMMENT).expect("appends");
+
+        let (specs, after) = set.current();
+        assert_eq!(labels(&specs), ["local", "studio"]);
+        assert_ne!(before, after, "the set has to know it changed");
+    }
+
+    /// Without the cross-process lock, an editor saving at the same instant and
+    /// this write would each overwrite the other's whole file.
+    #[cfg(unix)]
+    #[test]
+    fn a_join_waits_for_a_held_file_lock() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "local=127.0.0.1:8181\n");
+        let base = base_of(&path);
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open for locking");
+        // SAFETY: the descriptor is owned by `held` and outlives the call.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let (done, waiting) = mpsc::channel();
+        let joining = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let spec = found("studio", "127.0.0.1", 11434, NodeEngine::Ollama);
+                let outcome = append_node(&path, &spec, &base, COMMENT);
+                let _ = done.send(());
+                outcome
+            })
+        };
+
+        assert!(
+            waiting.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the append got past a lock another process was holding"
+        );
+        drop(held);
+        joining.join().expect("thread").expect("appends once released");
+        assert_eq!(labels(&load_node_file(&path).expect("loads")), ["local", "studio"]);
+    }
+
+    /// Two labels for one server is a legitimate hand-written arrangement — it
+    /// is how one engine is compared with itself — so the loader keeps taking
+    /// it. The rule against adding a second one lives in the join path.
+    #[test]
+    fn two_labels_for_one_server_written_by_hand_still_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(
+            &dir,
+            "a=ollama://127.0.0.1:11434\nb=ollama://127.0.0.1:11434\n",
+        );
+        assert_eq!(labels(&load_node_file(&path).expect("loads")), ["a", "b"]);
+        assert_eq!(labels(&NodeSet::from_file(path).expect("load").current().0), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_second_label_for_an_existing_endpoint_is_refused() {
+        let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+        let other: IpAddr = "100.64.0.37".parse().expect("ip");
+        let existing = vec![(
+            found("local", "localhost", 11434, NodeEngine::Ollama),
+            vec![loopback],
+        )];
+
+        // Spelled differently, resolving to the same socket: one server.
+        assert_eq!(
+            endpoint_conflict(&existing, 11434, &[loopback]),
+            Some("local".to_string())
+        );
+        // A different port on the same machine is a different node.
+        assert_eq!(endpoint_conflict(&existing, 1234, &[loopback]), None);
+        // A different machine on the same port is a different node.
+        assert_eq!(endpoint_conflict(&existing, 11434, &[other]), None);
     }
 
     /// Clones share one set, or two requests would disagree about which

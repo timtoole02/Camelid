@@ -20,12 +20,60 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use serde_json::Value;
+
 use super::cancel::Cancel;
 use super::divergence::Answer;
 use super::engine::NodeEngine;
 use super::http;
+use super::identify::{self, Answers, EngineVerdict, PathRead, PathVerdict};
 use super::node::{NodeReady, NodeSpec, NodeStatus};
 use super::transport::NodeTransport;
+
+/// What identifies an LM Studio server to a scan. One route, because it is the
+/// only one the documented API publishes without generating.
+pub(crate) const IDENTIFICATION_PATHS: &[&str] = &[MODELS_PATH];
+
+const MODELS_PATH: &str = "/api/v0/models";
+
+/// Whether these answers are an LM Studio server.
+///
+/// It publishes no version anywhere, so a match here carries none — which is
+/// the same "unknown, not a guess" this engine's probe already reports.
+pub(crate) fn identify(answers: &Answers<'_>) -> EngineVerdict {
+    let read = match answers.read(MODELS_PATH) {
+        PathRead::Json(value) => match listed_models(value) {
+            Some(count) => PathVerdict::Signature(format!(
+                "a listing object holding {count} identified models"
+            )),
+            None => PathVerdict::RuledOut(format!(
+                "{MODELS_PATH} answered 200 without this engine's model listing"
+            )),
+        },
+        PathRead::Withheld => PathVerdict::Withheld,
+        PathRead::Finished(detail) => PathVerdict::RuledOut(detail),
+        PathRead::Unanswered => PathVerdict::Unanswered,
+    };
+    identify::from_paths(&[(MODELS_PATH, read)], None)
+}
+
+/// How many models the listing identifies, or `None` when it is not that shape.
+/// Only the count is reported; the ids are a third party's strings.
+fn listed_models(value: &Value) -> Option<usize> {
+    let object = value.as_object()?;
+    if object.get("object")?.as_str()? != "list" {
+        return None;
+    }
+    let data = object.get("data")?.as_array()?;
+    data.iter()
+        .all(|entry| {
+            entry
+                .as_object()
+                .and_then(|entry| entry.get("id"))
+                .is_some_and(Value::is_string)
+        })
+        .then_some(data.len())
+}
 
 /// A model listing is a few hundred bytes per model; this bounds a hostile
 /// answer while staying generous for a very full library.

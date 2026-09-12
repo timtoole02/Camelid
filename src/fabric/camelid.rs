@@ -11,13 +11,104 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use serde_json::Value;
+
 use super::cancel::Cancel;
 use super::divergence::Answer;
 use super::http;
+use super::identify::{self, Answers, EngineVerdict, PathRead, PathVerdict};
 use super::node::NodeSpec;
 use super::transport::NodeTransport;
 
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// What identifies a `camelid serve` process to a scan.
+///
+/// One path, and the one route this engine serves without a credential, so a
+/// node started with an API key is still recognisable without being shown one.
+pub(crate) const IDENTIFICATION_PATHS: &[&str] = &[HEALTH];
+
+const HEALTH: &str = "/v1/health";
+
+/// What this fabric's own proxy calls itself on the same path.
+///
+/// It answers `/v1/health` too, and a proxy joined as a node would place work
+/// on every machine behind it a second time, through itself. So it is
+/// recognised and refused rather than left to look like a node with some
+/// fields missing.
+const FABRIC_SERVICE: &str = "camelid-fabric";
+
+/// Whether these answers are a `camelid serve` process.
+///
+/// Strict where [`super::probe`] is lenient, and for the opposite reason: the
+/// probe must not drop a declared node when a field is renamed, while this must
+/// not accept an address because an empty object satisfied every default.
+pub(crate) fn identify(answers: &Answers<'_>) -> EngineVerdict {
+    let mut version = None;
+    let read = match answers.read(HEALTH) {
+        PathRead::Json(value) => match health_signature(value) {
+            Signature::Proxy => {
+                return EngineVerdict::NotANode {
+                    reason: "this is a fabric proxy, not a node; point the Cluster view at it \
+                             instead of adding it"
+                        .to_string(),
+                }
+            }
+            Signature::Engine { reported } => {
+                version = reported;
+                PathVerdict::Signature(
+                    "a health object naming this engine, whether it can generate, and a version"
+                        .to_string(),
+                )
+            }
+            Signature::Other(why) => PathVerdict::RuledOut(format!("{HEALTH} {why}")),
+        },
+        PathRead::Withheld => PathVerdict::Withheld,
+        PathRead::Finished(detail) => PathVerdict::RuledOut(detail),
+        PathRead::Unanswered => PathVerdict::Unanswered,
+    };
+    identify::from_paths(&[(HEALTH, read)], version.as_deref())
+}
+
+enum Signature {
+    Engine { reported: Option<String> },
+    Proxy,
+    Other(&'static str),
+}
+
+/// The signature itself, pure and frozen against a capture of what a real node
+/// answers off-box. Every field named here must be present *and* of the stated
+/// type: the engine name, both booleans and a non-empty version.
+fn health_signature(value: &Value) -> Signature {
+    let Some(object) = value.as_object() else {
+        return Signature::Other("answered 200 with JSON that is not an object");
+    };
+    if let Some(service) = object.get("service").and_then(Value::as_str) {
+        if service == FABRIC_SERVICE {
+            return Signature::Proxy;
+        }
+        return Signature::Other("named a service this build does not recognise");
+    }
+    if object.get("engine").and_then(Value::as_str) != Some(super::engine::NodeEngine::Camelid.as_str())
+    {
+        return Signature::Other("did not name this engine");
+    }
+    if !object.get("ok").is_some_and(Value::is_boolean)
+        || !object.get("generation_ready").is_some_and(Value::is_boolean)
+    {
+        return Signature::Other("did not report readiness as this engine does");
+    }
+    let Some(version) = object
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+    else {
+        return Signature::Other("published no version");
+    };
+    Signature::Engine {
+        reported: Some(version.to_string()),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ChoiceMessage {

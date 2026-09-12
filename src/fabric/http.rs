@@ -113,28 +113,39 @@ enum NodeConnection {
     Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
 }
 
-type ResolveResult = Result<Vec<SocketAddr>, String>;
-type Lookup = Box<dyn FnOnce() -> ResolveResult + Send + 'static>;
+type LookupResult<T> = Result<T, String>;
+pub(crate) type Lookup<T> = Box<dyn FnOnce() -> LookupResult<T> + Send + 'static>;
 
-struct ResolveJob {
-    lookup: Lookup,
-    reply: mpsc::Sender<ResolveResult>,
+pub(crate) struct ResolveJob<T> {
+    lookup: Lookup<T>,
+    reply: mpsc::Sender<LookupResult<T>>,
     deadline: Instant,
     cancel: Cancel,
 }
 
-struct ResolverPool {
-    jobs: mpsc::SyncSender<ResolveJob>,
+/// A set of threads that run blocking name lookups off the caller's thread.
+///
+/// Generic over what a lookup answers, and constructible more than once, so a
+/// second caller can own a pool of its own. Discovery needs that: `getaddrinfo`
+/// has no portable cancellation, so one stuck lookup holds a worker for its
+/// whole deadline, and a scan queueing behind live placement would stall the
+/// requests this proxy exists to serve.
+pub(crate) struct ResolverPool<T> {
+    jobs: mpsc::SyncSender<ResolveJob<T>>,
 }
 
-impl ResolverPool {
-    fn new(worker_count: usize, queue_capacity: usize) -> Result<Self, String> {
-        let (jobs, receiver) = mpsc::sync_channel::<ResolveJob>(queue_capacity);
+impl<T: Send + 'static> ResolverPool<T> {
+    pub(crate) fn new(
+        name: &'static str,
+        worker_count: usize,
+        queue_capacity: usize,
+    ) -> Result<Self, String> {
+        let (jobs, receiver) = mpsc::sync_channel::<ResolveJob<T>>(queue_capacity);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             std::thread::Builder::new()
-                .name(format!("camelid-node-resolver-{index}"))
+                .name(format!("{name}-{index}"))
                 .spawn(move || loop {
                     let job = {
                         let receiver = receiver
@@ -159,33 +170,40 @@ impl ResolverPool {
         }
         Ok(Self { jobs })
     }
+
+    pub(crate) fn sender(&self) -> mpsc::SyncSender<ResolveJob<T>> {
+        self.jobs.clone()
+    }
 }
 
-fn resolver_sender() -> Result<mpsc::SyncSender<ResolveJob>, HttpError> {
-    static RESOLVER: OnceLock<Mutex<Option<ResolverPool>>> = OnceLock::new();
+fn resolver_sender() -> Result<mpsc::SyncSender<ResolveJob<Vec<SocketAddr>>>, HttpError> {
+    static RESOLVER: OnceLock<Mutex<Option<ResolverPool<Vec<SocketAddr>>>>> = OnceLock::new();
     let resolver = RESOLVER.get_or_init(|| Mutex::new(None));
     let mut resolver = resolver
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if resolver.is_none() {
         *resolver = Some(
-            ResolverPool::new(RESOLVER_WORKERS, RESOLVER_QUEUE_CAPACITY)
-                .map_err(HttpError::Resolve)?,
+            ResolverPool::new(
+                "camelid-node-resolver",
+                RESOLVER_WORKERS,
+                RESOLVER_QUEUE_CAPACITY,
+            )
+            .map_err(HttpError::Resolve)?,
         );
     }
     Ok(resolver
         .as_ref()
         .expect("resolver initialized above")
-        .jobs
-        .clone())
+        .sender())
 }
 
-fn resolve_with_sender(
-    jobs: &mpsc::SyncSender<ResolveJob>,
+pub(crate) fn resolve_with_sender<T: Send + 'static>(
+    jobs: &mpsc::SyncSender<ResolveJob<T>>,
     deadline: Instant,
     cancel: &Cancel,
-    lookup: Lookup,
-) -> Result<Vec<SocketAddr>, HttpError> {
+    lookup: Lookup<T>,
+) -> Result<T, HttpError> {
     if cancel.is_cancelled() {
         return Err(HttpError::Cancelled);
     }
@@ -529,8 +547,32 @@ fn parse_head(head: &str) -> Result<ResponseHead, HttpError> {
     Ok(parsed)
 }
 
+/// Parse a whole HTTP/1.1 response, keeping the head. Pure.
+///
+/// Split out because identification turns on the media type as well as the
+/// status, and [`parse_response`] deliberately answers only what the probe and
+/// forward paths read.
+pub(crate) fn parse_response_parts(
+    raw: &[u8],
+    max_body: usize,
+) -> Result<(ResponseHead, Vec<u8>), HttpError> {
+    let response = parse_response_inner(raw, max_body)?;
+    Ok(response)
+}
+
 /// Parse a whole HTTP/1.1 response. Pure; see the tests at the bottom.
 pub(crate) fn parse_response(raw: &[u8], max_body: usize) -> Result<HttpResponse, HttpError> {
+    let (head, body) = parse_response_inner(raw, max_body)?;
+    Ok(HttpResponse {
+        status: head.status,
+        body,
+    })
+}
+
+fn parse_response_inner(
+    raw: &[u8],
+    max_body: usize,
+) -> Result<(ResponseHead, Vec<u8>), HttpError> {
     let split = find_header_end(raw)
         .ok_or_else(|| HttpError::Malformed("no header terminator".to_string()))?;
     let head = std::str::from_utf8(&raw[..split.headers_end])
@@ -558,10 +600,7 @@ pub(crate) fn parse_response(raw: &[u8], max_body: usize) -> Result<HttpResponse
     if body.len() > max_body {
         return Err(HttpError::TooLarge(max_body));
     }
-    Ok(HttpResponse {
-        status: head.status,
-        body,
-    })
+    Ok((head, body))
 }
 
 /// Connect to the first address that accepts.
@@ -756,6 +795,226 @@ fn request_head(
 /// server-sent event stream back.
 pub(crate) const ACCEPT_JSON: &str = "application/json";
 pub(crate) const ACCEPT_EVENT_STREAM: &str = "text/event-stream";
+
+/// How a discovery probe names itself to a machine nobody declared.
+///
+/// Only discovery sends it. Node traffic is byte-identical to what it always
+/// was, so nothing an operator already runs changes because this exists.
+pub(crate) const DISCOVERY_USER_AGENT: &str =
+    concat!("camelid-fabric-discover/", env!("CARGO_PKG_VERSION"));
+
+/// Build the head of a discovery request. Pure.
+///
+/// There is no `bearer` parameter, and that absence is the guarantee: no
+/// function discovery can reach takes a credential, so no edit inside discovery
+/// can present one. It is a separate function from [`request_head`] rather than
+/// a flag on it for the same reason — a flag can be passed wrongly.
+fn anonymous_request_head(path: &str, authority: &str, user_agent: &str) -> Result<String, HttpError> {
+    for (what, value) in [("path", path), ("host", authority)] {
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err(HttpError::InvalidRequest(format!(
+                "discovery {what} is empty or contains a control character"
+            )));
+        }
+    }
+    Ok(format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: {ACCEPT_JSON}\r\n\
+         User-Agent: {user_agent}\r\nConnection: close\r\n\r\n"
+    ))
+}
+
+/// What one TCP connect established, and nothing more.
+///
+/// Stage one of a scan writes no bytes at all, so an address that is not an
+/// engine is never sent anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConnectOutcome {
+    Open,
+    Refused,
+    TimedOut,
+    Unreachable,
+    Other(String),
+}
+
+/// Connect, then close without writing a byte.
+pub(crate) fn connect_only(addr: SocketAddr, timeout: Duration) -> ConnectOutcome {
+    match TcpStream::connect_timeout(&addr, timeout) {
+        Ok(stream) => {
+            drop(stream);
+            ConnectOutcome::Open
+        }
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::ConnectionRefused => ConnectOutcome::Refused,
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                ConnectOutcome::TimedOut
+            }
+            // macOS answers "No route to host" for a LAN address nothing
+            // replies for, and for one the Local Network privacy pane is
+            // silently denying. Kept apart from a refusal so a scan that found
+            // nothing can say which of those it was.
+            std::io::ErrorKind::HostUnreachable | std::io::ErrorKind::NetworkUnreachable => {
+                ConnectOutcome::Unreachable
+            }
+            _ => ConnectOutcome::Other(error.to_string()),
+        },
+    }
+}
+
+/// One answer to a discovery probe, including the media type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnonymousAnswer {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Vec<u8>,
+}
+
+/// Send one credential-free GET to exactly these addresses, in this order.
+///
+/// It never resolves. A finding's address and its evidence have to describe the
+/// same socket, and a function that re-resolved could record one machine's
+/// address beside another machine's answer. `host_header` is what goes on the
+/// wire; `tls_name` is the name the certificate must be signed for, which under
+/// a pinned CA is a proven name rather than the IP literal, because real node
+/// certificates carry DNS names.
+///
+/// Returns which address answered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn request_anonymous_any(
+    addrs: &[SocketAddr],
+    host_header: &str,
+    tls_name: Option<&str>,
+    path: &str,
+    timeout: Duration,
+    max_body: usize,
+    transport: &NodeTransport,
+    cancel: &Cancel,
+) -> Result<(AnonymousAnswer, SocketAddr), HttpError> {
+    let head = anonymous_request_head(path, host_header, DISCOVERY_USER_AGENT)?;
+    let addrs = transport
+        .permitted_addresses(addrs)
+        .map_err(|error| HttpError::Policy(error.to_string()))?;
+    let deadline = Instant::now() + timeout;
+    let config = transport.tls_config();
+
+    let mut last: Option<HttpError> = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
+        }
+        // The same budget sharing `connect_any` uses, so one black-holing
+        // address cannot starve the ones behind it.
+        let untried = (addrs.len() - index) as u32;
+        let attempt = (remaining / untried)
+            .min(CONNECT_ATTEMPT_CAP)
+            .max(Duration::from_millis(1));
+        match anonymous_attempt(
+            *addr,
+            &head,
+            tls_name,
+            config.clone(),
+            now + attempt,
+            attempt,
+            max_body,
+            cancel,
+        ) {
+            Ok(answer) => return Ok((answer, *addr)),
+            Err(HttpError::Cancelled) => return Err(HttpError::Cancelled),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        HttpError::Connect("no address answered within the budget".to_string())
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anonymous_attempt(
+    addr: SocketAddr,
+    head: &str,
+    tls_name: Option<&str>,
+    config: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    attempt: Duration,
+    max_body: usize,
+    cancel: &Cancel,
+) -> Result<AnonymousAnswer, HttpError> {
+    let stream = TcpStream::connect_timeout(&addr, attempt)
+        .map_err(|error| HttpError::Connect(format!("{addr}: {error}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| HttpError::Io(error.to_string()))?;
+    stream
+        .set_write_timeout(Some(attempt))
+        .map_err(|error| HttpError::Io(error.to_string()))?;
+
+    let mut connection = match config {
+        Some(config) => {
+            // Under a pinned CA the certificate still has to be signed for
+            // whatever name is used here, so a proven name is safe and an IP
+            // literal is simply what is left when there is no proven name.
+            let name = tls_server_name(tls_name.unwrap_or(&addr.ip().to_string()))?;
+            negotiate_tls(stream, name, config, deadline, cancel)?
+        }
+        None => NodeConnection::Plain(stream),
+    };
+
+    connection
+        .write_all(head.as_bytes())
+        .map_err(|error| HttpError::Io(error.to_string()))?;
+
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            // A peer that accepted the connection and then said nothing at all
+            // is a different fact from one that started answering and stalled:
+            // the first is "it is not talking to us", the second is a check
+            // that did not finish. Reported apart so a scan can say which.
+            if raw.is_empty() {
+                return Err(HttpError::Malformed("answered nothing at all".to_string()));
+            }
+            return Err(HttpError::Io("probe exceeded its deadline".to_string()));
+        }
+        match connection.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.len() > max_body {
+                    return Err(HttpError::TooLarge(max_body));
+                }
+            }
+            Err(error) if is_retryable(&error) => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+                    && parse_response_parts(&raw, max_body).is_ok() =>
+            {
+                break;
+            }
+            Err(error) => return Err(HttpError::Io(error.to_string())),
+        }
+    }
+    if raw.is_empty() {
+        // An accept with nothing behind it. Reported as its own thing, because
+        // "said nothing" and "said something we did not understand" are
+        // different facts about a machine.
+        return Err(HttpError::Malformed("answered nothing at all".to_string()));
+    }
+
+    let (head, body) = parse_response_parts(&raw, max_body)?;
+    Ok(AnonymousAnswer {
+        status: head.status,
+        content_type: head.content_type,
+        body,
+    })
+}
 
 /// Resolve, connect, and write one request, leaving the socket ready to read.
 ///
@@ -1201,7 +1460,7 @@ mod tests {
 
     #[test]
     fn a_stalled_resolution_cannot_outlive_the_request_deadline() {
-        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let pool = ResolverPool::new("camelid-test-resolver", 1, 1).expect("resolver pool starts");
         let (release, blocked) = mpsc::channel();
         let started = Instant::now();
         let error = resolve_with_sender(
@@ -1221,7 +1480,7 @@ mod tests {
 
     #[test]
     fn cancellation_stops_waiting_for_a_blocked_resolution() {
-        let pool = Arc::new(ResolverPool::new(1, 1).expect("resolver pool starts"));
+        let pool = Arc::new(ResolverPool::new("camelid-test-resolver", 1, 1).expect("resolver pool starts"));
         let cancel = Cancel::new();
         let handed_to_waiter = cancel.clone();
         let (release, blocked) = mpsc::channel();
@@ -1253,7 +1512,7 @@ mod tests {
 
     #[test]
     fn a_saturated_resolver_queue_backpressures_until_the_deadline() {
-        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let pool = ResolverPool::new("camelid-test-resolver", 1, 1).expect("resolver pool starts");
         let first_jobs = pool.jobs.clone();
         let (first_started, wait_for_first) = mpsc::channel();
         let (release_first, first_blocked) = mpsc::channel();
@@ -1312,7 +1571,7 @@ mod tests {
 
     #[test]
     fn a_panicking_lookup_does_not_retire_its_resolver_worker() {
-        let pool = ResolverPool::new(1, 1).expect("resolver pool starts");
+        let pool = ResolverPool::new("camelid-test-resolver", 1, 1).expect("resolver pool starts");
         let error = resolve_with_sender(
             &pool.jobs,
             Instant::now() + Duration::from_secs(1),
@@ -1337,7 +1596,7 @@ mod tests {
     #[test]
     fn a_burst_of_resolutions_is_backpressured_not_rejected() {
         const CALLERS: usize = 128;
-        let pool = Arc::new(ResolverPool::new(4, 64).expect("resolver pool starts"));
+        let pool = Arc::new(ResolverPool::new("camelid-test-resolver", 4, 64).expect("resolver pool starts"));
         let start = Arc::new(std::sync::Barrier::new(CALLERS + 1));
         let handles: Vec<_> = (0..CALLERS)
             .map(|_| {
@@ -2134,6 +2393,237 @@ mod tests {
 
     /// Answer one connection with canned bytes and hang up, so a frame that
     /// stops early can be exercised without a stub node.
+    /// A loopback listener that records the request head it was sent and
+    /// answers `response`. Returns its port and the recorded head.
+    fn recording_stub(response: &'static [u8]) -> (u16, Arc<Mutex<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("stub addr").port();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while let Ok(read) = stream.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *recorded.lock().expect("record") = String::from_utf8_lossy(&raw).into_owned();
+            let _ = stream.write_all(response);
+        });
+        (port, seen)
+    }
+
+    /// A finding's address and its evidence have to describe the same socket.
+    /// A host header that resolves nowhere reaching the stub is the proof that
+    /// the address given was the address used.
+    #[test]
+    fn an_anonymous_request_never_resolves() {
+        let (port, seen) = recording_stub(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let host_header = format!("no-such-host.invalid:{port}");
+        let (answer, answered_from) = request_anonymous_any(
+            &[addr],
+            &host_header,
+            None,
+            "/v1/health",
+            Duration::from_secs(3),
+            64 * 1024,
+            &NodeTransport::default(),
+            &Cancel::never(),
+        )
+        .expect("the stub answered");
+
+        assert_eq!(answered_from, addr, "the answer names the socket it came from");
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.content_type.as_deref(), Some("application/json"));
+        let request = seen.lock().expect("record").clone();
+        assert!(
+            request.starts_with("GET /v1/health HTTP/1.1\r\n"),
+            "{request:?}"
+        );
+        assert!(request.contains(&format!("Host: {host_header}")), "{request:?}");
+    }
+
+    /// The guarantee is the type signature: there is no bearer parameter, so no
+    /// edit inside discovery can add one. The paired half pins that node
+    /// traffic is byte-for-byte what it always was.
+    #[test]
+    fn an_anonymous_request_carries_no_authorization_header() {
+        let head = anonymous_request_head("/api/version", "192.0.2.10:11434", DISCOVERY_USER_AGENT)
+            .expect("head");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization"),
+            "{head:?}"
+        );
+        assert!(!head.to_ascii_lowercase().contains("cookie"), "{head:?}");
+        assert!(
+            head.contains("User-Agent: camelid-fabric-discover/"),
+            "{head:?}"
+        );
+        for refused in ["/a\r\nX: y", ""] {
+            assert!(matches!(
+                anonymous_request_head(refused, "h:1", DISCOVERY_USER_AGENT),
+                Err(HttpError::InvalidRequest(_))
+            ));
+        }
+
+        let node = request_head(
+            "GET",
+            "/v1/health",
+            "h:1",
+            ACCEPT_JSON,
+            None,
+            Some("s3cret"),
+        )
+        .expect("node head");
+        assert_eq!(
+            node,
+            "GET /v1/health HTTP/1.1\r\nHost: h:1\r\nAccept: application/json\r\n\
+             Connection: close\r\nAuthorization: Bearer s3cret\r\n\r\n",
+            "node traffic must be unchanged by discovery existing"
+        );
+    }
+
+    /// Real node certificates carry DNS names, not IP addresses. A scan reaches
+    /// them by address, so if the server name were always the address, every
+    /// genuinely TLS-authenticated node would be reported unauthenticated. The
+    /// proven name is safe to use because the pinned CA must still have signed
+    /// a certificate for it.
+    #[test]
+    fn a_proven_name_authenticates_a_dns_only_certificate_reached_by_address() {
+        let issued = rcgen::generate_simple_self_signed(vec!["node.test".to_string()])
+            .expect("generate a self-signed certificate");
+        let directory = tempfile::tempdir().expect("temp dir");
+        let bundle = directory.path().join("node-ca");
+        std::fs::write(&bundle, rcgen::Certificate::pem(&issued.cert)).expect("write bundle");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![issued.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(issued.key_pair.serialize_der().into()),
+            )
+            .expect("server config");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("stub addr").port();
+        let config = Arc::new(server_config);
+        std::thread::spawn(move || {
+            // Two connections: the named attempt, then the one without a name.
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(connection) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut chunk = [0_u8; 1024];
+                // A refused handshake fails here, which is the point of the
+                // second connection.
+                if tls.read(&mut chunk).is_err() {
+                    continue;
+                }
+                let _ = tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+            }
+        });
+
+        let transport =
+            NodeTransport::resolve(Some(&bundle), false).expect("the bundle is a usable CA");
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let probe = |tls_name: Option<&str>| {
+            request_anonymous_any(
+                &[addr],
+                &format!("node.test:{port}"),
+                tls_name,
+                "/v1/health",
+                Duration::from_secs(5),
+                64 * 1024,
+                &transport,
+                &Cancel::never(),
+            )
+        };
+
+        let (answer, answered_from) = probe(Some("node.test")).expect("the proven name authenticates");
+        assert_eq!(answer.status, 200);
+        assert_eq!(answered_from, addr);
+
+        // Without it the only name left is the address, which this certificate
+        // does not carry — reported as TLS failing, never as a plain answer.
+        assert!(
+            matches!(probe(None), Err(HttpError::Tls(_))),
+            "an IP literal must not authenticate a DNS-only certificate"
+        );
+    }
+
+    /// A scan queues one lookup per address it proves a name for. Those run on
+    /// discovery's own pool, because `getaddrinfo` cannot be cancelled — so a
+    /// stuck one holds its worker for the whole deadline, and a scan queueing
+    /// behind live placement would stall the requests this proxy exists to
+    /// serve.
+    #[test]
+    fn name_proof_never_occupies_the_node_resolver() {
+        use std::sync::atomic::Ordering;
+
+        // Every discovery worker and its whole queue, held.
+        let release = crate::fabric::netscope::saturate_discovery_resolver();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let resolved = resolve_host(
+            "localhost",
+            8181,
+            Instant::now() + Duration::from_millis(2000),
+            &Cancel::never(),
+        );
+        let waited = started.elapsed();
+        release.store(true, Ordering::SeqCst);
+
+        assert!(
+            resolved.is_ok(),
+            "node resolution failed while discovery was busy: {resolved:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(1500),
+            "node resolution waited {waited:?} on discovery's lookups"
+        );
+    }
+
+    /// A connect that writes nothing is what stage one of a scan is: an address
+    /// that is not an engine is never sent a byte.
+    #[test]
+    fn a_connect_only_probe_writes_nothing_and_names_what_happened() {
+        let (port, seen) = recording_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let open = SocketAddr::from(([127, 0, 0, 1], port));
+        assert_eq!(
+            connect_only(open, Duration::from_millis(500)),
+            ConnectOutcome::Open
+        );
+        // Port 1 on loopback is closed, which is a refusal rather than silence.
+        assert_eq!(
+            connect_only(SocketAddr::from(([127, 0, 0, 1], 1)), Duration::from_millis(500)),
+            ConnectOutcome::Refused
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            seen.lock().expect("record").as_str(),
+            "",
+            "stage one must write nothing at all"
+        );
+    }
+
     fn canned_node(raw: &'static [u8]) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("has an address").port();

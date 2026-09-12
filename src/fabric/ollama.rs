@@ -20,12 +20,85 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use serde_json::Value;
+
 use super::cancel::Cancel;
 use super::divergence::Answer;
 use super::engine::NodeEngine;
 use super::http;
+use super::identify::{self, Answers, EngineVerdict, PathRead, PathVerdict};
 use super::node::{NodeReady, NodeSpec, NodeStatus};
 use super::transport::NodeTransport;
+
+/// What identifies an Ollama server to a scan.
+///
+/// Both, not either: `/api/version` alone is one key in one object, which far
+/// too much of the web answers by accident.
+pub(crate) const IDENTIFICATION_PATHS: &[&str] = &[VERSION_PATH, TAGS_PATH];
+
+const VERSION_PATH: &str = "/api/version";
+const TAGS_PATH: &str = "/api/tags";
+
+/// Whether these answers are an Ollama server.
+///
+/// Strict where [`probe`] is lenient: `probe` reads `{}` as a declared node
+/// with nothing installed, which is right for a machine an operator named and
+/// wrong for a stranger.
+pub(crate) fn identify(answers: &Answers<'_>) -> EngineVerdict {
+    let mut version = None;
+    let version_read = match answers.read(VERSION_PATH) {
+        PathRead::Json(value) => match value
+            .as_object()
+            .and_then(|object| object.get("version"))
+            .and_then(Value::as_str)
+            .filter(|reported| !reported.is_empty())
+        {
+            Some(reported) => {
+                version = Some(reported.to_string());
+                PathVerdict::Signature("a JSON object naming a non-empty version".to_string())
+            }
+            None => PathVerdict::RuledOut(format!(
+                "{VERSION_PATH} answered 200 without a version string"
+            )),
+        },
+        PathRead::Withheld => PathVerdict::Withheld,
+        PathRead::Finished(detail) => PathVerdict::RuledOut(detail),
+        PathRead::Unanswered => PathVerdict::Unanswered,
+    };
+    let tags_read = match answers.read(TAGS_PATH) {
+        PathRead::Json(value) => match named_models(value) {
+            Some(count) => PathVerdict::Signature(format!("a model list of {count} entries")),
+            None => PathVerdict::RuledOut(format!(
+                "{TAGS_PATH} answered 200 without a list of named models"
+            )),
+        },
+        PathRead::Withheld => PathVerdict::Withheld,
+        PathRead::Finished(detail) => PathVerdict::RuledOut(detail),
+        PathRead::Unanswered => PathVerdict::Unanswered,
+    };
+    identify::from_paths(
+        &[(VERSION_PATH, version_read), (TAGS_PATH, tags_read)],
+        version.as_deref(),
+    )
+}
+
+/// How many models the listing names, or `None` when it is not that shape.
+///
+/// Only the count is ever reported. A model name is a third-party string, and
+/// the count answers the question ("is this a model listing") without
+/// repeating one.
+fn named_models(value: &Value) -> Option<usize> {
+    let models = value.as_object()?.get("models")?.as_array()?;
+    models
+        .iter()
+        .all(|entry| {
+            entry
+                .as_object()
+                .and_then(|entry| entry.get("name"))
+                .is_some_and(Value::is_string)
+        })
+        .then_some(models.len())
+}
 
 /// Refuse a listing larger than this. A tag list is a few KiB per model; this
 /// is generous for a very full library and still bounds a hostile answer.

@@ -45,6 +45,68 @@ impl NodeSpec {
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// The line an operator would have written for this node.
+    ///
+    /// Always an explicit scheme and an explicit port, even where both are the
+    /// defaults: a line written by a machine is read by a person, and a default
+    /// that changes later must not silently change what their file means.
+    pub(crate) fn to_line(&self) -> String {
+        format!(
+            "{}={}://{}:{}",
+            self.label,
+            self.engine.as_str(),
+            self.host,
+            self.port
+        )
+    }
+}
+
+/// Labels this build is willing to *write* into an operator's file.
+///
+/// Deliberately narrower than [`parse_node_spec`] accepts, and applied only to
+/// lines discovery composes. A label starting `#` would be read back as a
+/// comment; one containing `=` or a space would split differently than it was
+/// shown. Hand-written files are untouched by this — the loader still accepts
+/// everything it accepted before.
+pub(crate) fn is_writable_label(label: &str) -> bool {
+    let mut characters = label.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() || label.len() > 63 {
+        return false;
+    }
+    characters.all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+    })
+}
+
+/// Hosts this build is willing to write: an LDH hostname, a dotted IPv4
+/// literal, or a bracketed IPv6 literal.
+///
+/// Same rule and same reason as [`is_writable_label`]. This one also covers
+/// hosts typed into the confirm panel, because a host arriving from a browser
+/// is no more trusted than one arriving from a stranger's DNS.
+pub(crate) fn is_writable_host(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 || host.ends_with('.') {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    })
 }
 
 impl fmt::Display for NodeSpec {
@@ -553,6 +615,87 @@ mod tests {
         assert_eq!(
             parse_node_spec("win=host:99999"),
             Err(NodeSpecParseError::BadPort("99999".to_string()))
+        );
+    }
+
+    /// A line this build writes has to read back as exactly the node it was
+    /// written for, on every engine and every host shape.
+    #[test]
+    fn every_discovered_line_round_trips() {
+        for engine in NodeEngine::ALL {
+            for host in ["100.64.0.37", "[fd00::1]", "mini2.lan"] {
+                let spec = NodeSpec {
+                    label: "found".to_string(),
+                    host: host.to_string(),
+                    port: 8443,
+                    engine,
+                };
+                let line = spec.to_line();
+                assert!(
+                    line.contains("://"),
+                    "a written line names its engine explicitly: {line}"
+                );
+                assert_eq!(parse_node_spec(&line).expect("parses"), spec, "{line}");
+            }
+        }
+        // The default port is written out, not left implied.
+        let default = NodeSpec::camelid("a", "h", DEFAULT_NODE_PORT);
+        assert_eq!(default.to_line(), "a=camelid://h:8181");
+    }
+
+    /// The grammar that stands between a stranger's answer and a file that is
+    /// parsed line by line.
+    #[test]
+    fn a_label_that_would_read_as_a_comment_is_refused() {
+        for refused in ["#x", "a b", "a=b", "", "-a", ".a", "a\nb=c", "a/b", &"a".repeat(64)] {
+            assert!(!is_writable_label(refused), "{refused:?} must not be written");
+        }
+        for accepted in ["mini2-ollama", "a", "host-192-168-86-37-camelid", "A.b_c-1"] {
+            assert!(is_writable_label(accepted), "{accepted:?} must be writable");
+        }
+    }
+
+    #[test]
+    fn a_host_with_whitespace_or_control_characters_is_refused() {
+        for refused in [
+            "a b",
+            "a\nb",
+            "a\u{1b}b",
+            "-a",
+            "a-",
+            "a..b",
+            "a.",
+            "",
+            "[not-an-address]",
+            "169.254.0.9\nx=camelid://169.254.0.9:8181",
+        ] {
+            assert!(!is_writable_host(refused), "{refused:?} must not be written");
+        }
+        assert!(!is_writable_host(&"a".repeat(254)));
+        for accepted in ["mini2.lan", "100.64.0.37", "[fd00::1]", "[::1]", "mini2"] {
+            assert!(is_writable_host(accepted), "{accepted:?} must be writable");
+        }
+    }
+
+    /// The paired limit: the grammar applies to what discovery *writes*, and
+    /// changes nothing about what already loads. A file naming `my_box` was
+    /// legal yesterday and has to stay legal.
+    #[test]
+    fn hand_written_hosts_the_loader_accepts_today_still_load() {
+        for host in ["my_box", "box.", "_gateway", "HOST~1"] {
+            let spec = parse_node_spec(&format!("a={host}:8181"))
+                .unwrap_or_else(|error| panic!("{host}: {error}"));
+            assert_eq!(spec.host, host);
+            assert!(
+                !is_writable_host(host),
+                "{host} is outside the write grammar, which is the point of this test"
+            );
+        }
+        assert_eq!(
+            parse_fabric(&["a=my_box:8181".to_string(), "b=box.:8181".to_string()])
+                .expect("a hand-written fabric still parses")
+                .len(),
+            2
         );
     }
 

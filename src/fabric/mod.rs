@@ -28,11 +28,14 @@ pub(crate) mod camelid;
 pub mod cancel;
 pub mod capability;
 pub(crate) mod client_keys;
+pub mod discover;
 pub mod divergence;
 pub mod engine;
 pub mod forward;
 pub(crate) mod http;
+mod identify;
 mod lmstudio;
+mod netscope;
 pub mod node;
 pub(crate) mod nodes;
 mod ollama;
@@ -55,6 +58,20 @@ pub use aliases::{
 };
 pub use cancel::Cancel;
 pub use capability::{BlockerDetail, Capabilities, Capability, Provenance, RequirementLimit};
+pub use discover::{
+    display_safe, Discovery, Finding, HostAlternative, JoinRefusal, JoinRequest, Joined, Limits,
+    NameProof, NotListed, Plan, Proposal, ScanContext, Scope, ScopeRefusal, Session,
+};
+
+/// The SHA-256 of a node file as it stands, so a caller can say which version
+/// of it a person was shown before they agreed to add a line.
+pub fn node_file_sha256(path: &std::path::Path) -> Option<String> {
+    nodes::file_sha256(path)
+}
+// Re-exported rather than left inside a private module: they appear in
+// `Finding`, so a reader of the discovery wire shape has to be able to name
+// them.
+pub use identify::{Classification, EngineReport, Evidence};
 pub use divergence::{
     check_temperature, conclude, sha256_hex, shared_weights_digest, AppliedSampling, Comparison,
     Honoured, ModelIdentity, RenderedPrompt, Sample, SamplingPlan, Side, Stability,
@@ -71,7 +88,7 @@ pub use node::{
     parse_fabric, parse_node_spec, NodeLoad, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
 };
-pub use nodes::ForeignAddition;
+pub use nodes::{AppendRefusal, ForeignAddition};
 use nodes::NodeSet;
 use policy::{load_of, route_reserved_with_estimates, ServiceTimeEstimates};
 pub use policy::{
@@ -403,6 +420,15 @@ impl Fabric {
     /// A secret-free description suitable for startup logs.
     pub fn node_transport_description(&self) -> &'static str {
         self.transport.description()
+    }
+
+    /// The transport policy the node hop is held to.
+    ///
+    /// Handed out on its own, rather than the whole `Fabric`, so discovery can
+    /// be bound by the same fail-closed rule (I11) without ever being in reach
+    /// of the bearer this struct also holds.
+    pub(crate) fn transport(&self) -> &NodeTransport {
+        &self.transport
     }
 
     /// Run one prompt on two of this fabric's nodes and report what differed.
