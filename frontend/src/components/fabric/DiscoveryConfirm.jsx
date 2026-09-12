@@ -19,6 +19,7 @@ const WARNINGS = {
   bearer_will_be_sent: "This fabric's API key will be sent to this machine on every health check.",
   bearer_sent_if_configured: "If this fabric is started with an API key, that key will be sent to this machine.",
   name_resolves_to_several_addresses: 'That name resolves to more than one address; which one answers may change.',
+  name_not_written: 'The name this machine was reached by is not one this build will write into a nodes file, so the address is proposed instead.',
 }
 
 export function DiscoveryConfirm({ finding, nodesFile, onWrite, onCancel, busy, problem }) {

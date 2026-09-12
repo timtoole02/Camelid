@@ -570,9 +570,12 @@ add a second label for an endpoint already in the file is refused with `duplicat
 the existing label. Two labels for one server is a deliberate arrangement — it is how one engine is
 compared with itself — so **the loader still accepts it**; add the second by hand.
 
-**Joining.** `--join LABEL=ENGINE://HOST[:PORT]` re-checks everything after the click: the label and
-host grammars, the endpoint rule, that the name still reaches the machine that was scanned, and that
-the machine still answers like the engine being written. The nodes file is the only thing written,
+**Joining.** `--join LABEL=ENGINE://HOST[:PORT]` re-checks the label and host grammars, the endpoint
+rule, that the host still resolves from here, and that the machine still answers like the engine
+being written. One further check — that the host still reaches *the socket the scan actually
+reached* — needs the scan's own answer to compare against, so it runs for the terminal's y/N confirm
+and for the web UI, which both carry it, and **not** for a hand-typed `--join`, which is a command
+about a machine this run may never have looked at. The nodes file is the only thing written,
 as a byte-preserving append in the file's own line endings, through a temp file in the same
 directory and a rename — so a reader sees the old file or the new one, never half a line. A
 one-line provenance comment is added above the node line. Writes are serialized in-process and, on

@@ -26,7 +26,7 @@
 //! composed and refuses unless they mean the old file plus exactly one node.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,6 +93,13 @@ impl Limits {
     }
 }
 
+/// Most ranges and names one scope may carry.
+///
+/// Every range is bounded on its own by `checked_range`, so this bounds the
+/// *number* of them: without it a scope could name enough individually legal
+/// ranges to exhaust memory before the address cap had anything to count.
+const MAX_SCOPE_ENTRIES: usize = 64;
+
 /// What a scan was asked to cover.
 ///
 /// The defaults are the whole safety story: `loopback` and `default_ports` on,
@@ -133,12 +140,27 @@ impl Default for Scope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeRefusal {
     Range(RangeRefusal),
-    TooManyPorts { ports: usize, limit: usize },
-    TooLarge { addresses: usize, limit: usize },
+    TooManyPorts {
+        ports: usize,
+        limit: usize,
+    },
+    /// More ranges and names than one scope may carry, counted before any of
+    /// them is expanded into addresses.
+    TooManyEntries {
+        entries: usize,
+        limit: usize,
+    },
+    TooLarge {
+        addresses: usize,
+        limit: usize,
+    },
     /// The fabric's own fail-closed transport rule, unchanged, applied to a
     /// target this scan would otherwise have opened a socket to.
     TransportRefused(String),
-    Unresolvable { host: String, detail: String },
+    Unresolvable {
+        host: String,
+        detail: String,
+    },
     Nothing,
 }
 
@@ -150,6 +172,11 @@ impl std::fmt::Display for ScopeRefusal {
                 f,
                 "that names {ports} ports and this build scans at most {limit} in one run"
             ),
+            Self::TooManyEntries { entries, limit } => write!(
+                f,
+                "that names {entries} ranges and machines and this build reads at most {limit} in \
+                 one run; name fewer, or scan them in separate runs"
+            ),
             Self::TooLarge { addresses, limit } => write!(
                 f,
                 "that covers {addresses} addresses and this build scans at most {limit} in one \
@@ -158,7 +185,11 @@ impl std::fmt::Display for ScopeRefusal {
             ),
             Self::TransportRefused(detail) => write!(f, "{detail}"),
             Self::Unresolvable { host, detail } => {
-                write!(f, "`{}` could not be resolved: {detail}", display_safe(host))
+                write!(
+                    f,
+                    "`{}` could not be resolved: {detail}",
+                    display_safe(host)
+                )
             }
             Self::Nothing => write!(
                 f,
@@ -173,7 +204,9 @@ impl ScopeRefusal {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Range(refusal) => refusal.code(),
-            Self::TooLarge { .. } | Self::TooManyPorts { .. } => "scope_too_large",
+            Self::TooLarge { .. } | Self::TooManyPorts { .. } | Self::TooManyEntries { .. } => {
+                "scope_too_large"
+            }
             Self::TransportRefused(_) => "transport_refused",
             Self::Unresolvable { .. } | Self::Nothing => "scope_refused",
         }
@@ -246,10 +279,7 @@ impl Session {
     ///
     /// The same call `fabric status` and `fabric serve` make, so a machine
     /// discovery will show you is one this fabric would agree to talk to.
-    pub fn open(
-        ca_file: Option<&Path>,
-        allow_cleartext_remote: bool,
-    ) -> std::io::Result<Self> {
+    pub fn open(ca_file: Option<&Path>, allow_cleartext_remote: bool) -> std::io::Result<Self> {
         Ok(Self {
             transport: NodeTransport::resolve(ca_file, allow_cleartext_remote)?,
         })
@@ -341,6 +371,32 @@ fn plan_over(
         });
     }
 
+    // Counted before anything is built. Each range is bounded on its own, but
+    // a scope naming thousands of them would be expanded into tens of millions
+    // of addresses and only *then* refused — on the process that is also
+    // serving traffic. A refusal that costs more than the work it refuses is
+    // not a bound.
+    let entries = scope.ranges.len() + scope.hosts.len();
+    if entries > MAX_SCOPE_ENTRIES {
+        return Err(ScopeRefusal::TooManyEntries {
+            entries,
+            limit: MAX_SCOPE_ENTRIES,
+        });
+    }
+    let mut ranges = Vec::with_capacity(scope.ranges.len());
+    let mut counted = usize::from(scope.loopback) * 2 + scope.hosts.len();
+    for raw in &scope.ranges {
+        let range = netscope::checked_range(raw).map_err(ScopeRefusal::Range)?;
+        counted += range.host_count();
+        ranges.push(range);
+    }
+    if counted > limits.max_addresses {
+        return Err(ScopeRefusal::TooLarge {
+            addresses: counted,
+            limit: limits.max_addresses,
+        });
+    }
+
     // Address, then the name that produced it. A name is kept because a
     // finding's evidence has to say how the machine was reached.
     let mut addresses: Vec<(IpAddr, Option<String>)> = Vec::new();
@@ -348,8 +404,7 @@ fn plan_over(
         addresses.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
         addresses.push((IpAddr::V6(Ipv6Addr::LOCALHOST), None));
     }
-    for raw in &scope.ranges {
-        let range = netscope::checked_range(raw).map_err(ScopeRefusal::Range)?;
+    for range in &ranges {
         addresses.extend(range.hosts().into_iter().map(|ip| (IpAddr::V4(ip), None)));
     }
     for host in &scope.hosts {
@@ -571,13 +626,24 @@ pub struct HostAlternative {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Proposal {
     pub label: String,
-    pub engine: NodeEngine,
+    /// The engine this line would be written as, or `None` when the address
+    /// matched more than one and a person has to choose between them. Never
+    /// the first of several: the engine decides whether this fabric presents
+    /// its bearer to the machine, so a guess here is a credential decision.
+    pub engine: Option<NodeEngine>,
     pub host: String,
     pub port: u16,
+    /// The line as it would be written. With no engine settled it carries the
+    /// `<engine>` placeholder rather than a concrete scheme, so it cannot be
+    /// pasted into a file as though the choice had been made.
     pub line: String,
     /// The comment as it will be written, except for its timestamp, which is
     /// filled in at the moment of writing.
     pub comment_preview: String,
+    /// The socket this scan actually reached, composed once here so that
+    /// neither front door has to spell one for itself. A join sends it back
+    /// and it is compared with the address the host reaches then.
+    pub scanned_address: String,
     /// Engines a person must choose between. Empty unless the address matched
     /// more than one, and never resolved by taking the first.
     pub engine_choices: Vec<NodeEngine>,
@@ -585,6 +651,17 @@ pub struct Proposal {
     /// Decided on the server from facts it holds. A page renders these
     /// verbatim and never derives one from the engine name.
     pub warnings: Vec<&'static str>,
+}
+
+impl Proposal {
+    /// Whether somebody still has to say which engine this is.
+    ///
+    /// Both front doors ask before offering to write: a row that matched two
+    /// engines has no line to write until a person picks one, and the engine
+    /// is what decides whether this fabric ever shows the machine its bearer.
+    pub fn needs_an_engine_choice(&self) -> bool {
+        self.engine.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -730,7 +807,9 @@ pub(crate) fn scan(
                     .reserve();
                 let wait = at.saturating_duration_since(Instant::now());
                 if !wait.is_zero() {
-                    std::thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
+                    std::thread::sleep(
+                        wait.min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 let probe = probe_target(target, plan, connector, cancel, transport);
                 probed
@@ -741,7 +820,9 @@ pub(crate) fn scan(
         }
     });
 
-    let probes = probed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let probes = probed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut not_listed = NotListed::default();
     let mut answered = Vec::new();
     for probe in probes {
@@ -761,7 +842,11 @@ pub(crate) fn scan(
     Discovery {
         scope: ScopeReport {
             ranges: plan.ranges.clone(),
-            hosts: plan.hosts.iter().map(|host| display_safe(host).into_owned()).collect(),
+            hosts: plan
+                .hosts
+                .iter()
+                .map(|host| display_safe(host).into_owned())
+                .collect(),
             loopback: plan.loopback,
             default_ports: plan.default_ports,
             addresses: plan.addresses,
@@ -864,13 +949,20 @@ fn probe_target(
 
 /// Turn what answered into rows a person can act on.
 fn assemble(
-    answered: Vec<(Target, Vec<Answer>, Option<String>)>,
+    mut answered: Vec<(Target, Vec<Answer>, Option<String>)>,
     context: &ScanContext,
     transport: &NodeTransport,
     cancel: &Cancel,
 ) -> Vec<Finding> {
     let existing = resolved_existing(&context.existing, cancel);
     let authenticated = transport.tls_config().is_some();
+
+    // Ordered before any id is handed out. Workers push in completion order,
+    // so without this the same machines come back in a different order — and
+    // `possibly_same_as` points at different ids — from one run of the same
+    // scan to the next, which a reader has no way to read as anything but a
+    // change in the network.
+    answered.sort_by_key(|(target, _, _)| (target.addr.ip(), target.addr.port()));
 
     let mut findings: Vec<Finding> = Vec::new();
     for (index, (target, answers, tls_name_used)) in answered.into_iter().enumerate() {
@@ -913,10 +1005,8 @@ fn assemble(
         .iter()
         .map(|spec| spec.label.clone())
         .collect();
-    let loopback_answers = loopback_answers(&findings);
     for finding in &mut findings {
-        let (proposal, not_proposed) =
-            propose(finding, context, transport, &mut taken, &loopback_answers);
+        let (proposal, not_proposed) = propose(finding, context, transport, &mut taken);
         finding.proposal = proposal;
         finding.not_proposed = not_proposed;
     }
@@ -950,9 +1040,8 @@ fn in_fabric(
     let mut unknown = None;
     for (spec, resolved) in existing {
         let Some(resolved) = resolved else {
-            unknown.get_or_insert_with(|| {
-                format!("`{}` did not resolve", display_safe(&spec.label))
-            });
+            unknown
+                .get_or_insert_with(|| format!("`{}` did not resolve", display_safe(&spec.label)));
             continue;
         };
         if spec.port != target.addr.port() {
@@ -1027,9 +1116,11 @@ fn note_lookalikes(findings: &mut [Finding]) {
             .collect();
         Some((engine.as_str().to_string(), facts))
     };
-    let signatures: Vec<Option<(String, Vec<String>)>> =
-        findings.iter().map(&signature).collect();
-    let addresses: Vec<String> = findings.iter().map(|finding| finding.address.clone()).collect();
+    let signatures: Vec<Option<(String, Vec<String>)>> = findings.iter().map(&signature).collect();
+    let addresses: Vec<String> = findings
+        .iter()
+        .map(|finding| finding.address.clone())
+        .collect();
     let ids: Vec<String> = findings.iter().map(|finding| finding.id.clone()).collect();
 
     for index in 0..findings.len() {
@@ -1046,19 +1137,25 @@ fn note_lookalikes(findings: &mut [Finding]) {
     }
 }
 
-/// Which ports answered on loopback in this scan, and as what.
-fn loopback_answers(findings: &[Finding]) -> BTreeMap<u16, Option<NodeEngine>> {
-    findings
+/// The loopback address this row actually answered on, IPv4 first.
+///
+/// Read off the row's own merged addresses rather than a port-keyed index.
+/// [`merge_local_findings`] folds only addresses of this machine that answered
+/// the same way on the same port, so a loopback address in here is by
+/// construction one that answered the same way. A port-keyed index cannot say
+/// which *family* answered, and proposing 127.0.0.1 for an engine bound only
+/// to [::1] writes a line that nothing is listening on.
+fn loopback_in(addresses: &[String]) -> Option<IpAddr> {
+    let parsed: Vec<IpAddr> = addresses
         .iter()
-        .filter(|finding| {
-            finding
-                .addresses
-                .iter()
-                .filter_map(|address| address.parse::<IpAddr>().ok())
-                .any(|address| address.is_loopback())
-        })
-        .map(|finding| (finding.port, finding.classification.matched_engine()))
-        .collect()
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .filter(IpAddr::is_loopback)
+        .collect();
+    parsed
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or_else(|| parsed.first())
+        .copied()
 }
 
 /// A name is listed only when a forward lookup on this host returns the address
@@ -1155,7 +1252,6 @@ fn propose(
     context: &ScanContext,
     transport: &NodeTransport,
     taken: &mut Vec<String>,
-    loopback_answers: &BTreeMap<u16, Option<NodeEngine>>,
 ) -> (Option<Proposal>, Option<String>) {
     if let Some(in_fabric) = &finding.in_fabric {
         if let Some(label) = &in_fabric.label {
@@ -1169,12 +1265,18 @@ fn propose(
         }
     }
 
+    // `None` where more than one engine matched, and nothing below resolves
+    // that by taking the first. The engine decides whether this fabric ever
+    // presents its bearer to the machine, so guessing it is a credential
+    // decision taken about a machine whose identity was never settled.
     let (engine, choices) = match &finding.classification {
-        Classification::AnswersLike { engine, .. } => (*engine, Vec::new()),
-        Classification::Ambiguous { engines } => match engines.first() {
-            Some(first) => (*first, engines.clone()),
-            None => return (None, None),
-        },
+        Classification::AnswersLike { engine, .. } => (Some(*engine), Vec::new()),
+        Classification::Ambiguous { engines } => {
+            if engines.is_empty() {
+                return (None, None);
+            }
+            (None, engines.clone())
+        }
         Classification::FabricProxy { .. } => {
             return (
                 None,
@@ -1225,49 +1327,79 @@ fn propose(
         }
     };
 
-    // Loopback is proposed for this machine only when loopback was actually
-    // seen to answer the same way on this port. An engine bound only to the LAN
-    // address is not reachable on 127.0.0.1, and a line saying it is would
-    // simply not work.
-    let host = if finding.this_machine == Some(true)
-        && loopback_answers.get(&finding.port) == Some(&Some(engine))
-    {
-        Ipv4Addr::LOCALHOST.to_string()
-    } else {
-        finding.address.clone()
+    // Every engine this line might end up being written as, for the facts that
+    // have to hold whichever one of them a person picks.
+    let candidates: Vec<NodeEngine> = match engine {
+        Some(engine) => vec![engine],
+        None => choices.clone(),
     };
-    let host = writable_host(&host);
+    // A label is a name somebody edits, not a claim about identity, so an
+    // unsettled row still gets a suggested one.
+    let Some(label_engine) = engine.or_else(|| choices.first().copied()) else {
+        return (None, None);
+    };
+    let Ok(found_at) = finding.address.parse::<IpAddr>() else {
+        return (
+            None,
+            Some("this build could not read the address it answered on".to_string()),
+        );
+    };
+
+    // Loopback is proposed for this machine only where loopback actually
+    // answered the same way on this port, and then in the family that
+    // answered. An engine bound only to the LAN address is not reachable on
+    // 127.0.0.1 — and one bound only to [::1] is not reachable there either,
+    // so a line naming it would point at whatever else holds that port.
+    let answered_at = if finding.this_machine == Some(true) {
+        loopback_in(&finding.addresses).unwrap_or(found_at)
+    } else {
+        found_at
+    };
+    // An operator's own name, or one a pinned CA authenticated, is preferred
+    // to the address — but only when it is also a host this build will write.
+    let preferred = match (&finding.name.name, finding.name.source_trust) {
+        (Some(name), Some("operator" | "certificate_verified")) => Some(name.as_str()),
+        _ => None,
+    };
+    let (host, name_not_written) = proposed_host(answered_at, preferred);
+
+    let label = label_for(&host, label_engine, taken);
+    taken.push(label.clone());
 
     // A device-claimed name is offered, never defaulted: on a consumer router
     // the device chooses its own name, so anything on the network can claim it
-    // later and receive this node's prompts.
+    // later and receive this node's prompts. Its label is drawn against the
+    // same taken list, because pressing the button sets the label too.
     let mut alternatives = Vec::new();
     if let (Some(name), Some(trust)) = (&finding.name.name, finding.name.source_trust) {
-        if trust == "device_claimed" {
+        if trust == "device_claimed" && node::is_writable_host(name) {
+            let alternative = label_for(name, label_engine, taken);
+            taken.push(alternative.clone());
             alternatives.push(HostAlternative {
                 host: name.clone(),
-                label: label_for(name, engine, &[]),
+                label: alternative,
                 source_trust: trust,
                 warning: "this name comes from your router; the device chooses it, and anything \
                           on this network can claim it later",
             });
         }
     }
-    // An operator's own name, or one a pinned CA authenticated, is the default.
-    let host = match (&finding.name.name, finding.name.source_trust) {
-        (Some(name), Some("operator" | "certificate_verified")) => name.clone(),
-        _ => host,
-    };
-
-    let label = label_for(&host, engine, taken);
-    taken.push(label.clone());
 
     let mut warnings: Vec<&'static str> = Vec::new();
     if transport.tls_config().is_none() {
         warnings.push("cleartext");
     }
-    if let Some(warning) = engine.bearer_warning(context.bearer_configured) {
-        warnings.push(warning);
+    // True of whichever engine is chosen: if any candidate would be shown the
+    // bearer, that belongs on the row before anybody picks.
+    for candidate in &candidates {
+        if let Some(warning) = candidate.bearer_warning(context.bearer_configured) {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+    }
+    if name_not_written {
+        warnings.push("name_not_written");
     }
     if finding
         .name
@@ -1278,37 +1410,60 @@ fn propose(
         warnings.push("name_resolves_to_several_addresses");
     }
 
-    let spec = NodeSpec {
-        label: label.clone(),
-        host: host.clone(),
-        port: finding.port,
-        engine,
-    };
-    let version = finding
-        .engines
-        .iter()
-        .find(|report| report.engine == engine)
-        .and_then(|report| report.verdict.recorded_version());
+    // A concrete scheme only where one engine is settled. `NodeSpec::to_line`
+    // stays the one place a real node line is composed, and a test pins that
+    // this agrees with it wherever there is an engine to agree about.
+    let scheme = engine.map_or("<engine>", NodeEngine::as_str);
+    let line = format!("{label}={scheme}://{host}:{}", finding.port);
+    let version = engine.and_then(|engine| {
+        finding
+            .engines
+            .iter()
+            .find(|report| report.engine == engine)
+            .and_then(|report| report.verdict.recorded_version())
+    });
+    let scanned = SocketAddr::new(answered_at, finding.port);
 
     (
         Some(Proposal {
-            line: spec.to_line(),
+            line,
             comment_preview: provenance_comment(
                 "<time of writing>",
-                &format!("{}:{}", finding.address, finding.port),
-                engine,
+                &scanned.to_string(),
+                scheme,
                 version,
             ),
             label,
             engine,
             host,
             port: finding.port,
+            scanned_address: scanned.to_string(),
             engine_choices: choices,
             host_alternatives: alternatives,
             warnings,
         }),
         None,
     )
+}
+
+/// The host a proposal carries: the address that answered, unless a name this
+/// build is willing to *write* was preferred to it.
+///
+/// Returns that host and whether a preferred name was turned down. A name that
+/// fails the write grammar is never used silently: the join applies the same
+/// grammar, so a proposal carrying one would be a command printed as though it
+/// could be run, and refused the moment anybody ran it.
+fn proposed_host(answered_at: IpAddr, preferred: Option<&str>) -> (String, bool) {
+    let address = writable_host(&answered_at.to_string());
+    let Some(name) = preferred else {
+        return (address, false);
+    };
+    let candidate = writable_host(name);
+    if node::is_writable_host(&candidate) {
+        (candidate, false)
+    } else {
+        (address, true)
+    }
 }
 
 /// A host string that is safe to write, falling back to the address shape.
@@ -1332,7 +1487,10 @@ fn label_for(host: &str, engine: NodeEngine, taken: &[String]) -> String {
         } else {
             format!(
                 "host-{}",
-                address.to_string().replace(['.', ':'], "-").trim_matches('-')
+                address
+                    .to_string()
+                    .replace(['.', ':'], "-")
+                    .trim_matches('-')
             )
         }
     } else if host.starts_with('[') {
@@ -1343,7 +1501,9 @@ fn label_for(host: &str, engine: NodeEngine, taken: &[String]) -> String {
 
     let cleaned: String = stem
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
         .collect();
     let base = format!(
         "{}-{}",
@@ -1374,12 +1534,11 @@ fn label_for(host: &str, engine: NodeEngine, taken: &[String]) -> String {
 pub(crate) fn provenance_comment(
     at: &str,
     endpoint: &str,
-    engine: NodeEngine,
+    engine: &str,
     version: Option<&str>,
 ) -> String {
     let comment = format!(
-        "# joined by fabric discover {at}: {endpoint} answered like {} {}",
-        engine.as_str(),
+        "# joined by fabric discover {at}: {endpoint} answered like {engine} {}",
         version
             .and_then(identify::recorded_version)
             .unwrap_or(VERSION_NOT_RECORDED)
@@ -1449,10 +1608,27 @@ pub enum JoinRefusal {
     InvalidLabel(String),
     InvalidHost(String),
     NotAnEngine(String),
-    NameNotProven { host: String, detail: String },
-    DuplicateEndpoint { existing_label: String },
-    NoLongerAnswers { expected: NodeEngine, found: String },
-    NameReachesAnotherAddress { scanned: String, answered_from: String },
+    NameNotProven {
+        host: String,
+        detail: String,
+    },
+    DuplicateEndpoint {
+        existing_label: String,
+    },
+    NoLongerAnswers {
+        expected: NodeEngine,
+        found: String,
+    },
+    NameReachesAnotherAddress {
+        scanned: String,
+        answered_from: String,
+    },
+    /// The socket the caller said was scanned is not one this build can read.
+    /// Refused rather than ignored: skipping the check silently would drop the
+    /// one guard that notices a name now leading somewhere else.
+    ScannedAddressUnreadable {
+        scanned: String,
+    },
     TransportRefused(String),
     Append(AppendRefusal),
 }
@@ -1503,6 +1679,13 @@ impl std::fmt::Display for JoinRefusal {
                 "that name now reaches {answered_from}, and the machine that was scanned was \
                  {scanned}. Nothing was added; add the address itself if that is what you meant"
             ),
+            Self::ScannedAddressUnreadable { scanned } => write!(
+                f,
+                "`{}` is not an address and port this build can read. It should be the \
+                 `scanned_address` the scan reported, such as 127.0.0.1:11434 or [::1]:11434. \
+                 Nothing was added",
+                display_safe(scanned)
+            ),
             Self::TransportRefused(detail) => write!(f, "{detail}"),
             Self::Append(refusal) => write!(f, "{refusal}"),
         }
@@ -1519,6 +1702,7 @@ impl JoinRefusal {
             Self::DuplicateEndpoint { .. } => "duplicate_endpoint",
             Self::NoLongerAnswers { .. } => "no_longer_answers",
             Self::NameReachesAnotherAddress { .. } => "name_reaches_another_address",
+            Self::ScannedAddressUnreadable { .. } => "invalid_scanned_address",
             Self::TransportRefused(_) => "transport_refused",
             Self::Append(refusal) => refusal.code(),
         }
@@ -1550,12 +1734,13 @@ pub(crate) fn join(
 
     // Resolved in the fabric's own order, so the address that answers here is
     // the one the fabric's own connect would reach first.
-    let resolved = netscope::forward_lookup(&request.host, request.port, cancel).map_err(
-        |error| JoinRefusal::NameNotProven {
-            host: request.host.clone(),
-            detail: error.to_string(),
-        },
-    )?;
+    let resolved =
+        netscope::forward_lookup(&request.host, request.port, cancel).map_err(|error| {
+            JoinRefusal::NameNotProven {
+                host: request.host.clone(),
+                detail: error.to_string(),
+            }
+        })?;
     if resolved.is_empty() {
         return Err(JoinRefusal::NameNotProven {
             host: request.host.clone(),
@@ -1583,34 +1768,20 @@ pub(crate) fn join(
         .is_some()
         .then(|| request.host.clone());
     let limits = Limits::default();
-    let mut answered_from = None;
-    let answers: Vec<Answer> = union_paths()
-        .into_iter()
-        .map(|path| {
-            let outcome = match first_answer(
-                connector,
-                &permitted,
-                &authority,
-                tls_name.as_deref(),
-                path,
-                &limits,
-                cancel,
-            ) {
-                Ok((answer, from)) => {
-                    answered_from.get_or_insert(from);
-                    Outcome::Http {
-                        status: answer.status,
-                        content_type: answer.content_type.clone(),
-                        json: serde_json::from_slice(&answer.body).ok(),
-                        bytes_len: answer.body.len(),
-                    }
-                }
-                Err(HttpError::Tls(detail)) => Outcome::TlsRefused(detail),
-                Err(error) => Outcome::Unanswered(error.to_string()),
-            };
-            Answer::new(path, outcome)
-        })
-        .collect();
+    let answered = identify_at_one_address(
+        connector,
+        &permitted,
+        &authority,
+        tls_name.as_deref(),
+        &limits,
+        cancel,
+    );
+    let Some((answered_from, answers)) = answered else {
+        return Err(JoinRefusal::NoLongerAnswers {
+            expected: engine,
+            found: "nothing that answered".to_string(),
+        });
+    };
 
     let identification = identify::classify(&answers);
     let agrees = match &identification.classification {
@@ -1625,14 +1796,19 @@ pub(crate) fn join(
         });
     }
 
-    let answered_from = answered_from.ok_or_else(|| JoinRefusal::NoLongerAnswers {
-        expected: engine,
-        found: "nothing that answered".to_string(),
-    })?;
     if let Some(scanned) = &request.scanned_address {
-        if scanned != &answered_from.to_string() {
+        // Compared as sockets, never as text. `::1:11434` and `[::1]:11434`
+        // are one machine written two ways, so a string comparison refuses
+        // every IPv6 join — with a message that misstates what happened.
+        let scanned: SocketAddr =
+            scanned
+                .parse()
+                .map_err(|_| JoinRefusal::ScannedAddressUnreadable {
+                    scanned: scanned.clone(),
+                })?;
+        if scanned != answered_from {
             return Err(JoinRefusal::NameReachesAnotherAddress {
-                scanned: scanned.clone(),
+                scanned: scanned.to_string(),
                 answered_from: answered_from.to_string(),
             });
         }
@@ -1648,7 +1824,7 @@ pub(crate) fn join(
     let comment = provenance_comment(
         &crate::receipt::rfc3339_utc_now(),
         &answered_from.to_string(),
-        engine,
+        engine.as_str(),
         version,
     );
 
@@ -1676,38 +1852,62 @@ pub(crate) fn join(
     })
 }
 
-/// Ask each address in turn and return the first that answers, with its socket.
-fn first_answer(
+/// Ask every identification path at the first address that answers any of them.
+///
+/// The scan pins stage two to the socket stage one found open, and the join
+/// has to do the same. Asking each path independently across a resolved list
+/// lets one name that reaches two machines be identified from both at once —
+/// `/v1/health` from a half-dead first address and the rest from whatever sits
+/// behind the second — and recorded as though a single machine had answered.
+fn identify_at_one_address(
     connector: &dyn Connector,
     addrs: &[SocketAddr],
     authority: &str,
     tls_name: Option<&str>,
-    path: &str,
     limits: &Limits,
     cancel: &Cancel,
-) -> Result<(AnonymousAnswer, SocketAddr), HttpError> {
-    let mut last = None;
+) -> Option<(SocketAddr, Vec<Answer>)> {
     for addr in addrs {
-        match connector.ask(
-            *addr,
-            authority,
-            tls_name,
-            path,
-            limits.request_timeout(),
-            limits.max_body_bytes,
-            cancel,
-        ) {
-            Ok(answer) => return Ok((answer, *addr)),
-            Err(error) => last = Some(error),
+        let mut answered = false;
+        let answers: Vec<Answer> = union_paths()
+            .into_iter()
+            .map(|path| {
+                let outcome = match connector.ask(
+                    *addr,
+                    authority,
+                    tls_name,
+                    path,
+                    limits.request_timeout(),
+                    limits.max_body_bytes,
+                    cancel,
+                ) {
+                    Ok(answer) => {
+                        answered = true;
+                        Outcome::Http {
+                            status: answer.status,
+                            content_type: answer.content_type.clone(),
+                            json: serde_json::from_slice(&answer.body).ok(),
+                            bytes_len: answer.body.len(),
+                        }
+                    }
+                    Err(HttpError::Tls(detail)) => Outcome::TlsRefused(detail),
+                    Err(error) => Outcome::Unanswered(error.to_string()),
+                };
+                Answer::new(path, outcome)
+            })
+            .collect();
+        if answered {
+            return Some((*addr, answers));
         }
     }
-    Err(last.unwrap_or_else(|| HttpError::Connect("no address answered".to_string())))
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
 
     /// A connector that answers from a script and records every call, so a
@@ -1721,10 +1921,16 @@ mod tests {
         peak: AtomicUsize,
         starts: Mutex<Vec<Instant>>,
         stall: Option<Duration>,
+        /// Per-address delay, so a test can decide which worker finishes
+        /// first and pin an order that is otherwise a race.
+        stalls: BTreeMap<SocketAddr, Duration>,
     }
 
     impl Fake {
-        fn serving(addr: SocketAddr, answers: &[(&'static str, u16, &'static str, String)]) -> Self {
+        fn serving(
+            addr: SocketAddr,
+            answers: &[(&'static str, u16, &'static str, String)],
+        ) -> Self {
             let mut fake = Fake::default();
             fake.add(addr, answers);
             fake
@@ -1749,7 +1955,7 @@ mod tests {
             self.starts.lock().expect("starts").push(Instant::now());
             let now = self.overlapping.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            if let Some(stall) = self.stall {
+            if let Some(stall) = self.stalls.get(&addr).copied().or(self.stall) {
                 std::thread::sleep(stall);
             }
             self.overlapping.fetch_sub(1, Ordering::SeqCst);
@@ -1852,7 +2058,9 @@ mod tests {
         let fake = Fake::default();
         scan_with(&plan, &fake, &loopback_context());
         assert!(
-            fake.connected_to().iter().all(|addr| addr.ip().is_loopback()),
+            fake.connected_to()
+                .iter()
+                .all(|addr| addr.ip().is_loopback()),
             "a default scan connected off-box: {:?}",
             fake.connected_to()
         );
@@ -1901,7 +2109,10 @@ mod tests {
         let refusal = plan(&scope, &NodeTransport::default()).expect_err("refused");
         assert_eq!(refusal.code(), "transport_refused");
         let message = refusal.to_string();
-        assert!(message.contains("--allow-cleartext-node-transport"), "{message}");
+        assert!(
+            message.contains("--allow-cleartext-node-transport"),
+            "{message}"
+        );
         assert!(message.contains("--node-tls-ca"), "{message}");
 
         // Paired: the acknowledgement is the same one a node needs, and it works.
@@ -1970,7 +2181,13 @@ mod tests {
             stall: Some(Duration::from_millis(5)),
             ..Fake::default()
         };
-        scan(&plan, &fake, &Cancel::never(), &loopback_context(), &acknowledged);
+        scan(
+            &plan,
+            &fake,
+            &Cancel::never(),
+            &loopback_context(),
+            &acknowledged,
+        );
 
         assert!(
             fake.peak.load(Ordering::SeqCst) <= plan.limits.concurrency,
@@ -2092,8 +2309,11 @@ mod tests {
         let discovery = scan_with(&plan, &fake, &loopback_context());
 
         let finding = &discovery.findings[0];
-        let proposal = finding.proposal.as_ref().expect("an ollama node is proposable");
-        assert_eq!(proposal.engine, NodeEngine::Ollama);
+        let proposal = finding
+            .proposal
+            .as_ref()
+            .expect("an ollama node is proposable");
+        assert_eq!(proposal.engine, Some(NodeEngine::Ollama));
         assert_eq!(proposal.port, 9961);
         assert!(proposal.line.contains("ollama://"), "{}", proposal.line);
         assert!(
@@ -2149,7 +2369,10 @@ mod tests {
             label_for("100.64.0.37", NodeEngine::Ollama, &[]),
             "host-100-64-0-37-ollama"
         );
-        assert_eq!(label_for("mini2.lan", NodeEngine::Camelid, &[]), "mini2-camelid");
+        assert_eq!(
+            label_for("mini2.lan", NodeEngine::Camelid, &[]),
+            "mini2-camelid"
+        );
         assert!(node::is_writable_label(&label_for(
             "[fd00::1]",
             NodeEngine::Camelid,
@@ -2164,7 +2387,7 @@ mod tests {
         let comment = provenance_comment(
             "2026-09-12T10:04:11Z",
             "100.64.0.37:11434",
-            NodeEngine::Ollama,
+            NodeEngine::Ollama.as_str(),
             Some("0.1\nx=camelid://169.254.0.9:8181"),
         );
         assert!(comment.contains(VERSION_NOT_RECORDED), "{comment}");
@@ -2174,7 +2397,7 @@ mod tests {
         let carriage = provenance_comment(
             "2026-09-12T10:04:11Z",
             "100.64.0.37:11434",
-            NodeEngine::Ollama,
+            NodeEngine::Ollama.as_str(),
             Some("0.1\r\nx=camelid://169.254.0.9:8181"),
         );
         assert!(carriage.contains(VERSION_NOT_RECORDED), "{carriage}");
@@ -2183,10 +2406,13 @@ mod tests {
         let ordinary = provenance_comment(
             "2026-09-12T10:04:11Z",
             "100.64.0.37:11434",
-            NodeEngine::Ollama,
+            NodeEngine::Ollama.as_str(),
             Some("0.33.2"),
         );
-        assert!(ordinary.ends_with("answered like ollama 0.33.2"), "{ordinary}");
+        assert!(
+            ordinary.ends_with("answered like ollama 0.33.2"),
+            "{ordinary}"
+        );
     }
 
     #[test]
@@ -2240,5 +2466,390 @@ mod tests {
         };
         let refusal = plan(&scope, &NodeTransport::default()).expect_err("refused");
         assert_eq!(refusal.code(), "scope_too_large");
+    }
+
+    /// The refusal has to cost less than the work it refuses. Each of these
+    /// ranges is legal on its own, so expanding them all before counting would
+    /// allocate millions of addresses on the process that is also serving
+    /// traffic — and only then turn the request down.
+    #[test]
+    fn a_scope_naming_too_many_ranges_is_refused_before_any_is_expanded() {
+        let acknowledged = NodeTransport::resolve(None, true).expect("acknowledged");
+        let many = Scope {
+            ranges: (0..200).map(|n| format!("100.64.{n}.0/22")).collect(),
+            ports: vec![8181],
+            loopback: false,
+            default_ports: false,
+            ..Scope::default()
+        };
+        let refusal = plan(&many, &acknowledged).expect_err("refused");
+        assert_eq!(refusal.code(), "scope_too_large");
+        assert!(
+            matches!(refusal, ScopeRefusal::TooManyEntries { .. }),
+            "{refusal:?}"
+        );
+
+        // Inside the entry cap, the address total is what refuses it — counted
+        // from each range's size, before a single host list is built.
+        let large = Scope {
+            ranges: (0..8).map(|n| format!("100.64.{n}.0/22")).collect(),
+            ..many
+        };
+        let refusal = plan(&large, &acknowledged).expect_err("refused");
+        assert!(
+            matches!(refusal, ScopeRefusal::TooLarge { addresses, .. } if addresses == 8 * 1022),
+            "{refusal:?}"
+        );
+    }
+
+    /// An engine bound only to the IPv6 loopback is not reachable on
+    /// 127.0.0.1. A line naming it points at whatever else holds that port, or
+    /// at nothing at all.
+    #[test]
+    fn a_service_only_on_ipv6_loopback_is_proposed_on_ipv6_loopback() {
+        let addr: SocketAddr = "[::1]:9981".parse().expect("addr");
+        let fake = Fake::serving(addr, &ollama_answers("0.33.2"));
+        let scope = Scope {
+            ports: vec![9981],
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        let finding = discovery
+            .findings
+            .iter()
+            .find(|finding| finding.address == "::1")
+            .expect("the v6 loopback answered");
+        let proposal = finding.proposal.as_ref().expect("proposable");
+        assert_eq!(proposal.host, "[::1]", "127.0.0.1 never answered here");
+        assert_eq!(proposal.scanned_address, "[::1]:9981");
+        assert!(proposal.line.contains("[::1]:9981"), "{}", proposal.line);
+    }
+
+    /// The paired half: both families answering is one machine, and the
+    /// address most likely to be reachable is the one proposed.
+    #[test]
+    fn a_machine_answering_on_both_loopbacks_is_one_proposal_on_the_v4_one() {
+        let mut fake = Fake::serving(
+            SocketAddr::from(([127, 0, 0, 1], 9982)),
+            &ollama_answers("0.33.2"),
+        );
+        fake.add(
+            "[::1]:9982".parse().expect("addr"),
+            &ollama_answers("0.33.2"),
+        );
+        let scope = Scope {
+            ports: vec![9982],
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        assert_eq!(discovery.findings.len(), 1, "one machine, one row");
+        let finding = &discovery.findings[0];
+        assert_eq!(finding.addresses.len(), 2, "{:?}", finding.addresses);
+        let proposal = finding.proposal.as_ref().expect("proposable");
+        assert_eq!(proposal.host, "127.0.0.1");
+        assert_eq!(proposal.scanned_address, "127.0.0.1:9982");
+    }
+
+    /// Loopback is proposed only where loopback answered, and then as the
+    /// address that answered. Every 127.x address is this machine too, and
+    /// substituting 127.0.0.1 for one names a socket nothing probed.
+    #[test]
+    fn this_machine_is_proposed_on_loopback_only_when_loopback_answered_the_same() {
+        let addr = SocketAddr::from(([127, 0, 0, 2], 9983));
+        let fake = Fake::serving(addr, &ollama_answers("0.33.2"));
+        let scope = Scope {
+            ranges: vec!["127.0.0.0/30".to_string()],
+            ports: vec![9983],
+            loopback: false,
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        let finding = discovery
+            .findings
+            .iter()
+            .find(|finding| finding.address == "127.0.0.2")
+            .expect("127.0.0.2 answered");
+        let proposal = finding.proposal.as_ref().expect("proposable");
+        assert_eq!(
+            proposal.host, "127.0.0.2",
+            "the address that answered is the address proposed"
+        );
+        assert_eq!(proposal.scanned_address, "127.0.0.2:9983");
+    }
+
+    /// Two engines matched, so nothing here picks one — not even in the line
+    /// the terminal prints. The engine decides whether this fabric ever shows
+    /// the machine its bearer.
+    #[test]
+    fn an_ambiguous_row_proposes_no_engine_and_no_concrete_line() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 9984));
+        let mut answers = ollama_answers("0.33.2");
+        answers[0] = (
+            "/v1/health",
+            200,
+            "application/json",
+            json_body(json!({
+                "ok": true,
+                "engine": "camelid",
+                "generation_ready": true,
+                "version": "v0.7.2-551",
+                "active_model_id": "llama-3.2-1b-instruct",
+            })),
+        );
+        let fake = Fake::serving(addr, &answers);
+        let scope = Scope {
+            hosts: vec!["127.0.0.1".to_string()],
+            ports: vec![9984],
+            loopback: false,
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        let finding = &discovery.findings[0];
+        assert_eq!(finding.classification.kind(), "ambiguous");
+        let proposal = finding
+            .proposal
+            .as_ref()
+            .expect("a choice is still offered");
+        assert_eq!(proposal.engine, None, "the first match is not a pick");
+        assert_eq!(
+            proposal.engine_choices.len(),
+            2,
+            "{:?}",
+            proposal.engine_choices
+        );
+        assert!(
+            proposal.needs_an_engine_choice(),
+            "both front doors ask this before offering to write"
+        );
+        assert!(
+            proposal.line.contains("<engine>"),
+            "an unsettled row must not carry a scheme: {}",
+            proposal.line
+        );
+        for settled in ["camelid://", "ollama://", "lmstudio://"] {
+            assert!(!proposal.line.contains(settled), "{}", proposal.line);
+        }
+        // ...and the warning is true of whichever engine is chosen.
+        let context = ScanContext {
+            bearer_configured: Some(true),
+            ..loopback_context()
+        };
+        let discovery = scan_with(&plan, &fake, &context);
+        let warnings = &discovery.findings[0]
+            .proposal
+            .as_ref()
+            .expect("proposable")
+            .warnings;
+        assert!(
+            warnings.contains(&"bearer_will_be_sent"),
+            "one of the candidates receives the bearer: {warnings:?}"
+        );
+    }
+
+    /// The proposal's line and the line the writer would actually compose are
+    /// the same string, so the two cannot drift apart.
+    #[test]
+    fn an_unambiguous_proposal_line_is_the_line_the_writer_would_write() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 9985));
+        let fake = Fake::serving(addr, &ollama_answers("0.33.2"));
+        let scope = Scope {
+            hosts: vec!["127.0.0.1".to_string()],
+            ports: vec![9985],
+            loopback: false,
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        let proposal = discovery.findings[0].proposal.as_ref().expect("proposable");
+        let spec = NodeSpec {
+            label: proposal.label.clone(),
+            host: proposal.host.clone(),
+            port: proposal.port,
+            engine: proposal.engine.expect("one engine matched"),
+        };
+        assert_eq!(proposal.line, spec.to_line());
+    }
+
+    /// An operator's own name is preferred to the address — but only in the
+    /// form this build will write. A proposal whose host this same build's
+    /// join refuses is a command printed as though it could be run.
+    #[test]
+    fn a_name_this_build_will_not_write_never_becomes_the_proposed_host() {
+        let v6: IpAddr = "::1".parse().expect("ip");
+        assert_eq!(proposed_host(v6, Some("::1")), ("[::1]".to_string(), false));
+        assert_eq!(proposed_host(v6, None), ("[::1]".to_string(), false));
+
+        // A name the loader still accepts and the writer will not: the address
+        // is kept, and the row says so rather than printing a dead command.
+        let v4: IpAddr = "127.0.0.1".parse().expect("ip");
+        assert!(!node::is_writable_host("my_box"));
+        assert_eq!(
+            proposed_host(v4, Some("my_box")),
+            ("127.0.0.1".to_string(), true)
+        );
+        for (host, _) in [
+            proposed_host(v6, Some("::1")),
+            proposed_host(v4, Some("my_box")),
+            proposed_host(v4, Some("mini2.lan")),
+        ] {
+            assert!(node::is_writable_host(&host), "{host}");
+        }
+    }
+
+    /// Pressing "use the name" sets the label as well as the host, so an
+    /// alternative whose label collides writes straight into a
+    /// `duplicate_label` refusal.
+    #[test]
+    fn an_alternative_label_never_collides_with_the_one_beside_it() {
+        let finding = Finding {
+            id: "f0".to_string(),
+            address: "100.64.0.37".to_string(),
+            port: 11434,
+            addresses: vec!["100.64.0.37".to_string()],
+            via_name: None,
+            this_machine: Some(false),
+            identity_basis: "unauthenticated_answer",
+            tls_name_used: None,
+            engines: Vec::new(),
+            classification: Classification::AnswersLike {
+                engine: NodeEngine::Ollama,
+                version: None,
+                withheld_elsewhere: Vec::new(),
+            },
+            evidence: Vec::new(),
+            name: NameProof {
+                name: Some("mini2.lan".to_string()),
+                source: Some("reverse_dns"),
+                source_trust: Some("device_claimed"),
+                proof: Some("resolves_to_this_address"),
+                resolved: Some(vec!["100.64.0.37".to_string()]),
+                why: None,
+                rejected: None,
+            },
+            in_fabric: None,
+            possibly_same_as: Vec::new(),
+            proposal: None,
+            not_proposed: None,
+        };
+        // The label that name would produce is already spoken for in the file.
+        let mut taken = vec!["mini2-ollama".to_string()];
+        let (proposal, _) = propose(
+            &finding,
+            &ScanContext::default(),
+            &NodeTransport::default(),
+            &mut taken,
+        );
+        let proposal = proposal.expect("proposable");
+        assert_eq!(
+            proposal.host, "100.64.0.37",
+            "a device-claimed name is offered, never defaulted"
+        );
+        let alternative = &proposal.host_alternatives[0];
+        assert_eq!(alternative.host, "mini2.lan");
+        assert_ne!(
+            alternative.label, "mini2-ollama",
+            "the one-click label collided with a label already in the file"
+        );
+        assert_ne!(alternative.label, proposal.label);
+    }
+
+    /// One name that reaches two machines must not be identified out of both
+    /// of their answers at once.
+    #[test]
+    fn every_identification_path_is_asked_at_one_address() {
+        let half_dead = SocketAddr::from(([127, 0, 0, 1], 9991));
+        let other = SocketAddr::from(([127, 0, 0, 2], 9991));
+        let mut fake = Fake::default();
+        // Answers the first path and nothing else, as a machine that stops
+        // accepting part-way through an identification does.
+        fake.add(
+            half_dead,
+            &[(
+                "/v1/health",
+                200,
+                "application/json",
+                json_body(json!({"ok": true})),
+            )],
+        );
+        fake.add(other, &ollama_answers("0.33.2"));
+
+        let (answered_from, answers) = identify_at_one_address(
+            &fake,
+            &[half_dead, other],
+            "stub.test:9991",
+            None,
+            &Limits::default(),
+            &Cancel::never(),
+        )
+        .expect("something answered");
+
+        assert_eq!(answered_from, half_dead);
+        assert_eq!(answers.len(), union_paths().len());
+        assert!(
+            fake.asked
+                .lock()
+                .expect("asked")
+                .iter()
+                .all(|(addr, _)| *addr == half_dead),
+            "a second machine's answers were mixed into one identification: {:?}",
+            fake.asked.lock().expect("asked")
+        );
+    }
+
+    /// Two runs of one scan have to describe the network in the same order: a
+    /// reader has no way to read a reordering as anything but a change.
+    #[test]
+    fn findings_come_back_in_address_order_however_the_workers_finish() {
+        let mut fake = Fake::default();
+        let mut stalls = BTreeMap::new();
+        // The lowest port finishes last, so completion order is the reverse of
+        // the order the findings must come back in.
+        for (port, delay) in [(9986_u16, 60_u64), (9987, 30), (9988, 0)] {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            fake.add(addr, &ollama_answers("0.33.2"));
+            stalls.insert(addr, Duration::from_millis(delay));
+        }
+        fake.stalls = stalls;
+
+        let scope = Scope {
+            hosts: vec!["127.0.0.1".to_string()],
+            ports: vec![9986, 9987, 9988],
+            loopback: false,
+            default_ports: false,
+            ..Scope::default()
+        };
+        let plan = plan(&scope, &NodeTransport::default()).expect("plans");
+        let discovery = scan_with(&plan, &fake, &loopback_context());
+
+        let ports: Vec<u16> = discovery
+            .findings
+            .iter()
+            .map(|finding| finding.port)
+            .collect();
+        assert_eq!(ports, [9986, 9987, 9988], "findings came back out of order");
+        let ids: Vec<&str> = discovery
+            .findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["f0", "f1", "f2"],
+            "ids follow the order, not the race"
+        );
     }
 }

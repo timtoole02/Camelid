@@ -2062,17 +2062,6 @@ async fn discovery_scan(
     };
 
     let fabric = Arc::clone(&state.fabric);
-    let plan = match discover::plan(&scope, fabric.transport()) {
-        Ok(plan) => plan,
-        Err(refusal) => {
-            let status = match refusal.code() {
-                "transport_refused" => StatusCode::FORBIDDEN,
-                "scope_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
-                _ => StatusCode::BAD_REQUEST,
-            };
-            return error_response_coded(status, refusal.code(), &refusal.to_string());
-        }
-    };
 
     // Fired when this frame is dropped, which is what a client going away
     // looks like from here. Without it a scan nobody is waiting for would run
@@ -2086,17 +2075,31 @@ async fn discovery_scan(
         reverse_dns: true,
     };
 
+    // Planning is blocking too: it resolves every name the scope carries, each
+    // on a deadline. Left on the executor it would hold the worker that
+    // accepted this request — and this process's actual job is forwarding
+    // traffic, not waiting on somebody's DNS.
     let scanning = tokio::task::spawn_blocking(move || {
         let transport = fabric.transport();
+        let plan = discover::plan(&scope, transport)?;
         let connector = discover::Sockets::over(transport);
         let discovery = discover::scan(&plan, &connector, &cancel, &context, transport);
         drop(running);
-        discovery
+        Ok(discovery)
     })
     .await;
 
     match scanning {
-        Ok(discovery) => (StatusCode::OK, Json(discovery)).into_response(),
+        Ok(Ok(discovery)) => (StatusCode::OK, Json(discovery)).into_response(),
+        Ok(Err(refusal)) => {
+            let refusal: discover::ScopeRefusal = refusal;
+            let status = match refusal.code() {
+                "transport_refused" => StatusCode::FORBIDDEN,
+                "scope_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            error_response_coded(status, refusal.code(), &refusal.to_string())
+        }
         Err(join_error) => error_response_coded(
             StatusCode::INTERNAL_SERVER_ERROR,
             "scan_failed",
@@ -2173,10 +2176,13 @@ async fn discovery_join(
                 "transport_refused" => StatusCode::FORBIDDEN,
                 _ => StatusCode::UNPROCESSABLE_ENTITY,
             };
-            let mut response =
-                error_response_coded(status, refusal.code(), &refusal.to_string());
+            let mut response = error_response_coded(status, refusal.code(), &refusal.to_string());
             if let fabric::JoinRefusal::DuplicateEndpoint { existing_label } = &refusal {
-                insert(response.headers_mut(), "x-camelid-fabric-node", existing_label);
+                insert(
+                    response.headers_mut(),
+                    "x-camelid-fabric-node",
+                    existing_label,
+                );
             }
             response
         }

@@ -154,6 +154,17 @@ export function DiscoveryPanel({ base, labels = [], pageOrigin }) {
   const labelKey = labels.join(',')
   useEffect(() => { settle(labelKey ? labelKey.split(',') : []) }, [labelKey, settle])
 
+  // ...and again on a timer while anything is still waiting. Keyed on the
+  // labels alone, the effect above never re-runs in the one case the
+  // "not picked up" state exists for — the proxy never reporting the label —
+  // so the row would sit on "waiting" for ever, implying progress.
+  const waiting = Object.values(joins).some((join) => join.phase === 'waiting')
+  useEffect(() => {
+    if (!waiting) return undefined
+    const timer = setInterval(() => settle(labelKey ? labelKey.split(',') : []), 2000)
+    return () => clearInterval(timer)
+  }, [waiting, labelKey, settle])
+
   const suggestion = policy?.suggestions?.[0] ?? null
   const groups = useMemo(
     () => (scan.discovery ? groupFindings(scan.discovery.findings) : []),
@@ -370,7 +381,11 @@ export function DiscoveryPanel({ base, labels = [], pageOrigin }) {
                             engine,
                             port: finding.port,
                             base_sha256: scan.discovery.nodesFile?.sha256,
-                            scanned_address: `${finding.address}:${finding.port}`,
+                            /* The server's own spelling, sent back untouched.
+                               Composed here it gets IPv6 wrong: `::1` and
+                               `[::1]` are one machine, and only one of the two
+                               is an address anything can read. */
+                            scanned_address: finding.proposal?.scannedAddress,
                           },
                           { clientKey },
                         )

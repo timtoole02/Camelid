@@ -39,6 +39,7 @@ const PROPOSAL = {
   port: 11434,
   line: 'host-100-64-0-37-ollama=ollama://100.64.0.37:11434',
   comment_preview: '# joined by fabric discover <time of writing>: 100.64.0.37:11434 answered like ollama 0.33.2',
+  scanned_address: '100.64.0.37:11434',
   engine_choices: [],
   host_alternatives: [],
   warnings: ['cleartext'],
@@ -120,6 +121,40 @@ check('an ambiguous row carries the choice and never resolves it', () => {
   assert.equal(row.canJoin, true)
   assert.deepEqual(row.proposal.engineChoices, ['camelid', 'ollama'])
   assert.equal(groupOf(row), 'ambiguous')
+})
+
+check('an unsettled row carries no engine, and neither does the page', () => {
+  // The server sends no engine for a row that matched two, so there is nothing
+  // here to fall back to a first match with.
+  const row = describeFinding(finding({
+    classification: { kind: 'ambiguous', engines: ['camelid', 'ollama'] },
+    proposal: {
+      ...PROPOSAL,
+      engine: null,
+      engine_choices: ['camelid', 'ollama'],
+      line: 'host-100-64-0-37-ollama=<engine>://100.64.0.37:11434',
+    },
+  }))
+  assert.equal(row.canJoin, true, 'the choice is the thing the confirm panel collects')
+  assert.equal(row.proposal.engine, null, 'the page must not invent one either')
+  assert.deepEqual(row.proposal.engineChoices, ['camelid', 'ollama'])
+  assert.match(row.proposal.line, /<engine>/)
+
+  // No engine and nothing to choose between is not a proposal at all.
+  const empty = describeFinding(finding({ proposal: { ...PROPOSAL, engine: null, engine_choices: [] } }))
+  assert.equal(empty.proposal, null)
+  assert.equal(empty.canJoin, false)
+})
+
+check('the socket the scan reached is read from the body, never composed', () => {
+  const row = describeFinding(finding({
+    address: 'fd00::1',
+    proposal: { ...PROPOSAL, host: '[fd00::1]', scanned_address: '[fd00::1]:11434' },
+  }))
+  assert.equal(row.proposal.scannedAddress, '[fd00::1]:11434')
+  // Exactly the shape a page gets wrong by building it out of address and
+  // port: `fd00::1:11434` is not an address anything can read.
+  assert.notEqual(row.proposal.scannedAddress, `${row.address}:${row.port}`)
 })
 
 check('an incomplete row names what it could not rule out', () => {

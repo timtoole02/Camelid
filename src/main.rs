@@ -1536,7 +1536,10 @@ fn print_discovery(discovery: &camelid::fabric::Discovery, nodes_file: Option<&s
         discovery.elapsed_ms
     );
     println!("transport: {}", discovery.transport);
-    println!("credentials presented to any host: {}", discovery.credentials_presented);
+    println!(
+        "credentials presented to any host: {}",
+        discovery.credentials_presented
+    );
     let not_listed = &discovery.not_listed;
     println!(
         "nothing answered on {} address(es): {} refused, {} timed out, {} unreachable, {} other{}",
@@ -1546,7 +1549,10 @@ fn print_discovery(discovery: &camelid::fabric::Discovery, nodes_file: Option<&s
         not_listed.unreachable,
         not_listed.other,
         if discovery.not_scanned > 0 {
-            format!("; {} not reached before the time limit", discovery.not_scanned)
+            format!(
+                "; {} not reached before the time limit",
+                discovery.not_scanned
+            )
         } else {
             String::new()
         }
@@ -1565,21 +1571,29 @@ fn print_discovery(discovery: &camelid::fabric::Discovery, nodes_file: Option<&s
     println!();
     for finding in &discovery.findings {
         let where_ = if finding.addresses.len() > 1 {
-            format!("{} (also {})", finding.address, finding.addresses[1..].join(", "))
+            format!(
+                "{} (also {})",
+                finding.address,
+                finding.addresses[1..].join(", ")
+            )
         } else {
             finding.address.clone()
         };
-        print!("{where_}:{}  {}", finding.port, finding.classification.kind());
-        if let camelid::fabric::Classification::AnswersLike { engine, version, .. } =
-            &finding.classification
+        print!(
+            "{where_}:{}  {}",
+            finding.port,
+            finding.classification.kind()
+        );
+        if let camelid::fabric::Classification::AnswersLike {
+            engine, version, ..
+        } = &finding.classification
         {
             print!(
                 " {engine} {}",
-                version
-                    .as_deref()
-                    .map_or_else(|| "(version not recorded)".to_string(), |version| {
-                        display_safe(version).into_owned()
-                    })
+                version.as_deref().map_or_else(
+                    || "(version not recorded)".to_string(),
+                    |version| { display_safe(version).into_owned() }
+                )
             );
         }
         println!();
@@ -1614,17 +1628,57 @@ fn print_discovery(discovery: &camelid::fabric::Discovery, nodes_file: Option<&s
                         alternative.warning
                     );
                 }
-                match nodes_file {
-                    Some(path) => println!(
-                        "    add it with: camelid fabric discover --nodes-file {} --join '{}'",
-                        path.display(),
-                        display_safe(&proposal.line)
-                    ),
-                    None => println!(
-                        "    add it by giving --nodes-file PATH and repeating this command with \
-                         --join '{}'",
-                        display_safe(&proposal.line)
-                    ),
+                // Two engines matched, so this prints both commands and
+                // resolves neither. A single concrete line here would be a
+                // choice — and the engine is what decides whether this fabric
+                // ever shows the machine its bearer.
+                if proposal.needs_an_engine_choice() {
+                    println!(
+                        "    it answered like {}, and this build will not choose between them",
+                        proposal
+                            .engine_choices
+                            .iter()
+                            .map(|engine| engine.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    );
+                    for engine in &proposal.engine_choices {
+                        let line = format!(
+                            "{}={}://{}:{}",
+                            proposal.label,
+                            engine.as_str(),
+                            proposal.host,
+                            proposal.port
+                        );
+                        match nodes_file {
+                            Some(path) => println!(
+                                "    if it is {}: camelid fabric discover --nodes-file {} \
+                                 --join '{}'",
+                                engine.as_str(),
+                                path.display(),
+                                display_safe(&line)
+                            ),
+                            None => println!(
+                                "    if it is {}: give --nodes-file PATH and repeat this command \
+                                 with --join '{}'",
+                                engine.as_str(),
+                                display_safe(&line)
+                            ),
+                        }
+                    }
+                } else {
+                    match nodes_file {
+                        Some(path) => println!(
+                            "    add it with: camelid fabric discover --nodes-file {} --join '{}'",
+                            path.display(),
+                            display_safe(&proposal.line)
+                        ),
+                        None => println!(
+                            "    add it by giving --nodes-file PATH and repeating this command \
+                             with --join '{}'",
+                            display_safe(&proposal.line)
+                        ),
+                    }
                 }
             }
             (None, Some(why)) => println!("    not offered: {}", display_safe(why)),
@@ -5697,8 +5751,7 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(2);
                     }
                 };
-                let discovery =
-                    session.scan(&plan, &camelid::fabric::Cancel::never(), &context);
+                let discovery = session.scan(&plan, &camelid::fabric::Cancel::never(), &context);
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&discovery)?);
@@ -5716,22 +5769,36 @@ async fn main() -> anyhow::Result<()> {
                         let Some(proposal) = &finding.proposal else {
                             continue;
                         };
+                        // A row that matched two engines has no line to write
+                        // until somebody names one, and a y/N prompt is not a
+                        // way to name it. `--join` is.
+                        let Some(engine) = proposal.engine else {
+                            println!(
+                                "\n{}:{} answered like more than one engine, so nothing is \
+                                 offered here. Name one with --join.",
+                                camelid::fabric::display_safe(&finding.address),
+                                finding.port
+                            );
+                            continue;
+                        };
                         println!("\nAppend to {}:", path.display());
-                        println!("  {}", camelid::fabric::display_safe(&proposal.comment_preview));
+                        println!(
+                            "  {}",
+                            camelid::fabric::display_safe(&proposal.comment_preview)
+                        );
                         println!("  {}", camelid::fabric::display_safe(&proposal.line));
                         if !confirm_join("") {
                             continue;
                         }
                         let request = camelid::fabric::JoinRequest {
                             label: proposal.label.clone(),
-                            engine: proposal.engine.as_str().to_string(),
+                            engine: engine.as_str().to_string(),
                             host: proposal.host.clone(),
                             port: proposal.port,
                             base_sha256: camelid::fabric::node_file_sha256(&path),
-                            scanned_address: Some(format!(
-                                "{}:{}",
-                                finding.address, finding.port
-                            )),
+                            // The server's own spelling of the socket the scan
+                            // reached; composed here it gets IPv6 wrong.
+                            scanned_address: Some(proposal.scanned_address.clone()),
                         };
                         match session.join(
                             &path,
@@ -5740,10 +5807,9 @@ async fn main() -> anyhow::Result<()> {
                             &camelid::fabric::Cancel::never(),
                         ) {
                             Ok(joined) => print!("{}", joined.appended),
-                            Err(refusal) => eprintln!(
-                                "nothing was added ({}): {refusal}",
-                                refusal.code()
-                            ),
+                            Err(refusal) => {
+                                eprintln!("nothing was added ({}): {refusal}", refusal.code())
+                            }
                         }
                     }
                 }

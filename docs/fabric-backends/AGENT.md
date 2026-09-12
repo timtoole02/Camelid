@@ -54,10 +54,16 @@ This feature is successful when **all** of the following hold. They are delibera
 **S6 is checked mechanically. Run this and expect no output:**
 
 ```bash
-# Production code only. The test module below `#[cfg(test)]` legitimately names
-# engines to build fixtures, so scanning the whole file gives a false alarm.
+# Production code only. The test module legitimately names engines to build
+# fixtures, so scanning the whole file would give a false alarm.
+#
+# Terminated at `mod tests`, NOT at the first `#[cfg(test)]`. Several of these
+# files carry a `#[cfg(test)]` *seam* — an injectable default-ports list, a
+# resolver saturator — hundreds of lines above their test module, and stopping
+# at the first one scanned 314 of discover.rs's 2244 lines while the text
+# claimed it covered the module. It was a check that did not check.
 for f in policy discover identify netscope; do
-  sed -n '1,/^#\[cfg(test)\]/p' "src/fabric/$f.rs" |
+  awk '/^mod tests/{exit} {print}' "src/fabric/$f.rs" |
     grep -nE 'Ollama|LmStudio|NodeEngine::Camelid|"camelid"|"ollama"|"lmstudio"'
 done
 ```
@@ -69,7 +75,11 @@ ports, the proxy-shape `NotANode` and `receives_fabric_bearer` all live in
 plus a row.
 
 If that ever prints, the seam has leaked and placement has started knowing about engines by name.
-Verified on this branch: production `policy.rs` is lines 1–787 and names no engine.
+
+Verified on this branch, recording the line count each command actually covered
+so that a silently truncated scan cannot read as a clean one: `policy.rs`
+1–1281, `discover.rs` 1–1906, `identify.rs` 1–560, `netscope.rs` 1–573. All
+four print nothing.
 
 ---
 
@@ -402,7 +412,7 @@ binary was built on the second machine and copied, matching sha256 on both
 
 | Claim | How it was shown |
 |---|---|
-| The three kinds are classified correctly | Over a 14-address slice × 4 named ports: `answers_like camelid 0.7.3`, `answers_like ollama 0.33.2`, `other_http` for the unrelated service, `silent_after_connect` for a port that accepts and never writes. The unrelated service is never called an unknown engine. |
+| The three kinds are classified correctly | Over a 14-address slice plus both loopbacks — 16 addresses — × 4 named ports, which is the `planned=64` below: `answers_like camelid 0.7.3`, `answers_like ollama 0.33.2`, `other_http` for the unrelated service, `silent_after_connect` for a port that accepts and never writes. The unrelated service is never called an unknown engine. |
 | A fourth kind, unprompted | A second address on the same slice answered identically and was linked with `possibly_same_as`, with the wording that this build cannot tell whether they are one machine. Neither row was merged or suppressed. |
 | Nothing is claimed that was not reached | `planned=64`, `8 findings + 12 refused + 44 timed out + 0 not_scanned = 64`. The accounting closes exactly. |
 | The default scope touches nothing off-box | Recorder accept counts captured before and after a zero-argument run were byte-identical. The run reported 2 addresses × 3 engine ports, all refused locally. This is accept-level evidence, not an application log. |

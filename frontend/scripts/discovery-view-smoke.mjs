@@ -132,6 +132,26 @@ const FINDINGS = [
     in_fabric: null, possibly_same_as: [], proposal: null,
     not_proposed: 'it asked for a credential on /api/v0/models',
   },
+  {
+    id: 'f6',
+    address: 'fd00::1', port: 11434, addresses: ['fd00::1'], via_name: null,
+    this_machine: false, identity_basis: 'unauthenticated_answer', tls_name_used: null,
+    engines: [{ engine: 'ollama', verdict: 'matched', version: '0.33.2' }],
+    classification: { kind: 'answers_like', engine: 'ollama', version: '0.33.2', withheld_elsewhere: [] },
+    evidence: [{ request: 'GET /api/version', status: 200, content_type: 'application/json', fact: 'a JSON object naming a non-empty version', matched: ['ollama'] }],
+    name: { name: null, source: null, source_trust: null, proof: null, resolved: null, why: 'no reverse DNS record', rejected: null },
+    in_fabric: null, possibly_same_as: [],
+    proposal: {
+      label: 'host-fd00--1-ollama', engine: 'ollama', host: '[fd00::1]', port: 11434,
+      line: 'host-fd00--1-ollama=ollama://[fd00::1]:11434',
+      comment_preview: '# joined by fabric discover <time of writing>: [fd00::1]:11434 answered like ollama 0.33.2',
+      /* Bracketed, and deliberately not `address:port`: a page that composed
+         this itself would send `fd00::1:11434`, which is not an address. */
+      scanned_address: '[fd00::1]:11434',
+      engine_choices: [], host_alternatives: [], warnings: ['cleartext'],
+    },
+    not_proposed: null,
+  },
 ]
 
 const DISCOVERY = {
@@ -473,6 +493,45 @@ try {
     const { page } = await openCluster({ expect: 'old_build' })
     assert.match(await textOf(page, '[data-testid="fabric-discovery"]'), /before discovery existed/)
     check('a build from before discovery is told apart from one with it switched off')
+    await page.close()
+  }
+
+  /* ---- the socket the scan reached is the server's to spell ---- */
+  resetProxy()
+  {
+    const { page, errors } = await openCluster()
+    await scan(page)
+    await page.click('[data-testid="discovery-row"][data-address="fd00::1"] [data-testid="discovery-add"]')
+    await page.waitForSelector('[data-testid="discovery-confirm"]', { timeout: 5000 })
+    await page.click('[data-testid="discovery-confirm-write"]')
+    assert.ok(await until(() => proxy.joins.length === 1), 'the write should have been sent')
+
+    assert.equal(proxy.lastJoin.host, '[fd00::1]')
+    assert.equal(proxy.lastJoin.scanned_address, '[fd00::1]:11434',
+      "the page must send the server's spelling, not one built from address and port")
+    check('an IPv6 machine is joined by the socket the server said it reached')
+    assert.deepEqual(errors, [], 'no page errors')
+    await page.close()
+  }
+
+  /* ---- a write the proxy never reports stops implying progress ---- */
+  resetProxy()
+  {
+    const { page, errors } = await openCluster()
+    await scan(page)
+    await page.click('[data-testid="discovery-row"][data-address="100.64.0.37"] [data-testid="discovery-add"]')
+    await page.waitForSelector('[data-testid="discovery-confirm"]', { timeout: 5000 })
+    await page.click('[data-testid="discovery-confirm-write"]')
+    await page.waitForSelector('[data-testid="discovery-joined-waiting"]', { timeout: 10000 })
+
+    // proxy.labels never changes: the file was written and the process never
+    // picked it up. The row has to say so on its own, because nothing else
+    // will ever arrive to make it.
+    await page.waitForSelector('[data-testid="discovery-joined-unreported"]', { timeout: 25000 })
+    const said = await textOf(page, '[data-testid="discovery-joined-unreported"]')
+    assert.match(said, /has not picked it up/)
+    check('a write the proxy never reports escalates instead of waiting for ever')
+    assert.deepEqual(errors, [], 'no page errors')
     await page.close()
   }
 

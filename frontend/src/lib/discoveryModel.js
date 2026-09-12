@@ -86,7 +86,13 @@ function describeProposal(raw) {
   const label = stringOrNull(raw.label)
   const host = stringOrNull(raw.host)
   const engine = stringOrNull(raw.engine)
-  if (!line || !label || !host || !engine) return null
+  /* Non-empty only when the address matched more than one engine, and then a
+     choice is required rather than defaulted. */
+  const engineChoices = listOf(raw.engine_choices, (entry) => String(entry))
+  /* An unsettled row carries no engine at all — the server does not pick one,
+     and neither does this. It is still a proposal, because the choice is the
+     thing the confirm panel exists to collect. */
+  if (!line || !label || !host || (!engine && engineChoices.length === 0)) return null
   return {
     label,
     engine,
@@ -94,9 +100,11 @@ function describeProposal(raw) {
     port: countOrNull(raw.port),
     line,
     commentPreview: stringOrNull(raw.comment_preview),
-    /* Non-empty only when the address matched more than one engine, and then a
-       choice is required rather than defaulted. */
-    engineChoices: listOf(raw.engine_choices, (entry) => String(entry)),
+    /* Composed by the server, sent back verbatim on a join. The page never
+       spells a socket itself: `::1` and `[::1]` are one machine written two
+       ways, and only one of them is an address. */
+    scannedAddress: stringOrNull(raw.scanned_address),
+    engineChoices,
     hostAlternatives: listOf(raw.host_alternatives, (entry) => ({
       host: stringOrNull(entry?.host),
       label: stringOrNull(entry?.label),
@@ -285,6 +293,7 @@ const PROBLEMS = {
   file_changed: 'The nodes file changed since it was read. Scan again, then add it.',
   no_longer_answers: 'That machine no longer answers like the engine it was going to be added as. Nothing was written.',
   name_reaches_another_address: 'That name now reaches a different machine than the one that was scanned. Nothing was written.',
+  invalid_scanned_address: 'That request did not say, in a form this proxy can read, which machine the scan reached. Nothing was written; scan again.',
   duplicate_endpoint: 'That machine is already in this fabric under another label. Nothing was written.',
   duplicate_label: 'That label is already used in the nodes file.',
   invalid_label: 'That label is not one this build will write into a nodes file.',

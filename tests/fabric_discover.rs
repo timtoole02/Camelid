@@ -58,10 +58,21 @@ fn stub(answers: &'static [(&'static str, u16, &'static str, &'static str)]) -> 
 }
 
 /// Start a stub whose answer for each path is decided by `answer`.
-fn serving(
+fn serving(answer: impl Fn(&str) -> Option<(u16, &'static str, String)> + Send + 'static) -> Stub {
+    serving_at("127.0.0.1:0", answer)
+}
+
+/// The same, bound where the caller says, so the IPv6 paths are exercised
+/// against a real socket rather than only in fixtures.
+fn serving_at(
+    bind: &str,
     answer: impl Fn(&str) -> Option<(u16, &'static str, String)> + Send + 'static,
 ) -> Stub {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    // Loud rather than skipped: a test that quietly does nothing on a machine
+    // without this address is a green result for an unexercised path.
+    let listener = TcpListener::bind(bind).unwrap_or_else(|error| {
+        panic!("could not bind {bind} ({error}), so that path cannot be exercised here")
+    });
     let port = listener.local_addr().expect("stub addr").port();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -165,14 +176,60 @@ fn keyed_camelid_stub() -> Stub {
     serving(|path| {
         Some(match path {
             "/v1/health" => (200, "application/json", CAMELID_HEALTH.to_string()),
-            _ => (401, "application/json", r#"{"error":"unauthorized"}"#.to_string()),
+            _ => (
+                401,
+                "application/json",
+                r#"{"error":"unauthorized"}"#.to_string(),
+            ),
         })
     })
 }
 
 fn ollama_stub() -> Stub {
     stub(&[
-        ("/api/version", 200, "application/json", r#"{"version":"0.33.2"}"#),
+        (
+            "/api/version",
+            200,
+            "application/json",
+            r#"{"version":"0.33.2"}"#,
+        ),
+        (
+            "/api/tags",
+            200,
+            "application/json",
+            r#"{"models":[{"name":"llama3.2:latest"}]}"#,
+        ),
+    ])
+}
+
+/// An Ollama on the IPv6 loopback.
+fn ollama_stub_on_v6() -> Stub {
+    serving_at("[::1]:0", |path| match path {
+        "/api/version" => Some((
+            200,
+            "application/json",
+            r#"{"version":"0.33.2"}"#.to_string(),
+        )),
+        "/api/tags" => Some((
+            200,
+            "application/json",
+            r#"{"models":[{"name":"llama3.2:latest"}]}"#.to_string(),
+        )),
+        _ => None,
+    })
+}
+
+/// One address answering both signatures at once — a Camelid behind a reverse
+/// proxy that also fronts an Ollama.
+fn two_engine_stub() -> Stub {
+    stub(&[
+        ("/v1/health", 200, "application/json", CAMELID_HEALTH),
+        (
+            "/api/version",
+            200,
+            "application/json",
+            r#"{"version":"0.33.2"}"#,
+        ),
         (
             "/api/tags",
             200,
@@ -183,7 +240,13 @@ fn ollama_stub() -> Stub {
 }
 
 fn html_stub() -> Stub {
-    serving(|_| Some((200, "text/html", "<!doctype html><title>files</title>".to_string())))
+    serving(|_| {
+        Some((
+            200,
+            "text/html",
+            "<!doctype html><title>files</title>".to_string(),
+        ))
+    })
 }
 
 fn proxy_stub() -> Stub {
@@ -261,7 +324,10 @@ async fn request(
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let mut head = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
-    if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
         head.push_str(&format!("Host: {addr}\r\n"));
     }
     for (name, value) in headers {
@@ -365,7 +431,12 @@ async fn a_scan_classifies_camelid_ollama_and_an_unrelated_service() {
             .expect("findings")
             .iter()
             .find(|finding| finding["port"] == port)
-            .map(|finding| finding["classification"]["kind"].as_str().unwrap_or("").to_string())
+            .map(|finding| {
+                finding["classification"]["kind"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
             .unwrap_or_else(|| "<no finding>".to_string())
     };
     let finding_on = |port: u16| -> Value {
@@ -379,9 +450,15 @@ async fn a_scan_classifies_camelid_ollama_and_an_unrelated_service() {
     };
 
     assert_eq!(kind_on(camelid.port), "answers_like");
-    assert_eq!(finding_on(camelid.port)["classification"]["engine"], "camelid");
+    assert_eq!(
+        finding_on(camelid.port)["classification"]["engine"],
+        "camelid"
+    );
     assert_eq!(kind_on(ollama.port), "answers_like");
-    assert_eq!(finding_on(ollama.port)["classification"]["engine"], "ollama");
+    assert_eq!(
+        finding_on(ollama.port)["classification"]["engine"],
+        "ollama"
+    );
     assert_eq!(
         finding_on(ollama.port)["classification"]["version"],
         "0.33.2"
@@ -530,7 +607,9 @@ async fn no_host_receives_a_credential_it_was_not_declared_to_receive() {
         );
     }
     assert!(
-        ollama.bytes().contains("User-Agent: camelid-fabric-discover/"),
+        ollama
+            .bytes()
+            .contains("User-Agent: camelid-fabric-discover/"),
         "a discovery probe must say what it is:\n{}",
         ollama.bytes()
     );
@@ -581,13 +660,21 @@ async fn a_joined_camelid_node_receives_the_fabric_bearer_as_the_warning_says() 
         "base_sha256": hash_of(&nodes),
     })
     .to_string();
-    let (status, body) = request(addr, "POST", "/v1/fabric/discover/join", &[JSON], Some(&join)).await;
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&join),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
 
     tokio::time::sleep(RELOAD * 4).await;
     let (_, _) = request(addr, "GET", "/v1/health", &[], None).await;
     assert!(
-        node.bytes().contains(&format!("Authorization: Bearer {BEARER}")),
+        node.bytes()
+            .contains(&format!("Authorization: Bearer {BEARER}")),
         "the warning said this node would be sent the bearer, and it was not:\n{}",
         node.bytes()
     );
@@ -678,14 +765,22 @@ async fn discovery_is_off_unless_asked_for() {
 
     for (method, path, body) in [
         ("GET", "/v1/fabric/discover", None),
-        ("POST", "/v1/fabric/discover", Some(scope_over(&[ollama.port]))),
+        (
+            "POST",
+            "/v1/fabric/discover",
+            Some(scope_over(&[ollama.port])),
+        ),
         ("POST", "/v1/fabric/discover/join", Some("{}".to_string())),
     ] {
         let (status, answer) = request(addr, method, path, &[JSON], body.as_deref()).await;
         assert_eq!(status, 404, "{method} {path}: {answer}");
         assert_eq!(answer["error"]["code"], "discovery_disabled", "{answer}");
     }
-    assert_eq!(ollama.bytes(), "", "a disabled proxy connected to something");
+    assert_eq!(
+        ollama.bytes(),
+        "",
+        "a disabled proxy connected to something"
+    );
 
     // The health body keeps exactly the keys it had, and the fallback 404 keeps
     // its codeless shape — which is how a page tells this build from an older
@@ -693,11 +788,26 @@ async fn discovery_is_off_unless_asked_for() {
     // the seeded node is a closed port, so this fabric has nothing ready and
     // answers 503, which is correct and not what this test is about.
     let (_, health) = request(addr, "GET", "/v1/health", &[], None).await;
-    let mut keys: Vec<&str> = health.as_object().expect("object").keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = health
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["build", "models", "node_detail", "nodes", "ok", "placement", "ready", "service", "version"],
+        [
+            "build",
+            "models",
+            "node_detail",
+            "nodes",
+            "ok",
+            "placement",
+            "ready",
+            "service",
+            "version"
+        ],
         "the health body gained or lost a key: {health}"
     );
 
@@ -718,11 +828,7 @@ async fn discovery_is_off_unless_asked_for() {
 /// Drive the real router with the peer address chosen, which a socket cannot
 /// do: a test that connected over loopback would always look like a local
 /// caller, so the guard that matters most could never be exercised.
-async fn as_peer(
-    nodes: &Path,
-    peer: SocketAddr,
-    ports: &[u16],
-) -> (u16, Value) {
+async fn as_peer(nodes: &Path, peer: SocketAddr, ports: &[u16]) -> (u16, Value) {
     use tower::ServiceExt;
 
     let fabric = Fabric::from_node_file(nodes.to_path_buf())
@@ -757,7 +863,10 @@ async fn as_peer(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("collect body");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// A proxy that scanned on anyone's request would be a way into the network
@@ -777,7 +886,11 @@ async fn a_remote_peer_cannot_trigger_a_scan() {
     .await;
     assert_eq!(status, 403, "{body}");
     assert_eq!(body["error"]["code"], "discovery_loopback_only");
-    assert_eq!(ollama.bytes(), "", "a remote caller reached a machine on this network");
+    assert_eq!(
+        ollama.bytes(),
+        "",
+        "a remote caller reached a machine on this network"
+    );
 }
 
 /// On a dual-stack `[::]` bind a real IPv4 loopback client arrives as
@@ -792,7 +905,10 @@ async fn a_mapped_ipv4_loopback_peer_is_loopback() {
 
     let mapped: SocketAddr = "[::ffff:127.0.0.1]:5555".parse().expect("mapped loopback");
     let (status, body) = as_peer(&nodes, mapped, &[ollama.port]).await;
-    assert_eq!(status, 200, "a mapped IPv4 loopback caller is a local caller: {body}");
+    assert_eq!(
+        status, 200,
+        "a mapped IPv4 loopback caller is a local caller: {body}"
+    );
 }
 
 #[tokio::test]
@@ -982,9 +1098,19 @@ async fn a_join_through_the_proxy_appears_in_its_own_health() {
         "port": ollama.port, "base_sha256": hash_of(&nodes),
     })
     .to_string();
-    let (status, body) = request(addr, "POST", "/v1/fabric/discover/join", &[JSON], Some(&join)).await;
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&join),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
-    assert!(body["appended"].as_str().expect("appended").contains("found-ollama="));
+    assert!(body["appended"]
+        .as_str()
+        .expect("appended")
+        .contains("found-ollama="));
 
     tokio::time::sleep(RELOAD * 4).await;
     let (_, health) = request(addr, "GET", "/v1/health", &[], None).await;
@@ -1019,7 +1145,14 @@ async fn a_join_refuses_an_engine_the_host_no_longer_answers_like() {
         "port": html.port, "base_sha256": before,
     })
     .to_string();
-    let (status, body) = request(addr, "POST", "/v1/fabric/discover/join", &[JSON], Some(&join)).await;
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&join),
+    )
+    .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"]["code"], "no_longer_answers");
     assert_eq!(hash_of(&nodes), before);
@@ -1055,7 +1188,14 @@ async fn a_join_refuses_a_name_that_reaches_another_address() {
         "scanned_address": format!("127.0.0.1:{closed}"),
     })
     .to_string();
-    let (status, body) = request(addr, "POST", "/v1/fabric/discover/join", &[JSON], Some(&join)).await;
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&join),
+    )
+    .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"]["code"], "name_reaches_another_address");
     assert!(
@@ -1111,7 +1251,10 @@ async fn two_concurrent_joins_never_lose_a_line() {
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .count();
-    assert_eq!(node_lines, 2, "the file gained more or fewer than one node:\n{text}");
+    assert_eq!(
+        node_lines, 2,
+        "the file gained more or fewer than one node:\n{text}"
+    );
 }
 
 // ---- the command line -------------------------------------------------------
@@ -1136,10 +1279,20 @@ fn the_cli_never_reads_camelid_api_key_for_discovery() {
         .output()
         .expect("run discover");
 
-    assert!(output.status.success(), "{:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let seen = ollama.bytes();
-    assert!(!seen.contains("env-secret-91"), "the key reached a scanned host:\n{seen}");
-    assert!(!seen.to_ascii_lowercase().contains("authorization"), "{seen}");
+    assert!(
+        !seen.contains("env-secret-91"),
+        "the key reached a scanned host:\n{seen}"
+    );
+    assert!(
+        !seen.to_ascii_lowercase().contains("authorization"),
+        "{seen}"
+    );
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(printed.contains("answers_like"), "{printed}");
     assert!(printed.contains("ollama 0.33.2"), "{printed}");
@@ -1173,9 +1326,16 @@ fn a_non_tty_run_never_writes_without_join() {
 
     assert!(output.status.success());
     let printed = String::from_utf8_lossy(&output.stdout);
-    assert!(printed.contains("--join"), "it must print the command instead:\n{printed}");
+    assert!(
+        printed.contains("--join"),
+        "it must print the command instead:\n{printed}"
+    );
     assert!(printed.contains("Nothing has been added"), "{printed}");
-    assert_eq!(hash_of(&nodes), before, "a piped run wrote to the nodes file");
+    assert_eq!(
+        hash_of(&nodes),
+        before,
+        "a piped run wrote to the nodes file"
+    );
 }
 
 /// A proxy asked to discover with nowhere legitimate to write is refused at
@@ -1270,4 +1430,137 @@ async fn the_route_and_the_cli_print_the_same_discovery() {
     assert_eq!(from_route["scope"]["ports"], from_cli["scope"]["ports"]);
     assert_eq!(from_route["credentials_presented"], "none");
     assert_eq!(from_cli["credentials_presented"], "none");
+}
+
+/// The server spells the socket it reached, and both front doors send that
+/// spelling back untouched.
+///
+/// Composed from a finding's address and port it reads `::1:PORT`, which is
+/// not an address at all — so every IPv6 machine was refused, with a message
+/// saying its name reached somewhere else. It never did.
+#[tokio::test]
+async fn a_join_over_ipv6_loopback_is_not_refused_as_another_address() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ollama = ollama_stub_on_v6();
+    let closed = closed_port();
+    let nodes = nodes_file(&dir, &format!("local=camelid://127.0.0.1:{closed}\n"));
+    let addr = start_proxy(
+        &nodes,
+        ClientAuth::none(),
+        None,
+        Some(discovery_config(&nodes, false, &[])),
+        None,
+    )
+    .await;
+    let before = hash_of(&nodes);
+
+    let scope = serde_json::json!({
+        "hosts": ["::1"],
+        "ports": [ollama.port],
+        "loopback": false,
+        "default_ports": false,
+    })
+    .to_string();
+    let (status, body) = request(addr, "POST", "/v1/fabric/discover", &[JSON], Some(&scope)).await;
+    assert_eq!(status, 200, "{body}");
+    let proposal = body["findings"][0]["proposal"].clone();
+    assert_eq!(
+        proposal["host"], "[::1]",
+        "an IPv6 host is written in the form the file takes: {body}"
+    );
+    assert_eq!(
+        proposal["scanned_address"],
+        format!("[::1]:{}", ollama.port),
+        "the server spells the socket so that no front door has to"
+    );
+
+    // The hand-composed spelling is refused outright, rather than quietly
+    // skipping the check that notices a name now leading somewhere else.
+    let composed = serde_json::json!({
+        "label": "v6-ollama",
+        "engine": "ollama",
+        "host": proposal["host"],
+        "port": ollama.port,
+        "base_sha256": before,
+        "scanned_address": format!("::1:{}", ollama.port),
+    })
+    .to_string();
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&composed),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_scanned_address");
+    assert_eq!(hash_of(&nodes), before, "a refused join changed the file");
+
+    // ...and the server's own spelling joins, which is the whole point.
+    let join = serde_json::json!({
+        "label": proposal["label"],
+        "engine": "ollama",
+        "host": proposal["host"],
+        "port": ollama.port,
+        "base_sha256": before,
+        "scanned_address": proposal["scanned_address"],
+    })
+    .to_string();
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/v1/fabric/discover/join",
+        &[JSON],
+        Some(&join),
+    )
+    .await;
+    assert_eq!(status, 200, "an IPv6 machine must be joinable: {body}");
+    assert_eq!(body["answered_from"], format!("[::1]:{}", ollama.port));
+    assert_ne!(hash_of(&nodes), before, "the node was not written");
+}
+
+/// A row that matched two engines is never resolved to the first — not even in
+/// the line the terminal prints, and not by pressing y.
+///
+/// The engine is what decides whether this fabric shows the machine its
+/// bearer, so a concrete line here is a credential decision taken about a
+/// machine whose identity was never settled.
+#[tokio::test]
+async fn the_cli_never_resolves_an_ambiguous_row_to_the_first_engine() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let both = two_engine_stub();
+    let closed = closed_port();
+    let nodes = nodes_file(&dir, &format!("local=camelid://127.0.0.1:{closed}\n"));
+    let before = hash_of(&nodes);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_camelid"))
+        .args([
+            "fabric",
+            "discover",
+            "--no-loopback",
+            "--no-default-ports",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &both.port.to_string(),
+            "--nodes-file",
+            nodes.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run discover");
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(printed.contains("ambiguous"), "{printed}");
+    assert!(
+        printed.contains("will not choose between them"),
+        "{printed}"
+    );
+    assert!(printed.contains("camelid"), "{printed}");
+    assert!(printed.contains("ollama"), "{printed}");
+    // The placeholder, never a scheme somebody could paste without choosing.
+    assert!(printed.contains("<engine>"), "{printed}");
+    assert!(printed.contains("if it is camelid:"), "{printed}");
+    assert!(printed.contains("if it is ollama:"), "{printed}");
+    assert_eq!(hash_of(&nodes), before, "looking wrote something");
 }
