@@ -131,20 +131,28 @@ All of the following is on this PR branch and green. Commits, newest first:
 | **P3** LM Studio + capabilities | done | LM Studio read via `/api/v0/models` only; **no version endpoint exists**, so its version is unknown, not guessed; capability matrix with `measured` / `declared` / `not_probed` provenance, keyed on the exact version string. |
 | **P6** Divergence view | done | `fabric compare`, `POST /v1/fabric/compare`, GUI Screen D. Runs each side N times, withholds a verdict unless both sides are self-consistent, suppresses the diff when nothing can be attributed, never names a winner. |
 | **O6** Model identity | done | `alias CANONICAL=LABEL:LOCAL` in the nodes file. Ollama suffixes `:latest`, LM Studio does not, neither publishes a comparable digest — so a human declares it and it is recorded as `asserted_by_operator`. |
-| **P5** Mixed routing | **core only** | Eligibility, ranking, tools and affinity guards + CLI flag + 9 tests. **Screen E and a live mixed receipt are NOT done.** |
-| **P4** Discovery | **not started** | |
+| **P5** Mixed routing | done, one receipt owed | `fabric serve --allow-mixed-engines` (startup flag only: nothing could authenticate a runtime switch), residency- and alias-aware matching with a stated cold-load price, typed backpressure trusted only from an engine that declares it, requirements read at the dispatch chokepoint under the amended I12, and a Routing section rendering only proxy-supplied strings. Adversarially reviewed; 8 findings fixed, 1 rejected with a reason. **The relay-don't-re-place receipt is still against a stand-in engine — see "What is NOT claimed" 2.** |
+| **P4** Discovery | **not delivered** | Stopped mid-implementation. What exists is preserved on the branch `wip/pr756-p4-partial`: `discover.rs`, the proxy routes, the CLI, a discovery panel and smokes — **ungated, unreviewed, no ablations, no LAN receipt**. Treat it as a starting point against the reviewed P4 spec, not as working code. |
 | **P7** Background lifetime | **code done; live receipts owed** | Closing the window quits by default again. That reverts a v0.7.0 regression: the hidden Spotlight window kept 0.7.x alive after a close (live receipt on 0.7.3 in the desktop README). The tray's opt-in "Keep engine running when window closes" hides the window and keeps the engine. Status is observed, never assumed. A starting sidecar is reapable, and `serve --exit-when-stdin-closes` is the macOS crash backstop. **The macOS GUI receipt for the new build and the real-engine Windows receipt are not taken yet, and the Windows code has not yet compiled or run on a runner.** |
 
 ### What is NOT claimed
 
 Stated here so nobody has to discover it by reading code:
 
-1. **The §4 template divergence is not reproduced.** The original measurement (Camelid answers `12`
-   where llama.cpp/Ollama/LM Studio answer `7`) used one pinned GGUF on every arm. The live receipt
-   here has weights that are only *asserted* equivalent; both engines answered `12`, and the
-   difference was in surrounding prose. **Reproducing it requires the same GGUF file loaded into
-   both engines** — see §6, task R1.
-2. **Mixed routing has no live receipt.** The policy is proven offline only.
+1. **The template divergence IS reproduced, and it is an engine defect, not a fabric one.**
+   `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `432f310a…`) loaded from the same file into Camelid and
+   into llama.cpp b8680; prompt "Say hi.", temperature 0, seed 42. Camelid answers `Hi!`
+   (sha `ca51ce1f…`); llama.cpp `--jinja` answers `Hi. How can I assist you today?` (`d7b96b56…`),
+   as does Ollama 0.33.2; llama.cpp `--no-jinja` renders exactly what Camelid renders and answers
+   `Hi!`. So Camelid drops the system block its own GGUF template emits unconditionally. Tracked
+   separately from this lane. **Caveat:** Ollama re-serialises a GGUF on `ollama create` (blob
+   `a2fa82e5…` ≠ the file's `432f310a…`), so the Ollama arm is not byte-identical weights; the
+   llama.cpp arms are, and they carry the conclusion.
+2. **The relay-don't-re-place receipt is still against a stand-in engine.** Three attempts to make a
+   real Ollama refuse (queue capped at 1, occupied by long generations) failed to saturate it: a 1B
+   model on this hardware finishes faster than the queue can be filled, so every burst arrived at an
+   idle node and returned 200. The offline guards and the stand-in receipt stand; real-engine
+   evidence needs a model slow enough to hold the queue.
 3. **LM Studio's per-model `capabilities: ["tool_use"]` field is deliberately unused.** It appears
    in the real API response but not in the docs, and it is a vendor declaration about a model, not a
    measurement of the engine. Wiring it in would violate I5.
@@ -188,27 +196,47 @@ Passing tests are not the bar. The bar is **a test that would have failed if the
 
 ### 5.1 Gates — all must be green before any push
 
+Measured on the merged head (P0–P3, P6, O6, the review fixes, the compare-honesty pass, P5 and P7),
+on an M4 Mac with Homebrew rustc 1.94.1:
+
 ```bash
 cargo fmt --all -- --check                       # 0
-cargo clippy --all-targets -- -D warnings        # 0
-cargo test --lib fabric::                        # 322 passed, 0 failed
-cargo test --test fabric_serve                   # 74
-cargo test --test fabric_end_to_end              # 17
-cargo test --test fabric_engines                 # 15
-cargo test --bin camelid                         # 67 (includes serve_optional_desktop_flags_default_off)
-cargo test --test serve_stdin_close              # 2
+cargo clippy --all-targets -- -D warnings        # 0, except one pre-existing
+                                                 # clippy::unnecessary_cast at src/metal.rs:69514 that
+                                                 # fires only under 1.94.1; CI pins 1.95.0
 cargo clippy -p camelid-desktop --all-targets -- -D warnings   # 0
+cargo test --all-targets --no-fail-fast          # 71 suites, 0 failed. The notable ones:
+                                                 #   lib                  2704
+                                                 #   api_vertical_slice    101
+                                                 #   fabric_serve           94
+                                                 #   --bin camelid          70
+                                                 #   fabric_engines         39
+                                                 #   fabric_end_to_end      18
 cargo test -p camelid-desktop --all-targets      # macOS: 48 unit + 10 installer_hooks + 14 lifetime_guards
-                                                 # Windows: NOT YET RUN on any runner; expected
-                                                 # 51 unit (+ verbatim-path x2, job object) + 10 + 14
+                                                 # Windows: NOT YET RUN on any runner
 
 cd frontend
-npm run build
-npm run smoke:fabric-model                       # 27 checks
-npm run smoke:fabric-view                        # 26 checks
-npm run smoke:divergence-model                   # 18 checks
-npm run smoke:divergence-view                    # 18 checks
+npm run build                                    # clean
+npm run smoke:fabric-model                       # 38 checks
+npm run smoke:fabric-view                        # 44 checks
+npm run smoke:divergence-model                   # 44 checks
+npm run smoke:divergence-view                    # 40 checks
+# and every other smoke the CI `frontend` job runs, all passing.
 ```
+
+Two traps this table has already sprung, both worth repeating:
+
+- `cargo test --lib fabric::` used to be the headline number here. Run the **whole** suite: a narrow
+  filter passed against a stale build while the binary could not compile (§7.5).
+- The browser smokes need a page server. CI starts `npm run preview` first; without it
+  `smoke:workspace-visual` dies with `ERR_CONNECTION_REFUSED` **and `npm run` still exits 0**. A
+  smoke whose output is only a Node version banner did not run.
+
+`fabric::http::tests::{an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http,
+bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated}` pass here but fail intermittently on
+a dual-stack host with `Connect("[::1]:…: Connection refused")`. That is the pre-existing error-masking
+defect (a dead sibling address overwrites the real diagnosis); it is unrelated to this lane and unfixed
+on `main`.
 
 **A count that goes down is a regression even if everything passes.** Record the new counts when you
 add tests.
