@@ -56,8 +56,17 @@ This feature is successful when **all** of the following hold. They are delibera
 ```bash
 # Production code only. The test module below `#[cfg(test)]` legitimately names
 # engines to build fixtures, so scanning the whole file gives a false alarm.
-sed -n '1,/^#\[cfg(test)\]/p' src/fabric/policy.rs | grep -nE 'Ollama|LmStudio'
+for f in policy discover identify netscope; do
+  sed -n '1,/^#\[cfg(test)\]/p' "src/fabric/$f.rs" |
+    grep -nE 'Ollama|LmStudio|NodeEngine::Camelid|"camelid"|"ollama"|"lmstudio"'
+done
 ```
+
+P4 extended this to the three discovery modules. They iterate `NodeEngine::ALL`
+and never name a member: the identification paths, the signatures, the default
+ports, the proxy-shape `NotANode` and `receives_fabric_bearer` all live in
+`engine.rs` and the per-engine modules, so a fourth engine is still a new file
+plus a row.
 
 If that ever prints, the seam has leaked and placement has started knowing about engines by name.
 Verified on this branch: production `policy.rs` is lines 1–787 and names no engine.
@@ -126,7 +135,7 @@ All of the following is on this PR branch and green. Commits, newest first:
 | **P6** Divergence view | done | `fabric compare`, `POST /v1/fabric/compare`, GUI Screen D. Runs each side N times, withholds a verdict unless both sides are self-consistent, suppresses the diff when nothing can be attributed, never names a winner. |
 | **O6** Model identity | done | `alias CANONICAL=LABEL:LOCAL` in the nodes file. Ollama suffixes `:latest`, LM Studio does not, neither publishes a comparable digest — so a human declares it and it is recorded as `asserted_by_operator`. |
 | **P5** Mixed routing | **core only** | Eligibility, ranking, tools and affinity guards + CLI flag + 9 tests. **Screen E and a live mixed receipt are NOT done.** |
-| **P4** Discovery | **not started** | |
+| **P4** Discovery | done | `fabric discover` plus three proxy routes and a "Find machines" panel, sharing one implementation. Loopback-only by default; a LAN needs an explicit range and the same cleartext acknowledgement a node needs. Nothing is ever added without a person confirming it. |
 | **P7** Background lifetime | **not started** | |
 
 ### What is NOT claimed
@@ -144,6 +153,23 @@ Stated here so nobody has to discover it by reading code:
    measurement of the engine. Wiring it in would violate I5.
 4. **One ablation (D5) is unguarded offline** and is declared so by the harness rather than counted.
    It is closed by a live receipt instead.
+5. **An unauthenticated answer can be imitated.** "Answers like camelid" means one address produced
+   this engine's health signature, nothing more. Anything on the network can produce that signature,
+   and a NanoCamelid on this very LAN implements the same contract. The human confirm, the
+   server-computed bearer warning and `identity_basis` on every finding all bound the consequences;
+   none of them eliminates it. `--node-tls-ca` is the authenticated route, and under it a match
+   records `certificate_verified`.
+6. **Discovery's Windows paths have no live receipt.** Interface enumeration and reverse DNS are
+   implemented for unix only: `local_interfaces` and `reverse_lookup` are `cfg(unix)`, and elsewhere
+   they answer "not available on this platform", which surfaces as an unknown rather than a guess.
+   The suggestion then falls back to a routed-address probe labelled `assumed_24`. The spec called
+   for `GetAdaptersAddresses` and `ws2_32` bindings; those are not written, so no Windows-only FFI
+   ships untested rather than shipping unverified.
+7. **LM Studio's signature is proven offline only.** No LM Studio instance was reached in any live
+   run, so its identification is exercised by fixtures taken from its documented API and by a stub.
+8. **"Possibly the same machine" is never a claim.** Rows that answer identically across addresses
+   are linked with `possibly_same_as` and the wording says this build cannot tell whether they are
+   one machine. Nothing de-duplicates them, and nothing suppresses either row.
 
 ---
 
@@ -156,19 +182,33 @@ Passing tests are not the bar. The bar is **a test that would have failed if the
 ```bash
 cargo fmt --all -- --check                       # 0
 cargo clippy --all-targets -- -D warnings        # 0
-cargo test --lib fabric::                        # 322 passed, 0 failed
-cargo test --test fabric_serve                   # 74
-cargo test --test fabric_end_to_end              # 17
-cargo test --test fabric_engines                 # 15
-cargo test --bin camelid                         # 61
+cargo test --lib fabric::                        # 458 passed, 2 failed (see below)
+cargo test --test fabric_discover                # 19
+cargo test --test fabric_serve                   # 94
+cargo test --test fabric_end_to_end              # 18
+cargo test --test fabric_engines                 # 39
+cargo test --bin camelid                         # 71
 
 cd frontend
 npm run build
-npm run smoke:fabric-model                       # 27 checks
-npm run smoke:fabric-view                        # 26 checks
-npm run smoke:divergence-model                   # 18 checks
-npm run smoke:divergence-view                    # 18 checks
+npm run smoke:fabric-model                       # 38 checks
+npm run smoke:fabric-view                        # 44 checks
+npm run smoke:divergence-model                   # 44 checks
+npm run smoke:divergence-view                    # 40 checks
+npm run smoke:discovery-model                    # 22 checks
+npm run smoke:discovery-view                     # 14 checks
 ```
+
+**Two `fabric::http` TLS tests fail on the M4 node and are not P4's.**
+`an_untrusted_ca_and_a_wrong_server_name_are_refused_before_http` and
+`bearer_bytes_are_not_sent_before_the_tls_peer_is_authenticated` both reach a
+stub through the name `localhost`, which resolves dual-stack. `connect_tls_any`
+keeps the *last* failure, so a dead `::1` sibling overwrites the certificate
+error the test asserts on, and it reads as `Connect` rather than `Tls`. It is
+unfixed on main and P4 touched none of that path. Everything else above is
+green; `cargo clippy --all-targets -- -D warnings` is clean apart from one
+pre-existing `unnecessary_cast` at `src/metal.rs:69514`, which appears under
+Homebrew rustc 1.94.1 and not under the 1.95.0 CI pins.
 
 **A count that goes down is a regression even if everything passes.** Record the new counts when you
 add tests.
@@ -253,6 +293,55 @@ failed, every file was restored and verified by SHA-256 (9 files, all pristine a
 | R2 | `engine_and_version` says "version not published" for every node without a version | `a_node_that_was_not_reached_has_an_unknown_version_not_an_unpublished_one`, `health_calls_an_unreached_nodes_version_unknown_never_unpublished` |
 | R3 | the unplaced holders are not filtered by what the request needs | `a_holder_the_flag_would_still_refuse_is_never_offered_the_flag` |
 
+P4 discovery. Twenty rows were run on the M4 node, one edit each unless noted,
+every file restored and verified by SHA-256, with a preflight before each row
+confirming the tree was pristine. A row counts as caught only when **that named
+check** failed and the log carried `test result:`, so a gate that silently did
+not run cannot pass for a guard:
+
+| # | Sabotage | Caught by |
+|---|---|---|
+| X1 | the default scope also covers a LAN /24 | `the_default_scope_is_loopback_only` |
+| X2 | remove the private-range allowlist | `a_public_range_is_refused_before_any_socket` |
+| X3 | accept an oversized range instead of refusing it | `a_range_over_the_address_limit_is_refused_not_truncated` |
+| X4 | `plan()` skips the node-transport preflight | `cleartext_to_the_lan_is_refused_without_the_acknowledgement` |
+| X5 | the scan presents the fabric bearer to whatever answered | `no_host_receives_a_credential_it_was_not_declared_to_receive` |
+| X6 | the CLI reads `CAMELID_API_KEY` and sends it | `the_cli_never_reads_camelid_api_key_for_discovery` |
+| X10 | give an unmatched HTTP service an engine proposal | `an_html_page_is_other_http_with_no_proposal` |
+| X13 | skip the `base_sha256` comparison | `a_file_changed_since_the_scan_is_refused_and_untouched` |
+| X14 | re-serialize the file from parsed specs | `joining_appends_and_leaves_every_existing_byte_alone` |
+| X18 | remove the loopback-peer guard | `a_remote_peer_cannot_trigger_a_scan` |
+| X19 | remove the Host-header guard | `a_rebound_host_header_is_refused` |
+| X20 | remove the Origin guard and rely on CORS | `an_origin_not_on_the_cors_list_cannot_trigger_a_scan_or_a_join` |
+| X21 | the join trusts the client's classification | `a_join_refuses_an_engine_the_host_no_longer_answers_like` |
+| X22 | a disabled proxy stops being tellable from an old build | `discovery_is_off_unless_asked_for` |
+| X34 | remove the duplicate-endpoint check | `a_second_label_for_an_existing_endpoint_is_refused` |
+| X39 | the join's re-identification presents the bearer | `no_host_receives_a_credential_it_was_not_declared_to_receive` |
+| X46 | remove the `answered_from` check at join | `a_join_refuses_a_name_that_reaches_another_address` |
+| X50 | a non-TTY run prompts and defaults to yes (two edits: the TTY gate and the default) | `a_non_tty_run_never_writes_without_join` |
+
+**X30 is the interesting one, and it is reported as it happened.** Removing
+only the post-append spec-list check — the sabotage as specified — did *not*
+fail its named test: those fixtures are refused earlier, by the comment
+sanitiser. Rather than record a guard that is not doing the work, two further
+rows establish what each layer is worth:
+
+| # | Sabotage | Result |
+|---|---|---|
+| X30a | remove the comment sanitiser, keep the post-append check | test still passes — the backstop alone refuses it |
+| X30b | remove both | `an_append_that_would_add_anything_but_the_requested_node_is_refused` fails |
+
+So the nodes file has two independent layers in front of it and either one is
+sufficient. That is a stronger result than the single row would have given, and
+it is the reason the single row looked unguarded.
+
+**X12 has no offline guard and is not claimed to have one.** The rule is that a
+reverse-DNS name is listed only after a forward lookup confirms it. Proving it
+offline needs an injectable resolver, which this build does not have:
+`prove_name` calls `netscope::forward_lookup` directly. It is closed by the
+live receipt instead, and the seam is worth adding before anyone relies on the
+rule in a unit test.
+
 **Any new guard in P4/P5/P7 needs the same treatment.**
 
 ### 5.3 Receipts — against real software, not stubs
@@ -299,14 +388,38 @@ be relayed once, not retried on a sibling, because it cannot be distinguished fr
 **Exit:** ablation proves each guard fires; live receipt on two real backends; a tool-calling request
 demonstrably never lands on an unmeasured backend.
 
-### R3 — P4 discovery
+### R3 — P4 discovery *(done — receipt below)*
 
-**Do:** `fabric discover` plus GUI Screen B sharing one implementation. Confirm-before-join
-throughout (I8).
+`fabric discover` and GUI Screen B share one implementation and one serialized `Discovery` value,
+so the terminal and the browser cannot describe different networks. Confirm-before-join throughout.
 
-**Exit:** scanning a LAN containing a Camelid node, an Ollama node and an unrelated HTTP service
-classifies all three correctly; nothing joins without a click; the nodes file is the only thing
-written; listed names are proven resolvable from the scanning host.
+**Live receipt.** Run between two M4 machines on a lab LAN. Every target sat behind an ~80-line
+stdlib Python recorder that logs each `accept()` and every client-to-server byte, because the claim
+being tested is about what is *not* on the wire and neither Ollama nor `http.server` records request
+headers. The engines stayed bound to loopback; the recorder is what the scanner talked to. The
+binary was built on the second machine and copied, matching sha256 on both
+(`fa139257bb86934e…`); nothing was built on the machine the scan ran from.
+
+| Claim | How it was shown |
+|---|---|
+| The three kinds are classified correctly | Over a 14-address slice × 4 named ports: `answers_like camelid 0.7.3`, `answers_like ollama 0.33.2`, `other_http` for the unrelated service, `silent_after_connect` for a port that accepts and never writes. The unrelated service is never called an unknown engine. |
+| A fourth kind, unprompted | A second address on the same slice answered identically and was linked with `possibly_same_as`, with the wording that this build cannot tell whether they are one machine. Neither row was merged or suppressed. |
+| Nothing is claimed that was not reached | `planned=64`, `8 findings + 12 refused + 44 timed out + 0 not_scanned = 64`. The accounting closes exactly. |
+| The default scope touches nothing off-box | Recorder accept counts captured before and after a zero-argument run were byte-identical. The run reported 2 addresses × 3 engine ports, all refused locally. This is accept-level evidence, not an application log. |
+| A LAN needs the acknowledgement | `--cidr <lab range>` without it: exit 2, naming both `--allow-cleartext-node-transport` and `--node-tls-ca`, before any packet. |
+| Public ranges are refused outright | `--cidr 8.8.8.0/24` *with* the acknowledgement: exit 2, listing the ranges this build will scan. |
+| No credential reaches a scanned host | `CAMELID_API_KEY` was set to a marker for every scan. Across all four recorders: marker `0`, `authorization` `0`, and — the positive evidence that the scan actually arrived — `User-Agent: camelid-fabric-discover/` `16`. An earlier run of this same check read "clean" only because the scan had not run; the UA column is what caught it. |
+| The bearer warning is true in both directions | One probe round over a fabric holding both engines: the Camelid node's recorder shows the marker and an `Authorization` header (`bearer_will_be_sent`); the Ollama node's shows neither. |
+| Looking adds nothing | The nodes file's sha256 was identical before and after two full scans. |
+| The nodes file is the only thing written | A join left the first 44 bytes byte-identical and appended exactly a comment line and a node line; the directory listing was unchanged, so no temp, lock or backup file survived. `fabric status` then probed the joined node `ready`, so the loader accepts what discovery wrote. |
+| Refusals leave the file alone | `duplicate_endpoint` (naming the existing label and pointing at hand-editing), `no_longer_answers` (the HTTP service claimed as an engine), `invalid_label` (`#x`), `invalid_host` (a host with a space). |
+| Listed names are proven from the scanning host | The one reverse-DNS name found was forward-resolved from the scanning machine and the answering address was in the set (membership, not order). Its proposal still used the **address** as the host, with the name offered only as an alternative carrying the "your router chose this" warning. |
+| It agrees with itself | Two consecutive scans produced identical classifications for every address and port. |
+
+**Not established, and not claimed.** No LM Studio instance was reached, so that signature is
+offline-only. The GUI was exercised by its browser smoke against a scripted proxy rather than by a
+hand walkthrough against a live one. The Raspberry Pi on this network was deliberately left out of
+the scanned range. And X12 has no offline guard — see §5.2.
 
 **Care:** this is the highest-risk surface in the lane — it sends traffic to machines the user did
 not name. Never present the fabric's bearer token to an unidentified host.

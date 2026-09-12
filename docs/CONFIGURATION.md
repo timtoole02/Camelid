@@ -508,6 +508,106 @@ Every eligibility rule above is written against **capabilities, not engine names
 added later is a new row rather than a new argument — and placement still contains no engine name
 anywhere.
 
+### Finding machines to add
+
+`camelid fabric discover` looks for inference engines that could become nodes. **It never adds one.**
+Every machine it finds is printed with the exact line that would declare it and the command that
+would write it; a node exists when a person says so and not before.
+
+```bash
+# This machine only. Sends nothing to any other address.
+target/release/camelid fabric discover
+
+# A network you administer, which needs the same acknowledgement a node needs.
+target/release/camelid fabric discover \
+  --cidr 100.64.0.0/24 --allow-cleartext-node-transport \
+  --nodes-file /etc/camelid/nodes
+```
+
+**Scope.** With no arguments the scan covers loopback only — `127.0.0.1` and `[::1]` on each
+engine's own port (8181, 11434, 1234). A network is reached only through `--cidr` (repeatable) or
+`--host` (repeatable), and `--port` adds ports. `--no-loopback` and `--no-default-ports` make a scan
+cover exactly what was named and nothing else.
+
+**Bounds, all of them refusals rather than trims.** IPv4 only; an IPv6 range is refused with advice
+to use `--host`. Ranges must lie inside `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16` or `127/8` — there is no override. At most 1024 addresses and 8 ports in one run: a `/16` is
+**refused with its own size named**, never scanned down to the first 1024, so nobody believes a range
+was covered that was not. Concurrency is 32 with a 200/s connect budget, so the effective rate
+against addresses that black-hole is `min(200, 32 / 0.25s) = 128/s` — a `/24` across three ports is
+about six seconds. A 60-second wall clock stops a long scan, and whatever it did not reach is
+reported under `not_scanned` rather than dropped.
+
+**Transport.** A scan is held to the same fail-closed rule a node hop is (`--node-tls-ca`, or
+`--allow-cleartext-node-transport`, or `CAMELID_ALLOW_CLEARTEXT_NODE_TRANSPORT`). Without it a
+non-loopback target refuses the whole scan before any socket opens, so you never discover a machine
+your own fabric would then refuse to talk to.
+
+**What is sent.** Stage one is a TCP connect that writes **nothing**, so an address that is not an
+engine is never sent a byte. Stage two asks only the addresses stage one found open, at the socket
+stage one found them on, with fixed GETs carrying no `Authorization`, no cookies, and
+`User-Agent: camelid-fabric-discover/<version>`. **No credential is ever presented to a scanned
+host.** `fabric discover` has no `--bearer` and never reads `CAMELID_API_KEY`.
+
+**What each answer means.** `answers_like` is one engine matched and no rival check left unfinished.
+`ambiguous` is two matches, and a person picks — the first is never taken. `incomplete` means a
+check never finished, so nothing is concluded even beside a match. `other_http` means it speaks HTTP
+and no signature this build knows matched; it is never called an unknown engine, and `llama-server`
+lands here honestly. `requires_credentials`, `fabric_proxy`, `not_http`, `silent_after_connect` and
+`tls_not_authenticated` are the rest. A Camelid node started with an API key answers `401` on every
+other engine's path; that is a *finished* answer, so it still answers like camelid.
+
+**Names.** A name is listed only when a forward lookup on the scanning host returns the address that
+actually answered; otherwise it is absent with a reason. A reverse-DNS name is **offered, never
+used by default**: on a consumer router each device chooses its own name, so anything on that
+network can claim it later and would then receive that node's prompts. The proposed host is the IP
+address; the name is a one-click alternative. Names you typed with `--host`, and names a pinned CA
+authenticated, are used as given. Lookups run on discovery's own resolver pool, so a stuck
+`getaddrinfo` never holds up live placement. `--no-reverse-dns` turns the lookups off.
+
+**One endpoint, one node.** Findings on this machine's own addresses merge into one row, and
+loopback is proposed only when loopback was actually seen to answer the same way. A join that would
+add a second label for an endpoint already in the file is refused with `duplicate_endpoint` naming
+the existing label. Two labels for one server is a deliberate arrangement — it is how one engine is
+compared with itself — so **the loader still accepts it**; add the second by hand.
+
+**Joining.** `--join LABEL=ENGINE://HOST[:PORT]` re-checks everything after the click: the label and
+host grammars, the endpoint rule, that the name still reaches the machine that was scanned, and that
+the machine still answers like the engine being written. The nodes file is the only thing written,
+as a byte-preserving append in the file's own line endings, through a temp file in the same
+directory and a rename — so a reader sees the old file or the new one, never half a line. A
+one-line provenance comment is added above the node line. Writes are serialized in-process and, on
+unix, by an `flock` on the file itself; **on Windows the hash check is the only protection**, which
+leaves a small window against an editor saving at the same instant. Rename also breaks hard links.
+
+On a terminal, with `--nodes-file`, you are asked once per machine and the default is no. A run whose
+output is piped never writes: it prints the `--join` command instead.
+
+Exit codes: `0` the scan completed, `2` the scope or transport was refused before any packet, `1` a
+join was refused.
+
+**Discoverability is smaller than you expect.** Both `ollama serve` and `camelid serve` listen on
+loopback by default, so they cannot be seen from another machine unless they were started on an
+address the network can reach. Scan only networks you administer: a sweep can trip intrusion
+detection elsewhere.
+
+#### From the web UI
+
+`fabric serve --discovery` adds three routes, off by default:
+
+```bash
+target/release/camelid fabric serve \
+  --nodes-file /etc/camelid/nodes --discovery \
+  --cors-origin http://127.0.0.1:8181
+```
+
+`--discovery` requires `--nodes-file` and is refused at startup with `--node`, because a confirmed
+machine has to be written somewhere. A browser cannot scan a network, so the proxy is the only
+honest place to trigger one — and a proxy that scanned on anyone's request would be a way into the
+network behind it. So the routes answer only a caller on the proxy's own machine, addressing it by a
+loopback name, from an origin named with `--cors-origin`, behind the client key like every other
+route. With the flag off they answer `404` with `code: "discovery_disabled"`, which is how the page
+tells "switched off" from a build that predates the feature.
+
 ### Comparing two nodes
 
 `fabric compare` asks two named nodes the same question and reports what differed. It is
@@ -979,6 +1079,9 @@ It places the engine's stateless inference routes, and answers discovery for the
 | `POST /v1/rerank`, `POST /v1/reranking` | Same. |
 | `GET /v1/models` | The union of what every ready node is serving. |
 | `GET /v1/models/{model}` | 200 exactly when a request naming that model would be placed. |
+| `GET /v1/fabric/discover` | What a scan may cover and what it will never send. Only with `--discovery`. |
+| `POST /v1/fabric/discover` | Runs one scan. Loopback callers only; one at a time. Only with `--discovery`. |
+| `POST /v1/fabric/discover/join` | Appends exactly one confirmed node to the nodes file. Only with `--discovery`. |
 
 A route is placed only if any node serving the named model could answer it, because the client cannot
 tell which node it reached and must not need to. That rules out the Responses and Conversations APIs:
