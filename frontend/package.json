@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4175",
     "build": "vite build",
+    "smoke:outputs-changes": "node scripts/outputs-changes-smoke.mjs",
+    "smoke:outputs-changes-browser": "node scripts/outputs-changes-browser-smoke.mjs",
     "smoke:mcp": "node scripts/mcp-smoke.mjs",
     "smoke:mcp-browser": "node scripts/mcp-browser-smoke.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4175",

@@ -3,6 +3,7 @@ import { Fragment, createContext, memo, useContext, useEffect, useLayoutEffect, 
 import { copyText } from './clipboard.js'
 import { displayMathOnlyLine, splitMathSegments } from './mathSegments.js'
 import { MathSpan } from '../components/chat/render/MathSpan.jsx'
+import { OutputActions } from '../components/outputs/OutputActions.jsx'
 import { MermaidDiagram } from '../components/chat/render/MermaidDiagram.jsx'
 
 /* Assistant markdown + fenced-code rendering.
@@ -431,7 +432,7 @@ const splitFenceInfo = (value) => {
 
 export const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
 
-export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
+export function CodeBlockCard({ language, code, sourceCode = code, keyPrefix, stillGenerating }) {
   const preRef = useRef(null)
   const autoFollowCodeRef = useRef(true)
   const [copied, setCopied] = useState(false)
@@ -477,6 +478,7 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
+        <OutputActions code={sourceCode} language={language} disabled={stillGenerating} />
         <button type="button" onClick={handleCopy} aria-label={`Copy ${language} code`}>{copied ? 'Copied' : 'Copy'}</button>
       </figcaption>
       {/* Highlighting deferred while the fence is open (Phase 8B): plain text
@@ -497,6 +499,7 @@ const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, 
       key={`code-${blocks.length}`}
       language={language}
       code={trimmedCode}
+      sourceCode={code}
       keyPrefix={keyPrefix}
       stillGenerating={stillGenerating}
     />

@@ -201,3 +201,13 @@ and the HTTP control-plane contract. Workspace remains read-only.
 Run `npm run smoke:mcp` and, after `npm run build`, `npm run smoke:mcp-browser`.
 The browser smoke exercises the actual chat request/result wiring using local
 fixtures; it is not model-quality evidence.
+
+## Output previews and file review
+
+Completed code blocks, structured replies, and supported MCP resources have preview
+and download actions. Text outputs can be sent to **Changes** for a full before/after
+review, explicit approval, and durable undo with file-version checks.
+See [Output previews and file review](../docs/OUTPUTS_AND_CHANGES.md).
+
+Validate with `npm run smoke:outputs-changes` and, after building,
+`npm run smoke:outputs-changes-browser`.
