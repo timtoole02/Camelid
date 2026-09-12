@@ -669,6 +669,7 @@ async fn start_proxy_waiting(
         cors: None,
         mixed: MixedEngines::default(),
         bound: addr,
+        discovery: None,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
@@ -694,6 +695,7 @@ async fn start_proxy_allowing(
         cors,
         mixed: MixedEngines::default(),
         bound: addr,
+        discovery: None,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
@@ -937,6 +939,7 @@ async fn start_tls_proxy(fabric: Fabric, auth: ClientAuth) -> (SocketAddr, TestC
         cors: None,
         mixed: MixedEngines::default(),
         bound: addr,
+        discovery: None,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;
@@ -2673,6 +2676,7 @@ async fn a_stop_finishes_the_work_in_flight_and_accepts_no_more() {
         cors: None,
         mixed: MixedEngines::default(),
         bound: addr,
+        discovery: None,
     };
 
     let (stop, stop_asked) = tokio::sync::oneshot::channel::<()>();
@@ -3954,6 +3958,7 @@ async fn a_tls_stop_finishes_the_work_in_flight_and_accepts_no_more() {
                 cors: None,
                 mixed: MixedEngines::default(),
                 bound: addr,
+                discovery: None,
             },
             async move {
                 let _ = stop_asked.await;
@@ -4080,6 +4085,7 @@ async fn start_proxy_in(fabric: Fabric, mode: RouteMode, mixed: MixedEngines) ->
         cors: None,
         mixed,
         bound: addr,
+        discovery: None,
     };
     tokio::spawn(async move {
         let _ = serve_on(listener, fabric, config).await;

@@ -191,6 +191,27 @@ const NODE_LOCAL_ROUTES: [&str; 6] = [
 /// the wire.
 pub use super::client_keys::ClientAuth;
 
+use super::discover::{self, JoinRequest, Scope};
+use super::netscope;
+
+/// What the discovery routes are allowed to do, and where they may write.
+///
+/// Deliberately not a `Fabric`: discovery must have no route to a credential,
+/// so the handlers are given the transport, a path, and a *fact* about whether
+/// a bearer is configured — never the bearer itself. That fact is what lets the
+/// warning shown before a join be true without this code holding the secret.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// The one file a join may write. Required: a proxy started with `--node`
+    /// has nowhere legitimate to put a confirmed machine.
+    pub nodes_file: PathBuf,
+    /// The origins allowed to drive these routes, from `--cors-origin`.
+    pub cors_origins: Arc<[String]>,
+    /// Whether this proxy holds a bearer it would present to a joined node of
+    /// an engine that receives one.
+    pub bearer_configured: bool,
+}
+
 /// The certificate this proxy presents to its clients.
 ///
 /// Holds the loaded certificate rather than the paths it came from. Reading it
@@ -323,6 +344,10 @@ pub struct ServeConfig {
     /// caller's guess. It is set there rather than in [`serve_on`] because
     /// every serving path goes through it, including the injected-stop seam.
     pub bound: SocketAddr,
+    /// Whether this proxy will look for machines to add, and where it may write
+    /// one. `None` — the default — answers the three discovery paths with a
+    /// coded 404 and changes nothing else about this proxy.
+    pub discovery: Option<DiscoveryConfig>,
 }
 
 #[derive(Clone)]
@@ -331,6 +356,9 @@ struct ServerState {
     /// a `Fabric` owns a `Vec<NodeSpec>`.
     fabric: Arc<Fabric>,
     config: ServeConfig,
+    /// One scan at a time. A scan holds blocking threads for up to its wall
+    /// clock, and this process is also serving traffic.
+    scanning: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the router without binding a socket, so tests can drive it directly.
@@ -365,6 +393,14 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         .route("/v1/models/:model", get(model))
         .route("/v1/health", get(health))
         .route("/v1/fabric/compare", post(compare))
+        // Registered whether or not discovery is on, so a page can tell "this
+        // proxy will not do that" (a coded 404) from "this proxy is too old to
+        // know what that is" (the unchanged, codeless fallback 404).
+        .route(
+            "/v1/fabric/discover",
+            get(discovery_policy).post(discovery_scan),
+        )
+        .route("/v1/fabric/discover/join", post(discovery_join))
         // A client that reaches an address it was told is OpenAI-compatible has
         // to be able to tell "wrong route" from "wrong model", and axum's own
         // 404 carries no body at all.
@@ -375,6 +411,7 @@ pub fn router(fabric: Fabric, config: ServeConfig) -> Router {
         .with_state(ServerState {
             fabric: Arc::new(fabric),
             config,
+            scanning: Arc::new(tokio::sync::Semaphore::new(1)),
         })
         // Wraps every route: an unauthenticated request is refused before
         // anything below reads its body or observes the fabric.
@@ -1828,6 +1865,329 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// A refusal a page can branch on without reading its prose.
+///
+/// Separate from [`error_response`] on purpose: adding a `code` key there would
+/// change the body of every error this proxy already answers with, and one of
+/// those bodies — the fallback 404 — is exactly how a page tells an old build
+/// from one that has discovery turned off.
+fn error_response_coded(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": "fabric_error", "code": code }
+        })),
+    )
+        .into_response()
+}
+
+/// Everything that must hold before a discovery request does anything at all.
+///
+/// In order, and all of them before any socket opens or any byte is written:
+/// the route is enabled; the peer is on this machine; the `Host` header is a
+/// loopback name (a page at another name resolving to 127.0.0.1 is a DNS
+/// rebind); and any `Origin` is one the operator named.
+///
+/// A browser cannot scan a LAN, so this proxy is the only honest place to
+/// trigger one — and a proxy that scans on request is a pivot into a network
+/// unless it answers nobody but this machine. CORS governs *reading* a reply,
+/// never whether the side effect happened, so `Origin` is checked here rather
+/// than left to the CORS layer.
+// The refusal a guard produces *is* a `Response`, which is a large type.
+// Boxing it would add an allocation to every guarded request in order to
+// satisfy a size lint about the path that refuses one.
+#[allow(clippy::result_large_err)]
+fn discovery_guard<'a>(
+    state: &'a ServerState,
+    peer: Option<&ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Result<&'a DiscoveryConfig, Response> {
+    let Some(config) = state.config.discovery.as_ref() else {
+        return Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "discovery_disabled",
+            "this proxy was not started with --discovery, so it does not look for machines to \
+             add. Restart it with --discovery and --nodes-file to turn this on",
+        ));
+    };
+
+    // On a dual-stack `[::]` bind an IPv4 loopback client arrives as
+    // ::ffff:127.0.0.1, which plain `is_loopback` refuses.
+    let loopback_peer = peer
+        .map(|ConnectInfo(peer)| peer.ip().to_canonical().is_loopback())
+        .unwrap_or(false);
+    if !loopback_peer {
+        return Err(error_response_coded(
+            StatusCode::FORBIDDEN,
+            "discovery_loopback_only",
+            "discovery runs only for a caller on the same machine as the proxy. Open this page \
+             on the proxy's own machine, or run `camelid fabric discover` there",
+        ));
+    }
+
+    let host_is_loopback = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| {
+            let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+            let name = name.trim_start_matches('[').trim_end_matches(']');
+            name == "localhost"
+                || name
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+    if !host_is_loopback {
+        return Err(error_response_coded(
+            StatusCode::FORBIDDEN,
+            "discovery_host_not_loopback",
+            "that request did not address this proxy by a loopback name",
+        ));
+    }
+
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        let allowed = origin
+            .to_str()
+            .ok()
+            .is_some_and(|origin| config.cors_origins.iter().any(|named| named == origin));
+        if !allowed {
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                "discovery_origin_not_allowed",
+                "that page's origin is not one this proxy was started with --cors-origin for",
+            ));
+        }
+    }
+
+    Ok(config)
+}
+
+/// Refuse a body that did not arrive as JSON, before it is read.
+fn discovery_wants_json(headers: &HeaderMap) -> Option<Response> {
+    let json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+        });
+    (!json).then(|| {
+        error_response_coded(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not_json",
+            "send this as application/json",
+        )
+    })
+}
+
+/// What a scan may cover, what it costs, and what it will never send.
+///
+/// Read-only, and the suggestion it offers is a *suggestion*: nothing here
+/// opens a socket, and the range named is scanned only after somebody asks.
+async fn discovery_policy(
+    State(state): State<ServerState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let config = match discovery_guard(&state, peer.as_ref(), &headers) {
+        Ok(config) => config,
+        Err(refusal) => return refusal,
+    };
+    let transport = state.fabric.transport();
+    let lan_permitted = transport
+        .permitted_addresses(&[SocketAddr::from(([100, 64, 0, 1], 8181))])
+        .is_ok();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "enabled": true,
+            "nodes_file": {
+                "path": config.nodes_file.display().to_string(),
+                "sha256": super::nodes::file_sha256(&config.nodes_file),
+                "labels": state.fabric.specs().iter().map(|spec| spec.label.clone()).collect::<Vec<_>>(),
+            },
+            "default_ports": fabric::NodeEngine::ALL
+                .iter()
+                .map(|engine| engine.default_port())
+                .collect::<Vec<_>>(),
+            "limits": fabric::Limits::default(),
+            "allowed_ranges": netscope::allowed_ranges(),
+            "suggestions": netscope::suggestions(),
+            "transport": {
+                "description": transport.description(),
+                "lan_permitted": lan_permitted,
+                "flag_needed": "--allow-cleartext-node-transport",
+            },
+            "fabric_bearer_configured": config.bearer_configured,
+            "credentials_presented": "none",
+        })),
+    )
+        .into_response()
+}
+
+async fn discovery_scan(
+    State(state): State<ServerState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<Scope>, JsonRejection>,
+) -> Response {
+    let config = match discovery_guard(&state, peer.as_ref(), &headers) {
+        Ok(config) => config.clone(),
+        Err(refusal) => return refusal,
+    };
+    if let Some(refusal) = discovery_wants_json(&headers) {
+        return refusal;
+    }
+    let scope = match body {
+        Ok(Json(scope)) => scope,
+        Err(rejection) => {
+            return error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "scope_refused",
+                &format!("could not read the scan request: {rejection}"),
+            )
+        }
+    };
+
+    // One at a time. A scan holds blocking threads for as long as its wall
+    // clock, and this process is serving traffic at the same time.
+    let Ok(running) = Arc::clone(&state.scanning).try_acquire_owned() else {
+        return error_response_coded(
+            StatusCode::CONFLICT,
+            "scan_in_progress",
+            "this proxy is already looking for machines; wait for that scan to finish",
+        );
+    };
+
+    let fabric = Arc::clone(&state.fabric);
+    let plan = match discover::plan(&scope, fabric.transport()) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let status = match refusal.code() {
+                "transport_refused" => StatusCode::FORBIDDEN,
+                "scope_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            return error_response_coded(status, refusal.code(), &refusal.to_string());
+        }
+    };
+
+    // Fired when this frame is dropped, which is what a client going away
+    // looks like from here. Without it a scan nobody is waiting for would run
+    // its full wall clock against somebody's network.
+    let cancel = Cancel::new();
+    let _stop = CancelOnDrop(cancel.clone());
+    let context = discover::ScanContext {
+        existing: fabric.specs(),
+        nodes_file: Some(config.nodes_file.clone()),
+        bearer_configured: Some(config.bearer_configured),
+        reverse_dns: true,
+    };
+
+    let scanning = tokio::task::spawn_blocking(move || {
+        let transport = fabric.transport();
+        let connector = discover::Sockets::over(transport);
+        let discovery = discover::scan(&plan, &connector, &cancel, &context, transport);
+        drop(running);
+        discovery
+    })
+    .await;
+
+    match scanning {
+        Ok(discovery) => (StatusCode::OK, Json(discovery)).into_response(),
+        Err(join_error) => error_response_coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "scan_failed",
+            &format!("the scan could not be run: {join_error}"),
+        ),
+    }
+}
+
+/// Add exactly the one machine somebody confirmed.
+async fn discovery_join(
+    State(state): State<ServerState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<JoinRequest>, JsonRejection>,
+) -> Response {
+    let config = match discovery_guard(&state, peer.as_ref(), &headers) {
+        Ok(config) => config.clone(),
+        Err(refusal) => return refusal,
+    };
+    if let Some(refusal) = discovery_wants_json(&headers) {
+        return refusal;
+    }
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_spec",
+                &format!("could not read the join request: {rejection}"),
+            )
+        }
+    };
+    // Through the proxy, a missing base is not "there is no file": its own
+    // startup already required a loadable one.
+    if request.base_sha256.is_none() {
+        return error_response_coded(
+            StatusCode::CONFLICT,
+            "file_changed",
+            "that request did not say which version of the nodes file it was based on",
+        );
+    }
+
+    let fabric = Arc::clone(&state.fabric);
+    let cancel = Cancel::new();
+    let _stop = CancelOnDrop(cancel.clone());
+    let joining = tokio::task::spawn_blocking(move || {
+        let transport = fabric.transport();
+        let connector = discover::Sockets::over(transport);
+        let context = discover::ScanContext {
+            existing: fabric.specs(),
+            nodes_file: Some(config.nodes_file.clone()),
+            bearer_configured: Some(config.bearer_configured),
+            reverse_dns: false,
+        };
+        discover::join(
+            &config.nodes_file,
+            &request,
+            transport,
+            &connector,
+            &context,
+            &cancel,
+        )
+    })
+    .await;
+
+    match joining {
+        Ok(Ok(joined)) => (StatusCode::OK, Json(joined)).into_response(),
+        Ok(Err(refusal)) => {
+            let status = match refusal.code() {
+                "file_changed" | "no_longer_answers" | "name_reaches_another_address" => {
+                    StatusCode::CONFLICT
+                }
+                "write_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+                "transport_refused" => StatusCode::FORBIDDEN,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            let mut response =
+                error_response_coded(status, refusal.code(), &refusal.to_string());
+            if let fabric::JoinRefusal::DuplicateEndpoint { existing_label } = &refusal {
+                insert(response.headers_mut(), "x-camelid-fabric-node", existing_label);
+            }
+            response
+        }
+        Err(join_error) => error_response_coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "write_failed",
+            &format!("the join could not be run: {join_error}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,7 +2231,46 @@ mod tests {
             cors: None,
             mixed: MixedEngines::default(),
             bound: "127.0.0.1:8490".parse().expect("loopback address"),
+            discovery: None,
         }
+    }
+
+    /// Every error body this proxy already answered with has to keep its exact
+    /// shape. The fallback 404 in particular: a page tells a build that predates
+    /// discovery from one that merely has it switched off by the *absence* of a
+    /// `code`, so a `code` appearing on every error — even as null — would make
+    /// the two indistinguishable.
+    #[tokio::test]
+    async fn existing_errors_carry_no_code_field() {
+        let unknown = unknown_route().await;
+        let (status, body) = read_json(unknown).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let keys: Vec<&String> = body["error"]
+            .as_object()
+            .expect("an error object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["message", "type"], "{body}");
+
+        let refusal = error_response(StatusCode::BAD_REQUEST, "studio does not hold that model");
+        let (_, body) = read_json(refusal).await;
+        let keys: Vec<&String> = body["error"]
+            .as_object()
+            .expect("an error object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["message", "type"], "{body}");
+
+        // ...and the coded refusals discovery adds carry one, which is what
+        // makes them tellable apart.
+        let coded = error_response_coded(
+            StatusCode::NOT_FOUND,
+            "discovery_disabled",
+            "not started with --discovery",
+        );
+        let (_, body) = read_json(coded).await;
+        assert_eq!(body["error"]["code"], "discovery_disabled");
+        assert_eq!(body["error"]["type"], "fabric_error");
     }
 
     #[test]

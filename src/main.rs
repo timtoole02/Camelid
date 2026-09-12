@@ -1513,6 +1513,140 @@ fn mixed_engines(allowed: bool) -> camelid::fabric::MixedEngines {
     }
 }
 
+/// What `fabric discover` prints.
+///
+/// Every string that came from a machine we have not identified — a name it
+/// claims, a version it reports, a status it answered — goes through
+/// `display_safe` on the way out, because a terminal acts on escape sequences
+/// and this output is, by construction, assembled from strangers' answers.
+fn print_discovery(discovery: &camelid::fabric::Discovery, nodes_file: Option<&std::path::Path>) {
+    use camelid::fabric::display_safe;
+
+    println!(
+        "looked at {} address(es) on port(s) {} — {} probe(s) in {} ms",
+        discovery.scope.addresses,
+        discovery
+            .scope
+            .ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        discovery.probes,
+        discovery.elapsed_ms
+    );
+    println!("transport: {}", discovery.transport);
+    println!("credentials presented to any host: {}", discovery.credentials_presented);
+    let not_listed = &discovery.not_listed;
+    println!(
+        "nothing answered on {} address(es): {} refused, {} timed out, {} unreachable, {} other{}",
+        not_listed.refused + not_listed.timed_out + not_listed.unreachable + not_listed.other,
+        not_listed.refused,
+        not_listed.timed_out,
+        not_listed.unreachable,
+        not_listed.other,
+        if discovery.not_scanned > 0 {
+            format!("; {} not reached before the time limit", discovery.not_scanned)
+        } else {
+            String::new()
+        }
+    );
+    if let Some(hint) = discovery.hint {
+        println!("\n{hint}");
+    }
+
+    if discovery.findings.is_empty() {
+        println!("\nNothing answered. Note that `ollama serve` and `camelid serve` both listen on");
+        println!("loopback by default, so they are invisible to another machine unless started");
+        println!("on an address the network can reach.");
+        return;
+    }
+
+    println!();
+    for finding in &discovery.findings {
+        let where_ = if finding.addresses.len() > 1 {
+            format!("{} (also {})", finding.address, finding.addresses[1..].join(", "))
+        } else {
+            finding.address.clone()
+        };
+        print!("{where_}:{}  {}", finding.port, finding.classification.kind());
+        if let camelid::fabric::Classification::AnswersLike { engine, version, .. } =
+            &finding.classification
+        {
+            print!(
+                " {engine} {}",
+                version
+                    .as_deref()
+                    .map_or_else(|| "(version not recorded)".to_string(), |version| {
+                        display_safe(version).into_owned()
+                    })
+            );
+        }
+        println!();
+        match (&finding.name.name, &finding.name.why) {
+            (Some(name), _) => println!("    name: {} (proven from here)", display_safe(name)),
+            (None, Some(why)) => println!("    name: none — {}", display_safe(why)),
+            (None, None) => {}
+        }
+        if let Some(in_fabric) = &finding.in_fabric {
+            if let Some(label) = &in_fabric.label {
+                println!("    already in this fabric as `{}`", display_safe(label));
+            }
+        }
+        if !finding.possibly_same_as.is_empty() {
+            println!(
+                "    answers identically to {}; this build cannot tell whether they are one machine",
+                finding.possibly_same_as.join(", ")
+            );
+        }
+        match (&finding.proposal, &finding.not_proposed) {
+            (Some(proposal), _) => {
+                println!("    would be declared as:");
+                println!("      {}", display_safe(&proposal.comment_preview));
+                println!("      {}", display_safe(&proposal.line));
+                for warning in &proposal.warnings {
+                    println!("    note: {warning}");
+                }
+                for alternative in &proposal.host_alternatives {
+                    println!(
+                        "    or by the name `{}` — {}",
+                        display_safe(&alternative.host),
+                        alternative.warning
+                    );
+                }
+                match nodes_file {
+                    Some(path) => println!(
+                        "    add it with: camelid fabric discover --nodes-file {} --join '{}'",
+                        path.display(),
+                        display_safe(&proposal.line)
+                    ),
+                    None => println!(
+                        "    add it by giving --nodes-file PATH and repeating this command with \
+                         --join '{}'",
+                        display_safe(&proposal.line)
+                    ),
+                }
+            }
+            (None, Some(why)) => println!("    not offered: {}", display_safe(why)),
+            (None, None) => {}
+        }
+        println!();
+    }
+    println!("Nothing has been added. A machine becomes a node only when you say so.");
+}
+
+/// Ask once, on a terminal, defaulting to no.
+fn confirm_join(question: &str) -> bool {
+    use std::io::Write as _;
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y")
+}
+
 /// What `fabric run --json` prints. Pure, so the fields a script reads are
 /// pinned by a test rather than by a terminal.
 fn run_report_json(
@@ -2043,6 +2177,59 @@ enum FabricAction {
         #[arg(long)]
         json: bool,
     },
+    /// Look for machines on this network that could be added to the fabric.
+    ///
+    /// With no arguments this looks at **this machine only** — 127.0.0.1 and
+    /// [::1] on each engine's own port — and sends nothing anywhere else. A
+    /// network is scanned only when you name one with `--cidr`, or a machine
+    /// with `--host`, and then only under the same transport acknowledgement a
+    /// node needs.
+    ///
+    /// Nothing is ever added by looking. Each machine that answers like an
+    /// engine is printed with the exact line that would declare it, and the
+    /// `--join` command that would write it. No credential is presented to any
+    /// host: this command never reads CAMELID_API_KEY and has no --bearer.
+    Discover {
+        /// A private IPv4 range to look at, as `100.64.0.0/24`. Repeatable.
+        ///
+        /// Only private ranges, and at most 1024 addresses in total. A larger
+        /// range is refused rather than cut short, so nobody believes a range
+        /// was covered that was not.
+        #[arg(long = "cidr", value_name = "IPV4/PREFIX")]
+        cidr: Vec<String>,
+        /// A machine to look at by name or address. Repeatable. Every address
+        /// the name resolves to is looked at separately.
+        #[arg(long = "host", value_name = "NAME|IP")]
+        host: Vec<String>,
+        /// A port to look at, in addition to each engine's own. Repeatable,
+        /// and at most 8 ports in total.
+        #[arg(long = "port", value_name = "PORT")]
+        port: Vec<u16>,
+        /// Look only at the ports named with --port.
+        #[arg(long)]
+        no_default_ports: bool,
+        /// Do not look at this machine.
+        #[arg(long)]
+        no_loopback: bool,
+        /// Cross-check what is found against this file, and write to it — and
+        /// only it — when a machine is confirmed.
+        #[arg(long, value_name = "PATH")]
+        nodes_file: Option<PathBuf>,
+        /// Add exactly this node, after re-checking that it still answers that
+        /// way. Repeatable. Requires --nodes-file, and scans nothing else.
+        #[arg(long = "join", value_name = "LABEL=ENGINE://HOST[:PORT]")]
+        join: Vec<String>,
+        #[command(flatten)]
+        transport: NodeTransportArgs,
+        /// How long to wait for each connection. Capped at 2000.
+        #[arg(long, default_value_t = 250)]
+        connect_timeout_ms: u64,
+        /// Do not ask the network what any address is called.
+        #[arg(long)]
+        no_reverse_dns: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a resident HTTP proxy in front of the fabric.
     ///
     /// Every request to `/v1/chat/completions`, `/v1/completions`,
@@ -2173,6 +2360,17 @@ enum FabricAction {
         /// and without disturbing the others.
         #[arg(long, value_name = "PATH", conflicts_with_all = ["api_key", "api_key_file"])]
         client_keys: Option<PathBuf>,
+        /// Also serve the three discovery routes, to callers on this machine
+        /// only.
+        ///
+        /// Off unless given. It requires --nodes-file, because a confirmed
+        /// machine is written there and a proxy started with --node has
+        /// nowhere legitimate to put one. The routes answer only a loopback
+        /// caller, addressing this proxy by a loopback name, from an origin
+        /// named with --cors-origin — a proxy that scanned on anyone's request
+        /// would be a way into this network.
+        #[arg(long)]
+        discovery: bool,
     },
 }
 
@@ -2673,11 +2871,79 @@ mod fabric_command_tests {
                         | FabricAction::Run { bearer, .. }
                         | FabricAction::Compare { bearer, .. }
                         | FabricAction::Serve { bearer, .. } => bearer,
+                        // Deliberately absent from the list above: discovery
+                        // talks to machines nobody has identified yet, so it
+                        // holds no credential to accidentally present.
+                        FabricAction::Discover { .. } => {
+                            panic!("discover must not be in the bearer list")
+                        }
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
                 assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
             }
+        });
+    }
+
+    /// The guarantee is the absence: there is no flag, so no invocation of this
+    /// command can be made to carry the fabric's credential to a machine
+    /// nobody has identified.
+    #[test]
+    fn discover_takes_no_bearer() {
+        on_cli_test_stack(|| {
+            Cli::try_parse_from(["camelid", "fabric", "discover", "--bearer", "s3cret"])
+                .expect_err("discover must not accept a bearer");
+            // ...and the command itself is perfectly usable without one.
+            Cli::try_parse_from(["camelid", "fabric", "discover"]).expect("parses with no flags");
+        });
+    }
+
+    /// Discovery is held to the same transport rule as every other subcommand,
+    /// and reads the same node file, rather than growing flags of its own.
+    #[test]
+    fn discover_shares_the_node_transport_and_node_file_contract() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "fabric",
+                "discover",
+                "--nodes-file",
+                "fabric.nodes",
+                "--node-tls-ca",
+                "node-ca",
+            ])
+            .expect("parses");
+            match cli.command {
+                Some(Command::Fabric {
+                    action:
+                        FabricAction::Discover {
+                            transport,
+                            nodes_file,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(
+                        transport.node_tls_ca.as_deref(),
+                        Some(std::path::Path::new("node-ca"))
+                    );
+                    assert!(!transport.allow_cleartext_node_transport);
+                    assert_eq!(
+                        nodes_file.as_deref(),
+                        Some(std::path::Path::new("fabric.nodes"))
+                    );
+                }
+                other => panic!("expected a discover command, got {other:?}"),
+            }
+
+            Cli::try_parse_from([
+                "camelid",
+                "fabric",
+                "discover",
+                "--node-tls-ca",
+                "node-ca",
+                "--allow-cleartext-node-transport",
+            ])
+            .expect_err("TLS and a cleartext acknowledgement conflict here too");
         });
     }
 
@@ -2703,7 +2969,8 @@ mod fabric_command_tests {
                         | FabricAction::Route { transport, .. }
                         | FabricAction::Run { transport, .. }
                         | FabricAction::Compare { transport, .. }
-                        | FabricAction::Serve { transport, .. } => transport,
+                        | FabricAction::Serve { transport, .. }
+                        | FabricAction::Discover { transport, .. } => transport,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
@@ -2754,7 +3021,8 @@ mod fabric_command_tests {
                         | FabricAction::Route { nodes_file, .. }
                         | FabricAction::Run { nodes_file, .. }
                         | FabricAction::Compare { nodes_file, .. }
-                        | FabricAction::Serve { nodes_file, .. } => nodes_file,
+                        | FabricAction::Serve { nodes_file, .. }
+                        | FabricAction::Discover { nodes_file, .. } => nodes_file,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
@@ -5330,6 +5598,156 @@ async fn main() -> anyhow::Result<()> {
                     print_comparison(&comparison);
                 }
             }
+            FabricAction::Discover {
+                cidr,
+                host,
+                port,
+                no_default_ports,
+                no_loopback,
+                nodes_file,
+                join,
+                transport,
+                connect_timeout_ms,
+                no_reverse_dns,
+                json,
+            } => {
+                // The same transport policy a node hop is held to. Resolved
+                // before anything is sent, so an operator is never shown a
+                // machine their own fabric would refuse to reach.
+                let session = camelid::fabric::Session::open(
+                    transport.node_tls_ca.as_deref(),
+                    transport.allow_cleartext_node_transport,
+                )?;
+                // Read leniently: a file that names no nodes yet is exactly the
+                // file somebody is about to add their first machine to.
+                let existing = nodes_file
+                    .as_ref()
+                    .and_then(|path| camelid::fabric::Fabric::from_node_file(path.clone()).ok())
+                    .map(|fabric| fabric.specs())
+                    .unwrap_or_default();
+                let context = camelid::fabric::ScanContext {
+                    existing,
+                    nodes_file: nodes_file.clone(),
+                    // This command never reads a key, so it cannot claim one is
+                    // configured; the warning it prints says "if configured".
+                    bearer_configured: None,
+                    reverse_dns: !no_reverse_dns,
+                };
+
+                if !join.is_empty() {
+                    let Some(path) = nodes_file.clone() else {
+                        anyhow::bail!(
+                            "--join writes a confirmed machine to the nodes file, so it needs \
+                             --nodes-file PATH"
+                        );
+                    };
+                    let mut refused = false;
+                    for raw in &join {
+                        let spec = camelid::fabric::parse_node_spec(raw)
+                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                        let request = camelid::fabric::JoinRequest {
+                            label: spec.label,
+                            engine: spec.engine.as_str().to_string(),
+                            host: spec.host,
+                            port: spec.port,
+                            base_sha256: camelid::fabric::node_file_sha256(&path),
+                            scanned_address: None,
+                        };
+                        match session.join(
+                            &path,
+                            &request,
+                            &context,
+                            &camelid::fabric::Cancel::never(),
+                        ) {
+                            Ok(joined) => {
+                                print!("{}", joined.appended);
+                                println!(
+                                    "added to {} — it answered from {}",
+                                    joined.path, joined.answered_from
+                                );
+                            }
+                            Err(refusal) => {
+                                eprintln!(
+                                    "fabric discover: nothing was added ({}): {refusal}",
+                                    refusal.code()
+                                );
+                                refused = true;
+                            }
+                        }
+                    }
+                    if refused {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+
+                let scope = camelid::fabric::Scope {
+                    ranges: cidr,
+                    hosts: host,
+                    ports: port,
+                    loopback: !no_loopback,
+                    default_ports: !no_default_ports,
+                };
+                let plan = match session.plan(&scope) {
+                    Ok(plan) => plan.with_connect_timeout_ms(connect_timeout_ms),
+                    Err(refusal) => {
+                        // Nothing was sent: this is a refusal to start, which
+                        // is why it has an exit code of its own.
+                        eprintln!("fabric discover: {refusal}");
+                        std::process::exit(2);
+                    }
+                };
+                let discovery =
+                    session.scan(&plan, &camelid::fabric::Cancel::never(), &context);
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&discovery)?);
+                    return Ok(());
+                }
+                print_discovery(&discovery, nodes_file.as_deref());
+
+                // One prompt per proposal, and only on a terminal with
+                // somewhere to write. A run whose output is piped never writes
+                // anything: it prints the --join command instead.
+                let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    && std::io::IsTerminal::is_terminal(&std::io::stdout());
+                if let (true, Some(path)) = (interactive, nodes_file.clone()) {
+                    for finding in &discovery.findings {
+                        let Some(proposal) = &finding.proposal else {
+                            continue;
+                        };
+                        println!("\nAppend to {}:", path.display());
+                        println!("  {}", camelid::fabric::display_safe(&proposal.comment_preview));
+                        println!("  {}", camelid::fabric::display_safe(&proposal.line));
+                        if !confirm_join("") {
+                            continue;
+                        }
+                        let request = camelid::fabric::JoinRequest {
+                            label: proposal.label.clone(),
+                            engine: proposal.engine.as_str().to_string(),
+                            host: proposal.host.clone(),
+                            port: proposal.port,
+                            base_sha256: camelid::fabric::node_file_sha256(&path),
+                            scanned_address: Some(format!(
+                                "{}:{}",
+                                finding.address, finding.port
+                            )),
+                        };
+                        match session.join(
+                            &path,
+                            &request,
+                            &context,
+                            &camelid::fabric::Cancel::never(),
+                        ) {
+                            Ok(joined) => print!("{}", joined.appended),
+                            Err(refusal) => eprintln!(
+                                "nothing was added ({}): {refusal}",
+                                refusal.code()
+                            ),
+                        }
+                    }
+                }
+            }
             FabricAction::Serve {
                 nodes,
                 nodes_file,
@@ -5350,10 +5768,30 @@ async fn main() -> anyhow::Result<()> {
                 cors_origins,
                 allow_mixed_engines,
                 client_keys,
+                discovery,
             } => {
                 let mode = route_mode(&mode)?;
                 let mixed = mixed_engines(allow_mixed_engines);
                 let bearer = fabric_bearer(bearer);
+                // Before anything is bound or announced: a proxy asked to
+                // discover with nowhere legitimate to write is a refusal, not a
+                // warning after the listening line.
+                let discovery_config = if discovery {
+                    let Some(path) = nodes_file.clone() else {
+                        anyhow::bail!(
+                            "--discovery writes confirmed machines to the nodes file, so it \
+                             needs --nodes-file PATH rather than --node"
+                        );
+                    };
+                    Some(camelid::fabric::server::DiscoveryConfig {
+                        nodes_file: path,
+                        cors_origins: cors_origins.clone().into(),
+                        // A fact about this process, never the token itself.
+                        bearer_configured: bearer.is_some(),
+                    })
+                } else {
+                    None
+                };
                 let auth = match client_keys {
                     Some(path) => camelid::fabric::server::ClientAuth::from_key_file(path)?,
                     None => camelid::fabric::server::ClientAuth::resolve(api_key, api_key_file)?,
@@ -5417,6 +5855,12 @@ async fn main() -> anyhow::Result<()> {
                          machine without a restart"
                     );
                 }
+                if let Some(config) = &discovery_config {
+                    println!(
+                        "discovery: loopback callers only; writes {}",
+                        config.nodes_file.display()
+                    );
+                }
                 // Before the first look at the file, so that every foreign node
                 // added from here on is announced: the flag covers them too.
                 if mixed == camelid::fabric::MixedEngines::Allowed {
@@ -5455,6 +5899,7 @@ async fn main() -> anyhow::Result<()> {
                         cors,
                         mixed,
                         bound,
+                        discovery: discovery_config,
                     },
                 )
                 .await?;
