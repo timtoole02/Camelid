@@ -3,6 +3,7 @@ import { useFabric } from '../hooks/useFabric'
 import { FabricNodeTable } from '../components/fabric/FabricNodeTable'
 import { FabricNodeDrawer } from '../components/fabric/FabricNodeDrawer'
 import { RoutingMode } from '../components/fabric/RoutingMode'
+import { DiscoveryPanel } from '../components/fabric/DiscoveryPanel.jsx'
 import { CopyableCommand } from '../components/fabric/CopyableCommand'
 import { CorsHint } from '../components/fabric/CorsHint'
 import { Unknown } from '../components/fabric/Unknown'
@@ -205,7 +206,24 @@ export default function ClusterView() {
           </section>
 
           <RoutingMode fabric={fabric} />
+
+          <DiscoveryPanel
+            base={proxyOrigin}
+            labels={(nodes ?? []).map((node) => node.label).filter(Boolean)}
+            pageOrigin={pageOrigin}
+          />
         </>
+      )}
+
+      {/* A scan runs on the proxy's machine, not in this browser, so a proxy
+          that withholds its detail is also one this page cannot look from. */}
+      {fabric?.detail === 'withheld' && (
+        <section className="discovery" data-testid="fabric-discovery" data-state="withheld">
+          <h2>Find machines</h2>
+          <p className="fabric-note">
+            Looking for machines runs on the proxy&apos;s own machine. Open this page there to use it.
+          </p>
+        </section>
       )}
 
       {selected && (

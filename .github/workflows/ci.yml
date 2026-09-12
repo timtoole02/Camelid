@@ -648,6 +648,19 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:divergence-view
 
+      # Discovery is the one surface that sends traffic to machines the user did
+      # not name, so its page has two jobs beyond rendering: never to offer a
+      # way to add something the proxy did not identify, and never to add
+      # anything without a second, explicit click. These prove both -- in the
+      # pure layer, and then in a browser against a scripted proxy.
+      - name: Frontend discovery model smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:discovery-model
+
+      - name: Frontend discovery view smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:discovery-view
+
       - name: Workspace read-only visual smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |

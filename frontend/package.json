@@ -63,6 +63,8 @@
     "smoke:fabric-view": "node scripts/fabric-view-smoke.mjs",
     "smoke:divergence-model": "node scripts/divergence-model-smoke.mjs",
     "smoke:divergence-view": "node scripts/divergence-view-smoke.mjs",
+    "smoke:discovery-model": "node scripts/discovery-model-smoke.mjs",
+    "smoke:discovery-view": "node scripts/discovery-view-smoke.mjs",
     "smoke:flow": "node scripts/flow-visual-smoke.mjs"
   },
   "dependencies": {
