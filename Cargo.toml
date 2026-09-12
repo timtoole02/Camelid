@@ -39,6 +39,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 futures-util = "0.3"
+# MCP client only: stdio and Streamable HTTP, with the existing Rustls provider.
+process-wrap = { version = "10", features = ["tokio1"] }
+rmcp = { version = "=3.3.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 memmap2 = "0.9"
 llguidance = "=1.7.6"
 toktrie = "=1.7.6"

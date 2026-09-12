@@ -1,3 +1,4 @@
+import { ConnectedTools } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
@@ -170,6 +171,7 @@ async function prepareVisionAttachment(file) {
 }
 
 export default function ChatWorkspace({
+  mcp = null, mcpSelectedKeys = [], toggleMcpTool = null,
   selectedConversation,
   selectedModel,
   selectedModelId,
@@ -912,7 +914,8 @@ export default function ChatWorkspace({
           </p>
         </div>
       )}
-      {toolCapability.capable && toolsEnabled && setToolsText && (
+      {mcp && !demoMode && runtime?.api_surface !== 'lan_chat_only' && <ConnectedTools connections={mcp.connections} selectedKeys={mcpSelectedKeys} onToggle={toggleMcpTool} onManage={() => setTab('connections')} disabled={requestActive} capability={toolCapability} />}
+      {toolCapability.capable && toolsEnabled && setToolsText && !mcpSelectedKeys.length && (
         <div className="tooldef">
           <textarea
             className="tooldef__field"
@@ -1382,6 +1385,7 @@ export default function ChatWorkspace({
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
                 const showDaySeparator = Boolean(dayKey && priorDayKey && dayKey !== priorDayKey)
+                if (message.role === 'tool') return <details className="mcp-result" key={message.id}><summary>{message.mcp?.connection ? `${message.mcp.connection} · ` : ''}{message.mcp?.tool || 'Tool result'} · {message.mcp?.status || 'received'}{message.mcp?.is_error ? ' · error' : ''}</summary><pre>{message.content}</pre></details>
                 return (
                   <Fragment key={message.id}>
                     {showDaySeparator && (

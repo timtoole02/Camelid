@@ -1936,7 +1936,7 @@ fn workspace_request_allowed(headers: &HeaderMap, cli_token: Option<&str>) -> bo
     matches!((cli_token, provided), (Some(expected), Some(provided)) if crate::workspace_auth::token_matches(expected, provided))
 }
 
-fn local_management_request_allowed(headers: &HeaderMap) -> bool {
+pub(super) fn local_management_request_allowed(headers: &HeaderMap) -> bool {
     let authority = headers
         .get("host")
         .and_then(|value| value.to_str().ok())

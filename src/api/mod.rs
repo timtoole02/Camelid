@@ -32,6 +32,7 @@ mod continuous_batch;
 mod contract;
 pub(crate) mod documents;
 mod engine;
+mod mcp;
 mod metrics;
 mod responses;
 mod responses_store;
@@ -194,6 +195,7 @@ pub struct AppState {
     /// idempotency key) are serialized through a process-local keyed lock.
     responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
+    mcp: mcp::McpManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
     workspace_cli_token: Option<Arc<str>>,
@@ -272,6 +274,7 @@ impl Default for AppState {
             responses_store: responses_store::ResponsesStore::default(),
             responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            mcp: mcp::McpManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
@@ -2776,6 +2779,19 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/generation/preflight", post(preflight_generation))
         .route("/api/web/research", post(web_research::handler))
+        .route("/api/mcp/connections", get(mcp::list).post(mcp::save))
+        .route(
+            "/api/mcp/connections/:id",
+            axum::routing::delete(mcp::remove),
+        )
+        .route("/api/mcp/connections/:id/connect", post(mcp::connect))
+        .route("/api/mcp/connections/:id/disconnect", post(mcp::disconnect))
+        .route("/api/mcp/calls", post(mcp::prepare_call))
+        .route(
+            "/api/mcp/calls/:id",
+            get(mcp::call_status).delete(mcp::cancel_call),
+        )
+        .route("/api/mcp/calls/:id/decision", post(mcp::decide_call))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),

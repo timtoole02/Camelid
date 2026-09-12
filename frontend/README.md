@@ -189,3 +189,15 @@ phase gate.
 - `Enter` / `Shift+Enter` — send / newline in the composer
 - `Esc` — stop a running generation, close overlays
 - `?` — shortcut map (outside text fields)
+
+## Connected tools (MCP preview)
+
+Connections manages local stdio and remote Streamable HTTP MCP servers. Chat
+selects tools per conversation, requests approval for each call, displays tool
+results, and continues automatically within an eight-round limit. See
+[`docs/MCP.md`](../docs/MCP.md) for setup, credential configuration, boundaries,
+and the HTTP control-plane contract. Workspace remains read-only.
+
+Run `npm run smoke:mcp` and, after `npm run build`, `npm run smoke:mcp-browser`.
+The browser smoke exercises the actual chat request/result wiring using local
+fixtures; it is not model-quality evidence.

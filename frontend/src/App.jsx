@@ -15,12 +15,14 @@ import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
 import { useTheme } from './hooks/useTheme'
 import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry'
+import { McpRunPanel } from './components/mcp/ConnectedTools'
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
+const ConnectionsView = lazy(() => import('./views/ConnectionsView'))
 const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
 const HistoryView = lazy(() => import('./views/HistoryView'))
 const MemoryView = lazy(() => import('./views/MemoryView'))
@@ -38,7 +40,7 @@ const ArenaView = lazy(() => import('./views/ArenaView'))
 const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
@@ -87,6 +89,7 @@ function App() {
     inspectMode, setInspectMode, tokenInspections, inspectionSupported,
     structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
     structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
+    mcp, mcpSelectedKeys, toggleMcpTool, mcpActivity, mcpApproval, decideMcpApproval,
     toolsEnabled, setToolsEnabled, toolsText, setToolsText, toolContract, toolCapability, toolsReadiness, toolCallSignatures,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
@@ -391,6 +394,8 @@ function App() {
           demoMode={DEMO_UI}
         />
 
+        {mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
+
         {notice && (
           <div className="camelid-notice-slot">
             <Notice notice={notice} tone={noticeTone} onDismiss={clearNotice} />
@@ -420,6 +425,7 @@ function App() {
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
+              mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} toggleMcpTool={toggleMcpTool}
               selectedConversation={selectedConversation}
               selectedModel={selectedModel}
               selectedModelId={selectedModelId}
@@ -478,6 +484,8 @@ function App() {
               demoMode={DEMO_UI}
             />
           )}
+
+          {tab === 'connections' && <ConnectionsView mcp={mcp} />}
 
           {tab === 'workspace' && (
             <WorkspaceView

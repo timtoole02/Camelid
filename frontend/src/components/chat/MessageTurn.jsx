@@ -328,7 +328,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
-  const noVisibleResponse = message.role === 'assistant' && !assistantStreaming && !String(messageContent || '').trim()
+  const noVisibleResponse = message.role === 'assistant' && !message.tool_calls?.length && !assistantStreaming && !String(messageContent || '').trim()
   const hiddenTokenLimit = noVisibleResponse
     && message.finish_reason === 'length'
     && Number(message.usage?.completion_tokens || 0) > 0
@@ -493,7 +493,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
           />
         )}
         {message.role === 'assistant' && !assistantStreaming && message.tool_calls && (
-          <ToolCallsCard toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
+          <ToolCallsCard managed={message.mcp_managed} toolCalls={message.tool_calls} repeated={toolCallRepeat} replyContent={messageContent} />
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>
