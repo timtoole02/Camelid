@@ -1036,22 +1036,24 @@ fn route_reserved_with_estimates_at(
                     .collect();
                 serving.sort();
                 serving.dedup();
-                return Err(match refused_for_unplaced_holders(
-                    snapshots,
-                    &admitted_nodes,
-                    request,
-                    model,
-                    serving.clone(),
-                    unobserved,
-                ) {
-                    Some(refusal) => refusal,
-                    None => RouteError::ModelUnavailable {
-                        model: model.to_string(),
-                        serving,
+                return Err(
+                    match refused_for_unplaced_holders(
+                        snapshots,
+                        &admitted_nodes,
+                        request,
+                        model,
+                        serving.clone(),
                         unobserved,
-                        held_by_unplaced: Vec::new(),
+                    ) {
+                        Some(refusal) => refusal,
+                        None => RouteError::ModelUnavailable {
+                            model: model.to_string(),
+                            serving,
+                            unobserved,
+                            held_by_unplaced: Vec::new(),
+                        },
                     },
-                });
+                );
             }
             matched
         }
