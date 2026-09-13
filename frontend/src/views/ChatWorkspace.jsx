@@ -1,3 +1,4 @@
+import { ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
 import { ConnectedTools } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
@@ -1385,7 +1386,7 @@ export default function ChatWorkspace({
                 const dayKey = dayKeyOf(message.created_at)
                 const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
                 const showDaySeparator = Boolean(dayKey && priorDayKey && dayKey !== priorDayKey)
-                if (message.role === 'tool') return <details className="mcp-result" key={message.id}><summary>{message.mcp?.connection ? `${message.mcp.connection} · ` : ''}{message.mcp?.tool || 'Tool result'} · {message.mcp?.status || 'received'}{message.mcp?.is_error ? ' · error' : ''}</summary><pre>{message.content}</pre></details>
+                if (message.role === 'tool') return <details className="mcp-result" key={message.id}><summary>{message.mcp?.connection ? `${message.mcp.connection} · ` : ''}{message.mcp?.tool || 'Tool result'} · {message.mcp?.status || 'received'}{message.mcp?.is_error ? ' · error' : ''}</summary><ToolOutputGallery content={message.content} /><pre>{message.content}</pre></details>
                 return (
                   <Fragment key={message.id}>
                     {showDaySeparator && (

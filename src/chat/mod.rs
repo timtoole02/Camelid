@@ -56,6 +56,9 @@ pub(crate) mod workspace_bridge;
 mod workspace_cli;
 pub(crate) mod workspace_memory;
 
+pub(crate) use checkpoint::line_diff as file_change_diff;
+pub(crate) use tools::{replace_temp_atomically, Sandbox};
+
 pub use workspace_cli::{run as run_workspace_cli, WorkspaceCliAction, WorkspaceCliOptions};
 
 use std::io::IsTerminal;

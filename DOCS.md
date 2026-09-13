@@ -17,6 +17,7 @@ Read these first:
 - [`README.md`](README.md) — product overview, quick start, and starter models
 - [`docs/MODELS.md`](docs/MODELS.md) — full download catalog, model setup, and validation details
 - [`docs/MCP.md`](docs/MCP.md) — connected tool servers, approvals, and automatic chat continuation (preview)
+- [Output previews and file review](docs/OUTPUTS_AND_CHANGES.md) — downloads, approved local file changes, and undo.
 - [`docs/REMOTE_CHAT.md`](docs/REMOTE_CHAT.md) — browser chat over a private LAN or Tailscale
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
 - [`STATUS.md`](./docs/reference/STATUS.md) — current milestone/evidence snapshot and exact blockers

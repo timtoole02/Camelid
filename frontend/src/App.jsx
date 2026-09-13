@@ -16,12 +16,14 @@ import { useNotice } from './hooks/useNotice'
 import { useTheme } from './hooks/useTheme'
 import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry'
 import { McpRunPanel } from './components/mcp/ConnectedTools'
+import { OutputReviewContext } from './components/outputs/OutputActions.jsx'
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
+const ChangesView = lazy(() => import('./views/ChangesView'))
 const ConnectionsView = lazy(() => import('./views/ConnectionsView'))
 const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
 const HistoryView = lazy(() => import('./views/HistoryView'))
@@ -40,7 +42,7 @@ const ArenaView = lazy(() => import('./views/ArenaView'))
 const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
@@ -67,6 +69,7 @@ function App() {
   const [ledgerFocusRow, setLedgerFocusRow] = useState(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [outputDraft, setOutputDraft] = useState(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
@@ -111,6 +114,12 @@ function App() {
   const backend = useBackendLauncher({ showNotice, loadDashboard })
   const authReturnTabRef = useRef(null)
   const apiSurface = runtime?.api_surface || 'full'
+  const queueOutputReview = useCallback(output => {
+    setOutputDraft(output)
+    setTab('changes')
+    setMobileNavOpen(false)
+    if (typeof window !== 'undefined') window.history.replaceState(null, '', '#changes')
+  }, [setTab])
 
   useEffect(() => {
     if (authRequired) {
@@ -335,6 +344,7 @@ function App() {
   ].filter(Boolean).join(' ')
 
   return (
+    <OutputReviewContext.Provider value={!DEMO_UI && !isLanChatOnly(apiSurface) ? queueOutputReview : null}>
     <div className={shellClasses}>
       {/* macOS desktop only: the window draws no title bar of its own, so the
           traffic lights float over the top-left of our content. This strip is
@@ -485,6 +495,7 @@ function App() {
             />
           )}
 
+          {tab === 'changes' && <ChangesView apiBase={apiBase} draft={outputDraft} onConsumeDraft={() => setOutputDraft(null)} />}
           {tab === 'connections' && <ConnectionsView mcp={mcp} />}
 
           {tab === 'workspace' && (
@@ -626,6 +637,7 @@ function App() {
         onConfirm={handleDeleteConfirm}
       />
     </div>
+    </OutputReviewContext.Provider>
   )
 }
 

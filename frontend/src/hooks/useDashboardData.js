@@ -67,7 +67,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
+const VALID_TABS = new Set(['changes', 'connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;

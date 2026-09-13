@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { OutputActions } from '../../outputs/OutputActions.jsx'
 import { EVIDENCE_COPY, assessStructuredReply } from '../../../lib/structuredOutput'
 
 /* Structured-output card — what a constrained reply actually demonstrates.
@@ -41,6 +42,7 @@ export function StructuredOutputCard({ record }) {
         <span className="structout__label">Structured output</span>
         <span className={`structout__verdict structout__verdict--${assessment.evidence}`}>{copy.label}</span>
       </div>
+      <OutputActions code={record.content} language={isJsonMode ? "json" : "text"} />
       <p className="structout__detail">{copy.detail}</p>
 
       <dl className="structout__rows">

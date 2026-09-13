@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
+mod changes;
 #[allow(dead_code)]
 mod continuous_batch;
 mod contract;
@@ -196,6 +197,7 @@ pub struct AppState {
     responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
     mcp: mcp::McpManager,
+    changes: changes::ChangeManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
     workspace_cli_token: Option<Arc<str>>,
@@ -275,6 +277,7 @@ impl Default for AppState {
             responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
             mcp: mcp::McpManager::default(),
+            changes: changes::ChangeManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
@@ -2779,6 +2782,13 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/generation/preflight", post(preflight_generation))
         .route("/api/web/research", post(web_research::handler))
+        .route("/api/changes", get(changes::list).post(changes::prepare))
+        .route(
+            "/api/changes/:id",
+            get(changes::get).delete(changes::remove),
+        )
+        .route("/api/changes/:id/decision", post(changes::decide))
+        .route("/api/changes/:id/undo", post(changes::undo))
         .route("/api/mcp/connections", get(mcp::list).post(mcp::save))
         .route(
             "/api/mcp/connections/:id",
