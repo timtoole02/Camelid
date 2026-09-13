@@ -278,7 +278,7 @@ try {
   await openContext()
   await page.evaluate(() => { for (const input of document.querySelectorAll('.context-check input')) if (!input.checked) input.click() })
   await saveContext()
-  await click('.mcp-picker summary')
+  await click('.mcp-trigger')
   await page.waitForSelector('.mcp-tool-options input:not([disabled])')
   await click('.mcp-tool-options input')
   await fill('textarea[aria-label="Message Camelid"]', 'Say hello using the echo tool.')

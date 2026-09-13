@@ -563,6 +563,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run smoke:project-context
 
+      - name: Frontend connected tools and saved sets smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:mcp
+
+      - name: Frontend composer tools browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:mcp-browser
+
       - name: Frontend project and conversation context browser smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:project-context-browser
