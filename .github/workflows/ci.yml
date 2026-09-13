@@ -559,6 +559,14 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:organization-browser
 
+      - name: Frontend project and conversation context smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:project-context
+
+      - name: Frontend project and conversation context browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:project-context-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one

@@ -1,3 +1,5 @@
+import { ConversationContext } from '../components/context/ContextEditors'
+import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
 import { ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
 import { ConnectedTools } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -30,7 +32,7 @@ import {
   setCompactionOverride,
 } from '../lib/conversationCompaction.js'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
-import { classifyWebResearchNeed } from '../lib/webResearch.js'
+import { classifyWebResearchNeed, estimateWebResearchChatTokens } from '../lib/webResearch.js'
 import {
   ATTACHED_DOCUMENTS_STORAGE_KEY,
   normalizeAttachedDocuments,
@@ -172,6 +174,7 @@ async function prepareVisionAttachment(file) {
 }
 
 export default function ChatWorkspace({
+  projects = [], chatContext = {}, updateChatContext = null, contextSources = [], globalPrompt, updateGlobalPrompt,
   mcp = null, mcpSelectedKeys = [], toggleMcpTool = null,
   selectedConversation,
   selectedModel,
@@ -760,12 +763,12 @@ export default function ChatWorkspace({
      clamps to the context's remaining room, so an overshoot is a non-blocking
      notice — only a prompt that fills the whole context is a hard error. Prompt
      size is a client estimate, labeled as such. */
-  const estimatedPromptTokens = useMemo(() => {
-    const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
-    const text = `${history} ${composer}`
-    const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-    return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
-  }, [visibleMessages, composer])
+  const previewMessages = [...contextSourceMessages(contextSources), ...chatHistoryForRequest([
+    ...visibleMessages.filter(message => !message.streaming),
+    ...(composer.trim() ? [{ id: 'context-preview-draft', role: 'user', content: composer.trim(), ...(composerImage ? { image: composerImage } : {}) }] : []),
+  ])]
+  const estimatePrompt = messages => estimateWebResearchChatTokens(messages, { visionTokenAllowance: runtime?.vision_token_allowance })
+  const untrimmedPromptTokens = estimatePrompt(previewMessages)
   const configuredMaxTokens = getConfiguredMaxTokens(selectedModelId)
   const effectiveMaxTokens = applyGemma4GhostChatTokenCap(
     configuredMaxTokens,
@@ -773,6 +776,39 @@ export default function ChatWorkspace({
   )
   const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const activeContextLength = runtime?.active_context_length || modelContextLength(selectedModel)
+  /* The meter reads the same three numbers the budget check does, so the chip
+     and the notice under the composer can never disagree. The verified bound is
+     drawn as a marker rather than a limit: past it the row is still served, it
+     simply has no committed evidence pack. */
+  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
+  const executionLane = runtime?.execution_plan?.selected_backend || ''
+
+  /* Compaction preview. The panel must describe what the NEXT send will do, so
+     it runs the same pure trim the send path runs, over the same preference
+     store -- there is no second copy of the rule to drift. */
+  const conversationId = selectedConversation?.id || ''
+  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
+  const [compactionOverride, setCompactionOverrideState] = useState(null)
+  useEffect(() => {
+    setCompactionOverrideState(getCompactionOverride(conversationId))
+  }, [conversationId])
+
+  const contextBudget = composeContextBudget({
+    contextLength: activeContextLength,
+    promptTokens: untrimmedPromptTokens,
+    reservedTokens: effectiveMaxTokens,
+    verifiedBound,
+    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
+  })
+  const compactionPreview = applySendCompaction(previewMessages, {
+    enabled: compactionOverride === 'off' ? false : autoCompact,
+    forced: compactionOverride === 'force',
+    filledPercent: contextBudget?.filledPercent ?? 0,
+  })
+  const estimatedPromptTokens = estimatePrompt(compactionPreview.messages)
+  const systemTokens = estimatePrompt(compactionPreview.messages.filter(message => message.role === 'system'))
+  const elidedTokenEstimate = Math.max(0, untrimmedPromptTokens - estimatedPromptTokens)
+
   const rawSendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
     maxTokens: effectiveMaxTokens,
@@ -794,44 +830,6 @@ export default function ChatWorkspace({
   const sendBudget = segmentedVideoComposerBypass && rawSendBudget.level === 'error'
     ? { ...rawSendBudget, level: 'ok', message: null }
     : rawSendBudget
-
-  /* The meter reads the same three numbers the budget check does, so the chip
-     and the notice under the composer can never disagree. The verified bound is
-     drawn as a marker rather than a limit: past it the row is still served, it
-     simply has no committed evidence pack. */
-  const verifiedBound = verifiedContextBound(capabilities, selectedModel)
-  const executionLane = runtime?.execution_plan?.selected_backend || ''
-
-  /* Compaction preview. The panel must describe what the NEXT send will do, so
-     it runs the same pure trim the send path runs, over the same preference
-     store -- there is no second copy of the rule to drift. */
-  const conversationId = selectedConversation?.id || ''
-  const [autoCompact, setAutoCompactState] = useState(() => getAutoCompactEnabled())
-  const [compactionOverride, setCompactionOverrideState] = useState(null)
-  useEffect(() => {
-    setCompactionOverrideState(getCompactionOverride(conversationId))
-  }, [conversationId])
-
-  const contextBudget = composeContextBudget({
-    contextLength: activeContextLength,
-    promptTokens: estimatedPromptTokens,
-    reservedTokens: effectiveMaxTokens,
-    verifiedBound,
-    warnAtPercent: AUTO_COMPACT_THRESHOLD_PERCENT,
-  })
-  const compactionPreview = applySendCompaction(visibleMessages, {
-    enabled: compactionOverride === 'off' ? false : autoCompact,
-    forced: compactionOverride === 'force',
-    filledPercent: contextBudget?.filledPercent ?? 0,
-  })
-  const elidedTokenEstimate = compactionPreview.compacted    ? visibleMessages
-      .filter((message) => !compactionPreview.messages.includes(message))
-      .reduce((sum, message) => {
-        const text = String(message?.content || '')
-        const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
-        return sum + Math.round(Math.max(pieces.length, text.length / 4))
-      }, 0)
-    : 0
 
   const handleToggleAutoCompact = (next) => {
     setAutoCompactEnabled(next)
@@ -862,11 +860,15 @@ export default function ChatWorkspace({
     'Camelid runs the loaded model locally. Verify important output.',
   ].filter(Boolean).join(' ')
 
+  const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending} />)
+
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
+      {renderConversationContext(false)}
       {showControls && (
         <ChatControls
           capabilities={capabilities}
+          globalPrompt={globalPrompt} onGlobalPromptChange={updateGlobalPrompt} busy={sending}
           modelId={getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)}
           onClose={() => setShowControls(false)}
         />
@@ -1038,6 +1040,7 @@ export default function ChatWorkspace({
             ) : (
               <button type="button" className="cxcomposer__tool" onClick={() => setTab('library')}>Add a model</button>
             )}
+            {renderConversationContext(true)}
             {visionReady && (
               <>
                 <input
@@ -1269,13 +1272,14 @@ export default function ChatWorkspace({
         <ContextMeter
           contextLength={activeContextLength}
           promptTokens={estimatedPromptTokens}
+          systemTokens={systemTokens}
           reservedTokens={effectiveMaxTokens}
           verifiedBound={verifiedBound}
           executionLane={executionLane}
           autoCompact={autoCompact}
           onToggleAutoCompact={handleToggleAutoCompact}
           onCompactNow={compactionPreview.compacted ? null : handleCompactNow}
-          canCompact={compactForSend(visibleMessages) !== null}
+          canCompact={compactForSend(previewMessages) !== null}
           compaction={compactionPreview.compacted
             ? {
               active: true,

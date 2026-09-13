@@ -9,7 +9,7 @@ import { isPinned } from '../../lib/conversationOrganization.js'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
   IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
-  IconScale,
+  IconScale, IconFolder,
 } from '../ui/icons'
 
 const NAV_SECTIONS = [
@@ -18,6 +18,7 @@ const NAV_SECTIONS = [
     items: [
       { tab: 'chat', label: 'Chat', Icon: IconChat },
       { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
+      { tab: 'projects', label: 'Projects', Icon: IconFolder },
       { tab: 'history', label: 'Chat history', Icon: IconHistory },
       { tab: 'memory', label: 'Memory', Icon: IconMemory },
       { tab: 'changes', label: 'Changes', Icon: IconReceipt },

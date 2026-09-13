@@ -23,6 +23,7 @@ import { ShortcutsOverlay } from './components/ShortcutsOverlay'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
+const ProjectsView = lazy(() => import('./views/ProjectsView'))
 const ChangesView = lazy(() => import('./views/ChangesView'))
 const ConnectionsView = lazy(() => import('./views/ConnectionsView'))
 const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
@@ -42,7 +43,7 @@ const ArenaView = lazy(() => import('./views/ArenaView'))
 const SpotlightView = lazy(() => import('./views/SpotlightView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'arena', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   if (typeof window !== 'undefined' && window.location.hash === '#spotlight') {
@@ -106,6 +107,7 @@ function App() {
     clearConversationTagFilter, showArchivedConversations, setShowArchivedConversations,
     setConversationPinned, setConversationArchived, addConversationTag, removeConversationTag,
     importConversationsFromText,
+    projects, saveProject, deleteProject, chatContext, updateChatContext, contextSources, globalPrompt, updateGlobalPrompt,
     activateModel, unloadCurrentModel,
     registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -264,12 +266,13 @@ function App() {
 
   const selectConversation = (id) => {
     setSelectedConversationId(id)
-    setTab('chat')
+    navigateTab('chat')
     closeMobileNav()
   }
 
-  const startNewChat = () => {
-    showNewChatLanding()
+  const startNewChat = (projectId = '') => {
+    showNewChatLanding(typeof projectId === 'string' ? projectId : '')
+    navigateTab('chat')
     closeMobileNav()
   }
 
@@ -435,6 +438,8 @@ function App() {
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
+              projects={projects} chatContext={chatContext} updateChatContext={updateChatContext} contextSources={contextSources}
+              globalPrompt={globalPrompt} updateGlobalPrompt={updateGlobalPrompt}
               mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} toggleMcpTool={toggleMcpTool}
               selectedConversation={selectedConversation}
               selectedModel={selectedModel}
@@ -495,6 +500,7 @@ function App() {
             />
           )}
 
+          {tab === 'projects' && <ProjectsView projects={projects} conversations={conversations} onSave={saveProject} onDelete={deleteProject} onNewChat={startNewChat} onOpenConversation={selectConversation} busy={sending} />}
           {tab === 'changes' && <ChangesView apiBase={apiBase} draft={outputDraft} onConsumeDraft={() => setOutputDraft(null)} />}
           {tab === 'connections' && <ConnectionsView mcp={mcp} />}
 

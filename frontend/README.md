@@ -211,3 +211,14 @@ See [Output previews and file review](../docs/OUTPUTS_AND_CHANGES.md).
 
 Validate with `npm run smoke:outputs-changes` and, after building,
 `npm run smoke:outputs-changes-browser`.
+
+## Projects and conversation context
+
+Projects group chats with shared instructions and reference files. The conversation
+context panel controls inheritance, chat-specific instructions/files, and shows
+the exact sources included in the next request. Context is saved locally and
+included in budget estimates and all chat send paths. See
+[Project and conversation context](../docs/PROJECT_CONTEXT.md).
+
+Validate with `npm run smoke:project-context` and, after building,
+`npm run smoke:project-context-browser`.
