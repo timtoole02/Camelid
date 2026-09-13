@@ -93,7 +93,7 @@ function App() {
     inspectMode, setInspectMode, tokenInspections, inspectionSupported,
     structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
     structuredGrammar, setStructuredGrammar, structuredRecords, structuredSupported, structuredReadiness,
-    mcp, mcpSelectedKeys, toggleMcpTool, mcpActivity, mcpApproval, decideMcpApproval,
+    mcp, mcpSelectedKeys, replaceMcpTools, mcpActivity, mcpApproval, decideMcpApproval,
     toolsEnabled, setToolsEnabled, toolsText, setToolsText, toolContract, toolCapability, toolsReadiness, toolCallSignatures,
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
@@ -407,7 +407,7 @@ function App() {
           demoMode={DEMO_UI}
         />
 
-        {mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
+        {(tab !== 'chat' || (mcpActivity.conversationId && mcpActivity.conversationId !== selectedConversation?.id)) && mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
 
         {notice && (
           <div className="camelid-notice-slot">
@@ -440,7 +440,8 @@ function App() {
             <ChatWorkspace
               projects={projects} chatContext={chatContext} updateChatContext={updateChatContext} contextSources={contextSources}
               globalPrompt={globalPrompt} updateGlobalPrompt={updateGlobalPrompt}
-              mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} toggleMcpTool={toggleMcpTool}
+              mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} replaceMcpTools={replaceMcpTools}
+              mcpActivity={!mcpActivity.conversationId || mcpActivity.conversationId === selectedConversation?.id ? mcpActivity : null} mcpApproval={mcpApproval} decideMcpApproval={decideMcpApproval}
               selectedConversation={selectedConversation}
               selectedModel={selectedModel}
               selectedModelId={selectedModelId}

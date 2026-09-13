@@ -3,6 +3,7 @@ import { codePolicyForMessages } from '../lib/chatPolicy.js'
 export { looksLikeCodePrompt } from '../lib/chatPolicy.js'
 import { useMcpConnections } from './useMcpConnections.js'
 import { mcpRequest, runMcpTurn, selectedMcpTools } from '../lib/mcp.js'
+import { normalizeMcpSelection } from '../lib/mcpToolSets.js'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
@@ -1096,10 +1097,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     grammarText: structuredGrammar,
   })
   const mcpSelectedKeys = selectedConversation ? (selectedConversation.mcp_tools || []) : mcpDraftKeys
-  const toggleMcpTool = (key) => {
+  const replaceMcpTools = (keys) => {
     if (sending || mcpRunRef.current) return
-    const next = key === null ? [] : mcpSelectedKeys.includes(key)
-      ? mcpSelectedKeys.filter(k => k !== key) : [...mcpSelectedKeys, key].slice(0, 16)
+    const next = normalizeMcpSelection(keys)
     if (selectedConversation) persistConversations(current => current.map(c => c.id === selectedConversation.id ? { ...c, mcp_tools: next } : c))
     else setMcpDraftKeys(next)
   }
@@ -2389,10 +2389,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
     if (tools.length !== mcpSelectedKeys.length) { showNotice('Reconnect the selected tools or clear the tool selection before sending.', 'error'); return }
     const controller = new AbortController()
     mcpRunRef.current = controller
+    let conversationId = selectedConversation?.id || null
     try {
-      await runMcpTurn({ initialOptions: options, tools, send: next => sendMessage({ ...next, frozenContextSources }),
+      await runMcpTurn({ initialOptions: options, tools, send: async next => {
+        const result = await sendMessage({ ...next, frozenContextSources })
+        conversationId = result?.conversationId || conversationId
+        return result
+      },
         request: (path, init) => mcpRequest(apiBase, path, init),
-        signal: controller.signal, activity: setMcpActivity,
+        signal: controller.signal, activity: next => setMcpActivity({ ...next, conversationId }),
         approve: (call, signal) => new Promise(resolve => {
           if (signal.aborted) { resolve(false); return }
           setMcpApproval(call)
@@ -2860,7 +2865,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     newChatTitle,
     setNewChatTitle,
     sending: sending || mcpActivity.phase !== 'idle',
-    mcp, mcpSelectedKeys, toggleMcpTool, mcpActivity, mcpApproval, decideMcpApproval,
+    mcp, mcpSelectedKeys, replaceMcpTools, mcpActivity, mcpApproval, decideMcpApproval,
 
     webResearchEnabled,
     setWebResearchEnabled,

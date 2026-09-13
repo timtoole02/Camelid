@@ -1,7 +1,7 @@
 import { ConversationContext } from '../components/context/ContextEditors'
 import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
 import { ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
-import { ConnectedTools } from '../components/mcp/ConnectedTools'
+import { ConnectedTools, McpRunPanel } from '../components/mcp/ConnectedTools'
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
@@ -175,7 +175,7 @@ async function prepareVisionAttachment(file) {
 
 export default function ChatWorkspace({
   projects = [], chatContext = {}, updateChatContext = null, contextSources = [], globalPrompt, updateGlobalPrompt,
-  mcp = null, mcpSelectedKeys = [], toggleMcpTool = null,
+  mcp = null, mcpSelectedKeys = [], replaceMcpTools = null, mcpActivity = null, mcpApproval = null, decideMcpApproval = null,
   selectedConversation,
   selectedModel,
   selectedModelId,
@@ -280,10 +280,12 @@ export default function ChatWorkspace({
   const hasStreamingAssistant = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming)
   const hasStreamingAssistantContent = rawVisibleMessages.some((m) => m.role === 'assistant' && m.streaming && String(m.content || '').trim())
   const requestActive = Boolean(sending)
+  const connectedToolsAvailable = Boolean(mcp && !demoMode && runtime?.api_surface !== 'lan_chat_only')
   // Sending is process-global (only one local-model request may run), while
   // loaders, stop controls, and auto-follow belong only to the conversation
   // that owns the pending/streaming turn.
   const generationActive = Boolean(pendingConversation || hasStreamingAssistant)
+  const followActive = generationActive || Boolean(mcpActivity && mcpActivity.phase !== 'idle')
   const visibleMessages = useMemo(() => {
     if (!generationActive) return rawVisibleMessages
     return rawVisibleMessages.filter((message, index, messages) => {
@@ -529,7 +531,7 @@ export default function ChatWorkspace({
   }, [])
 
   useEffect(() => {
-    if (!generationActive) return undefined
+    if (!followActive) return undefined
     autoFollowGenerationRef.current = true
     setUserScrolledAway(false)
     /* Auto-follow is released by the user's GESTURE, not by how far they got.
@@ -565,15 +567,15 @@ export default function ChatWorkspace({
       el?.removeEventListener('touchmove', releaseOnUpwardIntent)
       el?.removeEventListener('keydown', releaseOnUpwardIntent)
     }
-  }, [generationActive, selectedConversation?.id])
+  }, [followActive, selectedConversation?.id])
 
   useLayoutEffect(() => {
-    if (!generationActive || !autoFollowGenerationRef.current) return undefined
+    if (!followActive || !autoFollowGenerationRef.current) return undefined
     const frame = window.requestAnimationFrame(() => {
       chatBottomRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [generationActive, streamingScrollSignature])
+  }, [followActive, streamingScrollSignature, mcpActivity?.phase, mcpApproval?.id])
 
   useLayoutEffect(() => {
     const resize = () => resizeComposerInput(composerRef.current)
@@ -917,8 +919,7 @@ export default function ChatWorkspace({
           </p>
         </div>
       )}
-      {mcp && !demoMode && runtime?.api_surface !== 'lan_chat_only' && <ConnectedTools connections={mcp.connections} selectedKeys={mcpSelectedKeys} onToggle={toggleMcpTool} onManage={() => setTab('connections')} disabled={requestActive} capability={toolCapability} />}
-      {toolCapability.capable && toolsEnabled && setToolsText && !mcpSelectedKeys.length && (
+      {!connectedToolsAvailable && toolCapability.capable && toolsEnabled && setToolsText && !mcpSelectedKeys.length && (
         <div className="tooldef">
           <textarea
             className="tooldef__field"
@@ -1040,6 +1041,12 @@ export default function ChatWorkspace({
             ) : (
               <button type="button" className="cxcomposer__tool" onClick={() => setTab('library')}>Add a model</button>
             )}
+            {connectedToolsAvailable && <ConnectedTools key={'mcp-' + (selectedConversation?.id || 'draft')} connections={mcp.connections} selectedKeys={mcpSelectedKeys}
+              onSelectionChange={replaceMcpTools} onManage={() => setTab('connections')} disabled={requestActive} capability={toolCapability}
+              connectionBusy={mcp.busy} error={mcp.error} onRetry={() => mcp.refresh()}
+              onConnect={id => mcp.mutate('/connections/' + id + '/connect', { method: 'POST' })}
+              manualEnabled={toolsEnabled} onManualEnabledChange={setToolsEnabled} manualText={toolsText} onManualTextChange={setToolsText}
+              manualReadiness={toolsReadiness} structuredMode={structuredMode} />}
             {renderConversationContext(true)}
             {visionReady && (
               <>
@@ -1173,7 +1180,7 @@ export default function ChatWorkspace({
                 half is STRICTER than the engine — POST /v1/chat/completions gates
                 on the chat template and never reads tool_capable — so the copy
                 says Camelid declines, not that the engine refuses. */}
-            {!demoMode && setToolsEnabled && (
+            {!connectedToolsAvailable && !demoMode && setToolsEnabled && (
               <button
                 type="button"
                 className={`cxcomposer__tool cxcomposer__tool--collapsible ${toolsEnabled && toolCapability.capable ? 'is-on' : ''}`}
@@ -1423,7 +1430,7 @@ export default function ChatWorkspace({
                   </Fragment>
                 )
               })}
-              {generationActive && (
+              {followActive && (
                 <button
                   type="button"
                   className="cxchat__jump-latest"
@@ -1444,8 +1451,9 @@ export default function ChatWorkspace({
                   </article>
                 </>
               )}
+              <McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} />
               {/* Follow-up prompts sit under the latest reply — they act on it. */}
-              {visibleMessages.length > 0 && !generationActive && canChat && (
+              {visibleMessages.length > 0 && !requestActive && canChat && (
                 <div className="cxchat__followups" aria-label="Follow-up prompts">
                   {FOLLOW_UP_PROMPTS.map((prompt) => (
                     <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>
