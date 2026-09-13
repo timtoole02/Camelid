@@ -144,6 +144,7 @@ const messageTurnSource = read('../src/components/chat/MessageTurn.jsx')
 const streamingIndicatorSource = read('../src/components/chat/render/StreamingIndicator.jsx')
 const diagnosticsSource = read('../src/components/chat/render/Diagnostics.jsx')
 const markdownSource = read('../src/lib/markdown.jsx')
+const codePolicySource = readFileSync(new URL('../src/lib/chatPolicy.js', import.meta.url), 'utf8')
 const dashboardHookSource = read('../src/hooks/useDashboardData.js')
 const executionPlanSource = read('../src/lib/executionPlan.js')
 const loadedModelDisplaySource = read('../src/lib/loadedModelDisplay.js')
@@ -234,7 +235,7 @@ assert.doesNotMatch(messageTurnSource, /dangerouslySetInnerHTML/, 'message rows 
 assert.match(streamingIndicatorSource, /className="streaming-loader-label">\{label\}<\/span>/, 'pre-token status text must be visible next to the animated dots, not aria-only')
 
 /* ---- Dashboard data hook ---- */
-assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
+assert.match(codePolicySource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
 assert.match(
   dashboardHookSource,
   /const requestedMaxTokens = applyGemma4GhostChatTokenCap\([\s\S]*applyGemma4ChatTokenFloor\([\s\S]*applyBitNetFreshChatTokenCap\([\s\S]*localChatMaxTokens\(history, responseLimitModelId\)/,
@@ -267,17 +268,18 @@ assert.match(loadedModelDisplaySource, /ggufFileTypeValueFromLabel[\s\S]*quantLa
 assert.match(dashboardHookSource, /localRecordMatchesBackendId/, 'dashboard model merge should de-duplicate backend model rows against saved browser records by id or runtime_model_name')
 assert.match(dashboardHookSource, /const id = localRecord\?\.id \|\| item\.id/, 'backend model merges should preserve the browser row id while keeping the backend runtime id as runtime_model_name')
 assert.match(dashboardHookSource, /const conversation =[\s\S]*?await ensureConversation\(\)[\s\S]*?setSelectedConversationId\(conversation\.id\)[\s\S]*?fetch\(`\$\{normalizedApiBase\}\/v1\/chat\/completions`/, 'fresh-chat sends must select the real conversation before streaming starts so the main pane updates with sidebar previews')
-assert.match(dashboardHookSource, /applyLocalChatPolicy\(completeToolHistory\(requestHistory\)\)/, 'code/html prompts should use the local code-first request policy after image parts are attached')
-assert.match(dashboardHookSource, /activeImageIndex[\s\S]*image_url[\s\S]*image\.data_url/, 'the chat request must encode the latest local attachment as an OpenAI image_url data part')
-assert.match(dashboardHookSource, /CODE_FIRST_SYSTEM_PROMPT/, 'frontend should keep a code-first system prompt for code/html local chat requests')
-assert.match(dashboardHookSource, /begin immediately with complete runnable code/, 'code-first prompt should suppress slow prose preambles before code and ask for complete output')
-assert.match(dashboardHookSource, /Start exactly with ```html then <!doctype html>/, 'HTML code prompts should request visible code at the beginning of the stream')
-assert.match(dashboardHookSource, /ONE self-contained file/, 'HTML code prompts should ask for one complete file, not separated assets')
-assert.match(dashboardHookSource, /For Python, start exactly with ```python/, 'Python code prompts should get a Python-specific complete-script instruction')
-assert.match(dashboardHookSource, /prefer tkinter from the standard library over pygame/, 'Python game prompts should prefer compact standard-library demos over sprawling dependency-heavy pygame output')
-assert.match(dashboardHookSource, /complete runnable event loop/, 'Python game prompts should ask for runnable game logic, not a sketch')
-assert.match(dashboardHookSource, /python\|py\|pygame\|game\|pacman\|pacmac/, 'code-first detection should catch Python game demos and the pacmac typo')
-assert.match(dashboardHookSource, /Never use external files or script src/, 'HTML code prompts should prevent unusable external script references in demos')
+const projectContextSource = readFileSync(new URL('../src/lib/projectContext.js', import.meta.url), 'utf8')
+assert.match(dashboardHookSource, /contextSourcesFor\(conversation.context, requestHistory\)/, 'context policy uses the final mapped request history')
+assert.match(projectContextSource, /imageIndex[\s\S]*image_url[\s\S]*image\.data_url/, 'the chat request must encode the latest local attachment as an OpenAI image_url data part')
+assert.match(codePolicySource, /CODE_FIRST_SYSTEM_PROMPT/, 'frontend should keep a code-first system prompt for code/html local chat requests')
+assert.match(codePolicySource, /begin immediately with complete runnable code/, 'code-first prompt should suppress slow prose preambles before code and ask for complete output')
+assert.match(codePolicySource, /Start exactly with ```html then <!doctype html>/, 'HTML code prompts should request visible code at the beginning of the stream')
+assert.match(codePolicySource, /ONE self-contained file/, 'HTML code prompts should ask for one complete file, not separated assets')
+assert.match(codePolicySource, /For Python, start exactly with ```python/, 'Python code prompts should get a Python-specific complete-script instruction')
+assert.match(codePolicySource, /prefer tkinter from the standard library over pygame/, 'Python game prompts should prefer compact standard-library demos over sprawling dependency-heavy pygame output')
+assert.match(codePolicySource, /complete runnable event loop/, 'Python game prompts should ask for runnable game logic, not a sketch')
+assert.match(codePolicySource, /python\|py\|pygame\|game\|pacman\|pacmac/, 'code-first detection should catch Python game demos and the pacmac typo')
+assert.match(codePolicySource, /Never use external files or script src/, 'HTML code prompts should prevent unusable external script references in demos')
 
 /* ---- Stream parser ---- */
 assert.match(streamParserSource, /function defaultEstimateTokenCount/, 'central stream parser should keep a JSON fallback token estimator')

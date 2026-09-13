@@ -1,3 +1,4 @@
+import { normalizeChatContext } from './projectContext.js'
 import { normalizeMessageVariants } from './messageVariants.js'
 import { normalizeConversationOrganization } from './conversationOrganization.js'
 
@@ -43,6 +44,7 @@ export function normalizeStoredMessage(message, { clearStaleStreaming = false } 
 export function normalizeStoredConversations(records, options = {}) {
   return (Array.isArray(records) ? records : []).map((conversation) => normalizeConversationOrganization({
     ...conversation,
+    ...(conversation?.context ? { context: normalizeChatContext(conversation.context) } : {}),
     messages: Array.isArray(conversation?.messages)
       ? conversation.messages.map((message) => normalizeStoredMessage(message, options))
       : [],
