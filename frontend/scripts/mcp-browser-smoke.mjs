@@ -3,7 +3,7 @@
  * This verifies wiring; it makes no claim about a real model's tool quality. */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, mkdirSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -27,6 +27,7 @@ const MIME = {
 }
 
 if (!existsSync(distDir)) throw new Error(`missing ${distDir} -- run "npm run build" first`)
+mkdirSync(resolve(scriptDir, '../../target'), { recursive: true })
 
 const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
 const capabilities = {
@@ -399,8 +400,9 @@ try {
   assert.deepEqual(externalRequests, [])
   console.log('MCP browser smoke passed: picker limits/search, saved sets/storage failure, manual mode, reconnect, allow/deny/stop, conversation history, server setup, keyboard dismissal, and responsive layout.')
 } catch (error) {
-  await page.screenshot({ path: resolve(scriptDir, '../../target/mcp-browser-failure.png'), fullPage: true })
   console.error(pageErrors)
+  await page.screenshot({ path: resolve(scriptDir, '../../target/mcp-browser-failure.png'), fullPage: true })
+    .catch(screenshotError => console.error('Could not capture failure screenshot:', screenshotError.message))
   throw error
 } finally {
   await browser.close()
