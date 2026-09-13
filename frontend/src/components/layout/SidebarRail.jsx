@@ -20,6 +20,7 @@ const NAV_SECTIONS = [
       { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
       { tab: 'history', label: 'Chat history', Icon: IconHistory },
       { tab: 'memory', label: 'Memory', Icon: IconMemory },
+      { tab: 'connections', label: 'Connections', Icon: IconNetwork },
     ],
   },
   {

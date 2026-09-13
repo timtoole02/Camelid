@@ -1,3 +1,5 @@
+import { useMcpConnections } from './useMcpConnections.js'
+import { mcpRequest, runMcpTurn, selectedMcpTools, toolHistoryMessage, completeToolHistory } from '../lib/mcp.js'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
@@ -65,7 +67,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
+const VALID_TABS = new Set(['connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry', 'arena', 'observatory'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;
@@ -715,6 +717,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
   const [sending, setSending] = useState(false)
+  const mcp = useMcpConnections(apiBase)
+  const [mcpDraftKeys, setMcpDraftKeys] = useState([])
+  const [mcpActivity, setMcpActivity] = useState({ phase: 'idle' })
+  const [mcpApproval, setMcpApproval] = useState(null)
+  const mcpRunRef = useRef(null)
+  const mcpApprovalRef = useRef(null)
+  useEffect(() => () => {
+    mcpRunRef.current?.abort()
+    mcpApprovalRef.current?.(false)
+  }, [apiBase, selectedModelId])
   const [webResearchEnabled, setWebResearchEnabledState] = useState(readWebResearchEnabled)
   const [webResearchStatus, setWebResearchStatus] = useState({ phase: 'idle', sourceCount: 0, conversationId: null })
   // Opt-in parity receipts: sends the next message non-streaming with
@@ -1110,6 +1122,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
     schemaText: structuredSchema,
     grammarText: structuredGrammar,
   })
+  const mcpSelectedKeys = selectedConversation ? (selectedConversation.mcp_tools || []) : mcpDraftKeys
+  const toggleMcpTool = (key) => {
+    if (sending || mcpRunRef.current) return
+    const next = key === null ? [] : mcpSelectedKeys.includes(key)
+      ? mcpSelectedKeys.filter(k => k !== key) : [...mcpSelectedKeys, key].slice(0, 16)
+    if (selectedConversation) persistConversations(current => current.map(c => c.id === selectedConversation.id ? { ...c, mcp_tools: next } : c))
+    else setMcpDraftKeys(next)
+  }
   const toolContract = readToolContract(dashboard?.capabilities)
   const toolCapability = readModelToolCapability(dashboard?.capabilities, selectedModel, runtime)
   const toolsReadiness = toolReadiness({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })
@@ -1153,6 +1173,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const conversation = {
       id: makeId('conversation'),
       title: manualTitle || 'New conversation',
+      mcp_tools: [...mcpDraftKeys],
       model_id: selectedModelId || models[0]?.id || null,
       messages: manualTitle ? [] : [{ id: makeId('message'), role: 'assistant', content: 'Conversation created. Load a Camelid model and send a prompt when ready.', created_at: nowIso() }],
       created_at: nowIso(),
@@ -1198,6 +1219,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }
 
   const stopGeneration = () => {
+    if (mcpRunRef.current) {
+      mcpRunRef.current.abort()
+      mcpApprovalRef.current?.(false)
+      activeChatRequestRef.current?.abort()
+      return true
+    }
     if (!activeChatRequestRef.current || stoppingGeneration) return false
     setStoppingGeneration(true)
     activeChatRequestRef.current.abort()
@@ -1270,6 +1297,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       truncateFromMessageId = null,
       continueFromMessageId = null,
       variantOfMessageId = null,
+      mcpConversationId = null,
+      mcpHistory = null,
+      connectedTools = null,
+      mcpSignal = null,
     } = options
     /* Continuing supplies its own request text, so it never reads the composer
        and never blocks on an empty one. */
@@ -1325,11 +1356,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
     /* Hoisted so the finally below can always halt the display-pacing loop,
        including on abort and error paths. */
     let stopPacing = () => {}
+    let removeMcpAbortListener = () => {}
     let pendingAssistantPatch = null
     let pendingAssistantFrame = null
 
     try {
-      const conversation = await ensureConversation()
+      const conversation = mcpConversationId
+        ? localConversationsRef.current.find(c => c.id === mcpConversationId)
+        : await ensureConversation()
+      if (!conversation) throw new Error('The connected-tools conversation is no longer available.')
       activeConversationId = conversation.id
       // Fresh chats start from the __new__ sentinel. Select the real conversation immediately
       // so the main thread renders the same streaming message object as the sidebar preview.
@@ -1362,20 +1397,20 @@ export function useDashboardData({ showNotice, clearNotice }) {
             /* Everything BEFORE the reply being re-rolled, which already ends
                with the question that produced it. */
             ? (conversation.messages || []).slice(0, variantIndex)
-            : (conversation.messages || [])
+            : (mcpHistory || conversation.messages || [])
       /* A variant adds no user turn: appending one would duplicate the
          question in the prompt and in the transcript. */
-      const history = variantMessage ? [...baseMessages] : [...baseMessages, userMessage]
+      const history = ((variantMessage || mcpConversationId) ? [...baseMessages] : [...baseMessages, userMessage])
         // A token budget can end entirely inside a model-hidden channel. Keep
         // that diagnostic turn in the transcript, but never feed an empty
         // assistant message back into the next model prompt.
         .filter((message) => {
-          if (message.role === 'user') return true
+          if (message.role === 'user' || message.role === 'tool' || message.tool_calls?.length) return true
           if (message.role !== 'assistant') return false
           const content = String(message.content || '').trim()
           return content && content !== '(empty response)'
         })
-        .filter((message) => !message.content.startsWith('Conversation created.'))
+        .filter((message) => !String(message.content || '').startsWith('Conversation created.'))
       // The current Prism vision lanes accept one image. Retain every attachment in
       // the local transcript, but send only the most recent one so follow-ups
       // keep image context and attaching a replacement does not form an
@@ -1384,9 +1419,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
       history.forEach((message, index) => {
         if (message.image?.data_url) activeImageIndex = index
       })
-      const requestHistory = history.map(({ id, role, content, image }, index) => {
+      const requestHistory = history.map((message, index) => {
+        const { id, role, content, image } = message
         const payloadContent = id === userMessage.id ? requestMessageContent : content
         return {
+          ...toolHistoryMessage(message),
           role,
           content: index === activeImageIndex
             ? [
@@ -1396,7 +1433,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
             : payloadContent,
         }
       })
-      let requestMessages = applyLocalChatPolicy(requestHistory)
+      let requestMessages = applyLocalChatPolicy(completeToolHistory(requestHistory))
 
       /* Send-time compaction. Trims only this payload -- the stored transcript
          is untouched -- so a wrong call costs the user nothing. Reads the same
@@ -1462,7 +1499,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       /* The continuation instruction is request-only: storing it would leave a
          "Continue your previous reply..." turn in the transcript and re-send it
          on every later turn. */
-      if (!reusedMessage) {
+      if (!reusedMessage && !mcpConversationId) {
         persistConversations((current) => current.map((item) => (
           item.id === conversation.id
             ? {
@@ -1507,6 +1544,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let requestMaxTokens = admittedRequestMaxTokens
       const requestController = new AbortController()
       activeChatRequestRef.current = requestController
+      if (mcpSignal) {
+        const abort = () => requestController.abort()
+        mcpSignal.addEventListener('abort', abort, { once: true })
+        removeMcpAbortListener = () => mcpSignal.removeEventListener('abort', abort)
+        if (mcpSignal.aborted) abort()
+        requestController.signal.throwIfAborted()
+      }
       const researchPlan = classifyWebResearchNeed(messageContent)
       let researchResult = null
       let researchFailure = ''
@@ -1923,7 +1967,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
              paths, so unlike receipts and constrained decoding it does not force
              the turn off the stream. Contributes nothing unless the engine row
              AND the loaded model both carry the capability. */
-          ...(targetVerifiedRender ? {} : toolRequestFields({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })),
+          ...(targetVerifiedRender ? {} : connectedTools?.length ? { tools: connectedTools } : toolRequestFields({ enabled: toolsEnabled, contract: toolContract, capability: toolCapability, toolsText })),
           ...(targetVerifiedRender ? {
             // The private verifier contract is exact: its output allowance is
             // the complete fresh draft, not the planner's larger upper bound.
@@ -2237,6 +2281,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         /* Persisted on the message: unlike per-token logprobs these are small, and
            a turn that ended in a tool request is meaningless without them. */
         tool_calls: streamed.toolCalls || null,
+        mcp_managed: Boolean(connectedTools?.length),
         planner_ms: targetVerifiedPlannerMs,
         target_verified_render: targetVerifiedRender,
         segmented_target_verified_render: segmentedTargetVerifiedRender,
@@ -2275,6 +2320,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         outcome: streamed.finishReason === 'error' ? 'error' : 'ok',
         promptText: messageContent,
       })
+      return { conversationId: conversation.id, message: assistantMessage, history: [...history, assistantMessage] }
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
       if (chatLifecycleId) {
@@ -2326,6 +2372,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         showNotice(errorMessage, 'error')
       }
     } finally {
+      removeMcpAbortListener()
       stopPacing()
       activeChatRequestRef.current = null
       setWebResearchStatus({ phase: 'idle', sourceCount: 0, conversationId: null })
@@ -2333,6 +2380,40 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSending(false)
       await loadDashboard({ silent: true })
     }
+  }
+
+  const decideMcpApproval = (approved) => {
+    const resolve = mcpApprovalRef.current
+    mcpApprovalRef.current = null
+    setMcpApproval(null)
+    resolve?.(approved)
+  }
+  const sendConnectedMessage = async (options = {}) => {
+    if (sending || mcpRunRef.current) return
+    const tools = selectedMcpTools(mcp.connections, mcpSelectedKeys)
+    if (!mcpSelectedKeys.length) return sendMessage(options)
+    if (!toolContract.supported || !toolCapability.capable) { showNotice(toolCapability.reason || 'This model cannot use connected tools.', 'error'); return }
+    if (structuredMode !== 'off') { showNotice('Turn off structured output before using connected tools.', 'error'); return }
+    if (tools.length !== mcpSelectedKeys.length) { showNotice('Reconnect the selected tools or clear the tool selection before sending.', 'error'); return }
+    const controller = new AbortController()
+    mcpRunRef.current = controller
+    try {
+      await runMcpTurn({ initialOptions: options, tools, send: sendMessage,
+        request: (path, init) => mcpRequest(apiBase, path, init),
+        signal: controller.signal, activity: setMcpActivity,
+        approve: (call, signal) => new Promise(resolve => {
+          if (signal.aborted) { resolve(false); return }
+          setMcpApproval(call)
+          const abort = () => finish(false)
+          const finish = value => { signal.removeEventListener('abort', abort); mcpApprovalRef.current = null; setMcpApproval(null); resolve(value) }
+          mcpApprovalRef.current = finish
+          signal.addEventListener('abort', abort, { once: true })
+        }),
+        recordResults: (id, results) => persistConversations(current => current.map(c => c.id === id
+          ? { ...c, messages: [...c.messages, ...results.map(result => ({ ...result, id: makeId('message'), created_at: nowIso() }))], updated_at: nowIso() } : c)),
+      })
+    } catch (e) { showNotice(e.name === 'AbortError' ? 'Connected tool work stopped. Actions already sent to a server may have completed.' : e.message, e.name === 'AbortError' ? 'info' : 'error') }
+    finally { mcpRunRef.current = null; setMcpApproval(null); setMcpActivity({ phase: 'idle' }); await mcp.refresh() }
   }
 
   const updateConversationRecord = (id, update) => {
@@ -2404,6 +2485,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }
 
   const showNewChatLanding = () => {
+    setMcpDraftKeys([])
     setTab('chat')
     setSelectedConversationId(NEW_CHAT_SENTINEL)
     setComposer('')
@@ -2781,7 +2863,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setComposer,
     newChatTitle,
     setNewChatTitle,
-    sending,
+    sending: sending || mcpActivity.phase !== 'idle',
+    mcp, mcpSelectedKeys, toggleMcpTool, mcpActivity, mcpApproval, decideMcpApproval,
+
     webResearchEnabled,
     setWebResearchEnabled,
     webResearchStatus,
@@ -2829,7 +2913,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     pendingConversation,
     createConversation,
     showNewChatLanding,
-    sendMessage,
+    sendMessage: sendConnectedMessage,
     resendFromMessage,
     continueFromMessage,
     regenerateAsVariant,

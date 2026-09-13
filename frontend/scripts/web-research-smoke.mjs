@@ -656,8 +656,8 @@ assert.ok(
   (apiSource.match(/vision_token_allowance:/g)?.length ?? 0) >= 3,
   'the backend must declare vision_token_allowance and set it in BOTH health constructors, or the consumer above silently falls back to a default',
 )
-assert.doesNotMatch(dashboardHookSource, /\btools\s*:/, 'Gemma Web research must not add unsupported function tools to chat requests')
-assert.doesNotMatch(dashboardHookSource, /\btool_choice\s*:/, 'Web Auto must remain separate from native model tool selection')
+assert.match(dashboardHookSource, /connectedTools\?\.length \? \{ tools: connectedTools \} : toolRequestFields/, 'tools must remain gated by explicit MCP selection or the tool contract, not enabled by Web Auto')
+assert.match(dashboardHookSource, /if \(!toolContract.supported \|\| !toolCapability.capable\)/, 'connected tools require both protocol and model support')
 assert.doesNotMatch(dashboardHookSource, /\bcamelid_tools\s*:/, 'Web Auto must not enter a camelid_tools loop')
 assert.match(dashboardHookSource, /web_research_ms: webResearchMs/, 'public-web latency must be persisted separately from model TTFT and decode rate')
 assert.match(dashboardHookSource, /now - firstTokenAt/, 'decode tok\/s must start at the first generated token instead of including research or TTFT')

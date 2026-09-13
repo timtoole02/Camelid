@@ -17,7 +17,7 @@ import { formatArguments, normalizeToolCalls, replyCarriesRawEnvelope } from '..
    swallowed: a model emitting broken arguments is a real thing to know, and
    presenting it as a clean call would hide it. */
 
-export function ToolCallsCard({ toolCalls, repeated = null, replyContent = '' }) {
+export function ToolCallsCard({ toolCalls, repeated = null, replyContent = '', managed = false }) {
   const [expanded, setExpanded] = useState(true)
   const calls = normalizeToolCalls(toolCalls)
   if (!calls) return null
@@ -39,9 +39,7 @@ export function ToolCallsCard({ toolCalls, repeated = null, replyContent = '' })
       {expanded && (
         <div className="toolcalls__body">
           <p className="toolcalls__note">
-            The model ended this turn by asking to call {calls.length === 1 ? 'this' : 'these'}. Nothing
-            has run — Camelid does not execute tool calls from the browser. Supply a result below to
-            continue the conversation.
+            {managed ? 'The model requested these connected tools. Each action requires approval; execution outcomes appear below.' : 'The model requested these tools. These are manual tool definitions. Nothing has run. Use Connections to enable an MCP server.'}
           </p>
 
           {replyCarriesRawEnvelope(replyContent) && (

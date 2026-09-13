@@ -70,12 +70,20 @@ export function compactForSend(messages, { keepRecent = KEEP_RECENT_MESSAGES } =
   if (!Array.isArray(messages) || messages.length === 0) return null
   const recentFrom = Math.max(messages.length - Math.max(keepRecent, 0), 0)
 
+  // A tool call and all its responses are one indivisible context group.
+  const protectedTools = new Set()
+  for (let index = 0; index < messages.length; index += 1) {
+    if (!messages[index].tool_calls?.length) continue
+    let end = index + 1
+    while (end < messages.length && roleOf(messages[end]) === 'tool') end += 1
+    if (end > recentFrom) for (let j = index; j < end; j += 1) protectedTools.add(j)
+  }
   const kept = []
   let elidedCount = 0
   let elidedFrom = -1
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index]
-    if (index >= recentFrom || isProtectedRole(message)) {
+    if (index >= recentFrom || protectedTools.has(index) || isProtectedRole(message)) {
       kept.push(message)
       continue
     }
