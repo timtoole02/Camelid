@@ -167,7 +167,10 @@ fn publish(review: &Review, expected: &Option<String>, replacement: &Option<Stri
             temp.persist_noclobber(&path)
                 .map_err(|_| "The destination appeared before the file could be created.")?;
         } else {
-            crate::chat::replace_temp_atomically(temp.path(), &path)
+            // ReplaceFileW must reopen the replacement with its own sharing
+            // mode. Close our write handle first, retaining cleanup on failure.
+            let temp_path = temp.into_temp_path();
+            crate::chat::replace_temp_atomically(&temp_path, &path)
                 .map_err(|_| "Could not replace the file; the saved review is still available.")?;
         }
     } else {
