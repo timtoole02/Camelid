@@ -158,6 +158,10 @@ fn publish(review: &Review, expected: &Option<String>, replacement: &Option<Stri
         temp.write_all(content.as_bytes())
             .and_then(|_| temp.as_file().sync_all())
             .map_err(|_| "Could not save the replacement file.")?;
+        // ReplaceFileW opens the replacement without sharing its write access.
+        // Close our writer before publication, retaining cleanup of the staged
+        // path if validation or replacement fails (as the chat writer does).
+        let temp = temp.into_temp_path();
         let checked = destination(&review.workspace, &review.path)?;
         if checked != path {
             return Err("The destination changed during review.".into());
@@ -167,7 +171,7 @@ fn publish(review: &Review, expected: &Option<String>, replacement: &Option<Stri
             temp.persist_noclobber(&path)
                 .map_err(|_| "The destination appeared before the file could be created.")?;
         } else {
-            crate::chat::replace_temp_atomically(temp.path(), &path)
+            crate::chat::replace_temp_atomically(&temp, &path)
                 .map_err(|_| "Could not replace the file; the saved review is still available.")?;
         }
     } else {
@@ -491,6 +495,7 @@ mod tests {
         let review = m.propose(proposal(&w, "hello.txt", "after\n")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
         assert_eq!(m.decide(&review.id, true).unwrap().status, "applied");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
         assert!(m.decide(&review.id, true).is_err());
         let restarted = ChangeManager {
             directory: m.directory.clone(),

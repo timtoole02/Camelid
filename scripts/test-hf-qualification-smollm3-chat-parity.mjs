@@ -114,7 +114,7 @@ assert.deepEqual(TEMPLATE_IDENTITY, {
 assert.equal(GROUNDING_FILES.shape_pack.sha256,
   'd46794448b7c2585d0aa83dfd7bb17d4904c2dcbc048ade1ef68cd3863166de6')
 assert.equal(GROUNDING_FILES.runtime_envelope.sha256,
-  '153b991ed7317e807d437eedad0149c39555ce097c146d9cae0d8c5d899b52ce')
+  'd2e233e011d9b8bb7d1e28e65c0a0e89da4978fe39566374cd6ff5faf4d479bc')
 assert.equal(LLAMA_PIN.executable_sha256,
   '6c787bf07ac1d7e1bbaa1ee176c3ef0df58ea86494c8c1b1d2d9f4a9176b19ae')
 assert.equal(LLAMA_PIN.server_impl_sha256,
@@ -331,7 +331,7 @@ assert.equal(classifySmolLM3ChatParityError(sharedSmolError).error_code,
 
 const committedGrounding = await inspectGroundings(root)
 assert.equal(committedGrounding.renderer_git_blob_sha1,
-  'f7c4c04a0d4cd2f0443aa45a59d4912875a3c2e2')
+  '0f4fdf006b1e2e7909db39bd60dbd301f9fafa98')
 assert.equal(committedGrounding.shape_case.normalized_prompt_sha256,
   '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1')
 const shapePack = JSON.parse(await readFile(resolve(GROUNDING_FILES.shape_pack.path), 'utf8'))
