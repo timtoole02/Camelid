@@ -15,6 +15,8 @@ pub mod diagnostics;
 pub mod diffusion_gemma;
 pub mod distributed;
 pub mod eagle3;
+#[cfg(feature = "cuda")]
+pub mod eagle3_cuda;
 pub mod eagle3_runtime;
 pub mod eagle3_serving;
 pub mod embedding;

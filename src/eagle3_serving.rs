@@ -215,7 +215,11 @@ impl Eagle3ServeHeadKey {
             checkpoint_path: checkpoint_path.to_path_buf(),
             checkpoint_sha256: checkpoint_sha256.to_string(),
             target_sha256: target_sha256.to_string(),
-            draft_wire: crate::metal::eagle3_draft_wire_identity().map_err(invalid)?,
+            draft_wire: if cfg!(all(feature = "cuda", not(target_os = "macos"))) {
+                "cuda-q8_128-f32-linear1-v2".to_string()
+            } else {
+                crate::metal::eagle3_draft_wire_identity().map_err(invalid)?
+            },
             max_positions: Self::pooled_max_positions(configured_logical_token_limit()?)?,
         })
     }
@@ -300,6 +304,9 @@ impl<T> Default for Eagle3HeadPool<T> {
 
 /// The serve-wide pool of the one uploaded draft head.
 static SERVE_HEAD_POOL: Eagle3HeadPool<Eagle3Drafter> = Eagle3HeadPool::new();
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+static CUDA_SERVE_HEAD_POOL: Eagle3HeadPool<crate::eagle3_cuda::CudaEagle3Head> =
+    Eagle3HeadPool::new();
 
 pub fn logical_token_limit_from_value(value: Option<&str>) -> Result<usize> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -446,6 +453,8 @@ pub struct Eagle3ServingTimings {
 }
 
 pub struct Eagle3ServingState {
+    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+    cuda_head: Option<crate::eagle3_cuda::CudaEagle3Head>,
     phases: Eagle3ServingTimings,
     capture_layer_ids: [usize; 3],
     checkpoint: Option<Arc<Eagle3DraftModel>>,
@@ -464,6 +473,8 @@ pub struct Eagle3ServingState {
 impl Eagle3ServingState {
     pub fn new(checkpoint: Arc<Eagle3DraftModel>, config: Eagle3ServingConfig) -> Self {
         Self {
+            #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+            cuda_head: None,
             capture_layer_ids: checkpoint.config.geometry().target_layer_input_ids(),
             phases: Eagle3ServingTimings::default(),
             checkpoint: Some(checkpoint),
@@ -489,6 +500,10 @@ impl Eagle3ServingState {
     }
 
     pub fn is_initialized(&self) -> bool {
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        if self.cuda_head.is_some() {
+            return true;
+        }
         self.drafter.is_some()
     }
 
@@ -505,6 +520,13 @@ impl Eagle3ServingState {
     }
 
     pub fn dynamic_tree(&self) -> Eagle3DynamicTree {
+        if cfg!(all(feature = "cuda", not(target_os = "macos"))) {
+            return Eagle3DynamicTree {
+                verify_nodes: 2,
+                top_k: 1,
+                expansions: 1,
+            };
+        }
         Eagle3DynamicTree {
             verify_nodes: self.config.dynamic_verify_nodes,
             top_k: self.config.dynamic_top_k,
@@ -560,6 +582,24 @@ impl Eagle3ServingState {
     /// Capture the real target prompt activations, obtain the first target
     /// greedy token, upload the head, and seed its authoritative cache.
     pub fn bootstrap(
+        &mut self,
+        session: &mut LlamaInferenceSession,
+        target_weights: &Arc<LlamaLoadedWeights>,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+    ) -> Result<Eagle3ServingBootstrap> {
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        {
+            self.bootstrap_cuda(session, target_weights, prompt_tokens, max_tokens)
+        }
+        #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
+        {
+            self.bootstrap_metal(session, target_weights, prompt_tokens, max_tokens)
+        }
+    }
+
+    #[cfg_attr(all(feature = "cuda", not(target_os = "macos")), allow(dead_code))]
+    fn bootstrap_metal(
         &mut self,
         session: &mut LlamaInferenceSession,
         target_weights: &Arc<LlamaLoadedWeights>,
@@ -624,6 +664,24 @@ impl Eagle3ServingState {
     /// is no context room left; callers should finish rather than changing
     /// execution lanes after EAGLE has made target KV GPU-authoritative.
     pub fn run_round(
+        &mut self,
+        session: &mut LlamaInferenceSession,
+        target_weights: &Arc<LlamaLoadedWeights>,
+        history: &[u32],
+        remaining_output: usize,
+    ) -> Result<Option<Eagle3ServingRound>> {
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        {
+            self.run_round_cuda(session, target_weights, history, remaining_output)
+        }
+        #[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
+        {
+            self.run_round_metal(session, target_weights, history, remaining_output)
+        }
+    }
+
+    #[cfg_attr(all(feature = "cuda", not(target_os = "macos")), allow(dead_code))]
+    fn run_round_metal(
         &mut self,
         session: &mut LlamaInferenceSession,
         target_weights: &Arc<LlamaLoadedWeights>,
@@ -850,11 +908,197 @@ impl Eagle3ServingState {
     }
 }
 
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
+impl Eagle3ServingState {
+    fn bootstrap_cuda(
+        &mut self,
+        session: &mut LlamaInferenceSession,
+        weights: &Arc<LlamaLoadedWeights>,
+        prompt: &[u32],
+        max_tokens: usize,
+    ) -> Result<Eagle3ServingBootstrap> {
+        if self.is_initialized() || prompt.len() < 3 || max_tokens == 0 {
+            return Err(invalid("CUDA EAGLE bootstrap requires a fresh state, at least three prompt tokens and nonzero output budget"));
+        }
+        validate_logical_budget(prompt.len(), max_tokens)?;
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| invalid("missing EAGLE checkpoint"))?;
+        if checkpoint.config.geometry() != crate::eagle3::Eagle3Geometry::QWEN {
+            return Err(invalid(
+                "CUDA EAGLE serving currently requires the pinned Qwen3-4B head",
+            ));
+        }
+        session.set_resident_encode_ahead_enabled(false);
+        let started = std::time::Instant::now();
+        session.limit_cuda_eagle_context(configured_logical_token_limit()?)?;
+        let capture = session
+            .forward_greedy_cuda_prefill_with_layer_inputs(prompt, &self.capture_layer_ids)?;
+        let anchor = *capture
+            .predictions
+            .last()
+            .ok_or_else(|| invalid("empty CUDA prompt prediction"))?;
+        let capacity = self
+            .pooled_head
+            .as_ref()
+            .map_or(prompt.len() + max_tokens, |key| key.max_positions);
+        let mut head = match self
+            .pooled_head
+            .as_ref()
+            .map(|key| CUDA_SERVE_HEAD_POOL.checkout(key))
+        {
+            Some(Eagle3HeadCheckout::Hit(mut head)) => {
+                head.reset();
+                self.head_reused = true;
+                head
+            }
+            _ => crate::eagle3_cuda::CudaEagle3Head::new(checkpoint, capacity)?,
+        };
+        if head.capacity() < prompt.len() + max_tokens {
+            return Err(invalid("pooled CUDA head capacity is insufficient"));
+        }
+        let features =
+            crate::eagle3_runtime::interleave_target_layer_inputs(&capture.layer_inputs)?;
+        let mut paired = prompt[1..].to_vec();
+        paired.push(anchor);
+        let embeddings = weights
+            .token_embedding
+            .embedding_lookup(&paired, "eagle3_cuda_prompt_next_embeddings")?;
+        for row in 0..prompt.len() {
+            head.append(
+                &features[row * 7680..(row + 1) * 7680],
+                &embeddings.data[row * 2560..(row + 1) * 2560],
+                row + 1 == prompt.len(),
+            )?;
+        }
+        if head.filled() != session.kv_position() {
+            return Err(invalid("CUDA EAGLE prompt watermarks disagree"));
+        }
+        self.phases.head_bootstrap_us += started.elapsed().as_micros();
+        self.cuda_head = Some(head);
+        self.checkpoint = None;
+        tracing::info!(
+            head_reused = self.head_reused,
+            prompt_tokens = prompt.len(),
+            "EAGLE-3 CUDA learned head initialized (Q8/128 weights, FP32 KV, confidence-admitted draft)"
+        );
+        Ok(Eagle3ServingBootstrap {
+            first_token: anchor,
+            timings: capture.timings,
+        })
+    }
+
+    fn run_round_cuda(
+        &mut self,
+        session: &mut LlamaInferenceSession,
+        weights: &Arc<LlamaLoadedWeights>,
+        history: &[u32],
+        remaining: usize,
+    ) -> Result<Option<Eagle3ServingRound>> {
+        if remaining == 0 || session.remaining_context() == 0 {
+            return Ok(None);
+        }
+        let anchor = *history
+            .last()
+            .ok_or_else(|| invalid("empty CUDA EAGLE history"))?;
+        let head = self
+            .cuda_head
+            .as_mut()
+            .ok_or_else(|| invalid("CUDA EAGLE round before bootstrap"))?;
+        if head.filled() != session.kv_position() {
+            return Err(invalid("CUDA EAGLE authoritative watermarks disagree"));
+        }
+        if remaining == 1 || session.remaining_context() == 1 {
+            let started = std::time::Instant::now();
+            let token = session
+                .generate_next_token_greedy_resident(anchor)?
+                .ok_or_else(|| invalid("CUDA EAGLE target unavailable"))?
+                .0;
+            self.phases.verify_us += started.elapsed().as_micros();
+            return Ok(Some(Eagle3ServingRound {
+                emitted: vec![token],
+                offered: 0,
+                verify_nodes: 1,
+                suffix: false,
+                suffix_evidence: SuffixAdmissionEvidence::default(),
+                timings: LlamaForwardTimings::default(),
+            }));
+        }
+        // The Q4_K_M target admits two verify rows. The stable learned head
+        // prediction supplies one draft; the target supplies the bonus/correction.
+        let draft = head.next_token()?;
+        // A two-row target pass costs more than one ordinary step. Admit a
+        // learned proposal only when its probability gives useful headroom
+        // over that cost; otherwise maintain the head with one authoritative row.
+        let offered = usize::from(head.confidence().unwrap_or(0.0) >= 0.6);
+        let started = std::time::Instant::now();
+        let capture = if offered == 1 {
+            session.verify_drafts_cuda_with_layer_inputs(
+                anchor,
+                &[draft],
+                &self.capture_layer_ids,
+            )?
+        } else {
+            session.forward_greedy_cuda_with_layer_inputs(anchor, &self.capture_layer_ids)?
+        }
+        .ok_or_else(|| {
+            invalid("CUDA EAGLE verification unavailable; cannot change KV authority mid-request")
+        })?;
+        self.phases.verify_us += started.elapsed().as_micros();
+        let accepted = if offered == 1 {
+            accepted_draft_prefix(&[draft], &capture.predictions)
+        } else {
+            0
+        };
+        let emitted = capture.predictions[..=accepted].to_vec();
+        let started = std::time::Instant::now();
+        let features =
+            crate::eagle3_runtime::interleave_target_layer_inputs(&capture.layer_inputs)?;
+        let embeddings = weights
+            .token_embedding
+            .embedding_lookup(&emitted, "eagle3_cuda_authoritative_next_embeddings")?;
+        for row in 0..emitted.len() {
+            head.append(
+                &features[row * 7680..(row + 1) * 7680],
+                &embeddings.data[row * 2560..(row + 1) * 2560],
+                row + 1 == emitted.len() && remaining > emitted.len() + 1,
+            )?;
+        }
+        self.phases.head_update_us += started.elapsed().as_micros();
+        if head.filled() != session.kv_position() {
+            return Err(invalid("CUDA EAGLE commit watermarks disagree"));
+        }
+        tracing::debug!(
+            draft,
+            accepted,
+            target_position = session.kv_position(),
+            "EAGLE-3 CUDA learned verification"
+        );
+        Ok(Some(Eagle3ServingRound {
+            emitted,
+            offered,
+            verify_nodes: offered + 1,
+            suffix: false,
+            suffix_evidence: SuffixAdmissionEvidence::default(),
+            timings: capture.timings,
+        }))
+    }
+}
+
 impl Drop for Eagle3ServingState {
     fn drop(&mut self) {
         // A panicking generation may have left a Metal command mid-flight;
         // never pool that head.
         if std::thread::panicking() {
+            return;
+        }
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        if let Some(mut head) = self.cuda_head.take() {
+            if let Some(key) = self.pooled_head.take() {
+                head.reset();
+                CUDA_SERVE_HEAD_POOL.restore(key, head);
+            }
             return;
         }
         let (Some(key), Some(mut drafter)) = (self.pooled_head.take(), self.drafter.take()) else {

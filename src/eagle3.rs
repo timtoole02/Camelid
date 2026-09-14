@@ -946,42 +946,42 @@ const QWEN_TENSOR_SPECS: &[TensorSpec] = &[
     TensorSpec {
         name: FC,
         dtype: "BF16",
-        shape: &[2560 as u64, (3 * 2560) as u64],
+        shape: &[2560, (3 * 2560) as u64],
     },
     TensorSpec {
         name: LM_HEAD,
         dtype: "BF16",
-        shape: &[DRAFT_VOCAB_SIZE as u64, 2560 as u64],
+        shape: &[DRAFT_VOCAB_SIZE as u64, 2560],
     },
     TensorSpec {
         name: HIDDEN_NORM,
         dtype: "BF16",
-        shape: &[2560 as u64],
+        shape: &[2560],
     },
     TensorSpec {
         name: INPUT_NORM,
         dtype: "BF16",
-        shape: &[2560 as u64],
+        shape: &[2560],
     },
     TensorSpec {
         name: MLP_DOWN,
         dtype: "BF16",
-        shape: &[2560 as u64, 9728 as u64],
+        shape: &[2560, 9728],
     },
     TensorSpec {
         name: MLP_GATE,
         dtype: "BF16",
-        shape: &[9728 as u64, 2560 as u64],
+        shape: &[9728, 2560],
     },
     TensorSpec {
         name: MLP_UP,
         dtype: "BF16",
-        shape: &[9728 as u64, 2560 as u64],
+        shape: &[9728, 2560],
     },
     TensorSpec {
         name: POST_ATTN_NORM,
         dtype: "BF16",
-        shape: &[2560 as u64],
+        shape: &[2560],
     },
     TensorSpec {
         name: ATTN_K,
@@ -1006,12 +1006,12 @@ const QWEN_TENSOR_SPECS: &[TensorSpec] = &[
     TensorSpec {
         name: OUTPUT_NORM,
         dtype: "BF16",
-        shape: &[2560 as u64],
+        shape: &[2560],
     },
     TensorSpec {
         name: T2D,
         dtype: "BOOL",
-        shape: &[151936 as u64],
+        shape: &[151936],
     },
 ];
 

@@ -3345,9 +3345,10 @@ fn gemm_batched_matches_per_token() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn verify_batch_matches_sequential() {
-    if kernels().is_none() {
-        return;
-    }
+    assert!(
+        kernels().is_some(),
+        "this explicitly selected test requires CUDA"
+    );
     let n_layers = 2usize;
     let hidden = 64usize;
     let n_heads = 2usize;
@@ -3451,6 +3452,40 @@ fn verify_batch_matches_sequential() {
         got, expected,
         "verify_batch tokens != sequential forward_token"
     );
+    let mut captured = build();
+    // Deliberately reverse layer order. Layer zero must be the raw embedding,
+    // while layer one must include the first block's attention and FFN residuals.
+    let (tokens, taps) = captured
+        .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, 0, ktok, scale, &[1, 0])
+        .unwrap();
+    assert_eq!(tokens, expected);
+    assert_eq!(taps[1], embs);
+    assert_ne!(taps[0], embs);
+    assert!(taps[0].iter().all(|value| value.is_finite()));
+    let mut single = build();
+    for t in 0..ktok {
+        let (_, one) = single
+            .verify_batch_with_layer_inputs(
+                &per_emb[t],
+                &cos_all[t * pairs..(t + 1) * pairs],
+                &sin_all[t * pairs..(t + 1) * pairs],
+                t,
+                1,
+                scale,
+                &[0, 1],
+            )
+            .unwrap();
+        assert_eq!(one[0], per_emb[t]);
+        assert!(close(&taps[0][t * hidden..(t + 1) * hidden], &one[1], 1e-5));
+    }
+    for ids in [&[0, 0][..], &[n_layers][..]] {
+        assert!(captured
+            .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, 0, ktok, scale, ids,)
+            .is_err());
+    }
+    assert!(captured
+        .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, max_pos, ktok, scale, &[0],)
+        .is_err());
 }
 
 #[test]
@@ -5434,65 +5469,98 @@ fn q4k_gemv_matches_oracle() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn q4k_gemm_batched_matches_oracle() {
-    let Some(k) = kernels() else {
-        return;
-    };
-    let (rows, n_sb, k_tokens) = (64usize, 3usize, 4usize);
-    let kdim = n_sb * 256;
-    let mut rng = Lcg(0x4b_47_45_4d_4d);
-    let wire = synth_q4k_wire(rows, n_sb, &mut rng);
-    let weights = super::swz_q4k_blocks(&wire);
-    let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
-    let mut in_quants = Vec::with_capacity(k_tokens * kdim);
-    let mut expected = vec![0f32; k_tokens * rows];
-    for t in 0..k_tokens {
-        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
-        let q8k = crate::inference::quantize_q8_k_blocks(&act);
-        for block in &q8k {
-            in_scales.push(block.d);
-            in_quants.extend_from_slice(&block.qs);
+    let k = kernels().expect("explicit CUDA validation requires a device");
+    let rows = 67usize;
+    for (n_sb, k_tokens) in [(3usize, 4usize), (10, 1), (10, 2), (38, 2)] {
+        let kdim = n_sb * 256;
+        let mut rng = Lcg(0x4b_47_45_4d_4d);
+        let wire = synth_q4k_wire(rows, n_sb, &mut rng);
+        let weights = super::swz_q4k_blocks(&wire);
+        let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+        let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+        let mut expected = vec![0f32; k_tokens * rows];
+        for t in 0..k_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            let q8k = crate::inference::quantize_q8_k_blocks(&act);
+            for block in &q8k {
+                in_scales.push(block.d);
+                in_quants.extend_from_slice(&block.qs);
+            }
+            for row in 0..rows {
+                let lo = row * n_sb * 144;
+                expected[t * rows + row] =
+                    crate::inference::q4_k_wire_row_dot(&wire[lo..lo + n_sb * 144], &q8k);
+            }
         }
-        for row in 0..rows {
-            let lo = row * n_sb * 144;
-            expected[t * rows + row] =
-                crate::inference::q4_k_wire_row_dot(&wire[lo..lo + n_sb * 144], &q8k);
+
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+        let d_w = k.stream.clone_htod(&weights).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_kquant_gemm_batched(
+            &k.stream,
+            if k_tokens <= 2 {
+                &k.q4k_gemm_batched_small_dp4a
+            } else {
+                &k.q4k_gemm_batched
+            },
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            if k_tokens <= 2 { 0 } else { 9 },
+            &mut d_out,
+        )
+        .unwrap();
+        let mut got = vec![0f32; k_tokens * rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        let exact = got
+            .iter()
+            .zip(&expected)
+            .filter(|(g, e)| g.to_bits() == e.to_bits())
+            .count();
+        eprintln!(
+            "q4k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
+            got.len()
+        );
+        assert!(
+            close(&got, &expected, 1e-4),
+            "batched Q4_K diverged from q4_k_wire_row_dot"
+        );
+        for t in 0..k_tokens {
+            let one_scales = k
+                .stream
+                .clone_htod(&in_scales[t * n_sb..(t + 1) * n_sb])
+                .unwrap();
+            let one_quants = k
+                .stream
+                .clone_htod(&in_quants[t * kdim..(t + 1) * kdim])
+                .unwrap();
+            let mut one_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+            super::launch_q4k_gemv(
+                &k.stream,
+                &k.q4k_gemv,
+                &one_scales,
+                &one_quants,
+                &d_w.slice(..),
+                rows,
+                n_sb,
+                &mut one_out,
+                0,
+            )
+            .unwrap();
+            let expected_gpu = k.stream.clone_dtoh(&one_out).unwrap();
+            assert_same_bits(
+                "batched Q4_K versus resident GEMV",
+                &got[t * rows..(t + 1) * rows],
+                &expected_gpu,
+            );
         }
     }
-
-    let d_is = k.stream.clone_htod(&in_scales).unwrap();
-    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
-    let d_w = k.stream.clone_htod(&weights).unwrap();
-    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
-    super::launch_kquant_gemm_batched(
-        &k.stream,
-        &k.q4k_gemm_batched,
-        &d_is,
-        &d_iq,
-        &d_w,
-        rows,
-        n_sb,
-        k_tokens,
-        9,
-        &mut d_out,
-    )
-    .unwrap();
-    let mut got = vec![0f32; k_tokens * rows];
-    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
-    k.ctx.synchronize().unwrap();
-
-    let exact = got
-        .iter()
-        .zip(&expected)
-        .filter(|(g, e)| g.to_bits() == e.to_bits())
-        .count();
-    eprintln!(
-        "q4k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
-        got.len()
-    );
-    assert!(
-        close(&got, &expected, 1e-4),
-        "batched Q4_K diverged from q4_k_wire_row_dot"
-    );
 }
 
 // Build `rows*n_sb` synthetic Q5_K_M super-blocks (176 bytes each, row-major):
@@ -7986,20 +8054,21 @@ fn q6k_gemm_batched_matches_oracle() {
 #[test]
 #[ignore = "requires an SM61+ CUDA device"]
 fn q6k_gemm_batched_anchor_dp4a_matches_production_bitwise() {
-    let Some(k) = kernels() else {
-        return;
-    };
-    let rows = 64usize;
-    let n_sb = 11usize; // Gemma 4 hidden=2816 production contraction.
-    let kdim = n_sb * 256;
-    for (k_tokens, seed) in [
-        (1usize, 0x6b_44_50_34_01u64),
-        (7usize, 0x6b_44_50_34_07u64),
+    let k = kernels().expect("explicit CUDA validation requires an SM61+ device");
+    let rows = 67usize; // Include a partial final warp group.
+    for (n_sb, k_tokens, seed) in [
+        (11usize, 1usize, 0x6b_44_50_34_01u64),
+        (11, 7usize, 0x6b_44_50_34_07u64),
         (
+            11,
             crate::gemma4_runtime::MAX_MTP_VERIFY_ROWS,
             0x6b_44_50_34_14u64,
         ),
+        (10, 2, 0x6b_44_50_34_02), // Qwen hidden/output contraction.
+        (38, 1, 0x6b_44_50_34_03), // Qwen 9728-wide FFN contraction.
+        (38, 2, 0x6b_44_50_34_04),
     ] {
+        let kdim = n_sb * 256;
         let mut rng = Lcg(seed);
         let wire = synth_q6k_wire(rows, n_sb, &mut rng);
         let weights = super::pad_q6k_blocks(&wire);
@@ -8040,7 +8109,11 @@ fn q6k_gemm_batched_anchor_dp4a_matches_production_bitwise() {
         .unwrap();
         super::launch_kquant_gemm_batched(
             &k.stream,
-            &k.q6k_gemm_batched_anchor_dp4a,
+            if k_tokens <= 2 {
+                &k.q6k_gemm_batched_small_dp4a
+            } else {
+                &k.q6k_gemm_batched_anchor_dp4a
+            },
             &d_is,
             &d_iq,
             &d_w,

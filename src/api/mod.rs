@@ -3305,6 +3305,12 @@ pub async fn serve(
     // listener. Health and request admission must never disagree about the
     // active logical envelope.
     if spec_decode_mode_from_env() == Some(SpecDecodeMode::Eagle3) {
+        if !cfg!(any(target_os = "macos", feature = "cuda")) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "CAMELID_SPEC_DECODE=eagle3 requires a Metal or CUDA build",
+            ));
+        }
         configured_eagle3_logical_token_limit().map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })?;
@@ -21787,7 +21793,7 @@ async fn prepare_generation(
     // CPU speculation needs CPU-authoritative KV for chunk-verify rollback. The GPU verifier
     // currently returns greedy token IDs rather than full target distributions, so stochastic
     // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled. EAGLE-3
-    // is a Metal-only lane and must keep resident target KV enabled regardless of that generic
+    // owns a resident Metal or CUDA target and must keep it enabled regardless of that generic
     // toggle.
     session.set_resident_paths_disabled(
         speculative.is_some()

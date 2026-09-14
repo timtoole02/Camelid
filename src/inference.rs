@@ -3901,7 +3901,142 @@ impl LlamaInferenceSession {
         last_token: u32,
         drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
-        if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
+        self.verify_drafts_cuda_with_layer_inputs(last_token, drafts, &[])
+            .map(|capture| {
+                capture.map(|capture| {
+                    let accepted = speculative::accepted_draft_prefix(drafts, &capture.predictions);
+                    capture.predictions[..=accepted].to_vec()
+                })
+            })
+    }
+
+    /// CUDA linear target verification with pre-layer residual captures for a
+    /// future EAGLE head. Returns every verification row in caller layer order,
+    /// but commits only the accepted prefix plus bonus, as `verify_drafts_gpu`.
+    /// This seam alone does not enable learned speculation in the server.
+    #[cfg(feature = "cuda")]
+    pub fn verify_drafts_cuda_with_layer_inputs(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        if drafts.is_empty() {
+            return Ok(None);
+        }
+        self.cuda_verify_capture(last_token, drafts, capture_layer_ids, false)
+    }
+
+    /// One authoritative CUDA step with taps for a confidence-declined draft.
+    #[cfg(feature = "cuda")]
+    pub fn forward_greedy_cuda_with_layer_inputs(
+        &mut self,
+        token: u32,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        self.cuda_verify_capture(token, &[], capture_layer_ids, false)
+    }
+
+    /// Bound a fresh CUDA EAGLE session before admitting the target and head.
+    #[cfg(feature = "cuda")]
+    pub fn limit_cuda_eagle_context(&mut self, limit: usize) -> Result<()> {
+        if self.kv_position() != 0 || !(256..=4096).contains(&limit) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "CUDA EAGLE context must be set on a fresh session in 256..=4096".into(),
+            ));
+        }
+        let cap = self
+            .kv_cache
+            .plan
+            .max_sequence_length
+            .min(limit)
+            .min(resident_cuda_max_context());
+        self.kv_cache.plan.max_sequence_length = cap;
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let mut guard = self
+            .resident_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A startup warmup may have allocated native-context KV, consuming the
+        // memory needed by the learned head. Rebuild once at the serving rung.
+        if guard
+            .as_ref()
+            .is_some_and(|slot| slot.key == key && slot.engine.max_pos() != cap)
+        {
+            *guard = None;
+            crate::cuda::release_async_pool();
+        }
+        Ok(())
+    }
+
+    /// Fresh-prompt capture through the same batched CUDA kernels as decode
+    /// verification, using two rows per launch for the pinned K-quant target.
+    #[cfg(feature = "cuda")]
+    pub fn forward_greedy_cuda_prefill_with_layer_inputs(
+        &mut self,
+        tokens: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        if tokens.is_empty() || self.kv_position() != 0 || tokens.len() > self.remaining_context() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "CUDA EAGLE prefill requires a fresh session and a nonempty prompt within capacity"
+                    .into(),
+            ));
+        }
+        // Build/upload the target through its normal resident admission path,
+        // then overwrite that first row while capturing every prompt input.
+        self.generate_next_token_greedy_resident(tokens[0])?
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch("CUDA resident target is unavailable".into())
+            })?;
+        self.rollback_resident_to_position(0)?;
+        let mut data = vec![Vec::new(); capture_layer_ids.len()];
+        let mut last = None;
+        for chunk in tokens.chunks(2) {
+            let capture = self
+                .cuda_verify_capture(chunk[0], &chunk[1..], capture_layer_ids, true)?
+                .ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch("CUDA prompt capture is unavailable".into())
+                })?;
+            last = capture.predictions.last().copied();
+            for (out, tap) in data.iter_mut().zip(capture.layer_inputs) {
+                out.extend(tap.data);
+            }
+        }
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: vec![last.expect("nonempty prompt")],
+            layer_inputs: data
+                .into_iter()
+                .map(|values| {
+                    CpuTensor::from_f32(
+                        "cuda_prompt_layer_input",
+                        vec![tokens.len(), self.config.embedding_length as usize],
+                        values,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+            timings: LlamaForwardTimings::default(),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_verify_capture(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+        commit_all: bool,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        // Capture ids are absolute target layer ids. A pipeline engine contains
+        // only its owned range, so its local layer indices cannot satisfy this
+        // contract. Preserve the existing no-capture verifier's dispatch.
+        if !capture_layer_ids.is_empty() && self.weights.layer_range.is_some() {
+            return Ok(None);
+        }
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
             return Ok(None);
         }
         let position = self.kv_cache.position;
@@ -3969,14 +4104,19 @@ impl LlamaInferenceSession {
             return Ok(None);
         }
         let slot = guard.as_mut().expect("ready checked above");
-        let predicted =
-            match slot
-                .engine
-                .verify_batch(&embeddings.data, &cos_all, &sin_all, position, k, scale)
-            {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
-            };
+        let (predicted, captures) = match slot.engine.verify_batch_with_layer_inputs(
+            &embeddings.data,
+            &cos_all,
+            &sin_all,
+            position,
+            k,
+            scale,
+            capture_layer_ids,
+        ) {
+            Ok(m) => m,
+            Err(_) if capture_layer_ids.is_empty() => return Ok(None),
+            Err(message) => return Err(BackendError::RuntimeShapeMismatch(message)),
+        };
 
         // Accept the longest prefix of drafts that the model confirms, plus the
         // bonus token at the first mismatch (predicted[0] is always taken).
@@ -3986,11 +4126,25 @@ impl LlamaInferenceSession {
             accepted.push(predicted[j + 1]);
             j += 1;
         }
-        let new_position = position + accepted.len();
+        let new_position = position + if commit_all { k } else { accepted.len() };
         slot.engine.set_filled(new_position);
         drop(guard);
         self.kv_cache.position = new_position;
-        Ok(Some(accepted))
+        let layer_inputs = captures
+            .into_iter()
+            .map(|data| {
+                CpuTensor::from_f32(
+                    "cuda_verify_layer_input",
+                    vec![k, dims.embedding_length],
+                    data,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions: predicted,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
     }
 
     /// Verify a draft TREE against the resident GPU engine in one batched pass and
