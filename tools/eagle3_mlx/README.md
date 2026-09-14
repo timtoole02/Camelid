@@ -121,7 +121,7 @@ First write a new Camelid fixture under the Mini2 workload lock. Approximate EAG
 variables are deliberately unset; the fixture command refuses them if they leak in:
 
 ```bash
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+CAM_SESSION_PID=$$ /workspace/camelid/bin/cam-lock.sh env \
   -u CAMELID_EAGLE3_LM_HEAD_ROWS \
   -u CAMELID_EAGLE3_LM_HEAD_Q8 \
   -u CAMELID_EAGLE3_BODY_Q8 \
@@ -135,7 +135,7 @@ CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
 After that process exits, run MLX against the hash-pinned fixture and write a new receipt:
 
 ```bash
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+CAM_SESSION_PID=$$ /workspace/camelid/bin/cam-lock.sh env \
   PYTHONPATH=. \
   .venv-eagle3-mlx/bin/python -m tools.eagle3_mlx.cell_parity \
   --warm-start /path/to/Llama-3.2-3B-Instruct-Eagle3-ShareGPT-SW512 \
@@ -160,7 +160,7 @@ input JSONL records are already tokenized with the Llama 3.2 Instruct tokenizer 
 assistant-only `loss_mask`.
 
 ```bash
-CAM_SESSION_PID=$$ /Users/timtoole/bin/cam-lock.sh env \
+CAM_SESSION_PID=$$ /workspace/camelid/bin/cam-lock.sh env \
   CAMELID_METAL=1 \
   CAMELID_METAL_RESIDENT_DECODE=1 \
   /path/to/camelid export-eagle3-features \
