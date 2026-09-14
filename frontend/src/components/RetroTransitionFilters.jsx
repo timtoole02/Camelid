@@ -8,6 +8,11 @@ export function RetroTransitionFilters({ prefix }) {
   return (
     <svg className="retro-transition-filters" width="0" height="0" aria-hidden="true" focusable="false">
       <defs>
+        <filter id={`${prefix}-pixel`} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
+          <feFlood floodColor="white" />
+          <feComposite id={`${prefix}-sample`} in="SourceGraphic" operator="in" x="0" y="0" width="1" height="1" />
+          <feTile x="0" y="0" width="100%" height="100%" />
+        </filter>
         {MOSAIC_STEPS.map((size) => (
           <filter key={size} id={`${prefix}-${size}`} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
             <feFlood x={size / 2} y={size / 2} width="1" height="1" />

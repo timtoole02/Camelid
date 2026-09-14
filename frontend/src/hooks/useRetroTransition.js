@@ -2,8 +2,30 @@ import { useCallback, useLayoutEffect, useRef } from 'react'
 
 export const RETRO_TRANSITION_KEY = 'camelid.retroTransitions'
 export const MOSAIC_STEPS = [48, 32, 24, 16, 12, 8, 4, 2]
-const DIVE_MS = 640
+const DIVE_MS = 900
 const REVEAL_MS = 560
+
+// Prefer a visible text pixel so the destination is part of the screen's
+// content. Use source-pixel centers so the final sample matches the zoom target.
+function pickPixel(view) {
+  const bounds = view.getBoundingClientRect()
+  let point = { x: bounds.width * .5, y: bounds.height * .45 }
+  for (const node of view.querySelectorAll('h2, p')) {
+    if (node.closest('[hidden]')) continue
+    const range = document.createRange()
+    range.selectNodeContents(node)
+    const rect = [...range.getClientRects()].find(rect => rect.width > 8 && rect.height > 8 && rect.top > bounds.top + 16 && rect.bottom < bounds.bottom - 16)
+    if (!rect) continue
+    const x = rect.left + rect.width * .4
+    const y = rect.top + rect.height * .55
+    if (x > bounds.left + 16 && x < bounds.right - 16) {
+      point = { x: x - bounds.left, y: y - bounds.top }
+      break
+    }
+  }
+  const snap = (position, limit) => Math.max(4.5, Math.min(Math.floor((limit - 8) / 8) * 8 + 4.5, Math.floor(position / 8) * 8 + 4.5))
+  return { x: snap(point.x, bounds.width), y: snap(point.y, bounds.height) }
+}
 
 /** Animate only the content surface; navigation stays available to cancel it. */
 export function useRetroTransition({ tab, setTab, enabled, viewRef, stageRef, filterPrefix }) {
@@ -16,12 +38,17 @@ export function useRetroTransition({ tab, setTab, enabled, viewRef, stageRef, fi
     if (!run) return
     runRef.current = null
     clearTimeout(run.timer)
+    clearTimeout(run.pixelTimer)
     clearTimeout(run.watchdog)
     cancelAnimationFrame(run.frame)
     run.observer?.disconnect()
     run.animation?.cancel()
     run.view.style.removeProperty('visibility')
     run.view.style.removeProperty('filter')
+    run.view.style.removeProperty('transform-origin')
+    run.stage.style.removeProperty('--retro-target-x')
+    run.stage.style.removeProperty('--retro-target-y')
+    run.stage.style.removeProperty('--retro-dive-duration')
     run.view.inert = false
     delete run.stage.dataset.retroPhase
   }, [])
@@ -43,13 +70,30 @@ export function useRetroTransition({ tab, setTab, enabled, viewRef, stageRef, fi
     runRef.current = run
     stage.dataset.retroPhase = 'dive'
     view.inert = true
-    const pixelScale = 1 / Math.max(view.clientWidth, view.clientHeight, 1)
+    const pixel = pickPixel(view)
+    view.style.transformOrigin = `${pixel.x}px ${pixel.y}px`
+    stage.style.setProperty('--retro-target-x', `${pixel.x}px`)
+    stage.style.setProperty('--retro-target-y', `${pixel.y}px`)
+    stage.style.setProperty('--retro-dive-duration', `${DIVE_MS}ms`)
+    const sample = document.getElementById(`${filterPrefix}-sample`)
+    sample?.setAttribute('x', String(pixel.x - .5))
+    sample?.setAttribute('y', String(pixel.y - .5))
+    // Keep the source view unfiltered during the zoom. Finish by expanding
+    // the exact sampled pixel into the final solid-color frame.
+    const pixelScale = Math.max(2, Math.min(32, 16384 / Math.max(view.clientWidth, view.clientHeight, 1)))
     run.animation = view.animate([
-      { transform: 'perspective(1000px) rotateX(0deg) rotateZ(0deg) scale(1)', offset: 0 },
-      { transform: 'perspective(1000px) rotateX(48deg) rotateZ(-24deg) scale(.88)', offset: .26 },
-      { transform: 'perspective(1000px) rotateX(58deg) rotateZ(145deg) scale(.35)', offset: .65 },
-      { transform: `perspective(1000px) rotateX(0deg) rotateZ(360deg) scale(${pixelScale})`, offset: 1 },
+      { transform: 'scale(1) perspective(1000px) rotateX(0deg) rotateZ(0deg)', offset: 0 },
+      { transform: 'scale(1) perspective(1000px) rotateX(0deg) rotateZ(0deg)', offset: .18 },
+      { transform: 'scale(2) perspective(1000px) rotateX(-18deg) rotateZ(-24deg)', offset: .42 },
+      { transform: 'scale(10) perspective(1000px) rotateX(-32deg) rotateZ(145deg)', offset: .76 },
+      { transform: `scale(${pixelScale}) perspective(1000px) rotateX(0deg) rotateZ(360deg)`, offset: 1 },
     ], { duration: DIVE_MS, easing: 'cubic-bezier(.55, 0, .8, .45)', fill: 'forwards' })
+    run.pixelTimer = window.setTimeout(() => {
+      if (runRef.current !== run) return
+      run.animation.cancel()
+      stage.dataset.retroPhase = 'pixel'
+      view.style.filter = `url(#${filterPrefix}-pixel)`
+    }, DIVE_MS - 100)
     run.timer = window.setTimeout(() => {
       if (runRef.current !== run) return
       run.phase = 'waiting'
@@ -64,8 +108,8 @@ export function useRetroTransition({ tab, setTab, enabled, viewRef, stageRef, fi
       const destination = run.to
       cancel()
       setTab(destination)
-    }, 2500)
-  }, [cancel, enabled, setTab, stageRef, viewRef])
+    }, 3500)
+  }, [cancel, enabled, filterPrefix, setTab, stageRef, viewRef])
 
   useLayoutEffect(() => {
     const run = runRef.current

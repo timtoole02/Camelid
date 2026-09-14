@@ -26,5 +26,28 @@
 .settings-retro input { flex: none; width: 20px; height: 20px; accent-color: var(--color-accent); cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   .retro-transition-stage[data-retro-phase] > .camelid-view { transform: none !important; filter: none !important; visibility: visible !important; }
+  .retro-transition-stage[data-retro-phase]::before,
   .retro-transition-stage[data-retro-phase]::after { display: none; }
 }
+
+/* The outline marks the exact tile the camera is about to enter. It sits
+   outside the filtered view, so its color never becomes the sampled pixel. */
+.retro-transition-stage[data-retro-phase='dive']::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  left: var(--retro-target-x);
+  top: var(--retro-target-y);
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-canvas);
+  animation: retro-pixel-lock var(--retro-dive-duration) linear both;
+}
+@keyframes retro-pixel-lock {
+  0%, 22% { opacity: 1; }
+  38%, 100% { opacity: 0; }
+}
+

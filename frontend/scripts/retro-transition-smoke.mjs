@@ -74,9 +74,12 @@ try {
   await page.evaluate(() => {
     const animation = document.querySelector('.camelid-view').getAnimations()[0]
     animation.pause()
-    animation.currentTime = 330
+    animation.currentTime = 640
   })
+  assert.equal(await page.$eval('.camelid-view', node => getComputedStyle(node).filter), 'none', 'zoom-in stays unpixelated')
   await page.screenshot({ path: `${output}/dive.png` })
+  await phase('pixel')
+  assert.match(await page.$eval('.camelid-view', node => node.style.filter), /-pixel/)
   await phase('waiting')
   await phase('mosaic')
   assert.match(await page.$eval('.camelid-view', (node) => node.style.filter), /url\(/)
@@ -85,6 +88,7 @@ try {
   await view('code')
   await page.screenshot({ path: `${output}/complete.png` })
   assert.equal(await page.$eval('.camelid-view', (node) => node.style.filter), '', 'filter released')
+  assert.equal(await page.$eval('.camelid-view', node => node.style.transformOrigin), '', 'pixel target released')
   assert.equal(await page.$eval('.camelid-view', (node) => node.getAnimations().length), 0, 'animation released')
 
   await nav('Chat')
