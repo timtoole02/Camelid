@@ -1,4 +1,4 @@
-//! Qwen3-4B EAGLE-3 learned head on CUDA. BF16 checkpoint weights stay resident;
+//! Qwen3-4B EAGLE-3 learned head on CUDA. Q8/128 draft weights stay resident;
 //! activations and the private KV cache use FP32. Target verification, never the
 //! draft logits, decides which tokens can leave the server.
 
@@ -13,14 +13,21 @@ use cudarc::nvrtc::CompileOptions;
 use std::sync::Arc;
 
 const SOURCE: &str = r#"
-extern "C" __global__ void gemv(const unsigned short* w, const float* x, float* y, unsigned cols) {
-    __shared__ float s[256];
-    unsigned t=threadIdx.x, row=blockIdx.x;
-    float v=0.f;
-    for(unsigned i=t;i<cols;i+=256) v += __uint_as_float(((unsigned)w[row*cols+i])<<16)*x[i];
-    s[t]=v; __syncthreads();
-    for(unsigned d=128;d;d>>=1) { if(t<d) s[t]+=s[t+d]; __syncthreads(); }
-    if(t==0) y[row]=s[0];
+// Eight independent rows per CTA; four accumulators hide load/FMA latency.
+// All pinned Qwen projection dimensions are multiples of 128 columns/8 rows.
+extern "C" __global__ void gemv(const signed char* w, const float* scales, const float* x, float* y, unsigned cols) {
+    unsigned lane=threadIdx.x&31, row=blockIdx.x*8+(threadIdx.x>>5);
+    float a=0.f,b=0.f,c=0.f,d=0.f;
+    for(unsigned i=lane;i<cols;i+=128) {
+        float scale=scales[row*(cols/128)+i/128];
+        a+=((float)w[row*cols+i]*scale)*x[i];
+        b+=((float)w[row*cols+i+32]*scale)*x[i+32];
+        c+=((float)w[row*cols+i+64]*scale)*x[i+64];
+        d+=((float)w[row*cols+i+96]*scale)*x[i+96];
+    }
+    float v=((a+b)+c)+d;
+    for(unsigned offset=16;offset;offset>>=1) v+=__shfl_down_sync(0xffffffffu,v,offset);
+    if(lane==0) y[row]=v;
 }
 extern "C" __global__ void eagle_norm(const float* x,const float* w,float* y,unsigned n,unsigned offset,float eps) {
     __shared__ float s[256]; unsigned t=threadIdx.x;
@@ -76,7 +83,13 @@ extern "C" __global__ void argmax(const float* logits,unsigned* out,unsigned n) 
         if(t<d && (vals[t+d]>vals[t] || (vals[t+d]==vals[t] && ids[t+d]<ids[t]))) { vals[t]=vals[t+d];ids[t]=ids[t+d]; }
         __syncthreads();
     }
-    if(t==0) *out=ids[0];
+    float maximum=vals[0];
+    __syncthreads();
+    float sum=0.f;
+    for(unsigned i=t;i<n;i+=256) sum+=expf(logits[i]-maximum);
+    vals[t]=sum; __syncthreads();
+    for(unsigned d=128;d;d>>=1) { if(t<d) vals[t]+=vals[t+d]; __syncthreads(); }
+    if(t==0) { out[0]=ids[0];out[1]=__float_as_uint(1.f/vals[0]); }
 }
 "#;
 
@@ -90,6 +103,11 @@ fn launch(rows: usize, threads: u32) -> LaunchConfig {
         block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+struct DraftMatrix {
+    values: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
 }
 
 struct Kernels {
@@ -107,20 +125,22 @@ impl Kernels {
     fn matvec(
         &self,
         stream: &Arc<CudaStream>,
-        w: &CudaSlice<u16>,
+        w: &DraftMatrix,
         x: &CudaSlice<f32>,
         y: &mut CudaSlice<f32>,
         rows: usize,
         cols: usize,
     ) -> Result<()> {
+        assert!(rows.is_multiple_of(8) && cols.is_multiple_of(128));
         unsafe {
             stream
                 .launch_builder(&self.gemv)
-                .arg(w)
+                .arg(&w.values)
+                .arg(&w.scales)
                 .arg(x)
                 .arg(y)
                 .arg(&(cols as u32))
-                .launch(launch(rows, 256))
+                .launch(launch(rows / 8, 256))
         }
         .map_err(error)?;
         Ok(())
@@ -177,7 +197,7 @@ impl Kernels {
 pub struct CudaEagle3Head {
     stream: Arc<CudaStream>,
     kernels: Kernels,
-    matrices: Vec<CudaSlice<u16>>,
+    matrices: Vec<DraftMatrix>,
     norms: Vec<CudaSlice<f32>>,
     features: CudaSlice<f32>,
     embedding: CudaSlice<f32>,
@@ -206,6 +226,7 @@ pub struct CudaEagle3Head {
     capacity: usize,
     filled: usize,
     next_token: Option<u32>,
+    confidence: f32,
 }
 
 impl CudaEagle3Head {
@@ -247,6 +268,16 @@ impl CudaEagle3Head {
             argmax: f("argmax")?,
         };
         let stream = ctx.new_stream().map_err(error)?;
+        // All head buffers belong to this single stream. Inputs and readbacks
+        // synchronize with the host; no target allocation crosses this boundary.
+        // Avoid per-argument CUDA events, which are costly under Windows WDDM.
+        if !matches!(
+            std::env::var("CAMELID_CUDA_SAFE_EVENTS").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        ) {
+            // SAFETY: every access to every head allocation is ordered on stream.
+            unsafe { ctx.disable_event_tracking() };
+        }
         let m = &model.matrices;
         let mut matrices = Vec::new();
         for matrix in [
@@ -260,12 +291,30 @@ impl CudaEagle3Head {
             &m.mlp_down,
             &m.lm_head,
         ] {
-            let words: Vec<u16> = matrix
+            // Symmetric per-128 weight quantization; only the speculative head
+            // is compressed. Target logits and acceptance arithmetic are unchanged.
+            let values: Vec<f32> = matrix
                 .bytes
                 .chunks_exact(2)
-                .map(|v| u16::from_le_bytes([v[0], v[1]]))
+                .map(|v| f32::from_bits(u32::from(u16::from_le_bytes([v[0], v[1]])) << 16))
                 .collect();
-            matrices.push(stream.clone_htod(&words).map_err(error)?);
+            let mut quants = Vec::with_capacity(values.len());
+            let mut scales = Vec::with_capacity(values.len() / 128);
+            for block in values.chunks_exact(128) {
+                let scale = block.iter().fold(0.0f32, |max, v| max.max(v.abs())) / 127.0;
+                scales.push(scale);
+                quants.extend(block.iter().map(|&v| {
+                    if scale == 0.0 {
+                        0
+                    } else {
+                        (v / scale).round_ties_even().clamp(-127.0, 127.0) as i8
+                    }
+                }));
+            }
+            matrices.push(DraftMatrix {
+                values: stream.clone_htod(&quants).map_err(error)?,
+                scales: stream.clone_htod(&scales).map_err(error)?,
+            });
         }
         let n = &model.norms;
         let norms = [&n.input, &n.hidden, &n.post_attention, &n.output]
@@ -299,13 +348,14 @@ impl CudaEagle3Head {
             raw: alloc(2560)?,
             output: alloc(2560)?,
             logits: alloc(32000)?,
-            selected: stream.alloc_zeros(1).map_err(error)?,
+            selected: stream.alloc_zeros(2).map_err(error)?,
             stream,
             d2t: model.d2t_offsets.clone(),
             theta: model.config.rope_theta,
             capacity,
             filled: 0,
             next_token: None,
+            confidence: 0.0,
         })
     }
     pub fn filled(&self) -> usize {
@@ -317,10 +367,14 @@ impl CudaEagle3Head {
     pub fn reset(&mut self) {
         self.filled = 0;
         self.next_token = None;
+        self.confidence = 0.0;
     }
     pub fn next_token(&self) -> Result<u32> {
         self.next_token
             .ok_or_else(|| error("head has no stable prediction"))
+    }
+    pub fn confidence(&self) -> Option<f32> {
+        self.next_token.map(|_| self.confidence)
     }
     /// Diagnostic readback for independent full-checkpoint numerical validation.
     pub fn logits(&self) -> Result<Vec<f32>> {
@@ -437,7 +491,12 @@ impl CudaEagle3Head {
                     .launch(launch(1, 256))
             }
             .map_err(error)?;
-            let id = s.clone_dtoh(&self.selected).map_err(error)?[0] as usize;
+            let selected = s.clone_dtoh(&self.selected).map_err(error)?;
+            let id = selected[0] as usize;
+            self.confidence = f32::from_bits(selected[1]);
+            if !self.confidence.is_finite() {
+                return Err(error("nonfinite draft confidence"));
+            }
             let offset = *self
                 .d2t
                 .get(id)

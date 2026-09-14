@@ -4459,6 +4459,77 @@ extern "C" __global__ void q4k_gemm_batched(
     }
 }
 
+// Two-row Q4_K verification: each warp distributes the eight independent
+// oracle accumulators over lanes 0..7. Integer quarter sums are associative;
+// each float accumulator still visits super-blocks in order. Only the input
+// tile uses shared memory, allowing more resident warps for wide FFNs.
+extern "C" __global__ void q4k_gemm_batched_small_dp4a(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem4s[];
+    signed char* iq = (signed char*)smem4s;
+    float* scales = (float*)(smem4s + (long)k_tokens*n_sb*256);
+    int tid=threadIdx.x, lane=tid&31, warp=tid>>5;
+    int row=blockIdx.x*(blockDim.x>>5)+warp;
+    int anchor=lane&7, quarter=lane>>3;
+    for(int i=tid;i<k_tokens*n_sb*256;i+=blockDim.x) {
+        int p=i&31;
+        iq[(i&~31)+(p&7)*4+(p>>3)]=input_quants[i];
+    }
+    for(int i=tid;i<k_tokens*n_sb;i+=blockDim.x) scales[i]=input_scales[i];
+    __syncthreads();
+    float sums[2]={0.f,0.f}, mins[2]={0.f,0.f};
+    for(int sb=0;sb<n_sb;sb++) {
+        const unsigned char* b=weight_bytes;
+        if(row<rows) b+=((long)row*n_sb+sb)*144;
+        int j=2*quarter, slo=0,shi=0,mlo=0,mhi=0,q=0;
+        float d=0.f,dm=0.f;
+        if(row<rows) {
+            const unsigned char* h=b+4;
+            if(j<4) {
+                slo=h[j]&63;shi=h[j+1]&63;mlo=h[j+4]&63;mhi=h[j+5]&63;
+            } else {
+                slo=(h[j+4]&15)|((h[j-4]>>6)<<4);
+                shi=(h[j+5]&15)|((h[j-3]>>6)<<4);
+                mlo=(h[j+4]>>4)|((h[j]>>6)<<4);
+                mhi=(h[j+5]>>4)|((h[j+1]>>6)<<4);
+            }
+            q=((const int*)(b+16+quarter*32))[anchor];
+            d=f16_bits_to_f32((unsigned short)b[0]|((unsigned short)b[1]<<8));
+            dm=f16_bits_to_f32((unsigned short)b[2]|((unsigned short)b[3]<<8));
+        }
+        #pragma unroll
+        for(int t=0;t<2;t++) if(t<k_tokens) {
+            const int* y=(const int*)(iq+((long)t*n_sb+sb)*256+quarter*64);
+            int yl=y[anchor], yh=y[anchor+8];
+            int v=slo*__dp4a(q&0x0f0f0f0f,yl,0)+shi*__dp4a((q>>4)&0x0f0f0f0f,yh,0);
+            int m=mlo*__dp4a(yl,0x01010101,0)+mhi*__dp4a(yh,0x01010101,0);
+            v+=__shfl_down_sync(0xffffffffu,v,16);
+            v+=__shfl_down_sync(0xffffffffu,v,8);
+            m+=__shfl_down_sync(0xffffffffu,m,16);
+            m+=__shfl_down_sync(0xffffffffu,m,8);
+            m+=__shfl_down_sync(0xffffffffu,m,4);
+            m+=__shfl_down_sync(0xffffffffu,m,2);
+            m+=__shfl_down_sync(0xffffffffu,m,1);
+            float act=scales[(long)t*n_sb+sb];
+            if(lane<8) sums[t]+=(d*act)*(float)v;
+            if(lane==0) mins[t]-=dm*act*(float)m;
+        }
+    }
+    #pragma unroll
+    for(int t=0;t<2;t++) if(t<k_tokens) {
+        float main=0.f;
+        #pragma unroll
+        for(int a=0;a<8;a++) {
+            float v=__shfl_sync(0xffffffffu,sums[t],a);
+            if(lane==0) main+=v;
+        }
+        if(row<rows && lane==0) output[(long)t*rows+row]=mins[t]+main;
+    }
+}
+
 // ---- Batched Q6_K GEMM: K Q8_K inputs against M weight rows ----------------
 // Same strategy and parity contract as q4k_gemm_batched. Q8_K activations are
 // staged in natural order; the padded 224-byte weight block is loaded once per
@@ -4601,7 +4672,8 @@ extern "C" __global__ void q6k_gemm_batched(
 // Weight bytes remain in the existing 224-byte padded Q6_K upload layout. The
 // only extra shared memory is the K-row Q8_K activation tile, so verifier-width
 // K=14 at hidden=2816 fits with eight warps per CTA.
-extern "C" __global__ void q6k_gemm_batched_anchor_dp4a(
+template<int MAX_TOKENS>
+__device__ __forceinline__ void q6k_gemm_batched_anchor_dp4a_body(
     const float* __restrict__ input_scales,
     const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes,
@@ -4618,7 +4690,6 @@ extern "C" __global__ void q6k_gemm_batched_anchor_dp4a(
     __syncthreads();
 
     const int WIRE = 224;
-    const int MAX_TOKENS = 14;
     int warp = tid >> 5;
     int lane = tid & 31;
     int warps_per_block = blockDim.x >> 5;
@@ -4719,6 +4790,20 @@ extern "C" __global__ void q6k_gemm_batched_anchor_dp4a(
                 output[(long)t * rows + row] = acc;
         }
     }
+}
+
+extern "C" __global__ void q6k_gemm_batched_anchor_dp4a(
+    const float* input_scales, const signed char* input_quants,
+    const unsigned char* weight_bytes, int rows, int n_sb, int k_tokens, float* output
+) {
+    q6k_gemm_batched_anchor_dp4a_body<14>(input_scales, input_quants, weight_bytes, rows, n_sb, k_tokens, output);
+}
+
+extern "C" __global__ void q6k_gemm_batched_small_dp4a(
+    const float* input_scales, const signed char* input_quants,
+    const unsigned char* weight_bytes, int rows, int n_sb, int k_tokens, float* output
+) {
+    q6k_gemm_batched_anchor_dp4a_body<2>(input_scales, input_quants, weight_bytes, rows, n_sb, k_tokens, output);
 }
 
 // ---- RoPE: supports adjacent-even-odd (pairing=0) and split-half/NEOX (pairing=1).
@@ -8243,8 +8328,10 @@ pub struct CudaResidentKernels {
     pub(crate) q3k_gemv: CudaFunction,
     pub(crate) iq4xs_gemv: CudaFunction,
     pub(crate) q4k_gemm_batched: CudaFunction,
+    pub(crate) q4k_gemm_batched_small_dp4a: CudaFunction,
     pub(crate) q6k_gemm_batched: CudaFunction,
     pub(crate) q6k_gemm_batched_anchor_dp4a: CudaFunction,
+    pub(crate) q6k_gemm_batched_small_dp4a: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) rms_inv_norm_quantize_q8k: CudaFunction,
@@ -8539,8 +8626,10 @@ impl CudaResidentKernels {
             iq4xs_gemv: f("iq4xs_gemv")?,
             q3k_gemv: f("q3k_gemv")?,
             q4k_gemm_batched: f("q4k_gemm_batched")?,
+            q4k_gemm_batched_small_dp4a: f("q4k_gemm_batched_small_dp4a")?,
             q6k_gemm_batched: f("q6k_gemm_batched")?,
             q6k_gemm_batched_anchor_dp4a: f("q6k_gemm_batched_anchor_dp4a")?,
+            q6k_gemm_batched_small_dp4a: f("q6k_gemm_batched_small_dp4a")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
             rms_inv_norm_quantize_q8k: f("rms_inv_norm_quantize_q8k")?,
@@ -10480,26 +10569,34 @@ fn dispatch_gemm_batched(
         ),
         ProjQuant::Q4K => launch_kquant_gemm_batched(
             s,
-            &kern.q4k_gemm_batched,
+            if k_tokens <= 2 {
+                &kern.q4k_gemm_batched_small_dp4a
+            } else {
+                &kern.q4k_gemm_batched
+            },
             q8k_scales,
             q8k_quants,
             weight,
             rows,
             cols / 256,
             k_tokens,
-            9,
+            if k_tokens <= 2 { 0 } else { 9 },
             out,
         ),
         ProjQuant::Q6K => launch_kquant_gemm_batched(
             s,
-            &kern.q6k_gemm_batched,
+            if k_tokens <= 2 {
+                &kern.q6k_gemm_batched_small_dp4a
+            } else {
+                &kern.q6k_gemm_batched
+            },
             q8k_scales,
             q8k_quants,
             weight,
             rows,
             cols / 256,
             k_tokens,
-            8,
+            if k_tokens <= 2 { 0 } else { 8 },
             out,
         ),
         ProjQuant::Q1_0 if bmma_ready && prism_bmma_shape_enabled(kern, cols, k_tokens) => {
@@ -13582,6 +13679,8 @@ pub struct CudaResidentDecode {
     overlap: Option<StreamOverlap>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
+    capture_buffers: Vec<(usize, CudaSlice<f32>)>,
+    single_capture_active: bool,
     /// Wider prompt-only scratch. Keeping it separate preserves the small,
     /// bounded speculative-verify allocation while Q1 prefill uses J=128.
     prefill_scratch: Option<VerifyScratch>,
@@ -14217,6 +14316,8 @@ impl CudaResidentDecode {
             device_forward_graph: None,
             overlap,
             verify_scratch: None,
+            capture_buffers: Vec::new(),
+            single_capture_active: false,
             prefill_scratch: None,
             tree_scratch: None,
             offload: None,
@@ -15541,6 +15642,14 @@ impl CudaResidentDecode {
         let mut off_seq = 0usize;
 
         for li in 0..self.n_layers {
+            if self.single_capture_active {
+                if let Some((_, buffer)) = self.capture_buffers.iter_mut().find(|(id, _)| *id == li)
+                {
+                    s.memcpy_dtod(&self.d_hidden, &mut buffer.slice_mut(..self.hidden))
+                        .map_err(map)?;
+                }
+            }
+
             // Resolve this layer's seven projection weights to GPU slices. An
             // offloaded layer (weights in host RAM) reads from the scratch buffer its
             // prefetch streamed into; a resident layer uses its VRAM slice. The math
@@ -17106,7 +17215,11 @@ impl CudaResidentDecode {
         // schedule alternates between `attention_decode_sw` and the full-causal
         // kernel per layer; nothing here has been proven under capture, and the
         // safe outcome of getting it wrong is not a crash but a wrong token.
-        if cuda_graphs_enabled() && self.qwen35.is_none() && self.gemma3.is_none() {
+        if cuda_graphs_enabled()
+            && !self.single_capture_active
+            && self.qwen35.is_none()
+            && self.gemma3.is_none()
+        {
             return self
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
@@ -17667,6 +17780,51 @@ impl CudaResidentDecode {
         if embeddings.len() < k * hidden || cos_all.len() < k * half || sin_all.len() < k * half {
             return Err("verify_batch: input slices too short".into());
         }
+        // Keep tap allocations across rounds; one-row admissions use the same
+        // fused scalar target path as ordinary decode, with opt-in snapshots.
+        let captures_match = self.capture_buffers.len() == capture_layer_ids.len()
+            && self
+                .capture_buffers
+                .iter()
+                .zip(capture_layer_ids)
+                .all(|((id, buffer), requested)| id == requested && buffer.len() >= k * hidden);
+        if !captures_match {
+            self.capture_buffers = capture_layer_ids
+                .iter()
+                .map(|&id| {
+                    self.k
+                        .stream
+                        .alloc_zeros::<f32>(k * hidden)
+                        .map(|buffer| (id, buffer))
+                        .map_err(map)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        if k == 1 && !capture_layer_ids.is_empty() {
+            self.single_capture_active = true;
+            let prediction = self.forward_token(
+                &embeddings[..hidden],
+                &cos_all[..half],
+                &sin_all[..half],
+                base_position,
+                scale,
+                true,
+            );
+            self.single_capture_active = false;
+            let prediction =
+                prediction?.ok_or_else(|| "missing single-row prediction".to_string())?;
+            let layer_inputs = self
+                .capture_buffers
+                .iter()
+                .map(|(_, buffer)| {
+                    self.k
+                        .stream
+                        .clone_dtoh(&buffer.slice(..hidden))
+                        .map_err(map)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok((vec![prediction], layer_inputs));
+        }
         self.ensure_verify_scratch()?;
         let s = self.k.stream.clone();
         let mut sc = self.verify_scratch.take().expect("allocated above");
@@ -17681,16 +17839,7 @@ impl CudaResidentDecode {
         s.memcpy_htod(&sin_all[..k * half], &mut sc.vsin.slice_mut(0..k * half))
             .map_err(map)?;
 
-        // Allocate only on the opt-in capture path. Device-to-device snapshots
-        // preserve the normal projection/attention arithmetic and stream order.
-        let mut captures = capture_layer_ids
-            .iter()
-            .map(|&id| {
-                s.alloc_zeros::<f32>(k * hidden)
-                    .map(|buffer| (id, buffer))
-                    .map_err(map)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut captures = std::mem::take(&mut self.capture_buffers);
         self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false, &mut captures)?;
         let output_bmma = if self.k.fast_q1
             && self.output_quant == ProjQuant::Q1_0
@@ -17770,10 +17919,12 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
         let mut layer_inputs = vec![vec![0.0; k * hidden]; captures.len()];
         for ((_, device), host) in captures.iter().zip(&mut layer_inputs) {
-            s.memcpy_dtoh(device, host).map_err(map)?;
+            s.memcpy_dtoh(&device.slice(..k * hidden), host)
+                .map_err(map)?;
         }
         self.k.ctx.synchronize().map_err(map)?;
         out.truncate(k);
+        self.capture_buffers = captures;
         self.verify_scratch = Some(sc);
         Ok((out, layer_inputs))
     }
@@ -17911,8 +18062,11 @@ impl CudaResidentDecode {
         );
         for li in 0..self.n_layers {
             if let Some((_, destination)) = captures.iter_mut().find(|(id, _)| *id == li) {
-                s.memcpy_dtod(&sc.vh.slice(0..k * hidden), destination)
-                    .map_err(map)?;
+                s.memcpy_dtod(
+                    &sc.vh.slice(0..k * hidden),
+                    &mut destination.slice_mut(..k * hidden),
+                )
+                .map_err(map)?;
             }
             let layer = &self.layers[li];
             let lq = layer.quants;

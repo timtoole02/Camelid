@@ -3927,6 +3927,16 @@ impl LlamaInferenceSession {
         self.cuda_verify_capture(last_token, drafts, capture_layer_ids, false)
     }
 
+    /// One authoritative CUDA step with taps for a confidence-declined draft.
+    #[cfg(feature = "cuda")]
+    pub fn forward_greedy_cuda_with_layer_inputs(
+        &mut self,
+        token: u32,
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        self.cuda_verify_capture(token, &[], capture_layer_ids, false)
+    }
+
     /// Bound a fresh CUDA EAGLE session before admitting the target and head.
     #[cfg(feature = "cuda")]
     pub fn limit_cuda_eagle_context(&mut self, limit: usize) -> Result<()> {

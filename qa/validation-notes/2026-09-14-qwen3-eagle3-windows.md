@@ -1,4 +1,7 @@
-# Windows Qwen3-4B learned CUDA EAGLE validation
+# Windows Qwen3-4B learned CUDA EAGLE baseline validation
+
+Historical receipt for the BF16 implementation in 69a7ea9e. The current Q8/128
+head and faster serving path are covered by the [performance receipt](2026-09-14-qwen3-eagle3-cuda-performance.md).
 
 Tested September 14, 2026, as a follow-up to #767 head
 `7642db46e81a1465e960a5f65a3af31b0a137822`. The PR base remains

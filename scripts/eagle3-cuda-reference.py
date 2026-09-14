@@ -2,6 +2,7 @@
 
 Usage: python scripts/eagle3-cuda-reference.py CHECKPOINT_DIRECTORY OUTPUT_JSON
 No CUDA or Camelid implementation code is used to compute the reference.
+Pass --q8 for the production Q8/128 draft-weight format.
 """
 import hashlib
 import json
@@ -10,7 +11,11 @@ import struct
 import sys
 import numpy as np
 
-root, output = map(pathlib.Path, sys.argv[1:])
+arguments = sys.argv[1:]
+q8 = "--q8" in arguments
+if q8:
+    arguments.remove("--q8")
+root, output = map(pathlib.Path, arguments)
 path = root / "model.safetensors"
 assert hashlib.file_digest(path.open("rb"), "sha256").hexdigest() == "58ac5bbfdd71047ebaa5d5535b895c2af37004eb820ca2dda55bd7666658853e"
 with path.open("rb") as f:
@@ -27,6 +32,16 @@ def tensor(name):
     return raw.view({"I64": "<i8", "I32": "<i4", "F32": "<f4", "BOOL": "?"}[spec["dtype"]]).reshape(spec["shape"])
 
 w = {name: tensor(name) for name in header if name != "__metadata__"}
+if q8:
+    for name, value in w.items():
+        if value.ndim != 2:
+            continue
+        blocks = value.reshape(-1, 128)
+        scales = np.max(np.abs(blocks), axis=1) / np.float32(127)
+        safe_scales = np.where(scales == 0, np.float32(1), scales)
+        quantized = np.clip(np.rint(blocks / safe_scales[:, None]), -127, 127).astype(np.int8)
+        w[name] = (quantized.astype(np.float32) * scales[:, None]).reshape(value.shape)
+
 
 def norm(x, weight):
     return x * np.float32(1 / np.sqrt(np.mean(x * x, dtype=np.float32) + np.float32(1e-6))) * weight
@@ -58,5 +73,5 @@ for row in range(2):
     logits = w["lm_head.weight"] @ norm(raw, w["norm.weight"])
     draft = int(logits.argmax())
     rows.append({"logits": logits.tolist(), "target_token": draft + int(w["d2t"][draft])})
-output.write_text(json.dumps({"schema": "camelid.eagle3.cuda.numpy-reference.v1", "rows": rows}), encoding="utf-8")
+output.write_text(json.dumps({"schema": "camelid.eagle3.cuda.numpy-reference.v1", "weight_format": "q8_128" if q8 else "bf16", "rows": rows}), encoding="utf-8")
 print(json.dumps({"rows": len(rows), "target_tokens": [r["target_token"] for r in rows]}))

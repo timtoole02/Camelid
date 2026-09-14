@@ -216,7 +216,7 @@ impl Eagle3ServeHeadKey {
             checkpoint_sha256: checkpoint_sha256.to_string(),
             target_sha256: target_sha256.to_string(),
             draft_wire: if cfg!(all(feature = "cuda", not(target_os = "macos"))) {
-                "cuda-bf16-f32-linear1-v1".to_string()
+                "cuda-q8_128-f32-linear1-v2".to_string()
             } else {
                 crate::metal::eagle3_draft_wire_identity().map_err(invalid)?
             },
@@ -981,7 +981,7 @@ impl Eagle3ServingState {
         tracing::info!(
             head_reused = self.head_reused,
             prompt_tokens = prompt.len(),
-            "EAGLE-3 CUDA learned head initialized (BF16 weights, FP32 KV, one draft per round)"
+            "EAGLE-3 CUDA learned head initialized (Q8/128 weights, FP32 KV, confidence-admitted draft)"
         );
         Ok(Eagle3ServingBootstrap {
             first_token: anchor,
@@ -1028,16 +1028,29 @@ impl Eagle3ServingState {
         // The Q4_K_M target admits two verify rows. The stable learned head
         // prediction supplies one draft; the target supplies the bonus/correction.
         let draft = head.next_token()?;
+        // A two-row target pass costs more than one ordinary step. Admit a
+        // learned proposal only when its probability gives useful headroom
+        // over that cost; otherwise maintain the head with one authoritative row.
+        let offered = usize::from(head.confidence().unwrap_or(0.0) >= 0.6);
         let started = std::time::Instant::now();
-        let capture = session
-            .verify_drafts_cuda_with_layer_inputs(anchor, &[draft], &self.capture_layer_ids)?
-            .ok_or_else(|| {
-                invalid(
-                    "CUDA EAGLE verification unavailable; cannot change KV authority mid-request",
-                )
-            })?;
+        let capture = if offered == 1 {
+            session.verify_drafts_cuda_with_layer_inputs(
+                anchor,
+                &[draft],
+                &self.capture_layer_ids,
+            )?
+        } else {
+            session.forward_greedy_cuda_with_layer_inputs(anchor, &self.capture_layer_ids)?
+        }
+        .ok_or_else(|| {
+            invalid("CUDA EAGLE verification unavailable; cannot change KV authority mid-request")
+        })?;
         self.phases.verify_us += started.elapsed().as_micros();
-        let accepted = accepted_draft_prefix(&[draft], &capture.predictions);
+        let accepted = if offered == 1 {
+            accepted_draft_prefix(&[draft], &capture.predictions)
+        } else {
+            0
+        };
         let emitted = capture.predictions[..=accepted].to_vec();
         let started = std::time::Instant::now();
         let features =
@@ -1049,7 +1062,7 @@ impl Eagle3ServingState {
             head.append(
                 &features[row * 7680..(row + 1) * 7680],
                 &embeddings.data[row * 2560..(row + 1) * 2560],
-                row + 1 == emitted.len(),
+                row + 1 == emitted.len() && remaining > emitted.len() + 1,
             )?;
         }
         self.phases.head_update_us += started.elapsed().as_micros();
@@ -1064,8 +1077,8 @@ impl Eagle3ServingState {
         );
         Ok(Some(Eagle3ServingRound {
             emitted,
-            offered: 1,
-            verify_nodes: 2,
+            offered,
+            verify_nodes: offered + 1,
             suffix: false,
             suffix_evidence: SuffixAdmissionEvidence::default(),
             timings: capture.timings,

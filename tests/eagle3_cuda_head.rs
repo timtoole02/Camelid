@@ -25,6 +25,10 @@ fn cuda_learned_head_matches_numpy_and_resets_cache() {
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        reference["weight_format"], "q8_128",
+        "regenerate the reference with --q8"
+    );
     let model = Eagle3DraftModel::load(&path).unwrap();
     let mut head = CudaEagle3Head::new(&model, 4).unwrap();
     let mut max_error = 0f64;
@@ -34,6 +38,16 @@ fn cuda_learned_head_matches_numpy_and_resets_cache() {
         let logits = head.logits().unwrap();
         let expected = reference["rows"][n]["logits"].as_array().unwrap();
         assert_eq!(logits.len(), expected.len());
+        let maximum = expected
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let probability = 1.0
+            / expected
+                .iter()
+                .map(|x| (x.as_f64().unwrap() - maximum).exp())
+                .sum::<f64>();
+        assert!((f64::from(head.confidence().unwrap()) - probability).abs() < 1e-5);
         for (a, b) in logits.iter().zip(expected) {
             let b = b.as_f64().unwrap();
             let error = (*a as f64 - b).abs();

@@ -39,7 +39,7 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
         checkpoint_path: head_path,
         checkpoint_sha256: camelid::eagle3::QWEN_WEIGHTS_SHA256.into(),
         target_sha256: camelid::eagle3::QWEN_TARGET_SHA256.into(),
-        draft_wire: "cuda-bf16-f32-linear1-v1".into(),
+        draft_wire: "cuda-q8_128-f32-linear1-v2".into(),
         max_positions: 512,
     };
     let make_session = || {
@@ -55,8 +55,26 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
     ];
     let mut accepted_total = 0;
     let mut rejected_total = 0;
-    for (index, (text, count)) in cases.iter().enumerate() {
-        let prompt = tokenizer.encode(text, true, false).unwrap();
+    let mut declined_total = 0;
+    let repeats = std::env::var("CAMELID_EAGLE3_BENCH_REPEATS")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("integer benchmark repeat count")
+        })
+        .unwrap_or(1)
+        .clamp(1, 10);
+    let mut plain_totals = [0u128; 4];
+    let mut eagle_totals = [0u128; 4];
+    let prefix = std::env::var("CAMELID_EAGLE3_BENCH_PREFIX").unwrap_or_default();
+    for (index, (text, count)) in cases.iter().cycle().take(cases.len() * repeats).enumerate() {
+        let prompt = tokenizer
+            .encode(&format!("{prefix}{text}"), true, false)
+            .unwrap();
+        assert!(
+            prompt.len() + count <= 512,
+            "benchmark prompt exceeds its cache"
+        );
         let mut reference = make_session();
         let mut first = 0;
         for &token in &prompt {
@@ -84,6 +102,7 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
         let started = Instant::now();
         let mut accepted = 0;
         let mut rejected = 0;
+        let mut declined = 0;
         while actual.len() < *count {
             let round = state
                 .run_round(&mut target, &weights, &history, *count - actual.len())
@@ -96,6 +115,8 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
                 } else {
                     rejected += 1;
                 }
+            } else if *count - actual.len() > 1 {
+                declined += 1;
             }
             history.extend_from_slice(&round.emitted);
             actual.extend(round.emitted);
@@ -107,7 +128,12 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
         assert!(state.phase_timings().head_update_us > 0);
         accepted_total += accepted;
         rejected_total += rejected;
-        eprintln!("CUDA EAGLE case={index} tokens={count} accepted={accepted} rejected={rejected} head_reused={} plain_decode_ms={plain_ms} eagle_decode_ms={} parity=true",state.head_reused(),started.elapsed().as_millis());
+        declined_total += declined;
+        let eagle_ms = started.elapsed().as_millis();
+        let case = index % cases.len();
+        plain_totals[case] += plain_ms;
+        eagle_totals[case] += eagle_ms;
+        eprintln!("CUDA EAGLE trial={} case={case} prompt_tokens={} tokens={count} accepted={accepted} rejected={rejected} declined={declined} head_reused={} plain_decode_ms={plain_ms} eagle_decode_ms={eagle_ms} verify_ms={} head_ms={} parity=true",index / cases.len(), prompt.len(), state.head_reused(), state.phase_timings().verify_us / 1000, state.phase_timings().head_update_us / 1000);
         drop(state);
     }
     assert!(
@@ -118,4 +144,31 @@ fn learned_cuda_generation_matches_resident_and_reuses_head() {
         rejected_total > 0,
         "fixture did not exercise rejected-head updates"
     );
+    assert!(
+        declined_total > 0,
+        "fixture must exercise confidence-declined drafts"
+    );
+    let plain_total: u128 = plain_totals.iter().sum();
+    let eagle_total: u128 = eagle_totals.iter().sum();
+    eprintln!("CUDA EAGLE aggregate repeats={repeats} plain_ms={plain_total} eagle_ms={eagle_total} speedup={:.3}x", plain_total as f64 / eagle_total as f64);
+    // Opt-in hardware performance gate: ordinary CI must not depend on GPU
+    // clock state or an unqualified device, while a speed receipt must pass it.
+    if std::env::var("CAMELID_EAGLE3_REQUIRE_SPEEDUP").as_deref() == Ok("1") {
+        assert!(
+            repeats >= 3,
+            "performance qualification requires at least three trials"
+        );
+        for case in 0..cases.len() {
+            assert!(
+                eagle_totals[case] < plain_totals[case],
+                "case {case} regressed: plain={}ms EAGLE={}ms",
+                plain_totals[case],
+                eagle_totals[case]
+            );
+        }
+        assert!(
+            plain_total * 100 > eagle_total * 105,
+            "aggregate speedup must exceed 5%"
+        );
+    }
 }
