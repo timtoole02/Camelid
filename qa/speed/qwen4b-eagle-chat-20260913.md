@@ -57,8 +57,8 @@ Run only on mini2, sequentially, with other model servers stopped. Build with `C
 ```sh
 /usr/bin/python3 scripts/bench-qwen4b-metal-spec.py \
   --binary target/qwen-eagle/camelid-candidate \
-  --model /Users/timtoole/models/Qwen3-4B-Q4_K_M.gguf \
-  --eagle-model /Users/timtoole/models/Qwen3-4B-Eagle3-AngelSlim-fd331e59 \
+  --model /workspace/camelid/models/Qwen3-4B-Q4_K_M.gguf \
+  --eagle-model /workspace/camelid/models/Qwen3-4B-Eagle3-AngelSlim-fd331e59 \
   --arms qwenmma,qwenmma-eagle3-15 \
   --cases prose,code,json --max-tokens 256 --stream \
   --env CAMELID_BENCH_EAGLE3_AUTHORITATIVE_CB_FUSION=1 \
