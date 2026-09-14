@@ -9984,7 +9984,7 @@ fn run_eagle3_resident_greedy(
         .and_then(|n| n.checked_add(draft_tokens + 1))
         .ok_or_else(|| anyhow::anyhow!("EAGLE-3 cache capacity overflow"))?;
     let head_upload_started = Instant::now();
-    let mut drafter = Eagle3Drafter::new(checkpoint, head_capacity)?;
+    let mut drafter = Eagle3Drafter::new(&checkpoint, head_capacity)?;
     let head_upload_ms = head_upload_started.elapsed().as_secs_f64() * 1000.0;
     let mut run = Eagle3BenchRun {
         generated: vec![first],
@@ -10118,6 +10118,8 @@ fn run_eagle3_resident_greedy(
                     weights,
                     anchor,
                     Eagle3DynamicFrontierConfig {
+                        adaptive_branching: false,
+                        certified_argmax_shadow: false,
                         max_verify_nodes: round_node_budget,
                         max_lattice_nodes: tree_lattice_nodes.expect("tree budget is present"),
                         max_depth: budget,
