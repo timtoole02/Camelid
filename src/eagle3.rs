@@ -43,8 +43,7 @@ const EXPECTED_TENSOR_COUNT: usize = 15;
 const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 
 pub const DERIVED_ALLOW_ENV: &str = "CAMELID_EAGLE3_ALLOW_DERIVED";
-pub const DERIVED_TRAINING_RECEIPT_SCHEMA: &str =
-    "camelid-eagle3-mlx-training-receipt-v1";
+pub const DERIVED_TRAINING_RECEIPT_SCHEMA: &str = "camelid-eagle3-mlx-training-receipt-v1";
 pub const THOUGHTWORKS_WEIGHTS_SHA256: &str =
     "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
 pub const SHAREGPT_E8_WEIGHTS_SHA256: &str =
@@ -432,11 +431,12 @@ fn validate_derived_receipt_fields(
     actual_mapping_sha256: &str,
     config: &Eagle3Config,
 ) -> Result<Eagle3DerivedProvenance> {
-    let receipt: Eagle3TrainingReceipt = serde_json::from_slice(receipt_bytes).map_err(|error| {
-        invalid(format!(
-            "invalid derived EAGLE-3 {TRAINING_RECEIPT_FILE}: {error}"
-        ))
-    })?;
+    let receipt: Eagle3TrainingReceipt =
+        serde_json::from_slice(receipt_bytes).map_err(|error| {
+            invalid(format!(
+                "invalid derived EAGLE-3 {TRAINING_RECEIPT_FILE}: {error}"
+            ))
+        })?;
     if receipt.schema != DERIVED_TRAINING_RECEIPT_SCHEMA {
         return Err(invalid(format!(
             "derived EAGLE-3 receipt schema is {:?}, expected {DERIVED_TRAINING_RECEIPT_SCHEMA:?}",
@@ -560,12 +560,7 @@ pub fn validate_derived_checkpoint(
     // here. The full loader repeats this gate before loading matrices into the runtime.
     let (mut file, payload_start, descriptors) = open_weights(&weights_path)?;
     let d2t_descriptor = descriptor(&descriptors, D2T)?;
-    let raw_d2t = read_tensor(
-        &mut file,
-        &weights_path,
-        payload_start,
-        d2t_descriptor,
-    )?;
+    let raw_d2t = read_tensor(&mut file, &weights_path, payload_start, d2t_descriptor)?;
     let (_, draft_to_target) = decode_d2t(&raw_d2t, DRAFT_VOCAB_SIZE, TARGET_VOCAB_SIZE)?;
     let raw_t2d = read_tensor(
         &mut file,
@@ -616,29 +611,29 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
         )));
     }
     let sharegpt_extra = BTreeMap::from([
-            ("attention_bias".to_string(), serde_json::json!(false)),
-            ("attention_dropout".to_string(), serde_json::json!(0.0)),
-            ("bos_token_id".to_string(), serde_json::json!(128000)),
-            (
-                "eos_token_id".to_string(),
-                serde_json::json!([128001, 128008, 128009]),
-            ),
-            ("hidden_act".to_string(), serde_json::json!("silu")),
-            ("initializer_range".to_string(), serde_json::json!(0.02)),
-            (
-                "max_position_embeddings".to_string(),
-                serde_json::json!(131072),
-            ),
-            ("mlp_bias".to_string(), serde_json::json!(false)),
-            ("pad_token_id".to_string(), serde_json::json!(0)),
-            ("pretraining_tp".to_string(), serde_json::json!(1)),
-            ("rope_scaling".to_string(), serde_json::Value::Null),
-            (
-                "transformers_version".to_string(),
-                serde_json::json!("4.57.1"),
-            ),
-            ("use_cache".to_string(), serde_json::json!(true)),
-        ]);
+        ("attention_bias".to_string(), serde_json::json!(false)),
+        ("attention_dropout".to_string(), serde_json::json!(0.0)),
+        ("bos_token_id".to_string(), serde_json::json!(128000)),
+        (
+            "eos_token_id".to_string(),
+            serde_json::json!([128001, 128008, 128009]),
+        ),
+        ("hidden_act".to_string(), serde_json::json!("silu")),
+        ("initializer_range".to_string(), serde_json::json!(0.02)),
+        (
+            "max_position_embeddings".to_string(),
+            serde_json::json!(131072),
+        ),
+        ("mlp_bias".to_string(), serde_json::json!(false)),
+        ("pad_token_id".to_string(), serde_json::json!(0)),
+        ("pretraining_tp".to_string(), serde_json::json!(1)),
+        ("rope_scaling".to_string(), serde_json::Value::Null),
+        (
+            "transformers_version".to_string(),
+            serde_json::json!("4.57.1"),
+        ),
+        ("use_cache".to_string(), serde_json::json!(true)),
+    ]);
     let is_sharegpt = raw.architectures == ["LlamaForCausalLMEagle3"];
     let expected_extra = if is_sharegpt {
         sharegpt_extra
@@ -698,20 +693,19 @@ fn parse_and_validate_config(bytes: &[u8]) -> Result<Eagle3Config> {
         )));
     }
     require_equal("rms_norm_eps", &raw.rms_norm_eps, &CONFIG_RMS_NORM_EPS)?;
-    let dtype = match (raw.torch_dtype.as_deref(), raw.dtype.as_deref()) {
-        (Some(torch), None) | (None, Some(torch)) => torch,
-        (Some(torch), Some(dtype)) if torch == dtype => torch,
-        (Some(torch), Some(dtype)) => {
-            return Err(invalid(format!(
-                "EAGLE-3 config dtype aliases disagree: torch_dtype={torch:?}, dtype={dtype:?}"
-            )))
-        }
-        (None, None) => {
-            return Err(invalid(
+    let dtype =
+        match (raw.torch_dtype.as_deref(), raw.dtype.as_deref()) {
+            (Some(torch), None) | (None, Some(torch)) => torch,
+            (Some(torch), Some(dtype)) if torch == dtype => torch,
+            (Some(torch), Some(dtype)) => {
+                return Err(invalid(format!(
+                    "EAGLE-3 config dtype aliases disagree: torch_dtype={torch:?}, dtype={dtype:?}"
+                )))
+            }
+            (None, None) => return Err(invalid(
                 "EAGLE-3 config must contain exactly one BF16 dtype field (torch_dtype or dtype)",
-            ))
-        }
-    };
+            )),
+        };
     require_equal("dtype", &dtype, &"bfloat16")?;
     require_equal("tie_word_embeddings", &raw.tie_word_embeddings, &false)?;
 
@@ -964,12 +958,11 @@ fn parse_and_validate_header(
                     spec.name, tensor.dtype
                 ))
             })?;
-            tensor_elements(spec)?.checked_mul(element_bytes).ok_or_else(|| {
-                invalid(format!(
-                    "EAGLE-3 tensor {} byte count overflows",
-                    spec.name
-                ))
-            })?
+            tensor_elements(spec)?
+                .checked_mul(element_bytes)
+                .ok_or_else(|| {
+                    invalid(format!("EAGLE-3 tensor {} byte count overflows", spec.name))
+                })?
         };
         if end - start != expected_bytes {
             return Err(invalid(format!(
@@ -978,7 +971,11 @@ fn parse_and_validate_header(
                 end - start
             )));
         }
-        let dtype = if tensor.dtype == "I64" { "I64" } else { spec.dtype };
+        let dtype = if tensor.dtype == "I64" {
+            "I64"
+        } else {
+            spec.dtype
+        };
         let descriptor = TensorDescriptor { start, end, dtype };
         descriptors.insert(spec.name, descriptor);
         ranges.push((start, end, spec.name));
@@ -1163,8 +1160,8 @@ fn decode_d2t(
             ]))
         } else {
             i64::from_le_bytes([
-                encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5],
-                encoded[6], encoded[7],
+                encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
+                encoded[7],
             ])
         };
         let delta = i32::try_from(wide_delta).map_err(|_| {
@@ -1363,7 +1360,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provenance.schema, DERIVED_TRAINING_RECEIPT_SCHEMA);
-        assert_eq!(provenance.source_weights_sha256, THOUGHTWORKS_WEIGHTS_SHA256);
+        assert_eq!(
+            provenance.source_weights_sha256,
+            THOUGHTWORKS_WEIGHTS_SHA256
+        );
         assert_eq!(provenance.tensor_count, EXPECTED_TENSOR_COUNT);
     }
 
@@ -1446,15 +1446,17 @@ mod tests {
         assert_eq!(e9.torch_dtype, "bfloat16");
         assert_eq!(e9.sliding_window, Some(256));
 
-        let sw512 =
-            SHAREGPT_CONFIG.replace("\"sliding_window\": 256", "\"sliding_window\": 512");
+        let sw512 = SHAREGPT_CONFIG.replace("\"sliding_window\": 256", "\"sliding_window\": 512");
         let sw512 = parse_and_validate_config(sw512.as_bytes()).unwrap();
         assert_eq!(sw512.sliding_window, Some(512));
 
         let e8 = SHAREGPT_CONFIG
             .replace("        \"sliding_window\": 256,\n", "")
             .replace("        \"use_sliding_window\": true\n", "")
-            .replace("        \"use_cache\": true,\n", "        \"use_cache\": true\n");
+            .replace(
+                "        \"use_cache\": true,\n",
+                "        \"use_cache\": true\n",
+            );
         let config = parse_and_validate_config(e8.as_bytes()).unwrap();
         assert_eq!(config.architectures, ["LlamaForCausalLMEagle3"]);
         assert_eq!(config.rope_theta, SHAREGPT_ROPE_THETA);
@@ -1576,8 +1578,8 @@ mod tests {
         assert_eq!(offsets, [0, 0, 1]);
         assert_eq!(decoded, [0, 1, 3]);
 
-        let too_wide = decode_d2t(&i64_bytes(&[i64::from(i32::MAX) + 1]), 1, usize::MAX)
-            .unwrap_err();
+        let too_wide =
+            decode_d2t(&i64_bytes(&[i64::from(i32::MAX) + 1]), 1, usize::MAX).unwrap_err();
         assert!(too_wide.to_string().contains("I32"));
     }
 

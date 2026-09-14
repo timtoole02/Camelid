@@ -1220,10 +1220,17 @@ fn read_exact_at_wave_chunks(
         return read_exact_at(file, out, offset);
     }
     let chunk_bytes = q8_wave_chunk_bytes(out.len(), chunks);
-    let overflow = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "wave-chunked read offset overflow");
+    let overflow = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wave-chunked read offset overflow",
+        )
+    };
     let read_one = |(chunk_idx, chunk): (usize, &mut [u8])| -> std::io::Result<()> {
         let chunk_offset = chunk_idx.checked_mul(chunk_bytes).ok_or_else(overflow)?;
-        let source = offset.checked_add(chunk_offset as u64).ok_or_else(overflow)?;
+        let source = offset
+            .checked_add(chunk_offset as u64)
+            .ok_or_else(overflow)?;
         read_exact_at(file, chunk, source)
     };
     let mut run = || -> std::io::Result<()> {

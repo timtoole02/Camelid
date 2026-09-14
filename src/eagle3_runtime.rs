@@ -10,16 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::eagle3::{Eagle3DraftModel, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS, TARGET_VOCAB_SIZE};
 use crate::error::{BackendError, Result};
 use crate::inference::spec_tree::{
-    normalize_draft_top_logits, DynamicDraftLattice, PackedForestPlan, ScoredTokenTree,
-    TokenTree, TREE_MAX_NODES,
+    normalize_draft_top_logits, DynamicDraftLattice, PackedForestPlan, ScoredTokenTree, TokenTree,
+    TREE_MAX_NODES,
 };
 use crate::inference::LlamaLoadedWeights;
 use crate::metal::{
     Eagle3AuthoritativeE1ShadowComparison, Eagle3MetalOutput, Eagle3MetalScoredRow,
     Eagle3MetalState, Eagle3MetalWeights, Eagle3SelectiveEdgePromotionAttempt,
-    Eagle3SelectiveEdgePromotionReceipt,
-    ResidentIndexedHeadEarlyRow, ResidentIndexedHeadEarlySnapshot, EAGLE3_AUX_WIDTH,
-    EAGLE3_DRAFT_VOCAB,
+    Eagle3SelectiveEdgePromotionReceipt, ResidentIndexedHeadEarlyRow,
+    ResidentIndexedHeadEarlySnapshot, EAGLE3_AUX_WIDTH, EAGLE3_DRAFT_VOCAB,
     RESIDENT_INDEXED_HEAD_SHADOW_MAX_CANDIDATES,
 };
 use crate::tensor::CpuTensor;
@@ -1075,8 +1074,7 @@ impl Eagle3DraftForest {
                 )));
             }
             if (1..row).any(|earlier| {
-                tree.parent[earlier] == tree.parent[row]
-                    && tree.tokens[earlier] == tree.tokens[row]
+                tree.parent[earlier] == tree.parent[row] && tree.tokens[earlier] == tree.tokens[row]
             }) {
                 return Err(invalid(format!(
                     "EAGLE-3 device acceptance parent {parent} has duplicate child token {}",
@@ -1213,9 +1211,7 @@ impl Eagle3DraftForest {
         }
 
         let mut verified_edge_rows = Vec::with_capacity(acceptance.capture_rows.len() - 1);
-        for (emitted_index, &verifier_row) in
-            acceptance.capture_rows.iter().enumerate().skip(1)
-        {
+        for (emitted_index, &verifier_row) in acceptance.capture_rows.iter().enumerate().skip(1) {
             let edge = plan
                 .verified_edges
                 .get(verifier_row - 1)
@@ -1639,9 +1635,7 @@ fn eagle3_candidate_log_probabilities(logit_bits: &[u32]) -> Vec<Option<f64>> {
         let winner_log_probability = -(positive_infinities as f64).ln();
         return scores
             .into_iter()
-            .map(|score| {
-                (score == f32::INFINITY).then_some(winner_log_probability)
-            })
+            .map(|score| (score == f32::INFINITY).then_some(winner_log_probability))
             .collect();
     }
     let maximum = scores
@@ -1662,9 +1656,8 @@ fn eagle3_candidate_log_probabilities(logit_bits: &[u32]) -> Vec<Option<f64>> {
     scores
         .into_iter()
         .map(|score| {
-            (score > f32::NEG_INFINITY).then_some(
-                f64::from(score) - f64::from(maximum) - log_denominator,
-            )
+            (score > f32::NEG_INFINITY)
+                .then_some(f64::from(score) - f64::from(maximum) - log_denominator)
         })
         .collect()
 }
@@ -1681,10 +1674,7 @@ fn eagle3_logsumexp(values: &[f64]) -> Option<f64> {
 impl Eagle3EarlyTransactionPortfolio {
     /// Freeze all portfolio rankings using only the immutable N8 tree and layer-25 candidate
     /// scores. Current-round target predictions are absent from this signature by construction.
-    pub fn freeze(
-        tree: &TokenTree,
-        early: &ResidentIndexedHeadEarlySnapshot,
-    ) -> Result<Self> {
+    pub fn freeze(tree: &TokenTree, early: &ResidentIndexedHeadEarlySnapshot) -> Result<Self> {
         let nodes = tree.nodes();
         if nodes == 0
             || nodes > 8
@@ -1697,7 +1687,9 @@ impl Eagle3EarlyTransactionPortfolio {
                 .iter()
                 .any(|token| *token as usize >= TARGET_VOCAB_SIZE)
         {
-            return Err(invalid("EAGLE-3 transaction portfolio received an invalid tree"));
+            return Err(invalid(
+                "EAGLE-3 transaction portfolio received an invalid tree",
+            ));
         }
         for row in 1..nodes {
             let parent = usize::try_from(tree.parent[row]).map_err(|_| {
@@ -1724,7 +1716,10 @@ impl Eagle3EarlyTransactionPortfolio {
                 reason.label()
             )));
         }
-        if early.layer_id != *TARGET_LAYER_INPUT_IDS.last().expect("capture contract is non-empty")
+        if early.layer_id
+            != *TARGET_LAYER_INPUT_IDS
+                .last()
+                .expect("capture contract is non-empty")
             || early.compile_fast_math_enabled
             || early.rows.len() != nodes
             || early.candidate_union.is_empty()
@@ -1773,8 +1768,8 @@ impl Eagle3EarlyTransactionPortfolio {
             for edge in path_rows.windows(2) {
                 let parent = edge[0];
                 let child_token = tree.tokens[edge[1]];
-                let Some(log_probability) = candidate_index(child_token)
-                    .and_then(|index| log_probabilities[parent][index])
+                let Some(log_probability) =
+                    candidate_index(child_token).and_then(|index| log_probabilities[parent][index])
                 else {
                     path_possible = false;
                     break;
@@ -1794,8 +1789,7 @@ impl Eagle3EarlyTransactionPortfolio {
                     if child_tokens.contains(&token) {
                         None
                     } else {
-                        log_probabilities[verifier_row][candidate]
-                            .map(|score| (token, score))
+                        log_probabilities[verifier_row][candidate].map(|score| (token, score))
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1949,9 +1943,7 @@ impl Eagle3EarlyTransactionPortfolio {
             .collect::<Vec<_>>();
         let prepared_edge_rows = eagle3_selective_edge_path_union(&tree, &predicted_paths)
             .ok_or_else(|| {
-                invalid(
-                    "EAGLE-3 selective edge preparation found a non-canonical predicted path",
-                )
+                invalid("EAGLE-3 selective edge preparation found a non-canonical predicted path")
             })?;
         Ok(Eagle3SelectiveEdgePrepPlan {
             budget,
@@ -2021,8 +2013,7 @@ impl Eagle3EarlyTransactionPortfolio {
             .ranked_endpoints
             .iter()
             .position(|(verifier_row, candidate_terminal)| {
-                *verifier_row == acceptance.leaf_row
-                    && *candidate_terminal == terminal_token
+                *verifier_row == acceptance.leaf_row && *candidate_terminal == terminal_token
             })
             .map(|rank| rank + 1);
         let terminal_rank_at_authoritative_leaf = self.early_rows[acceptance.leaf_row]
@@ -2133,7 +2124,9 @@ pub enum Eagle3SelectiveEdgePromotionOutcome {
     Promoted(Eagle3SelectiveEdgePromotionReceipt),
     /// The candidate touched no visible watermark. The established serial update then
     /// overwrote the complete accepted range and remains authoritative.
-    Fallback { reason: String },
+    Fallback {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2177,12 +2170,13 @@ fn record_authoritative_e1_shadow(
             EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_MATCHED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
-            EAGLE3_E1_AUTHORITATIVE_EDGES
-                .fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_AUTHORITATIVE_EDGES.fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_HITS.fetch_add(*prepared_hits as u64, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_MISSES.fetch_add(*prepared_misses as u64, Ordering::Relaxed);
-            EAGLE3_E1_FULLY_COVERED_ROUNDS
-                .fetch_add(u64::from(*authoritative_path_fully_covered), Ordering::Relaxed);
+            EAGLE3_E1_FULLY_COVERED_ROUNDS.fetch_add(
+                u64::from(*authoritative_path_fully_covered),
+                Ordering::Relaxed,
+            );
         }
         Eagle3AuthoritativeE1ShadowComparison::Mismatched {
             prepared_edges,
@@ -2195,12 +2189,13 @@ fn record_authoritative_e1_shadow(
             EAGLE3_E1_ENCODED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_MISMATCHED.fetch_add(1, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_EDGES.fetch_add(*prepared_edges as u64, Ordering::Relaxed);
-            EAGLE3_E1_AUTHORITATIVE_EDGES
-                .fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
+            EAGLE3_E1_AUTHORITATIVE_EDGES.fetch_add(*authoritative_edges as u64, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_HITS.fetch_add(*prepared_hits as u64, Ordering::Relaxed);
             EAGLE3_E1_PREPARED_MISSES.fetch_add(*prepared_misses as u64, Ordering::Relaxed);
-            EAGLE3_E1_FULLY_COVERED_ROUNDS
-                .fetch_add(u64::from(*authoritative_path_fully_covered), Ordering::Relaxed);
+            EAGLE3_E1_FULLY_COVERED_ROUNDS.fetch_add(
+                u64::from(*authoritative_path_fully_covered),
+                Ordering::Relaxed,
+            );
         }
         Eagle3AuthoritativeE1ShadowComparison::Fallback(_) => {
             EAGLE3_E1_FALLBACK.fetch_add(1, Ordering::Relaxed);
@@ -3284,15 +3279,7 @@ mod tests {
         config.adaptive_branching = true;
         let mut frontier = Eagle3DynamicFrontier::new(10, config).unwrap();
         // Candidate 0 has probability ~0.80 (dominant). Weak siblings (0.05, 0.03, ...) should be pruned.
-        let exp = output(
-            &[
-                (11, 0.80),
-                (12, 0.05),
-                (13, 0.03),
-                (14, 0.02),
-            ],
-            1.0,
-        );
+        let exp = output(&[(11, 0.80), (12, 0.05), (13, 0.03), (14, 0.02)], 1.0);
         let children = frontier.record_expansion(0, &exp).unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(frontier.lattice().nodes().len(), 2);
@@ -3875,9 +3862,7 @@ mod tests {
 
         // Root -> row 1 -> row 3, then target-only bonus 77. Every authoritative cell is
         // already represented: edge rows 1/3 followed by virtual terminal row 3.
-        let acceptance = forest
-            .accept_target_predictions(&[11, 13, 0, 77])
-            .unwrap();
+        let acceptance = forest.accept_target_predictions(&[11, 13, 0, 77]).unwrap();
         assert_eq!(
             forest
                 .resolve_authoritative_precompute(&plan, &acceptance)
@@ -4241,7 +4226,10 @@ mod tests {
         let plan = forest.plan_device_acceptance().unwrap();
         let nodes = forest.scored.tree.nodes();
         assert_eq!(nodes, 8);
-        assert_eq!(forest.scored.tree.tokens, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(
+            forest.scored.tree.tokens,
+            vec![10, 11, 12, 13, 14, 15, 16, 17]
+        );
         assert_eq!(forest.scored.tree.parent, vec![-1, 0, 0, 1, 1, 2, 3, 3]);
         assert_eq!(forest.scored.tree.depth, vec![0, 1, 1, 2, 2, 2, 3, 3]);
 
@@ -4283,7 +4271,10 @@ mod tests {
                 selected.terminal_depth,
                 u32::from(forest.scored.tree.depth[leaf])
             );
-            assert_eq!(selected.terminal_token_valid, selected.terminal_token != u32::MAX);
+            assert_eq!(
+                selected.terminal_token_valid,
+                selected.terminal_token != u32::MAX
+            );
             assert_eq!(
                 selected.safe_terminal_token,
                 if selected.terminal_token_valid {

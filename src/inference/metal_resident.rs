@@ -55,8 +55,7 @@ pub(super) const MAX_VERIFY_K: usize = 16;
 /// acceptance walk to a real EAGLE tree verify and compares its device receipt with the existing
 /// host oracle. It does not authorize emission, compaction, or EAGLE state changes.
 #[cfg(any(target_os = "macos", test))]
-const EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV: &str =
-    "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW";
+const EAGLE3_DEVICE_ACCEPTANCE_SHADOW_ENV: &str = "CAMELID_BENCH_EAGLE3_DEVICE_ACCEPT_SHADOW";
 
 #[cfg(any(target_os = "macos", test))]
 fn eagle3_device_acceptance_shadow_setting_enables(raw: Option<&str>) -> bool {
@@ -78,8 +77,7 @@ fn eagle3_device_acceptance_shadow_enabled() -> bool {
 /// Stage-1 target-authoritative checkpoint. Exact spelling only: malformed campaign env cannot
 /// accidentally split the target queue or allocate E1 scratch.
 #[cfg(any(target_os = "macos", test))]
-const EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV: &str =
-    "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW";
+const EAGLE3_AUTHORITATIVE_E1_SHADOW_ENV: &str = "CAMELID_BENCH_EAGLE3_AUTHORITATIVE_E1_SHADOW";
 
 #[cfg(any(target_os = "macos", test))]
 fn eagle3_authoritative_e1_shadow_setting_enables(raw: Option<&str>) -> bool {
@@ -1875,16 +1873,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(
-                tree,
-                capture_layer_ids,
-                false,
-                true,
-                None,
-                None,
-                None,
-                None,
-            )?
+            .verify_tree_metal_inner(tree, capture_layer_ids, false, true, None, None, None, None)?
             .map(|(_emitted, capture, _target_top_k, _indexed_head)| capture))
     }
 
@@ -1927,12 +1916,14 @@ impl super::LlamaInferenceSession {
     ) -> Result<Option<LlamaTargetTopKVerify>> {
         Ok(self
             .verify_tree_metal_inner(tree, &[], true, true, None, None, None, None)?
-            .map(|(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
-                predictions: capture.predictions,
-                target_top_k,
-                emitted,
-                timings: capture.timings,
-            }))
+            .map(
+                |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerify {
+                    predictions: capture.predictions,
+                    target_top_k,
+                    emitted,
+                    timings: capture.timings,
+                },
+            ))
     }
 
     /// Benchmark-only combined EAGLE capture and Token Recycling candidate seam.
@@ -1947,16 +1938,7 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaTargetTopKVerifyCapture>> {
         Ok(self
-            .verify_tree_metal_inner(
-                tree,
-                capture_layer_ids,
-                true,
-                true,
-                None,
-                None,
-                None,
-                None,
-            )?
+            .verify_tree_metal_inner(tree, capture_layer_ids, true, true, None, None, None, None)?
             .map(
                 |(emitted, capture, target_top_k, _indexed_head)| LlamaTargetTopKVerifyCapture {
                     predictions: capture.predictions,
@@ -2050,17 +2032,16 @@ impl super::LlamaInferenceSession {
         capture_layer_ids: &[usize],
         candidate_ids: &[u32],
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
-        let Some((emitted, capture, target_top_k, indexed_head)) = self
-            .verify_tree_metal_inner(
-                tree,
-                capture_layer_ids,
-                true,
-                true,
-                Some(candidate_ids),
-                None,
-                None,
-                None,
-            )?
+        let Some((emitted, capture, target_top_k, indexed_head)) = self.verify_tree_metal_inner(
+            tree,
+            capture_layer_ids,
+            true,
+            true,
+            Some(candidate_ids),
+            None,
+            None,
+            None,
+        )?
         else {
             return Ok(None);
         };
@@ -2092,17 +2073,16 @@ impl super::LlamaInferenceSession {
         path_budget: usize,
         selective_promotion: Option<metal::Eagle3SelectiveEdgePromotionAuthorization>,
     ) -> Result<Option<LlamaIndexedHeadShadowVerify<LlamaTargetTopKVerifyCapture>>> {
-        let Some((emitted, capture, target_top_k, indexed_head)) = self
-            .verify_tree_metal_inner(
-                tree,
-                capture_layer_ids,
-                true,
-                true,
-                Some(candidate_ids),
-                Some(eagle3_head),
-                Some(path_budget),
-                selective_promotion,
-            )?
+        let Some((emitted, capture, target_top_k, indexed_head)) = self.verify_tree_metal_inner(
+            tree,
+            capture_layer_ids,
+            true,
+            true,
+            Some(candidate_ids),
+            Some(eagle3_head),
+            Some(path_budget),
+            selective_promotion,
+        )?
         else {
             return Ok(None);
         };
@@ -2508,19 +2488,14 @@ impl super::LlamaInferenceSession {
         // reuses that same allocation as the parity oracle, rather than reconstructing the
         // selected path a second time. A non-committing call only builds a path if a future
         // diagnostic explicitly supplies a receipt.
-        let accepted_path = (commit || device_acceptance_shadow.is_some())
-            .then(|| tree.path_to(leaf));
+        let accepted_path =
+            (commit || device_acceptance_shadow.is_some()).then(|| tree.path_to(leaf));
         if let Some(shadow) = device_acceptance_shadow.as_ref() {
             let host_path = accepted_path
                 .as_deref()
                 .expect("device acceptance receipt requires a host oracle path");
             let verdict = compare_eagle3_device_acceptance_shadow(
-                tree,
-                vocab,
-                &emitted,
-                leaf,
-                host_path,
-                shadow,
+                tree, vocab, &emitted, leaf, host_path, shadow,
             );
             let counters = record_eagle3_device_acceptance_shadow(verdict);
             match (verdict, shadow) {
@@ -2807,7 +2782,9 @@ mod eagle3_device_acceptance_shadow_tests {
         assert!(!eagle3_authoritative_e1_shadow_setting_enables(None));
         assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("")));
         assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("0")));
-        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("true")));
+        assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some(
+            "true"
+        )));
         assert!(!eagle3_authoritative_e1_shadow_setting_enables(Some("01")));
         assert!(eagle3_authoritative_e1_shadow_setting_enables(Some("1")));
         assert!(eagle3_authoritative_e1_shadow_setting_enables(Some(" 1\n")));
@@ -2818,10 +2795,14 @@ mod eagle3_device_acceptance_shadow_tests {
         assert!(!eagle3_device_acceptance_shadow_setting_enables(None));
         assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("")));
         assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("0")));
-        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("true")));
+        assert!(!eagle3_device_acceptance_shadow_setting_enables(Some(
+            "true"
+        )));
         assert!(!eagle3_device_acceptance_shadow_setting_enables(Some("01")));
         assert!(eagle3_device_acceptance_shadow_setting_enables(Some("1")));
-        assert!(eagle3_device_acceptance_shadow_setting_enables(Some(" 1\n")));
+        assert!(eagle3_device_acceptance_shadow_setting_enables(Some(
+            " 1\n"
+        )));
     }
 
     #[test]
