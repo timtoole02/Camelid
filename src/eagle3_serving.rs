@@ -90,7 +90,10 @@ impl Eagle3DynamicTree {
     };
 
     fn label(self) -> String {
-        format!("N{}/K{}/X{}", self.verify_nodes, self.top_k, self.expansions)
+        format!(
+            "N{}/K{}/X{}",
+            self.verify_nodes, self.top_k, self.expansions
+        )
     }
 }
 
@@ -375,10 +378,7 @@ fn clamp_max_tokens_to_logical_budget_at_limit(
 /// Keep verifier requests on Metal's checked row-count/position contract.
 /// N8 is valid at every supported 4K position; widths 9..=16 are retained only
 /// when their final row remains inside the receipted 2K wide-attention lane.
-pub fn cap_verify_nodes_for_position(
-    target_position: usize,
-    requested_nodes: usize,
-) -> usize {
+pub fn cap_verify_nodes_for_position(target_position: usize, requested_nodes: usize) -> usize {
     if requested_nodes > DEEP_CONTEXT_VERIFY_NODES
         && target_position.saturating_add(requested_nodes) > WIDE_VERIFY_POSITION_LIMIT
     {
@@ -831,8 +831,7 @@ impl Drop for Eagle3ServingState {
         if std::thread::panicking() {
             return;
         }
-        let (Some(key), Some(mut drafter)) = (self.pooled_head.take(), self.drafter.take())
-        else {
+        let (Some(key), Some(mut drafter)) = (self.pooled_head.take(), self.drafter.take()) else {
             return;
         };
         drafter.reset_for_reuse();

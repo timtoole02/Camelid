@@ -14,8 +14,7 @@ use crate::eagle3::{DRAFT_VOCAB_SIZE, HIDDEN_SIZE, TARGET_LAYER_INPUT_IDS, TARGE
 use crate::error::{BackendError, Result};
 
 pub const SCHEMA_ID: &str = "camelid-eagle3-q4-features-v1";
-pub const POSITIONAL_CONTRACT: &str =
-    "eagle3-aux-p-next-token-teacher-p1-runtime-mask-p2-v1";
+pub const POSITIONAL_CONTRACT: &str = "eagle3-aux-p-next-token-teacher-p1-runtime-mask-p2-v1";
 pub const AUX_WIDTH: usize = HIDDEN_SIZE * TARGET_LAYER_INPUT_IDS.len();
 pub const INVALID_TOKEN_ID: u32 = u32::MAX;
 

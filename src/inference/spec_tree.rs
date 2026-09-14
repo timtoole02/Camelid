@@ -445,7 +445,9 @@ impl DynamicDraftLattice {
                 .iter()
                 .enumerate()
                 .filter(|(idx, node)| {
-                    node.parent == Some(curr) && usize::from(node.depth) <= max_depth && !selected.contains(idx)
+                    node.parent == Some(curr)
+                        && usize::from(node.depth) <= max_depth
+                        && !selected.contains(idx)
                 })
                 .max_by(|(_, a), (_, b)| {
                     a.cumulative_log_probability

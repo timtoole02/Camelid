@@ -50,8 +50,8 @@ use crate::{
     eagle3_serving::{
         clamp_max_tokens_to_logical_budget as clamp_eagle3_max_tokens,
         configured_logical_token_limit as configured_eagle3_logical_token_limit,
-        validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServingConfig,
-        Eagle3ServeHeadKey, Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
+        validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServeHeadKey,
+        Eagle3ServingConfig, Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
     },
     embedding::{
         cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
@@ -17547,13 +17547,14 @@ fn bootstrap_eagle3_generation(
     if !prepared.is_eagle3() {
         return Ok(None);
     }
-    let already_initialized = prepared
-        .speculative
-        .as_ref()
-        .is_some_and(|spec| match &spec.drafter {
-            PreparedSpeculativeDrafter::Eagle3(state) => state.is_initialized(),
-            PreparedSpeculativeDrafter::Standard(_) => false,
-        });
+    let already_initialized =
+        prepared
+            .speculative
+            .as_ref()
+            .is_some_and(|spec| match &spec.drafter {
+                PreparedSpeculativeDrafter::Eagle3(state) => state.is_initialized(),
+                PreparedSpeculativeDrafter::Standard(_) => false,
+            });
     if already_initialized {
         return Ok(None);
     }
@@ -17699,13 +17700,7 @@ fn run_speculative_round(
                 }
             }
         }
-        commit_target_tokens(
-            prepared,
-            &round.emitted,
-            generated,
-            history,
-            finish_reason,
-        )?;
+        commit_target_tokens(prepared, &round.emitted, generated, history, finish_reason)?;
         return Ok(SpeculativeRound::Committed);
     }
     let spec = prepared
@@ -17787,13 +17782,13 @@ fn run_speculative_round(
                     .session
                     .forward_greedy_verify_chunk(&batch)
                     .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_verify_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "speculative_verify_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
                 let accepted = accepted_draft_prefix(&drafts, &predictions);
                 (predictions[..=accepted].to_vec(), accepted, timings)
             }
@@ -17832,8 +17827,7 @@ fn run_speculative_round(
                 let target_refs: Vec<&[f32]> =
                     target_probabilities.iter().map(Vec::as_slice).collect();
                 let rng = seeded_rejection_rng(sampling.seed.unwrap_or(0), history.len() as u64);
-                let result =
-                    speculative_rejection_sample(&drafts, &draft_refs, &target_refs, rng);
+                let result = speculative_rejection_sample(&drafts, &draft_refs, &target_refs, rng);
                 (result.emitted_tokens, result.accepted_draft_count, timings)
             }
         };
@@ -18402,10 +18396,9 @@ async fn prepare_generation(
             suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
-            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::NGram(NGramDrafter::new(
-                spec_ngram_min_from_env(),
-                spec_ngram_max_from_env(),
-            ))),
+            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::NGram(
+                NGramDrafter::new(spec_ngram_min_from_env(), spec_ngram_max_from_env()),
+            )),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
@@ -18450,10 +18443,10 @@ async fn prepare_generation(
             validate_eagle3_logical_budget(token_ids.len(), max_tokens as usize).map_err(
                 |error| {
                     api_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "eagle3_context_limit_exceeded",
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "eagle3_context_limit_exceeded",
                         error.to_string(),
-                    Some("max_tokens"),
+                        Some("max_tokens"),
                     )
                 },
             )?;
@@ -18505,26 +18498,25 @@ async fn prepare_generation(
                     )
                 })?;
             let checkpoint_path = sidecar_path.clone();
-            let (checkpoint, checkpoint_sha256) = tokio::task::spawn_blocking(move || {
-                load_eagle3_checkpoint_cached(&sidecar_path)
-            })
-            .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "eagle3_model_load_failed",
-                    format!("EAGLE-3 checkpoint loader task failed: {error}"),
-                    None,
-                )
-            })?
-            .map_err(|error| {
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "eagle3_model_load_failed",
-                    error.to_string(),
-                    None,
-                )
-            })?;
+            let (checkpoint, checkpoint_sha256) =
+                tokio::task::spawn_blocking(move || load_eagle3_checkpoint_cached(&sidecar_path))
+                    .await
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "eagle3_model_load_failed",
+                            format!("EAGLE-3 checkpoint loader task failed: {error}"),
+                            None,
+                        )
+                    })?
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "eagle3_model_load_failed",
+                            error.to_string(),
+                            None,
+                        )
+                    })?;
             // The uploaded draft wire is request-independent: the serving state
             // checks it out of the serve-wide single-slot pool at bootstrap
             // (keyed by head, target, wire gates and envelope) instead of
@@ -19915,14 +19907,12 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
         suffix_root_branch_count_sum = spec.suffix_root_branch_count_sum,
         suffix_expected_accepted_q16_sum = spec.suffix_expected_accepted_q16_sum,
         suffix_terminal_survival_q16_sum = spec.suffix_terminal_survival_q16_sum,
-        suffix_confidence_q16_scale =
-            crate::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE,
+        suffix_confidence_q16_scale = crate::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE,
         suffix_min_prefix_survival_q16 =
             crate::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16,
         suffix_min_expected_accepted_q16 =
             crate::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16,
-        suffix_min_confident_depth =
-            crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
+        suffix_min_confident_depth = crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
         eagle3 = spec.is_eagle3(),
         eagle3_head_reused,
         eagle3_early_exit_rounds,
@@ -21167,13 +21157,9 @@ fn stream_prompt_cache_prologue(
         streamed_text,
         first_content_ms,
     } = state;
-    if let Err(response) = bootstrap_eagle3_generation(
-        prepared,
-        input,
-        generated,
-        history,
-        finish_reason,
-    ) {
+    if let Err(response) =
+        bootstrap_eagle3_generation(prepared, input, generated, history, finish_reason)
+    {
         let (code, message) = stream_error_parts(&response);
         send(StreamDecodeEvent::Failed { code, message });
         return StreamPrologue::Stop;
@@ -22368,8 +22354,7 @@ pub fn render_llama3_training_chat_prompt(
         .ok_or_else(|| "Llama 3 training chat requires tokenizer.chat_template".to_string())?;
     if !is_llama3_instruct_template(template) {
         return Err(
-            "Llama 3 training chat requires start-header, end-header, and EOT markers"
-                .to_string(),
+            "Llama 3 training chat requires start-header, end-header, and EOT markers".to_string(),
         );
     }
     let messages = messages
@@ -22381,9 +22366,8 @@ pub fn render_llama3_training_chat_prompt(
             unsupported_content_parts: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let rendered =
-        render_metadata_jinja_chat_template_prompt(&messages, tokenizer, template, None)
-            .map_err(|error| error.to_string())?;
+    let rendered = render_metadata_jinja_chat_template_prompt(&messages, tokenizer, template, None)
+        .map_err(|error| error.to_string())?;
     Ok((rendered.text, rendered.add_special, rendered.parse_special))
 }
 
@@ -25385,8 +25369,7 @@ mod tests {
         // Token 0 was streamed by an earlier step; this round committed nine.
         let mut streamed = "Hi".to_string();
         let whole_round_delta = round_text.strip_prefix("Hi").unwrap().to_owned();
-        let deltas = stream_step_deltas(&decode, &generated, 1, false, &[], &mut streamed)
-            .unwrap();
+        let deltas = stream_step_deltas(&decode, &generated, 1, false, &[], &mut streamed).unwrap();
         assert_eq!(deltas, vec![" ", "😀", "日", "本", "語", "!"]);
         assert_eq!(deltas.concat(), whole_round_delta);
         assert_eq!(deltas.concat(), " 😀日本語!");
@@ -30858,9 +30841,7 @@ mod tests {
             rendered,
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
-        assert!(rendered.ends_with(
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        ));
+        assert!(rendered.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]

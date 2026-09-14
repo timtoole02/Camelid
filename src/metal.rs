@@ -490,8 +490,7 @@ fn eagle3_authoritative_e1_shape_fallback(
     stable_position: usize,
     max_positions: usize,
 ) -> Option<Eagle3AuthoritativeE1ShadowFallbackReason> {
-    let max_rows = (KQUANT_V3_MAX_COLUMNS + 1)
-        .min(crate::inference::spec_tree::TREE_MAX_NODES);
+    let max_rows = (KQUANT_V3_MAX_COLUMNS + 1).min(crate::inference::spec_tree::TREE_MAX_NODES);
     if !(2..=max_rows).contains(&rows) {
         return Some(Eagle3AuthoritativeE1ShadowFallbackReason::UnsupportedVerifierWidth);
     }
@@ -578,9 +577,7 @@ fn eagle3_authoritative_e1_selective_rows_valid(
     tree_parent: &[i32],
     prepared_edge_rows: &[usize],
 ) -> bool {
-    prepared_edge_rows
-        .windows(2)
-        .all(|rows| rows[0] < rows[1])
+    prepared_edge_rows.windows(2).all(|rows| rows[0] < rows[1])
         && prepared_edge_rows.iter().all(|&row| {
             if row == 0 || row >= tree_parent.len() {
                 return false;
@@ -644,12 +641,9 @@ fn eagle3_selective_edge_promotion_plan(
             return Err("tree_parent_or_depth");
         }
     }
-    let selected = eagle3_authoritative_e1_selected_edge_slots(
-        tree_parent,
-        tree_depth,
-        accepted_path,
-    )
-    .map_err(|_| "accepted_path")?;
+    let selected =
+        eagle3_authoritative_e1_selected_edge_slots(tree_parent, tree_depth, accepted_path)
+            .map_err(|_| "accepted_path")?;
     if emitted_tokens
         .iter()
         .take(emitted_tokens.len().saturating_sub(1))
@@ -20574,11 +20568,7 @@ fn encode_kquant_v4_tiled_fragment_stage(
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(1, Some(scales), 0);
     e.set_buffer(2, Some(&stage.y_stage), 0);
-    e.set_buffer(
-        3,
-        Some(stage.ysums.as_ref().unwrap_or(&stage.y_stage)),
-        0,
-    );
+    e.set_buffer(3, Some(stage.ysums.as_ref().unwrap_or(&stage.y_stage)), 0);
     e.set_buffer(4, Some(&stage.scalar), 0);
     e.set_buffer(5, Some(&stage.scalar), 8);
     e.set_buffer(6, Some(&stage.scalar), 20);
@@ -21224,8 +21214,7 @@ fn encode_shared_kquant_v4_activation_with_layout(
     if fragment_major && kquant_v4_tiled_prep_fusion_enabled() {
         // A shared projection group may mix Q4 and Q6 weights, so its immutable
         // activation panel always includes the Q4 min-term sums.
-        let stage =
-            allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, true);
+        let stage = allocate_kquant_v4_activation_stage(k, input_width, n_tokens, true, true);
         let routed = encode_kquant_v4_tiled_fragment_stage(e, k, y, &scales, &stage);
         record_kquant_v4_tiled_prep_route(KquantV4TiledPrepScope::Shared, &stage, routed);
         if routed {
@@ -21609,7 +21598,13 @@ fn encode_resident_kquant_v4_shared_group(
         if let Some(v4) = kquant_v2_kernels() {
             if kquant_v4_register_exact_v2_route_active(v4)
                 && encode_kquant_v4_stream16_group(
-                    e, k, keep, y, projections, input_width, n_tokens,
+                    e,
+                    k,
+                    keep,
+                    y,
+                    projections,
+                    input_width,
+                    n_tokens,
                 )
             {
                 return true;
@@ -22229,9 +22224,7 @@ fn encode_resident_kquant_matmul_f32(
                 dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
                 encode_kquant_v4_activation_stage(e, v4, quants, &stage);
             }
-            encode_kquant_v4_prepared_projection(
-                e, v4, scales, &stage, weight, out, scalar, rows,
-            );
+            encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
             stage.recycle_into(keep);
             return;
         }
@@ -22245,13 +22238,8 @@ fn encode_resident_kquant_matmul_f32(
         e.set_buffer(3, Some(scalar), 0);
         e.set_buffer(4, Some(scalar), 8);
         dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
-        let stage = allocate_kquant_v4_activation_stage(
-            k,
-            input_width,
-            n_tokens,
-            !is_q6k,
-            fragment_major,
-        );
+        let stage =
+            allocate_kquant_v4_activation_stage(k, input_width, n_tokens, !is_q6k, fragment_major);
         encode_kquant_v4_activation_stage(e, v4, quants, &stage);
         encode_kquant_v4_prepared_projection(e, v4, scales, &stage, weight, out, scalar, rows);
         stage.recycle_into(keep);
@@ -28389,8 +28377,21 @@ fn encode_attention_splitk_kv16_batch(
     tree: Option<&TreeAttn>,
 ) -> AttentionSplitkKv16BatchRoute {
     encode_attention_splitk_kv16_batch_offset(
-        e, k, keep, query, keys, values, out, scalar, n_heads, n_kv_heads,
-        head_dim, position_counts, tree, 0, 0,
+        e,
+        k,
+        keep,
+        query,
+        keys,
+        values,
+        out,
+        scalar,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_counts,
+        tree,
+        0,
+        0,
     )
 }
 
@@ -28417,13 +28418,22 @@ fn encode_attention_splitk_kv16_batch_offset(
 ) -> AttentionSplitkKv16BatchRoute {
     let rows = position_counts.len();
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-    let chunk_bytes = rows.checked_mul(n_heads).and_then(|v| v.checked_mul(head_dim))
-        .and_then(|v| v.checked_mul(4)).map(|v| v as u64);
-    if !query_offset.is_multiple_of(4) || !out_offset.is_multiple_of(4)
+    let chunk_bytes = rows
+        .checked_mul(n_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(4))
+        .map(|v| v as u64);
+    if !query_offset.is_multiple_of(4)
+        || !out_offset.is_multiple_of(4)
         || chunk_bytes.is_none_or(|bytes| {
-            query_offset.checked_add(bytes).is_none_or(|end| end > query.length())
-                || out_offset.checked_add(bytes).is_none_or(|end| end > out.length())
-        }) {
+            query_offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > query.length())
+                || out_offset
+                    .checked_add(bytes)
+                    .is_none_or(|end| end > out.length())
+        })
+    {
         return AttentionSplitkKv16BatchRoute::default();
     }
     if !(2..=16).contains(&rows)
@@ -33351,12 +33361,24 @@ mod resident_indexed_head_shadow_contract_tests {
     #[test]
     fn transaction_portfolio_gate_is_exact_and_default_off() {
         assert!(!eagle3_transaction_portfolio_shadow_setting_enables(None));
-        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("")));
-        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("0")));
-        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("true")));
-        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some("01")));
-        assert!(eagle3_transaction_portfolio_shadow_setting_enables(Some("1")));
-        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(" 1\n")));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            ""
+        )));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            "0"
+        )));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            "true"
+        )));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            "01"
+        )));
+        assert!(eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            "1"
+        )));
+        assert!(!eagle3_transaction_portfolio_shadow_setting_enables(Some(
+            " 1\n"
+        )));
     }
 }
 
@@ -35812,23 +35834,21 @@ impl Eagle3AuthoritativeE1Pending {
                 .selective_promotion_generation
                 .expect("promotion encode requires a bound head generation");
             pool_recycle(k, self.keep);
-            return Eagle3AuthoritativeE1Shadow::Promotable(
-                Eagle3SelectiveEdgePromotionScratch {
-                    scratch_k: self.scratch_k,
-                    scratch_v: self.scratch_v,
-                    epoch: Eagle3SelectiveEdgePromotionEpochAuthorization {
-                        proof: authorization,
-                        generation,
-                        stable_position: self.stable_position,
-                        tree_tokens: self.tree_tokens,
-                        tree_parent: self.tree_parent,
-                        tree_depth: self.tree_depth,
-                        prepared_edge_rows: self.prepared_edge_rows,
-                    },
-                    selective_path_budget: budget,
-                    timing,
+            return Eagle3AuthoritativeE1Shadow::Promotable(Eagle3SelectiveEdgePromotionScratch {
+                scratch_k: self.scratch_k,
+                scratch_v: self.scratch_v,
+                epoch: Eagle3SelectiveEdgePromotionEpochAuthorization {
+                    proof: authorization,
+                    generation,
+                    stable_position: self.stable_position,
+                    tree_tokens: self.tree_tokens,
+                    tree_parent: self.tree_parent,
+                    tree_depth: self.tree_depth,
+                    prepared_edge_rows: self.prepared_edge_rows,
                 },
-            );
+                selective_path_budget: budget,
+                timing,
+            });
         }
         let receipt = if let Some((scratch_k, scratch_v)) = scratch {
             Eagle3AuthoritativeE1Shadow::Encoded {
@@ -36564,8 +36584,7 @@ impl Eagle3MetalState {
                 !crate::eagle3_runtime::EAGLE3_TRANSACTION_PORTFOLIO_BUDGETS.contains(&budget)
             })
             || (plan.selective_path_budget.is_some() != plan.target_tail_baseline_us.is_some())
-            || (plan.selective_path_budget.is_some()
-                && rows != EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
+            || (plan.selective_path_budget.is_some() && rows != EAGLE3_SELECTIVE_EDGE_VERIFIER_ROWS)
         {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
         }
@@ -36620,10 +36639,8 @@ impl Eagle3MetalState {
         rows: usize,
         selective_edge_rows: Option<&[usize]>,
         selective_portfolio: Option<&ResidentIndexedHeadEarlySnapshot>,
-    ) -> std::result::Result<
-        Eagle3AuthoritativeE1Pending,
-        Eagle3AuthoritativeE1ShadowFallbackReason,
-    > {
+    ) -> std::result::Result<Eagle3AuthoritativeE1Pending, Eagle3AuthoritativeE1ShadowFallbackReason>
+    {
         if capture_bufs.len() != crate::eagle3::TARGET_LAYER_INPUT_IDS.len() {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::CaptureContract);
         }
@@ -36640,10 +36657,7 @@ impl Eagle3MetalState {
             // all-edge request must never inherit a stale portfolio receipt.
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
         }
-        if !eagle3_authoritative_e1_selective_rows_valid(
-            plan.tree_parent,
-            &prepared_edge_rows,
-        ) {
+        if !eagle3_authoritative_e1_selective_rows_valid(plan.tree_parent, &prepared_edge_rows) {
             return Err(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
         }
         let edges = prepared_edge_rows.len();
@@ -36872,8 +36886,7 @@ impl Eagle3MetalState {
             selective_promotion_generation,
             target_tail_baseline_us: plan.target_tail_baseline_us,
             portfolio_encode_us: selective_portfolio.map_or(0, |early| early.encode_us),
-            portfolio_commit_wait_us: selective_portfolio
-                .map_or(0, |early| early.commit_wait_us),
+            portfolio_commit_wait_us: selective_portfolio.map_or(0, |early| early.commit_wait_us),
             portfolio_gpu_us: selective_portfolio.map_or(0, |early| early.gpu_busy_us),
             portfolio_kernel_window_us: selective_portfolio
                 .map_or(0, |early| early.kernel_window_us),
@@ -36920,37 +36933,34 @@ impl Eagle3MetalState {
             scratch_k,
             scratch_v,
             timing,
-        ) =
-            match shadow {
-                Eagle3AuthoritativeE1Shadow::Encoded {
-                    stable_position,
-                    tree_parent,
-                    tree_depth,
-                    prepared_edge_rows,
-                    scratch_k,
-                    scratch_v,
-                    timing,
-                } => (
-                    stable_position,
-                    tree_parent,
-                    tree_depth,
-                    prepared_edge_rows,
-                    scratch_k,
-                    scratch_v,
-                    timing,
-                ),
-                Eagle3AuthoritativeE1Shadow::Fallback(reason) => {
-                    return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(reason));
-                }
-                Eagle3AuthoritativeE1Shadow::Promotable(scratch) => {
-                    recycle_authoritative_e1_artifact(
-                        Eagle3AuthoritativeE1Shadow::Promotable(scratch),
-                    );
-                    return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(
-                        Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract,
-                    ));
-                }
-            };
+        ) = match shadow {
+            Eagle3AuthoritativeE1Shadow::Encoded {
+                stable_position,
+                tree_parent,
+                tree_depth,
+                prepared_edge_rows,
+                scratch_k,
+                scratch_v,
+                timing,
+            } => (
+                stable_position,
+                tree_parent,
+                tree_depth,
+                prepared_edge_rows,
+                scratch_k,
+                scratch_v,
+                timing,
+            ),
+            Eagle3AuthoritativeE1Shadow::Fallback(reason) => {
+                return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(reason));
+            }
+            Eagle3AuthoritativeE1Shadow::Promotable(scratch) => {
+                recycle_authoritative_e1_artifact(Eagle3AuthoritativeE1Shadow::Promotable(scratch));
+                return Some(Eagle3AuthoritativeE1ShadowComparison::Fallback(
+                    Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePromotionContract,
+                ));
+            }
+        };
         let prepared_edges = prepared_edge_rows.len();
         let authoritative_edges = accepted_path.len().saturating_sub(1);
         let accepted_edge_rows = match eagle3_authoritative_e1_selected_edge_slots(
@@ -37100,8 +37110,9 @@ impl Eagle3MetalState {
                 Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
             ) => {
                 return Ok(Eagle3SelectiveEdgePromotionAttempt::Declined {
-                    reason: "selective promotion preparation fell back: selective_portfolio_unavailable"
-                        .to_string(),
+                    reason:
+                        "selective promotion preparation fell back: selective_portfolio_unavailable"
+                            .to_string(),
                 });
             }
             Eagle3AuthoritativeE1Shadow::Fallback(reason) => {
@@ -37334,11 +37345,7 @@ impl Eagle3MetalState {
         self.filled = start_position + rows;
         let promoted_hits = plan.copies.len();
         let serial_misses = plan.serial_miss_offsets.len();
-        let promoted_edge_rows = plan
-            .copies
-            .iter()
-            .map(|copy| copy.verifier_row)
-            .collect();
+        let promoted_edge_rows = plan.copies.iter().map(|copy| copy.verifier_row).collect();
         let serial_miss_edge_rows = plan
             .serial_miss_offsets
             .iter()
@@ -37368,8 +37375,7 @@ impl Eagle3MetalState {
                 logical_serial_fc_rows_displaced: promoted_hits,
                 saved_serial_kv_rows: promoted_hits,
                 serial_fc_logical_columns: projection_columns,
-                serial_fc_physical_columns:
-                    EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS,
+                serial_fc_physical_columns: EAGLE3_SELECTIVE_EDGE_PROMOTION_FC_PHYSICAL_COLUMNS,
                 terminal_authoritative_rows: 1,
                 preparation_timing,
             },
@@ -40266,10 +40272,8 @@ mod eagle3_metal_contract_tests {
         // is unconsumed and deliberately untouched, proving dense scratch slot != child-1.
         let prepared_edge_rows = vec![1usize, 3, 4];
         let prepared_edges = prepared_edge_rows.len();
-        let scratch_bytes = EAGLE3_KV_HEADS
-            * prepared_edges
-            * EAGLE3_HEAD_DIM
-            * std::mem::size_of::<u16>();
+        let scratch_bytes =
+            EAGLE3_KV_HEADS * prepared_edges * EAGLE3_HEAD_DIM * std::mem::size_of::<u16>();
         let scratch_k = pool_get(k, scratch_bytes as u64);
         let scratch_v = pool_get(k, scratch_bytes as u64);
         let setup = k.queue.new_command_buffer();
@@ -40283,20 +40287,8 @@ mod eagle3_metal_contract_tests {
                 let destination = ((kv_head * prepared_edges + scratch_slot)
                     * EAGLE3_HEAD_DIM
                     * std::mem::size_of::<u16>()) as u64;
-                blit.copy_from_buffer(
-                    &control.cache_k,
-                    source,
-                    &scratch_k,
-                    destination,
-                    row_bytes,
-                );
-                blit.copy_from_buffer(
-                    &control.cache_v,
-                    source,
-                    &scratch_v,
-                    destination,
-                    row_bytes,
-                );
+                blit.copy_from_buffer(&control.cache_k, source, &scratch_k, destination, row_bytes);
+                blit.copy_from_buffer(&control.cache_v, source, &scratch_v, destination, row_bytes);
             }
         }
         blit.end_encoding();
@@ -41104,12 +41096,7 @@ impl ResidentTreeAcceptancePending {
             || terminal_depth.checked_add(1) != Some(emitted_count)
             || terminal_valid > 1
             || (terminal_valid == 1) != terminal_in_vocab
-            || safe_terminal_token
-                != if terminal_in_vocab {
-                    terminal_token
-                } else {
-                    0
-                }
+            || safe_terminal_token != if terminal_in_vocab { terminal_token } else { 0 }
         {
             return Err(ResidentTreeAcceptanceShadowFallbackReason::InvalidDeviceOutput);
         }
@@ -41136,9 +41123,9 @@ impl ResidentTreeAcceptancePending {
             std::slice::from_raw_parts(self.tree_depth.contents() as *const u16, self.rows)
         };
         if tree_depth[selected_leaf as usize] as u32 != terminal_depth
-            || path_rows.windows(2).any(|edge| {
-                tree_parent[edge[1] as usize] != edge[0] as i32
-            })
+            || path_rows
+                .windows(2)
+                .any(|edge| tree_parent[edge[1] as usize] != edge[0] as i32)
             || emitted_tokens
                 .iter()
                 .take(count - 1)
@@ -41541,9 +41528,8 @@ fn resident_indexed_head_shadow_from_projection(
         let mut exact_logit_agreements = 0usize;
         let mut first_logit_mismatch = None;
         for &(token_id, indexed_score) in &projected.candidate_scores {
-            let full_score = unsafe {
-                *full_logits_ptr.add(projected.verifier_row * vocab + token_id as usize)
-            };
+            let full_score =
+                unsafe { *full_logits_ptr.add(projected.verifier_row * vocab + token_id as usize) };
             if indexed_score.to_bits() == full_score.to_bits() {
                 exact_logit_agreements += 1;
             } else if first_logit_mismatch.is_none() {
@@ -41555,13 +41541,11 @@ fn resident_indexed_head_shadow_from_projection(
             }
         }
         let top1 = resident_indexed_head_strict_argmax_sorted(&projected.candidate_scores);
-        let authoritative_argmax_token =
-            unsafe { *predictions_ptr.add(projected.verifier_row) };
+        let authoritative_argmax_token = unsafe { *predictions_ptr.add(projected.verifier_row) };
         let authoritative_argmax_logit_bits =
             ((authoritative_argmax_token as usize) < vocab).then(|| unsafe {
-                (*full_logits_ptr.add(
-                    projected.verifier_row * vocab + authoritative_argmax_token as usize,
-                ))
+                (*full_logits_ptr
+                    .add(projected.verifier_row * vocab + authoritative_argmax_token as usize))
                 .to_bits()
             });
         let compared_logits = projected.candidate_scores.len();
@@ -41704,9 +41688,7 @@ fn run_resident_indexed_head_early_snapshot(
                     .iter()
                     .map(|(_, score)| score.to_bits())
                     .collect(),
-                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(
-                    &row.candidate_scores,
-                ),
+                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(&row.candidate_scores),
             })
             .collect(),
     }
@@ -41801,9 +41783,7 @@ fn run_resident_indexed_head_early_snapshot_on_queue(
                     .iter()
                     .map(|(_, score)| score.to_bits())
                     .collect(),
-                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(
-                    &row.candidate_scores,
-                ),
+                ranked_candidate_tokens: resident_indexed_head_ranked_tokens(&row.candidate_scores),
             })
             .collect(),
     }
@@ -45768,9 +45748,8 @@ impl ResidentDecodeState {
                     && (!transaction_portfolio_shadow
                         || indexed_head_shadow_candidates.is_none()) =>
             {
-                eagle3_e1_fallback = Some(
-                    Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable,
-                );
+                eagle3_e1_fallback =
+                    Some(Eagle3AuthoritativeE1ShadowFallbackReason::SelectivePortfolioUnavailable);
                 false
             }
             Some(plan) => match plan.head.authoritative_e1_shadow_preflight(
@@ -45892,8 +45871,7 @@ impl ResidentDecodeState {
             write_buffer_f32(&buffer, embeddings);
             buffer
         });
-        let eagle3_e1_capture_event =
-            eagle3_e1_armed.then(|| kern.device.new_shared_event());
+        let eagle3_e1_capture_event = eagle3_e1_armed.then(|| kern.device.new_shared_event());
         let eagle3_e1_capture_event_value = 1u64;
         // Attention scores scratch (only read by the non-v2 fallback kernel); size to the
         // deepest row's position_count = base+k.
@@ -45921,9 +45899,8 @@ impl ResidentDecodeState {
         // The E1 capture split commits layers before 25 while the host encodes target B. GEMV
         // helpers write their `n_tokens` scalar during encoding, so B needs a disjoint set just
         // as the existing layer-0 early-submit path does. Gate-off allocates nothing here.
-        let eagle3_e1_tail_gemv_scalars: Option<[Buffer; 6]> = eagle3_e1_armed.then(|| {
-            [nb(12), nb(12), nb(12), nb(12), nb(12), nb(12)]
-        });
+        let eagle3_e1_tail_gemv_scalars: Option<[Buffer; 6]> =
+            eagle3_e1_armed.then(|| [nb(12), nb(12), nb(12), nb(12), nb(12), nb(12)]);
         let rope_q_scalar = nb(16);
         let rope_k_scalar = nb(16);
         let silu_n = nb(4);
@@ -45953,9 +45930,7 @@ impl ResidentDecodeState {
                 set_gemv(gateup, bpr_hidden, ffn_dim);
                 set_gemv(down, bpr_ffn, hidden);
             }
-            if let Some([q, kv, o, gateup, down, out]) =
-                eagle3_e1_tail_gemv_scalars.as_ref()
-            {
+            if let Some([q, kv, o, gateup, down, out]) = eagle3_e1_tail_gemv_scalars.as_ref() {
                 set_gemv(q, bpr_hidden, q_dim);
                 set_gemv(kv, bpr_hidden, kv_dim);
                 set_gemv(o, bpr_q, hidden);
@@ -46101,8 +46076,7 @@ impl ResidentDecodeState {
                             .expect("armed E1 has a capture event"),
                         eagle3_e1_capture_event_value,
                     );
-                    first_commit_started
-                        .get_or_insert_with(std::time::Instant::now);
+                    first_commit_started.get_or_insert_with(std::time::Instant::now);
                     cb.commit();
                     eagle3_e1_capture_cb = Some(cb);
                     cb = kern.queue.new_command_buffer().to_owned();
@@ -46620,25 +46594,20 @@ impl ResidentDecodeState {
         // Default-off, non-authoritative shadow. The tiny selector is encoded after the
         // unchanged production argmax and reads `pred_buf` directly on device. With no plan,
         // this block performs no pipeline lookup, allocation, binding, or dispatch.
-        let (tree_acceptance_pending, tree_acceptance_fallback) =
-            match tree_acceptance_shadow_plan {
-                None => (None, None),
-                Some(_) if verify_ablate("argmax") => (
-                    None,
-                    Some(ResidentTreeAcceptanceShadowFallbackReason::ArgmaxAblated),
-                ),
-                Some(plan) => match encode_resident_tree_acceptance_shadow(
-                    kern,
-                    e,
-                    &pred_buf,
-                    plan,
-                    k,
-                    vocab,
-                ) {
+        let (tree_acceptance_pending, tree_acceptance_fallback) = match tree_acceptance_shadow_plan
+        {
+            None => (None, None),
+            Some(_) if verify_ablate("argmax") => (
+                None,
+                Some(ResidentTreeAcceptanceShadowFallbackReason::ArgmaxAblated),
+            ),
+            Some(plan) => {
+                match encode_resident_tree_acceptance_shadow(kern, e, &pred_buf, plan, k, vocab) {
                     Ok(pending) => (Some(pending), None),
                     Err(reason) => (None, Some(reason)),
-                },
-            };
+                }
+            }
+        };
         e.end_encoding();
         let encode_us = encode_started.elapsed().as_micros();
         let tail_commit_started = std::time::Instant::now();
@@ -46646,9 +46615,9 @@ impl ResidentDecodeState {
         cb.commit();
         let mut selective_early_layer25 = None;
         let mut selective_edge_rows = None;
-        if let Some(plan) = eagle3_e1_shadow_plan.filter(|plan| {
-            eagle3_e1_armed && plan.selective_path_budget.is_some()
-        }) {
+        if let Some(plan) = eagle3_e1_shadow_plan
+            .filter(|plan| eagle3_e1_armed && plan.selective_path_budget.is_some())
+        {
             let candidate_ids = indexed_head_shadow_candidates
                 .expect("armed selective E1 preflight requires indexed candidates");
             let layer_id = *crate::eagle3::TARGET_LAYER_INPUT_IDS
@@ -46662,10 +46631,10 @@ impl ResidentDecodeState {
                 prefix.status() == metal::MTLCommandBufferStatus::Completed
             });
             if !prefix_completed {
-                eagle3_e1_fallback = Some(
-                    Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed,
-                );
-            } else if let Some(capture_slot) = capture_slot.filter(|slot| *slot < capture_bufs.len())
+                eagle3_e1_fallback =
+                    Some(Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed);
+            } else if let Some(capture_slot) =
+                capture_slot.filter(|slot| *slot < capture_bufs.len())
             {
                 let early = run_resident_indexed_head_early_snapshot_on_queue(
                     kern,
@@ -46733,9 +46702,8 @@ impl ResidentDecodeState {
                 }
                 selective_early_layer25 = Some(early);
             } else {
-                eagle3_e1_fallback = Some(
-                    Eagle3AuthoritativeE1ShadowFallbackReason::CaptureContract,
-                );
+                eagle3_e1_fallback =
+                    Some(Eagle3AuthoritativeE1ShadowFallbackReason::CaptureContract);
             }
         }
         // Submit E1 only after target B is already queued. Its event wait may release as soon as
@@ -46768,9 +46736,8 @@ impl ResidentDecodeState {
                     }
                 }
                 _ => {
-                    eagle3_e1_fallback = Some(
-                        Eagle3AuthoritativeE1ShadowFallbackReason::CaptureSplitMissing,
-                    );
+                    eagle3_e1_fallback =
+                        Some(Eagle3AuthoritativeE1ShadowFallbackReason::CaptureSplitMissing);
                     None
                 }
             }
@@ -46803,9 +46770,8 @@ impl ResidentDecodeState {
                     event.set_signaled_value(eagle3_e1_capture_event_value);
                 }
             }
-            eagle3_e1_fallback = Some(
-                Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed,
-            );
+            eagle3_e1_fallback =
+                Some(Eagle3AuthoritativeE1ShadowFallbackReason::CommandBufferFailed);
         }
         let target_gpu_us = if eagle3_e1_shadow_plan.is_some() {
             let target_head_gpu_us = layer0_cb
@@ -46852,8 +46818,8 @@ impl ResidentDecodeState {
             let gpu_busy_us = head_gpu_busy_us + capture_gpu_busy_us + tail_gpu_busy_us;
             let kernel_window_us =
                 head_kernel_window_us + capture_kernel_window_us + tail_kernel_window_us;
-            let command_buffers = 1 + usize::from(layer0_cb.is_some())
-                + usize::from(eagle3_e1_capture_cb.is_some());
+            let command_buffers =
+                1 + usize::from(layer0_cb.is_some()) + usize::from(eagle3_e1_capture_cb.is_some());
             eprintln!(
                 "[metal-verify-phase] base={base_position} k={k} \
                  encode={encode_us}us commit_wait={wall_us}us tail_commit_wait={tail_wait_us}us \
@@ -46888,8 +46854,7 @@ impl ResidentDecodeState {
                         );
                     }
                 };
-                let lens_norm =
-                    pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
+                let lens_norm = pool_get(kern, (k * hidden * std::mem::size_of::<f32>()) as u64);
                 let lens_cb: metal::CommandBuffer = kern.queue.new_command_buffer().to_owned();
                 {
                     let lens_encoder = lens_cb.new_compute_command_encoder();
@@ -47350,9 +47315,7 @@ impl ResidentDecodeState {
             None,
             None,
         )
-        .map(|(preds, _, layer_inputs, target_top_k, _, _, _)| {
-            (preds, layer_inputs, target_top_k)
-        })
+        .map(|(preds, _, layer_inputs, target_top_k, _, _, _)| (preds, layer_inputs, target_top_k))
     }
 
     /// Default-off real-model falsifier for device-side target acceptance.
@@ -47388,33 +47351,26 @@ impl ResidentDecodeState {
         ResidentTreeAcceptanceShadow,
     )> {
         let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
-        let (
-            preds,
-            _,
-            layer_inputs,
-            target_top_k,
-            _,
-            indexed_head_shadow,
-            acceptance_shadow,
-        ) = self.verify_batch_inner(
-            embeddings,
-            cos_all,
-            sin_all,
-            layers,
-            logits,
-            base_position,
-            n,
-            scale,
-            false,
-            read_target_top_k,
-            false,
-            Some(&tree),
-            capture_layer_ids,
-            indexed_head_shadow_candidates,
-            Some(acceptance_plan),
-            None,
-            None,
-        )?;
+        let (preds, _, layer_inputs, target_top_k, _, indexed_head_shadow, acceptance_shadow) =
+            self.verify_batch_inner(
+                embeddings,
+                cos_all,
+                sin_all,
+                layers,
+                logits,
+                base_position,
+                n,
+                scale,
+                false,
+                read_target_top_k,
+                false,
+                Some(&tree),
+                capture_layer_ids,
+                indexed_head_shadow_candidates,
+                Some(acceptance_plan),
+                None,
+                None,
+            )?;
         Some((
             preds,
             layer_inputs,
@@ -47457,33 +47413,26 @@ impl ResidentDecodeState {
     )> {
         let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
         let mut e1_shadow = None;
-        let (
-            preds,
-            _,
-            layer_inputs,
-            target_top_k,
-            _,
-            indexed_head_shadow,
-            acceptance_shadow,
-        ) = self.verify_batch_inner(
-            embeddings,
-            cos_all,
-            sin_all,
-            layers,
-            logits,
-            base_position,
-            n,
-            scale,
-            false,
-            read_target_top_k,
-            false,
-            Some(&tree),
-            capture_layer_ids,
-            indexed_head_shadow_candidates,
-            acceptance_plan,
-            Some(e1_plan),
-            Some(&mut e1_shadow),
-        )?;
+        let (preds, _, layer_inputs, target_top_k, _, indexed_head_shadow, acceptance_shadow) =
+            self.verify_batch_inner(
+                embeddings,
+                cos_all,
+                sin_all,
+                layers,
+                logits,
+                base_position,
+                n,
+                scale,
+                false,
+                read_target_top_k,
+                false,
+                Some(&tree),
+                capture_layer_ids,
+                indexed_head_shadow_candidates,
+                acceptance_plan,
+                Some(e1_plan),
+                Some(&mut e1_shadow),
+            )?;
         Some((
             preds,
             layer_inputs,
@@ -49141,10 +49090,8 @@ mod tests {
             EAGLE3_SELECTIVE_EDGE_B4_PROOF_RECEIPT_SHA256
         );
         assert!(
-            Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256(
-                "wrong"
-            )
-            .is_err()
+            Eagle3SelectiveEdgePromotionAuthorization::from_validated_b4_receipt_sha256("wrong")
+                .is_err()
         );
     }
 
@@ -53865,11 +53812,7 @@ mod tests {
                     let scales = pool_get(kernel, (N_TOKENS * n_sb * 4) as u64);
                     let quants = pool_get(kernel, (N_TOKENS * width) as u64);
                     let stage = allocate_kquant_v4_activation_stage(
-                        kernel,
-                        width,
-                        N_TOKENS,
-                        with_ysums,
-                        true,
+                        kernel, width, N_TOKENS, with_ysums, true,
                     );
                     encoder.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
                     encoder.set_buffer(0, Some(&input_buffer), 0);
@@ -53877,11 +53820,7 @@ mod tests {
                     encoder.set_buffer(2, Some(&quants), 0);
                     encoder.set_buffer(3, Some(&stage.scalar), 0);
                     encoder.set_buffer(4, Some(&stage.scalar), 8);
-                    dispatch_1d(
-                        encoder,
-                        &kernel.quantize_q8k_rows_pipeline,
-                        N_TOKENS * n_sb,
-                    );
+                    dispatch_1d(encoder, &kernel.quantize_q8k_rows_pipeline, N_TOKENS * n_sb);
                     encode_kquant_v4_activation_stage(encoder, v4, &quants, &stage);
                     prepared.push(SharedKquantV4Activation {
                         scales,
@@ -53897,13 +53836,14 @@ mod tests {
                 assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
                 let (gpu_start, gpu_end) = gpu_interval_seconds(&cb);
                 let last = prepared.last().expect("at least one preparation");
-                let bits = PrepBits {
-                    scales: read_f32_bits(&last.scales, N_TOKENS * n_sb),
-                    y: read_u16_bits(&last.stage.y_stage, N_TOKENS * width),
-                    ysums: last.stage.ysums.as_ref().map_or_else(Vec::new, |ysums| {
-                        read_u16_bits(ysums, n_sb * 16 * N_TOKENS)
-                    }),
-                };
+                let bits =
+                    PrepBits {
+                        scales: read_f32_bits(&last.scales, N_TOKENS * n_sb),
+                        y: read_u16_bits(&last.stage.y_stage, N_TOKENS * width),
+                        ysums: last.stage.ysums.as_ref().map_or_else(Vec::new, |ysums| {
+                            read_u16_bits(ysums, n_sb * 16 * N_TOKENS)
+                        }),
+                    };
                 let mut recycle = Vec::new();
                 for activation in prepared {
                     activation.recycle_into(&mut recycle);
@@ -54984,9 +54924,7 @@ mod tests {
             "fragment-major production route requires the complete V2 pipeline set"
         );
         assert!(
-            kernel
-                .quantize_q8k_v4_stage_reg_tiled_pipeline
-                .is_some(),
+            kernel.quantize_q8k_v4_stage_reg_tiled_pipeline.is_some(),
             "tiled strict preparation pipeline"
         );
 
@@ -55033,12 +54971,7 @@ mod tests {
                 3072usize,
                 true,
             ),
-            (
-                "single-ffn-q6",
-                ResidentWeightFormat::Q6K,
-                8192usize,
-                false,
-            ),
+            ("single-ffn-q6", ResidentWeightFormat::Q6K, 8192usize, false),
             (
                 "single-head-q6",
                 ResidentWeightFormat::Q6K,
@@ -55056,8 +54989,7 @@ mod tests {
                 match format {
                     ResidentWeightFormat::Q4K => {
                         block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                        block[2..4]
-                            .copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
+                        block[2..4].copy_from_slice(&f32_to_f16_bits(d * 0.375).to_le_bytes());
                     }
                     ResidentWeightFormat::Q6K => {
                         block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
@@ -55065,10 +54997,8 @@ mod tests {
                     _ => unreachable!(),
                 }
             }
-            let weight_buffer = device.new_buffer(
-                wire.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let weight_buffer =
+                device.new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
             write_buffer_u8(&weight_buffer, &wire);
             let weight = ResidentLinearWeight {
                 format,
@@ -55169,11 +55099,7 @@ mod tests {
                 e.set_buffer(2, Some(&canonical_quants), 0);
                 e.set_buffer(3, Some(&canonical_stage.scalar), 0);
                 e.set_buffer(4, Some(&canonical_stage.scalar), 8);
-                dispatch_1d(
-                    e,
-                    &kernel.quantize_q8k_rows_pipeline,
-                    n_tokens * n_sb,
-                );
+                dispatch_1d(e, &kernel.quantize_q8k_rows_pipeline, n_tokens * n_sb);
                 encode_kquant_v4_activation_stage(e, v4, &canonical_quants, &canonical_stage);
                 assert!(
                     encode_kquant_v4_tiled_fragment_stage(
@@ -55229,8 +55155,7 @@ mod tests {
                         ),
                     );
                 }
-                let canonical_projection =
-                    read_u32(&canonical_output, physical_columns * rows);
+                let canonical_projection = read_u32(&canonical_output, physical_columns * rows);
                 let tiled_projection = read_u32(&tiled_output, physical_columns * rows);
                 let sentinel = KQUANT_TEST_SENTINEL.to_bits();
                 for (route, projection) in [
