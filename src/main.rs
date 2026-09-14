@@ -703,6 +703,7 @@ fn default_launch_command() -> Command {
         apple_accelerate_min_elements: None,
         metal_linear: false,
         metal_q8: false,
+        kquant_v4_stream16: false,
         log_acceleration: true,
         spec_decode: None,
         spec_draft_model: None,
@@ -2074,6 +2075,9 @@ enum Command {
         /// Enable the experimental Metal Q8_0 encoded row-dot path on macOS.
         #[arg(long, env = "CAMELID_METAL_Q8", default_value_t = false)]
         metal_q8: bool,
+        /// Enable the opt-in width-16 V4 K-quant verifier path on macOS.
+        #[arg(long, env = "CAMELID_KQUANT_V4_STREAM16", default_value_t = false)]
+        kquant_v4_stream16: bool,
         /// Log the current acceleration/runtime discovery state at startup.
         #[arg(long, default_value_t = true)]
         log_acceleration: bool,
@@ -3829,6 +3833,7 @@ async fn main() -> anyhow::Result<()> {
             apple_accelerate_min_elements,
             metal_linear,
             metal_q8,
+            kquant_v4_stream16,
             log_acceleration,
             spec_decode,
             spec_draft_model,
@@ -3855,6 +3860,7 @@ async fn main() -> anyhow::Result<()> {
                 apple_accelerate_min_elements,
                 metal_linear && !deterministic,
                 metal_q8 && !deterministic,
+                kquant_v4_stream16 && !deterministic,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
             if let Some(cghost) = cghost {
@@ -19673,6 +19679,7 @@ fn apply_runtime_tuning_env(
     apple_accelerate_min_elements: Option<usize>,
     metal_linear: bool,
     metal_q8: bool,
+    kquant_v4_stream16: bool,
 ) {
     if let Some(value) = parallel_linear_min_outputs.filter(|value| *value > 0) {
         std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", value.to_string());
@@ -19685,6 +19692,9 @@ fn apply_runtime_tuning_env(
     }
     if metal_q8 {
         std::env::set_var("CAMELID_METAL_Q8", "1");
+    }
+    if kquant_v4_stream16 {
+        std::env::set_var("CAMELID_KQUANT_V4_STREAM16", "1");
     }
 }
 
