@@ -3108,8 +3108,8 @@ enum Command {
     BenchSpeculative {
         /// Target GGUF model path (the model whose output must be reproduced exactly).
         model: PathBuf,
-        /// Drafter: "ngram" (prompt lookup, no draft model) or "draft" (a smaller
-        /// same-tokenizer model; requires --draft-model).
+        /// Drafter: "ngram" (prompt lookup), "suffix" (frequency-based lookup),
+        /// or "draft" (a smaller same-tokenizer model; requires --draft-model).
         #[arg(long, default_value = "ngram")]
         drafter: String,
         /// Draft model GGUF for --drafter draft. Must share the target's token mapping.
@@ -9559,7 +9559,7 @@ fn run_bench_speculative(
             // Suffix drafting flattened to a chain: fills the verify window the
             // n-gram drafter leaves mostly empty, without paying the tree
             // verify's per-round cost.
-            "suffix" => Ok(SpeculativeDrafter::Suffix(Box::default())),
+            "suffix" => Ok(SpeculativeDrafter::suffix()),
             "draft" => {
                 let path = draft_model.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")

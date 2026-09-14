@@ -51,6 +51,50 @@ impl Default for SuffixDecodingDrafter {
 }
 
 impl SuffixDecodingDrafter {
+    /// Policy for a linear verifier. Longer matches disambiguate repeated labels
+    /// in code/tables; the bounded window retains the source passage while the
+    /// answer grows. Tree callers keep their existing, smaller search policy.
+    pub fn for_chain() -> Self {
+        Self {
+            max_match: 32,
+            min_match: 3,
+            window: 8192,
+            branch: 1,
+        }
+    }
+
+    /// Follow the most frequent continuation at each step, filling a linear
+    /// verification window without spending its budget on sibling branches.
+    /// Selecting the deepest leaf of a BFS tree is not equivalent: tied depths
+    /// can select a less frequent sibling and branching shortens the proposal.
+    pub fn draft_chain(&self, history: &[u32], max_tokens: usize) -> Vec<u32> {
+        let hist = &history[history.len().saturating_sub(self.window)..];
+        if self.min_match == 0 || hist.len() <= self.min_match {
+            return Vec::new();
+        }
+        let mut path = Vec::new();
+        for _ in 0..max_tokens {
+            let max_n = self
+                .max_match
+                .min(hist.len().saturating_sub(1) + path.len());
+            let next = (self.min_match..=max_n).rev().find_map(|n| {
+                let pattern = build_pattern(hist, &path, n);
+                if pattern.len() < n {
+                    return None;
+                }
+                let freq = Self::successor_freqs(hist, &pattern);
+                freq.into_iter()
+                    .max_by(|(ta, ca), (tb, cb)| ca.cmp(cb).then_with(|| tb.cmp(ta)))
+                    .map(|(token, _)| token)
+            });
+            match next {
+                Some(token) => path.push(token),
+                None => break,
+            }
+        }
+        path
+    }
+
     /// Of all earlier occurrences of `pattern` within `hist`, collect the token
     /// that immediately follows each, with its frequency. `pattern` is a suffix
     /// of the full history; matches whose continuation index falls inside the
@@ -272,5 +316,36 @@ mod tests {
         let tree = d.draft_tree(&history, 2, 5, 2);
         assert!(tree.nodes() <= 5, "node cap respected");
         assert!(tree.max_depth() <= 2, "depth cap respected");
+    }
+
+    #[test]
+    fn chain_prefers_frequent_branch_and_uses_the_whole_budget() {
+        let d = SuffixDecodingDrafter {
+            max_match: 2,
+            min_match: 2,
+            window: 512,
+            branch: 2,
+        };
+        let history = [3, 4, 7, 8, 10, 0, 3, 4, 7, 8, 10, 0, 3, 4, 9, 0, 3, 4];
+        assert_eq!(d.draft_chain(&history, 3), [7, 8, 10]);
+        assert!(d.draft_chain(&history, 0).is_empty());
+    }
+
+    #[test]
+    fn chain_uses_long_context_to_disambiguate_common_record_suffixes() {
+        let d = SuffixDecodingDrafter::for_chain();
+        let history = [10, 1, 2, 3, 4, 90, 20, 1, 2, 3, 4, 80, 20, 1, 2, 3, 4];
+        assert_eq!(d.draft_chain(&history, 1), [80]);
+    }
+
+    #[test]
+    fn chain_retains_source_beyond_old_512_token_window_but_honors_its_bound() {
+        let mut d = SuffixDecodingDrafter::for_chain();
+        let mut history = vec![11, 12, 13, 14, 15];
+        history.extend(100..700);
+        history.extend([11, 12, 13]);
+        assert_eq!(d.draft_chain(&history, 2), [14, 15]);
+        d.window = 512;
+        assert!(d.draft_chain(&history, 2).is_empty());
     }
 }

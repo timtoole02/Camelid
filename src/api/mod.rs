@@ -21036,7 +21036,7 @@ async fn prepare_generation(
             None
         }
         Some(SpecDecodeMode::Suffix) => Some(PreparedSpeculative {
-            drafter: SpeculativeDrafter::Suffix(Box::default()),
+            drafter: SpeculativeDrafter::suffix(),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
@@ -21069,6 +21069,11 @@ async fn prepare_generation(
     session.set_resident_paths_disabled(
         speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
     );
+    // A speculative target's next GPU work is a batched verify. A pre-committed
+    // next-token graph is unused and can block a model drafter behind its
+    // unsignaled event on Metal's shared serial queue. Match bench-speculative's
+    // policy before the first target forward, including non-streaming requests.
+    session.set_resident_encode_ahead_enabled(speculative.is_none());
     // A CUDA-resident prefill can skip the eager GPU->host KV mirror only for a request
     // that cannot reach `rollback_to_position`. Speculation is the caller that reaches it
     // (`run_speculative_round` rolls back to the accepted prefix after every round), and a
@@ -24221,12 +24226,14 @@ impl CooperativeStreamDecodeJob {
         if self.finished {
             return engine::StepOutcome::Complete;
         }
-        // Preserve the fast single-request pipeline when this is the only active stream.
+        // Preserve the fast single-request pipeline for ordinary decode. Even one
+        // speculative stream can contain a second model using the shared GPU queue;
+        // do not override the target's preparation-time encode-ahead exclusion.
         // With contention, consume any already-prepared current graph but do not enqueue
         // another session-local future graph ahead of the next round-robin participant.
-        self.prepared
-            .session
-            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
+        self.prepared.session.set_resident_encode_ahead_enabled(
+            context.active_slots <= 1 && self.prepared.speculative.is_none(),
+        );
         if let Some(guard) = &self.telemetry_guard {
             guard.activate();
         }

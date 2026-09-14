@@ -228,6 +228,12 @@ pub enum SpeculativeDrafter {
 }
 
 impl SpeculativeDrafter {
+    pub fn suffix() -> Self {
+        Self::Suffix(Box::new(
+            crate::inference::suffix_decoding::SuffixDecodingDrafter::for_chain(),
+        ))
+    }
+
     /// Propose up to `max_tokens` draft tokens to follow `history` (the full
     /// token sequence so far: prompt plus generated, including the trailing
     /// token the target has not consumed yet). May return fewer or none.
@@ -235,32 +241,7 @@ impl SpeculativeDrafter {
         match self {
             Self::NGram(drafter) => Ok(drafter.draft(history, max_tokens)),
             Self::Model(drafter) => drafter.draft(history, max_tokens),
-            Self::Suffix(drafter) => {
-                use crate::inference::spec_tree::TreeDrafter;
-                let Some(&anchor) = history.last() else {
-                    return Ok(Vec::new());
-                };
-                if max_tokens == 0 {
-                    return Ok(Vec::new());
-                }
-                // Node budget = anchor + max_tokens, depth budget = max_tokens:
-                // a chain of `max_tokens` edges is exactly what the linear
-                // verify window holds.
-                let tree = drafter.draft_tree(history, anchor, max_tokens + 1, max_tokens);
-                // Deepest node = longest proposal. `path_to` walks parents from
-                // it back to the root, so dropping the root leaves the chain in
-                // emission order.
-                let Some(deepest) = (0..tree.tokens.len()).max_by_key(|&i| tree.depth[i]) else {
-                    return Ok(Vec::new());
-                };
-                let path = tree.path_to(deepest);
-                Ok(path
-                    .into_iter()
-                    .skip(1)
-                    .map(|i| tree.tokens[i])
-                    .take(max_tokens)
-                    .collect())
-            }
+            Self::Suffix(drafter) => Ok(drafter.draft_chain(history, max_tokens)),
         }
     }
 

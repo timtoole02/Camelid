@@ -30671,6 +30671,21 @@ fn verify_attention_batch_enabled() -> bool {
     })
 }
 
+/// Experimental linear-verifier batching of independent Q/K normalization, RoPE,
+/// and F16 cache writes. Reuses prefill kernels without changing row arithmetic.
+#[cfg(target_os = "macos")]
+fn verify_glue_batch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_SPEC_VERIFY_BATCH_GLUE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+static VERIFY_GLUE_BATCH_ENCODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Split the f32 fallback decode attention into three dispatches
 /// (scores / softmax / context) instead of one. Default ON;
 /// `CAMELID_METAL_ATTN_SPLIT3=0` restores the single-kernel encode.
@@ -44154,6 +44169,12 @@ impl ResidentDecodeState {
         let e = cb.new_compute_command_encoder();
         let mut from_a = true;
         let mut batched_attention_layers = 0usize;
+        // Tree rows may use non-contiguous cache slots; retain their row-wise scatter.
+        let batch_glue = verify_glue_batch_enabled() && tree.is_none() && self.kv16 && k > 1;
+        #[cfg(test)]
+        if batch_glue {
+            VERIFY_GLUE_BATCH_ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         for l in 0..layers.len() {
             let (cur, nxt) = if from_a {
                 (&act_a, &act_b)
@@ -44184,88 +44205,143 @@ impl ResidentDecodeState {
             encode_resident_matmul_f32(
                 e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
             );
-            // 3. per-head Q/K-norm (Qwen3) — per row, in place
-            if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
-                for i in (0..k).take_while(|_| !verify_ablate("qknorm")) {
-                    encode_rms_norm_per_head(
+            // 3–5. Each head/row is independent until attention. The batched path
+            // emits at most five dispatches per layer instead of five per draft row.
+            if batch_glue {
+                if !verify_ablate("qknorm") {
+                    if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &q_buf,
+                            qn_buf,
+                            &q_buf,
+                            &perhead_qk_scalar,
+                            n_heads * k,
+                            0,
+                        );
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &k_buf,
+                            kn_buf,
+                            &k_buf,
+                            &perhead_qk_scalar,
+                            n_kv_heads * k,
+                            0,
+                        );
+                    }
+                }
+                if !verify_ablate("rope") {
+                    for (buf, scalar, heads) in [
+                        (&q_buf, &rope_q_scalar, n_heads),
+                        (&k_buf, &rope_k_scalar, n_kv_heads),
+                    ] {
+                        e.set_compute_pipeline_state(&kern.rope_rotate_batch_pipeline);
+                        e.set_buffer(0, Some(buf), 0);
+                        e.set_buffer(1, Some(&cos_buf), 0);
+                        e.set_buffer(2, Some(&sin_buf), 0);
+                        for field in 0..4 {
+                            e.set_buffer(3 + field, Some(scalar), field * 4);
+                        }
+                        dispatch_2d_rows(e, &kern.rope_rotate_batch_pipeline, heads * half_rope, k);
+                    }
+                }
+                if !verify_ablate("scatter") {
+                    e.set_compute_pipeline_state(&kern.kv_scatter_batch_kv16_pipeline);
+                    e.set_buffer(0, Some(&k_buf), 0);
+                    e.set_buffer(1, Some(&v_buf), 0);
+                    e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                    e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                    for field in 0..4 {
+                        e.set_buffer(4 + field, Some(&scatter_scalars), field * 4);
+                    }
+                    dispatch_2d_rows(e, &kern.kv_scatter_batch_kv16_pipeline, kv_dim, k);
+                }
+            } else {
+                // 3. per-head Q/K-norm (Qwen3) — per row, in place
+                if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
+                    for i in (0..k).take_while(|_| !verify_ablate("qknorm")) {
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &q_buf,
+                            qn_buf,
+                            &q_buf,
+                            &perhead_qk_scalar,
+                            n_heads,
+                            (i * q_dim * 4) as u64,
+                        );
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &k_buf,
+                            kn_buf,
+                            &k_buf,
+                            &perhead_qk_scalar,
+                            n_kv_heads,
+                            (i * kv_dim * 4) as u64,
+                        );
+                    }
+                }
+                // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
+                for i in (0..k).take_while(|_| !verify_ablate("rope")) {
+                    encode_rope(
                         e,
                         kern,
                         &q_buf,
-                        qn_buf,
-                        &q_buf,
-                        &perhead_qk_scalar,
+                        &cos_buf,
+                        &sin_buf,
+                        &rope_q_scalar,
                         n_heads,
+                        half_rope,
                         (i * q_dim * 4) as u64,
+                        (i * half_rope * 4) as u64,
                     );
-                    encode_rms_norm_per_head(
+                    encode_rope(
                         e,
                         kern,
                         &k_buf,
-                        kn_buf,
-                        &k_buf,
-                        &perhead_qk_scalar,
+                        &cos_buf,
+                        &sin_buf,
+                        &rope_k_scalar,
                         n_kv_heads,
+                        half_rope,
                         (i * kv_dim * 4) as u64,
+                        (i * half_rope * 4) as u64,
                     );
                 }
-            }
-            // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
-            for i in (0..k).take_while(|_| !verify_ablate("rope")) {
-                encode_rope(
-                    e,
-                    kern,
-                    &q_buf,
-                    &cos_buf,
-                    &sin_buf,
-                    &rope_q_scalar,
-                    n_heads,
-                    half_rope,
-                    (i * q_dim * 4) as u64,
-                    (i * half_rope * 4) as u64,
-                );
-                encode_rope(
-                    e,
-                    kern,
-                    &k_buf,
-                    &cos_buf,
-                    &sin_buf,
-                    &rope_k_scalar,
-                    n_kv_heads,
-                    half_rope,
-                    (i * kv_dim * 4) as u64,
-                    (i * half_rope * 4) as u64,
-                );
-            }
-            // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
-            //    split-K decode attention reads (ALL k before any attention reads).
-            for i in (0..k).take_while(|_| !verify_ablate("scatter")) {
-                let scatter_pipeline = if self.kvq8 {
-                    &kern.kv_scatter_kvq8_pipeline
-                } else if self.kv16 {
-                    &kern.kv_scatter_kv16_pipeline
-                } else {
-                    &kern.kv_scatter_pipeline
-                };
-                e.set_compute_pipeline_state(scatter_pipeline);
-                e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
-                e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
-                e.set_buffer(2, Some(&self.cache_k[l]), 0);
-                e.set_buffer(3, Some(&self.cache_v[l]), 0);
-                e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
-                e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
-                e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
-                e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
-                if !self.kv16 && !self.kvq8 {
-                    e.set_buffer(8, Some(&self.cache_k16[l]), 0);
-                    e.set_buffer(9, Some(&self.cache_v16[l]), 0);
-                    e.set_buffer(10, Some(&kv16_write), 0);
+                // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
+                //    split-K decode attention reads (ALL k before any attention reads).
+                for i in (0..k).take_while(|_| !verify_ablate("scatter")) {
+                    let scatter_pipeline = if self.kvq8 {
+                        &kern.kv_scatter_kvq8_pipeline
+                    } else if self.kv16 {
+                        &kern.kv_scatter_kv16_pipeline
+                    } else {
+                        &kern.kv_scatter_pipeline
+                    };
+                    e.set_compute_pipeline_state(scatter_pipeline);
+                    e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                    e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                    e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
+                    e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
+                    e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
+                    e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
+                    if !self.kv16 && !self.kvq8 {
+                        e.set_buffer(8, Some(&self.cache_k16[l]), 0);
+                        e.set_buffer(9, Some(&self.cache_v16[l]), 0);
+                        e.set_buffer(10, Some(&kv16_write), 0);
+                    }
+                    let scatter_units = if self.kvq8 {
+                        n_kv_heads * (head_dim / 32)
+                    } else {
+                        kv_dim
+                    };
+                    dispatch_1d(e, scatter_pipeline, scatter_units);
                 }
-                let scatter_units = if self.kvq8 {
-                    n_kv_heads * (head_dim / 32)
-                } else {
-                    kv_dim
-                };
-                dispatch_1d(e, scatter_pipeline, scatter_units);
             }
             // 6. attention. The opt-in F16 split-K batch emits one row-dimensional
             //    partial dispatch plus one row-dimensional merge for k<=16. Every row keeps
@@ -44473,7 +44549,8 @@ impl ResidentDecodeState {
             eprintln!(
                 "[metal-verify-phase] base={base_position} k={k} \
                  encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
-                 kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers}"
+                 kernel_window={kernel_window_us}us attn_batch_layers={batched_attention_layers} \
+                 batch_glue={batch_glue}"
             );
         }
         // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
@@ -65931,6 +66008,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_spec_verify_bit_identical() {
+        assert_metal_spec_verify_bit_identical(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_metal_spec_verify_bit_identical(with_qk_norm: bool) {
         if !detect_metal_device().available {
             return;
         }
@@ -65963,9 +66045,9 @@ mod tests {
 
         let n_layers = 2usize;
         let n_heads = 4usize;
-        let n_kv = 2usize; // group = 2
-        let head_dim = 32usize;
-        let hidden = 128usize;
+        let n_kv = if with_qk_norm { 1usize } else { 2usize };
+        let head_dim = if with_qk_norm { 128usize } else { 32usize };
+        let hidden = n_heads * head_dim;
         let ffn = 256usize;
         let vocab = 256usize;
         let eps = 1.0e-5f32;
@@ -66020,6 +66102,8 @@ mod tests {
                 }
             })
             .collect();
+        let q_norm: Vec<f32> = (0..head_dim).map(|i| 0.6 + (i % 7) as f32 * 0.04).collect();
+        let k_norm: Vec<f32> = (0..head_dim).map(|i| 0.7 + (i % 5) as f32 * 0.03).collect();
         let weights: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
@@ -66034,8 +66118,8 @@ mod tests {
                 gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
                 up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
-                q_norm: None,
-                k_norm: None,
+                q_norm: with_qk_norm.then_some(q_norm.as_slice()),
+                k_norm: with_qk_norm.then_some(k_norm.as_slice()),
                 post_attn_norm: None,
                 post_ffw_norm: None,
                 ffn_geglu: false,
@@ -66287,6 +66371,32 @@ mod tests {
         run(126, 6);
         // C3: deep split-K (rows pc in [511..516], n_splits varies).
         run(510, 6);
+        if with_qk_norm {
+            // GQA=4, Qwen head_dim=128, width-one fallback and boundary/tail widths.
+            for k in [1, 2, 7, 8, 15, 16] {
+                run(4090, k);
+            }
+        }
+    }
+
+    /// Fail-closed proof: all logits and intermediate captures must match row-wise
+    /// decode, including Qwen-style weighted Q/K norms and a 4k cache. Run in a fresh
+    /// process with F32Y/WIRE/WIRE_NSG8/ATTN2/ATTN_BATCH_K=1, KV_DTYPE=f16,
+    /// and CAMELID_SPEC_VERIFY_BATCH_GLUE=1 (all other gates use CAMELID_METAL_).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit F16-primary Metal proof lane; requires environment gates"]
+    fn metal_spec_verify_batched_qk_glue_bit_identical() {
+        assert!(detect_metal_device().available, "Metal device required");
+        assert_eq!(resident_kv_format(), ResidentKvFormat::F16);
+        assert!(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled());
+        assert!(attn2_enabled() && splitk_attention_enabled());
+        assert!(verify_attention_batch_enabled() && verify_glue_batch_enabled());
+        VERIFY_GLUE_BATCH_ENCODES.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_metal_spec_verify_bit_identical(true);
+        let encodes = VERIFY_GLUE_BATCH_ENCODES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(encodes > 0, "batched verifier glue was never encoded");
+        eprintln!("batched Q/K glue proof: {encodes} encodes, exact logits and captures");
     }
 
     /// WIN2METAL Phase 4 gate. The slot-indirected TREE verify path must reproduce the
