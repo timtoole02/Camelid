@@ -241,7 +241,19 @@ impl SpeculativeDrafter {
         match self {
             Self::NGram(drafter) => Ok(drafter.draft(history, max_tokens)),
             Self::Model(drafter) => drafter.draft(history, max_tokens),
-            Self::Suffix(drafter) => Ok(drafter.draft_chain(history, max_tokens)),
+            Self::Suffix(drafter) => {
+                let Some(&anchor) = history.last() else {
+                    return Ok(Vec::new());
+                };
+                Ok(drafter
+                    .draft_confident_chain(
+                        history,
+                        anchor,
+                        max_tokens.saturating_add(1),
+                        max_tokens,
+                    )
+                    .tokens)
+            }
         }
     }
 

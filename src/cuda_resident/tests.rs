@@ -3345,9 +3345,10 @@ fn gemm_batched_matches_per_token() {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn verify_batch_matches_sequential() {
-    if kernels().is_none() {
-        return;
-    }
+    assert!(
+        kernels().is_some(),
+        "this explicitly selected test requires CUDA"
+    );
     let n_layers = 2usize;
     let hidden = 64usize;
     let n_heads = 2usize;
@@ -3451,6 +3452,40 @@ fn verify_batch_matches_sequential() {
         got, expected,
         "verify_batch tokens != sequential forward_token"
     );
+    let mut captured = build();
+    // Deliberately reverse layer order. Layer zero must be the raw embedding,
+    // while layer one must include the first block's attention and FFN residuals.
+    let (tokens, taps) = captured
+        .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, 0, ktok, scale, &[1, 0])
+        .unwrap();
+    assert_eq!(tokens, expected);
+    assert_eq!(taps[1], embs);
+    assert_ne!(taps[0], embs);
+    assert!(taps[0].iter().all(|value| value.is_finite()));
+    let mut single = build();
+    for t in 0..ktok {
+        let (_, one) = single
+            .verify_batch_with_layer_inputs(
+                &per_emb[t],
+                &cos_all[t * pairs..(t + 1) * pairs],
+                &sin_all[t * pairs..(t + 1) * pairs],
+                t,
+                1,
+                scale,
+                &[0, 1],
+            )
+            .unwrap();
+        assert_eq!(one[0], per_emb[t]);
+        assert!(close(&taps[0][t * hidden..(t + 1) * hidden], &one[1], 1e-5));
+    }
+    for ids in [&[0, 0][..], &[n_layers][..]] {
+        assert!(captured
+            .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, 0, ktok, scale, ids,)
+            .is_err());
+    }
+    assert!(captured
+        .verify_batch_with_layer_inputs(&embs, &cos_all, &sin_all, max_pos, ktok, scale, &[0],)
+        .is_err());
 }
 
 #[test]

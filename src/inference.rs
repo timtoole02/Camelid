@@ -3901,6 +3901,32 @@ impl LlamaInferenceSession {
         last_token: u32,
         drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
+        self.verify_drafts_cuda_with_layer_inputs(last_token, drafts, &[])
+            .map(|capture| {
+                capture.map(|capture| {
+                    let accepted = speculative::accepted_draft_prefix(drafts, &capture.predictions);
+                    capture.predictions[..=accepted].to_vec()
+                })
+            })
+    }
+
+    /// CUDA linear target verification with pre-layer residual captures for a
+    /// future EAGLE head. Returns every verification row in caller layer order,
+    /// but commits only the accepted prefix plus bonus, as `verify_drafts_gpu`.
+    /// This seam alone does not enable learned speculation in the server.
+    #[cfg(feature = "cuda")]
+    pub fn verify_drafts_cuda_with_layer_inputs(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        // Capture ids are absolute target layer ids. A pipeline engine contains
+        // only its owned range, so its local layer indices cannot satisfy this
+        // contract. Preserve the existing no-capture verifier's dispatch.
+        if !capture_layer_ids.is_empty() && self.weights.layer_range.is_some() {
+            return Ok(None);
+        }
         if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
             return Ok(None);
         }
@@ -3969,14 +3995,19 @@ impl LlamaInferenceSession {
             return Ok(None);
         }
         let slot = guard.as_mut().expect("ready checked above");
-        let predicted =
-            match slot
-                .engine
-                .verify_batch(&embeddings.data, &cos_all, &sin_all, position, k, scale)
-            {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
-            };
+        let (predicted, captures) = match slot.engine.verify_batch_with_layer_inputs(
+            &embeddings.data,
+            &cos_all,
+            &sin_all,
+            position,
+            k,
+            scale,
+            capture_layer_ids,
+        ) {
+            Ok(m) => m,
+            Err(_) if capture_layer_ids.is_empty() => return Ok(None),
+            Err(message) => return Err(BackendError::RuntimeShapeMismatch(message)),
+        };
 
         // Accept the longest prefix of drafts that the model confirms, plus the
         // bonus token at the first mismatch (predicted[0] is always taken).
@@ -3990,7 +4021,21 @@ impl LlamaInferenceSession {
         slot.engine.set_filled(new_position);
         drop(guard);
         self.kv_cache.position = new_position;
-        Ok(Some(accepted))
+        let layer_inputs = captures
+            .into_iter()
+            .map(|data| {
+                CpuTensor::from_f32(
+                    "cuda_verify_layer_input",
+                    vec![k, dims.embedding_length],
+                    data,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LlamaGreedyVerifyCapture {
+            predictions: predicted,
+            layer_inputs,
+            timings: LlamaForwardTimings::default(),
+        }))
     }
 
     /// Verify a draft TREE against the resident GPU engine in one batched pass and

@@ -50592,7 +50592,11 @@ impl Eagle3MetalState {
         weights: Eagle3MetalWeights<'_>,
         max_positions: usize,
     ) -> std::result::Result<Self, String> {
-        eagle3_validate_weights(&weights, max_positions)?;
+        eagle3_validate_weights_with_geometry(
+            &weights,
+            max_positions,
+            crate::eagle3::Eagle3Geometry::LLAMA,
+        )?;
         Err("EAGLE-3 Metal is only available on macOS".to_string())
     }
 

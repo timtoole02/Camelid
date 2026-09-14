@@ -3305,6 +3305,12 @@ pub async fn serve(
     // listener. Health and request admission must never disagree about the
     // active logical envelope.
     if spec_decode_mode_from_env() == Some(SpecDecodeMode::Eagle3) {
+        if !cfg!(target_os = "macos") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "CAMELID_SPEC_DECODE=eagle3 requires macOS/Metal: the CUDA learned draft head and EAGLE cache orchestration are not implemented. Unset CAMELID_SPEC_DECODE for ordinary Windows/CUDA generation.",
+            ));
+        }
         configured_eagle3_logical_token_limit().map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })?;

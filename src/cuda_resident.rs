@@ -17606,6 +17606,46 @@ impl CudaResidentDecode {
         k: usize,
         scale: f32,
     ) -> Result<Vec<u32>, String> {
+        self.verify_batch_with_layer_inputs(
+            embeddings,
+            cos_all,
+            sin_all,
+            base_position,
+            k,
+            scale,
+            &[],
+        )
+        .map(|(predictions, _)| predictions)
+    }
+
+    /// CUDA target seam for learned speculation. Snapshots are pre-normalization
+    /// residuals in caller layer order, each flattened as `[row, hidden]`.
+    /// This does not run a draft head or commit accepted KV; the caller owns
+    /// acceptance exactly as for `verify_batch`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn verify_batch_with_layer_inputs(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        base_position: usize,
+        k: usize,
+        scale: f32,
+        capture_layer_ids: &[usize],
+    ) -> Result<(Vec<u32>, Vec<Vec<f32>>), String> {
+        let mut sorted = capture_layer_ids.to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|ids| ids[0] == ids[1])
+            || sorted.last().is_some_and(|&id| id >= self.n_layers)
+        {
+            return Err("verify_batch: capture layer ids must be unique and in range".into());
+        }
+        if base_position
+            .checked_add(k)
+            .is_none_or(|end| end > self.max_pos)
+        {
+            return Err("verify_batch: positions exceed KV capacity".into());
+        }
         if k == 0 || k > MAX_VERIFY_K {
             return Err(format!("verify_batch: k={k} out of 1..={MAX_VERIFY_K}"));
         }
@@ -17641,7 +17681,17 @@ impl CudaResidentDecode {
         s.memcpy_htod(&sin_all[..k * half], &mut sc.vsin.slice_mut(0..k * half))
             .map_err(map)?;
 
-        self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false)?;
+        // Allocate only on the opt-in capture path. Device-to-device snapshots
+        // preserve the normal projection/attention arithmetic and stream order.
+        let mut captures = capture_layer_ids
+            .iter()
+            .map(|&id| {
+                s.alloc_zeros::<f32>(k * hidden)
+                    .map(|buffer| (id, buffer))
+                    .map_err(map)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false, &mut captures)?;
         let output_bmma = if self.k.fast_q1
             && self.output_quant == ProjQuant::Q1_0
             && !prism_bmma_shape_enabled(&self.k, hidden, k)
@@ -17718,10 +17768,14 @@ impl CudaResidentDecode {
         .map_err(map)?;
         let mut out = vec![0u32; MAX_VERIFY_K];
         s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
+        let mut layer_inputs = vec![vec![0.0; k * hidden]; captures.len()];
+        for ((_, device), host) in captures.iter().zip(&mut layer_inputs) {
+            s.memcpy_dtoh(device, host).map_err(map)?;
+        }
         self.k.ctx.synchronize().map_err(map)?;
         out.truncate(k);
         self.verify_scratch = Some(sc);
-        Ok(out)
+        Ok((out, layer_inputs))
     }
 
     /// Allocate the K-batched scratch (`verify_scratch`) if not already present.
@@ -17829,6 +17883,7 @@ impl CudaResidentDecode {
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
+    #[allow(clippy::too_many_arguments)]
     fn run_batched_layer_stack(
         &mut self,
         sc: &mut VerifyScratch,
@@ -17837,6 +17892,7 @@ impl CudaResidentDecode {
         k: usize,
         scale: f32,
         flash_ok: bool, // SIROCCO Phase P M1: prefill passes true (opt-in flash); verify passes false.
+        captures: &mut [(usize, CudaSlice<f32>)],
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda batched layers: {e}");
         // Own the Arc locally so each per-launch `&s` is `&Arc<CudaStream>` (what the
@@ -17854,6 +17910,10 @@ impl CudaResidentDecode {
             self.eps,
         );
         for li in 0..self.n_layers {
+            if let Some((_, destination)) = captures.iter_mut().find(|(id, _)| *id == li) {
+                s.memcpy_dtod(&sc.vh.slice(0..k * hidden), destination)
+                    .map_err(map)?;
+            }
             let layer = &self.layers[li];
             let lq = layer.quants;
             let mixer_lane_count = if matches!(&layer.kind, LayerKind::Ssm(_)) {
@@ -19325,7 +19385,7 @@ impl CudaResidentDecode {
             .map_err(map)?;
             // Same stream → the next chunk's stage waits for this chunk's reads; no
             // explicit per-chunk sync needed (matches the serial prefill's one-sync-at-end).
-            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale, true)?;
+            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale, true, &mut [])?;
             base += kk;
         }
         self.k
