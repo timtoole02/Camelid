@@ -29,6 +29,8 @@ export default function SettingsView({
   refreshDashboard = null,
   backend,
   showNotice,
+  retroTransitions = false,
+  setRetroTransitions = () => {},
   themePreference = 'system',
   setThemePreference = () => {},
   onOpenCluster = () => {},
@@ -335,6 +337,13 @@ export default function SettingsView({
               </button>
             ))}
           </div>
+          <label className="settings-retro">
+            <span className="settings-retro__copy">
+              <strong>16-bit mode transitions</strong>
+              <small>A little Super Nintendo nostalgia: rotate and dive into a pixel, then reveal Chat or Code in chunky mosaic blocks. Off by default. Respects reduced motion.</small>
+            </span>
+            <input type="checkbox" role="switch" aria-label="16-bit mode transitions" checked={retroTransitions} onChange={(event) => setRetroTransitions(event.target.checked)} />
+          </label>
         </CardBody>
       </Card>
 

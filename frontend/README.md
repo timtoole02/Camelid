@@ -79,6 +79,12 @@ VITE_CAMELID_API_BASE=http://127.0.0.1:8181 npm run dev
 
 You can also edit the API base in the UI sidebar while testing.
 
+## Retro mode transitions
+
+Settings → Appearance → **16-bit mode transitions** enables a Mode 7-inspired rotating dive to a pixel, followed by a chunky mosaic reveal when switching between Chat and Code using the header mode switch. It is off by default and saved through the app's existing browser/desktop preferences. Reduced motion skips the effect; Escape skips to the destination, and other navigation cancels the transition.
+
+With the frontend running on port 4175, `npm run smoke:retro-transitions` checks the effect with mocked API responses, including saved opt-in/out, lazy loading, rapid navigation, reduced motion, and mobile layout. It saves screenshots under `target/retro-transition/`.
+
 ## Validation
 
 Build the frontend:

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
 import { BackendBanner, ENGINE_PATH_STORAGE_KEY, ENGINE_ADDR_STORAGE_KEY } from './components/layout/BackendBanner'
@@ -20,6 +20,8 @@ import { OutputReviewContext } from './components/outputs/OutputActions.jsx'
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
+import { RetroTransitionFilters } from './components/RetroTransitionFilters'
+import { RETRO_TRANSITION_KEY, useRetroTransition } from './hooks/useRetroTransition'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
@@ -61,7 +63,7 @@ function App() {
   const [chatMode, setChatMode] = useState(() => appStorage.getItem('camelid.chatMode') === 'code' ? 'code' : 'chat')
   const [codingVisited, setCodingVisited] = useState(() => appStorage.getItem('camelid.chatMode') === 'code' || Boolean(appStorage.getItem('camelid.codingSession')))
   const [codingActivity, setCodingActivity] = useState(null)
-  const chooseChatMode = useCallback(mode => { setChatMode(mode); if (mode === 'code') setCodingVisited(true); appStorage.setItem('camelid.chatMode', mode) }, [])
+  const commitChatMode = useCallback(mode => { setChatMode(mode); if (mode === 'code') setCodingVisited(true); appStorage.setItem('camelid.chatMode', mode) }, [])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     if (DEMO_UI) return true
     if (typeof window === 'undefined') return false
@@ -79,6 +81,9 @@ function App() {
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
+  const [retroTransitions, setRetroTransitions] = useState(() => appStorage.getItem(RETRO_TRANSITION_KEY) === 'true')
+  const retroFilterPrefix = `retro-${useId().replace(/:/g, '')}`
+  const stageRef = useRef(null)
   const viewRef = useRef(null)
   const hamburgerRef = useRef(null)
 
@@ -117,6 +122,12 @@ function App() {
     registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
   } = dash
+
+  const { navigate: chooseChatMode, cancel: cancelRetroTransition } = useRetroTransition({ tab: tab === 'chat' ? chatMode : `page:${tab}`, setTab: commitChatMode, enabled: retroTransitions && tab === 'chat', viewRef, stageRef, filterPrefix: retroFilterPrefix })
+  const updateRetroTransitions = (value) => {
+    setRetroTransitions(value)
+    appStorage.setItem(RETRO_TRANSITION_KEY, String(value))
+  }
 
   const backend = useBackendLauncher({ showNotice, loadDashboard })
   const authReturnTabRef = useRef(null)
@@ -277,7 +288,8 @@ function App() {
   }
 
   const startNewChat = (projectId = '') => {
-    chooseChatMode('chat')
+    cancelRetroTransition()
+    commitChatMode('chat')
     showNewChatLanding(typeof projectId === 'string' ? projectId : '')
     navigateTab('chat')
     closeMobileNav()
@@ -356,6 +368,7 @@ function App() {
   return (
     <OutputReviewContext.Provider value={!DEMO_UI && !isLanChatOnly(apiSurface) ? queueOutputReview : null}>
     <div className={shellClasses}>
+      {retroTransitions && <RetroTransitionFilters prefix={retroFilterPrefix} />}
       {/* macOS desktop only: the window draws no title bar of its own, so the
           traffic lights float over the top-left of our content. This strip is
           the room they sit in and the surface the window is dragged by —
@@ -399,7 +412,7 @@ function App() {
         <button type="button" className="camelid-app__scrim" aria-label="Close navigation" onClick={closeMobileNav} />
       )}
 
-      <main className="camelid-main" data-view={tab}>
+      <main className="camelid-main" data-view={tab} data-chat-mode={chatMode}>
         <TopBar
           tab={tab}
           setTab={navigateTab}
@@ -445,6 +458,7 @@ function App() {
         {/* --chat is the full-bleed frame for views that own their own edges and
            manage their own height (chat, workspace, cluster canvas). Every
            other view is a .cxv page and needs the padded page frame. */}
+        <div ref={stageRef} className="retro-transition-stage">
         <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {codingVisited && !isLanChatOnly(apiSurface) && <div className="coding-mount" hidden={tab !== 'chat' || chatMode !== 'code'}>
@@ -620,6 +634,8 @@ function App() {
               showNotice={showNotice}
               themePreference={preference}
               setThemePreference={setPreference}
+              retroTransitions={retroTransitions}
+              setRetroTransitions={updateRetroTransitions}
               onOpenCluster={() => navigateTab('cluster')}
               conversationCount={conversations.length}
               deleteAllConversations={deleteAllConversations}
@@ -632,6 +648,7 @@ function App() {
 
           {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
           </Suspense>
+        </div>
         </div>
       </main>
 
