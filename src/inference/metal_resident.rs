@@ -89,7 +89,9 @@ fn park_resident_metal(
     if tokens.is_empty() || state.filled() < tokens.len() {
         return;
     }
-    state.set_filled(tokens.len());
+    if state.filled() != tokens.len() {
+        state.set_filled(tokens.len());
+    }
     *resident_metal_park()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(ResidentMetalParking {
@@ -142,6 +144,25 @@ impl ResidentMetalGeometry {
 }
 
 impl super::LlamaInferenceSession {
+    /// Experimental Qwen K-quant continuation, separate from the matrix-attention
+    /// arithmetic opt-in. Other models retain their existing parking policy.
+    fn qwen_prefix_reuse_enabled(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.config.architecture == "qwen3"
+                && weights_use_kquant(&self.weights)
+                && metal::qk_norm_attn_mm_prefill_enabled()
+                && std::env::var("CAMELID_METAL_KQUANT_ATTN_MM")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                && std::env::var("CAMELID_QWEN_PREFIX_REUSE")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     /// Hand this session's resident Metal engine to the parking slot on the way out, so the
     /// next turn of the same conversation can continue from the rows it already holds.
     ///
@@ -150,20 +171,30 @@ impl super::LlamaInferenceSession {
     /// Everything that would make the handoff unsafe is refused rather than papered over:
     /// no model identity, no engine, or a record that disagrees with the watermark.
     pub(super) fn park_resident_metal_engine(&mut self) {
-        // Never park what can never be continued. Continuation is admitted only on an F32
-        // KV primary (see `metal::resident_kv_primary_is_half`), so on a half primary this
-        // would hold a GPU KV cache alive between requests to no purpose. Refusing here
-        // keeps that configuration byte-for-byte on its previous behaviour.
-        if metal::resident_kv_primary_is_half() {
+        // F16 continuation is admitted only for the separately opted-in Qwen path.
+        // Holding its cache otherwise would retain GPU memory without saving work.
+        let qwen_reuse = self.qwen_prefix_reuse_enabled();
+        if metal::resident_kv_primary_is_half() && !qwen_reuse {
             return;
         }
         let Some(key) = self.resident_cache_key else {
             return;
         };
-        let Some(state) = self.resident_decode.take() else {
+        let Some(mut state) = self.resident_decode.take() else {
             return;
         };
+        // Flags describe eligibility, not which arithmetic wrote this cache.
+        // A scratch-cap fallback may have produced row-attention KV instead.
+        if qwen_reuse && !state.has_qk_norm_matrix_prefix() {
+            return;
+        }
         let tokens = std::mem::take(&mut self.resident_tokens);
+        // A committed encode-ahead graph waits on the same serial GPU queue the
+        // next prefill needs. Drain it even if generation stopped at the prompt
+        // watermark; merely rewinding `filled` would leave that queue blocked.
+        if qwen_reuse && !state.prepare_for_prefix_reuse(tokens.len()) {
+            return;
+        }
         let geometry = ResidentMetalGeometry::of(&state);
         park_resident_metal(key, geometry, state, tokens);
     }
@@ -634,7 +665,8 @@ impl super::LlamaInferenceSession {
                 // from-scratch prefill driven through one produced corrupt output where a
                 // fresh (zero-filled) engine was correct. So with nothing to reuse, drop it
                 // and take the ordinary build path.
-                let reuse = if capture_layer_ids.is_empty() && !metal::resident_kv_primary_is_half()
+                let reuse = if capture_layer_ids.is_empty()
+                    && (!metal::resident_kv_primary_is_half() || self.qwen_prefix_reuse_enabled())
                 {
                     common_prefix_len(&parked, token_ids)
                         .min(state.filled())
@@ -656,7 +688,13 @@ impl super::LlamaInferenceSession {
                 }
                 // Drop the watermark to exactly the reused span BEFORE prefilling the rest,
                 // so a failure below leaves no claim on rows this prefill never wrote.
-                state.set_filled(reuse);
+                if self.qwen_prefix_reuse_enabled() {
+                    if !state.prepare_for_prefix_reuse(reuse) {
+                        return None;
+                    }
+                } else {
+                    state.set_filled(reuse);
+                }
                 Some((state, reuse))
             });
         let mut reused = 0usize;
@@ -865,7 +903,9 @@ impl super::LlamaInferenceSession {
         // Record the sequence those rows hold, so a later turn of this conversation can
         // continue from it. Only a prefill that actually wrote them may set this.
         self.resident_tokens = token_ids.to_vec();
-        if trace && reused > 0 {
+        let trace_prefix = std::env::var("CAMELID_QWEN_PREFIX_TRACE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if (trace || trace_prefix) && reused > 0 {
             eprintln!(
                 "[resident-prefill] prefix continuation: reused {reused} of {n} positions, \
                  prefilled {}",

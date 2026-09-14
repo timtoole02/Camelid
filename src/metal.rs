@@ -24290,6 +24290,20 @@ fn kquant_attn_mm_prefill_enabled() -> bool {
     })
 }
 
+/// Opt-in matrix attention for dense Q/K-normalized prefills on an F16 KV primary.
+/// Q/K normalization still runs in f32 before RoPE and half-query staging. The
+/// attention scores/probabilities use the existing half panels, so this is not a
+/// bit-identical replacement for row attention. K-quant models additionally need
+/// `CAMELID_METAL_KQUANT_ATTN_MM=1`; all existing shape and scratch gates still apply.
+#[cfg(target_os = "macos")]
+pub(crate) fn qk_norm_attn_mm_prefill_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_QK_NORM_ATTN_MM")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Bytes for the K-quant half staging panel: the largest single projection in the model,
 /// reused by every projection of every layer. `None` when it would exceed the scratch cap,
 /// which declines the lane rather than allocating it.
@@ -39312,6 +39326,11 @@ pub struct ResidentDecodeState {
     /// Number of KV positions currently materialized in the cache (seeded history + appended
     /// tokens). The caller uses this to detect a new sequence and reseed.
     filled: usize,
+    /// The reusable leading prompt was actually produced by Q/K-normalized
+    /// matrix prefill. Flags alone cannot establish this: shape or scratch gates
+    /// can select row attention, whose arithmetic is different. Decode appends
+    /// preserve the leading prompt; reseeding and other prefill modes do not.
+    qk_norm_matrix_prefix: bool,
     /// Encode-ahead pipeline: the NEXT token's fully-encoded AND committed command buffer,
     /// built on the CPU while the previous token executed on the GPU. Execution is gated on
     /// `gate_event`, signaled only after the token's input embedding is written — so by
@@ -39481,6 +39500,7 @@ impl ResidentDecodeState {
             buf_b: nb(hidden),
             mid: nb(hidden),
             filled: 0,
+            qk_norm_matrix_prefix: false,
             pending: None,
             pending_signaled: false,
             last_sampled: None,
@@ -39639,7 +39659,41 @@ impl ResidentDecodeState {
 
     /// Mark `n` positions as materialized (called after seeding history from a CPU cache).
     pub fn set_filled(&mut self, n: usize) {
+        // This generic watermark setter also follows host reseeding and verifier
+        // updates, so it cannot carry a matrix-prefill provenance claim forward.
+        self.qk_norm_matrix_prefix = false;
         self.filled = n;
+    }
+
+    /// Whether the leading prompt has matrix-prefill provenance. Callers must
+    /// still bound reuse by their recorded prompt tokens, not decoded appends.
+    pub(crate) fn has_qk_norm_matrix_prefix(&self) -> bool {
+        self.qk_norm_matrix_prefix && self.filled > 0
+    }
+
+    /// Settle request-owned GPU work before parking a reusable KV prefix.
+    /// Unlike speculative rollback, an unchanged watermark still needs cleanup:
+    /// encode-ahead may have left the next graph committed behind an unsignaled
+    /// event, which would block a subsequent request's prefill or cache-growth blit.
+    /// Only already materialized rows may be claimed; later slots are overwritten
+    /// by the continuation after the stale graph has completed.
+    pub(crate) fn prepare_for_prefix_reuse(&mut self, position: usize) -> bool {
+        if position > self.filled {
+            return false;
+        }
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+        if let Some(retiring) = self.retiring.take() {
+            retiring.cb.wait_until_completed();
+        }
+        self.pending_signaled = false;
+        self.last_sampled = None;
+        self.filled = position;
+        if position == 0 {
+            self.qk_norm_matrix_prefix = false;
+        }
+        true
     }
 
     /// Discard the KV positions at and after `position` (speculative rollback of rejected
@@ -39660,6 +39714,9 @@ impl ResidentDecodeState {
         self.pending_signaled = false;
         self.last_sampled = None;
         self.filled = position;
+        if position == 0 {
+            self.qk_norm_matrix_prefix = false;
+        }
     }
 
     /// Decode one token at sequence position `position` (0-based): append this token's K/V to
@@ -39780,6 +39837,11 @@ impl ResidentDecodeState {
         let requested_sample_signature = sample_stage
             .as_ref()
             .map(|stage| stage.mode.signature(position));
+        // Appending leaves the reusable matrix-prefilled prompt intact. An
+        // overwrite or a gap no longer carries that provenance.
+        if position != self.filled {
+            self.qk_norm_matrix_prefix = false;
+        }
         let pending = self.pending.take();
         let pending_signaled = std::mem::take(&mut self.pending_signaled);
         let usable = matches!(
@@ -40347,6 +40409,7 @@ impl ResidentDecodeState {
             scale,
             &[],
             0,
+            qk_norm_attn_mm_prefill_enabled(),
         )
         .map(|_| ())
     }
@@ -40389,6 +40452,7 @@ impl ResidentDecodeState {
             scale,
             &[],
             base_position,
+            qk_norm_attn_mm_prefill_enabled(),
         )
         .map(|_| ())
     }
@@ -40421,6 +40485,7 @@ impl ResidentDecodeState {
             scale,
             capture_layer_ids,
             0,
+            qk_norm_attn_mm_prefill_enabled(),
         )
     }
 
@@ -40435,6 +40500,7 @@ impl ResidentDecodeState {
         scale: f32,
         capture_layer_ids: &[usize],
         base_position: usize,
+        qk_norm_attn_mm: bool,
     ) -> Option<Vec<Vec<f32>>> {
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
@@ -40503,11 +40569,19 @@ impl ResidentDecodeState {
         let k = metal_linear_kernel()?;
         // Qwen3 per-head QK-norm: when the layers carry q_norm/k_norm we apply an
         // in-place per-head RMSNorm to Q and K (after the QKV GEMM, before RoPE).
-        // The per-head norm kernel is f32, so we keep the tiled-MM GEMM (fast) but
-        // force off use_attn_mm/use_h16: that makes the MM GEMM emit f32 Q/K
-        // [token][head][head_dim] and routes attention through the validated
-        // non-attn-mm path, so the per-head norm runs in the cpu_reference order.
+        // Keep the activation stream f32 so the per-head norm sees the same GEMM
+        // output and runs before RoPE. Matrix attention is a separate opt-in: it
+        // stages the normalized, rotated Q only when attention consumes it.
         let has_qk_norm = layers.first().is_some_and(|l| l.q_norm.is_some());
+        let use_qk_norm_attn_mm = qk_norm_attn_mm
+            && has_qk_norm
+            && self.kv16
+            && !has_moe
+            && layers.iter().all(|l| {
+                !l.qk_l2_norm_after_rope
+                    && l.q_norm.is_some_and(|n| n.len() == self.head_dim)
+                    && l.k_norm.is_some_and(|n| n.len() == self.head_dim)
+            });
         let q_dim = self.n_heads * self.head_dim;
         let kv_dim = self.n_kv_heads * self.head_dim;
         let bpr_hidden = self.hidden / 32;
@@ -40677,8 +40751,10 @@ impl ResidentDecodeState {
             // there, so the conjunct now excludes nothing that reaches this lane.
             && (all_q8 || (use_kq_mm && kquant_attn_mm_prefill_enabled()))
             && mm_prefill_enabled()
-            && !has_qk_norm
-            && attention_matmul_prefill_rows_fit(n_tokens, self.max_positions)
+            && (!has_qk_norm || use_qk_norm_attn_mm)
+            // Transpose and score GEMMs address the padded TOTAL cache extent,
+            // including a reused prefix, not just this batch's query rows.
+            && attention_matmul_prefill_rows_fit(kv_len, self.max_positions)
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
@@ -40697,6 +40773,16 @@ impl ResidentDecodeState {
             prefill_decline("prefill_tokens", 9);
             return None;
         }
+        // A later request may fit the matrix lane even when the original prompt
+        // fell back to row attention. Never combine those arithmetic paths merely
+        // because the same opt-in flags are still set.
+        if base_position != 0 && has_qk_norm && !self.has_qk_norm_matrix_prefix() {
+            prefill_decline("prefill_tokens", 10);
+            return None;
+        }
+        // Any later partial failure must stop vouching for this prefix. Restore
+        // provenance only after the complete GPU prefill succeeds below.
+        self.qk_norm_matrix_prefix = false;
         // Query-block width for the S/P panels: the panels are [head][qb][kv_pad], so
         // memory is linear in the block width and the budget sets how many query
         // columns are materialized at once. Prompts that fit in one block reproduce
@@ -40732,7 +40818,15 @@ impl ResidentDecodeState {
         // instead, which costs one dispatch per layer; the receipt for the Q8 lane records
         // es=2 as a fidelity and dispatch-count improvement, not a throughput one, so this
         // gives up nothing measurable.
-        let use_h16 = use_attn_mm && !self.kv16 && half_rope * 2 == self.head_dim;
+        let use_h16 = use_attn_mm && !has_qk_norm && !self.kv16 && half_rope * 2 == self.head_dim;
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-prefill] attention_mm={use_attn_mm} qk_norm_mm={} activation_bytes={} \
+                 n_tokens={n_tokens} base={base_position} kv_len={kv_len}",
+                use_attn_mm && use_qk_norm_attn_mm,
+                if use_h16 { 2 } else { 4 }
+            );
+        }
         if use_h16 && !capture_layer_ids.is_empty() {
             return None;
         }
@@ -40881,9 +40975,9 @@ impl ResidentDecodeState {
         // (BK=64 = 2 blocks/step), and half activations — decided once for the whole
         // prefill since the activation buffers are emitted in the matching precision.
         // QK-norm (Qwen3) keeps the tiled-MM GEMM (the dominant prefill cost: weights
-        // stream once per 64 tokens instead of once per 8) — only use_attn_mm/use_h16
-        // are forced off so Q/K stay f32 [token][head][head_dim] for the per-head norm
-        // and the validated non-attn-mm attention path. The MM GEMM here outputs f32
+        // stream once per 64 tokens instead of once per 8). Only use_h16 is forced
+        // off so Q/K stay f32 [token][head][head_dim] for the per-head norm. Matrix
+        // attention, when opted in, stages Q after the norm. The MM GEMM outputs f32
         // (use_h16 is false), so the per-head norm runs in f32 against the existing
         // rms_norm_per_head_f32 kernel.
         // MoE layers keep the GEMM path for attention + shared expert (their dense work is
@@ -42494,6 +42588,7 @@ impl ResidentDecodeState {
             .collect();
         // The cache now vouches for the reused prefix AND this batch, not just this batch.
         self.filled = kv_len;
+        self.qk_norm_matrix_prefix = use_attn_mm && use_qk_norm_attn_mm;
         Some(layer_inputs)
     }
 
@@ -42755,6 +42850,7 @@ impl ResidentDecodeState {
             }
         }
 
+        self.qk_norm_matrix_prefix = false;
         // A pre-committed pending graph (from forward_token's encode-ahead) sits gated on
         // the serial queue; release it so these command buffers are not ordered behind a
         // graph that never gets signaled.
@@ -43929,6 +44025,7 @@ impl ResidentDecodeState {
             return None;
         }
 
+        self.qk_norm_matrix_prefix = false;
         // A pre-committed pending graph (from forward_token's encode-ahead) sits gated on the
         // serial queue; release it so this command buffer is not ordered behind a graph that
         // never gets signaled (which would deadlock the wait below).
@@ -44795,6 +44892,7 @@ impl ResidentDecodeState {
     /// no-op (the byte-identity anchor — a linear tree leaves the cache exactly as a linear
     /// decode would).
     pub fn compact_tree_kv_path(&mut self, path: &[usize], base: usize) -> Result<(), String> {
+        self.qk_norm_matrix_prefix = false;
         let head_dim = self.head_dim;
         let max_positions = self.max_positions;
         let n_kv = self.n_kv_heads;
@@ -44880,6 +44978,9 @@ impl ResidentDecodeState {
     /// to scratch that the next real token overwrites). Skipping this would deadlock the
     /// queue. Happens at most once per KV growth or sequence restart.
     fn release_stale(&mut self, stale: PreparedToken) {
+        if stale.position < self.filled {
+            self.qk_norm_matrix_prefix = false;
+        }
         // A fast-path pending graph may already be signaled (pre-released); the shared
         // event is monotonic, so only raise it when it is actually still gated.
         if self.gate_event.signaled_value() < stale.event_value {
@@ -44906,6 +45007,7 @@ impl ResidentDecodeState {
         {
             return false;
         }
+        self.qk_norm_matrix_prefix = false;
         Self::seed_into(
             &self.cache_k[layer],
             keys,
@@ -45653,6 +45755,14 @@ impl ResidentDecodeState {
     }
 
     pub fn set_filled(&mut self, _n: usize) {}
+
+    pub(crate) fn has_qk_norm_matrix_prefix(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn prepare_for_prefix_reuse(&mut self, _position: usize) -> bool {
+        false
+    }
 
     pub fn rollback_to_position(&mut self, _position: usize) {}
 }
@@ -46782,6 +46892,80 @@ mod tests {
         }
     }
 
+    /// A parked engine must not keep the shared serial queue behind its old event.
+    /// Use a real committed, event-gated GPU copy so clearing an Option without
+    /// releasing and waiting for the graph cannot satisfy this proof. Cover equal
+    /// and shrinking watermarks, plus the sampling path's already-signaled graph.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit Metal prefix-parking event proof"]
+    fn metal_prefix_reuse_releases_pending_graph_at_equal_watermark() {
+        assert!(detect_metal_device().available, "Metal device required");
+        let kernel = metal_linear_kernel().expect("Metal pipelines required");
+        for (position, already_signaled) in [(8, false), (5, false), (8, true), (5, true)] {
+            let mut state =
+                ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 16, 1.0e-5, false, None)
+                    .expect("resident session required");
+            state.set_filled(8);
+            let source = kernel
+                .device
+                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            let marker = kernel
+                .device
+                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&source, &[37.0]);
+            write_buffer_f32(&marker, &[0.0]);
+            state.event_counter += 1;
+            let event_value = state.event_counter;
+            let command = kernel.queue.new_command_buffer();
+            command.encode_wait_for_event(&state.gate_event, event_value);
+            let blit = command.new_blit_command_encoder();
+            blit.copy_from_buffer(&source, 0, &marker, 0, 4);
+            blit.end_encoding();
+            command.commit();
+            state.pending = Some(PreparedToken {
+                position: 8,
+                has_logits: false,
+                has_sample: false,
+                sample_signature: None,
+                event_value,
+                cb: command.to_owned(),
+                logits_buf: None,
+                sampled_buf: None,
+                final_from_a: true,
+                _keep: vec![source, marker.clone()],
+                encode_us: 0,
+            });
+            state.pending_signaled = already_signaled;
+            state.last_sampled = Some(7);
+            if already_signaled {
+                state.gate_event.set_signaled_value(event_value);
+            }
+            assert!(!state.prepare_for_prefix_reuse(9));
+            assert_eq!(state.filled(), 8);
+            assert!(
+                state.pending.is_some(),
+                "invalid claims must not take ownership"
+            );
+
+            assert!(state.prepare_for_prefix_reuse(position));
+            assert_eq!(state.filled(), position);
+            assert!(state.pending.is_none());
+            assert!(state.retiring.is_none());
+            assert!(!state.pending_signaled);
+            assert!(state.last_sampled.is_none());
+            assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+            let mut actual = [0.0f32];
+            read_buffer_f32(&marker, &mut actual);
+            assert_eq!(actual, [37.0], "pending graph must finish before parking");
+            assert!(
+                state.prepare_for_prefix_reuse(position),
+                "cleanup is idempotent"
+            );
+        }
+        eprintln!("PREFIX_PARK_PROOF equal_and_rewound_gated_and_signaled_graphs_released=true");
+    }
+
     /// Prefix continuation must be BIT-IDENTICAL to a cold prefill of the same tokens.
     ///
     /// This is the whole safety argument for reusing KV across turns: a KV row is a pure
@@ -46800,6 +46984,40 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_prefix_continuation_is_bit_identical_to_a_cold_prefill() {
+        assert_metal_prefix_continuation_is_bit_identical(false, 192, 64);
+    }
+
+    /// Requires an explicit Metal proof run: absence of a device or any required
+    /// gate fails instead of silently skipping. The Qwen-shaped fixture has weighted
+    /// Q/K RMSNorm, 128-wide heads, GQA 4, hidden != Q width, nonconstant RoPE,
+    /// and an F16 primary.
+    /// Both aligned and unaligned continuation offsets must preserve every KV bit.
+    /// The row-attention control additionally bounds the newly admitted half-panel
+    /// arithmetic; bit identity is claimed only between the two matrix paths.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit Metal Q/K norm matrix-prefill proof; see required gates in assertion"]
+    fn metal_qk_norm_matrix_prefill_continuation_proof() {
+        assert!(detect_metal_device().available, "Metal device required");
+        assert!(
+            wire_weights_enabled()
+                && mm_prefill_enabled()
+                && qk_norm_attn_mm_prefill_enabled()
+                && resident_kv_primary_is_half(),
+            "run with CAMELID_METAL_WIRE=1 CAMELID_METAL_MM=1 \
+             CAMELID_METAL_KV_DTYPE=f16 CAMELID_METAL_QK_NORM_ATTN_MM=1"
+        );
+        for (tokens, split) in [(192, 64), (257, 131), (4_137, 4_099)] {
+            assert_metal_prefix_continuation_is_bit_identical(true, tokens, split);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_metal_prefix_continuation_is_bit_identical(
+        with_qk_norm: bool,
+        n_tokens: usize,
+        split: usize,
+    ) {
         use super::*;
 
         if !detect_metal_device().available {
@@ -46815,15 +47033,15 @@ mod tests {
             return;
         }
 
-        const N: usize = 192; // total prompt
-        const SPLIT: usize = 64; // reused prefix length
         let n_layers = 2usize;
         let n_heads = 4usize;
-        let n_kv = 2usize;
-        let head_dim = 64usize;
+        let n_kv = if with_qk_norm { 1usize } else { 2usize };
+        let head_dim = if with_qk_norm { 128usize } else { 64usize };
+        // Qwen's attention projection is wider than its residual stream. Keep
+        // those strides distinct in the Q/K-norm proof (Q width 512, hidden 256).
         let hidden = 256usize;
         let ffn = 256usize;
-        let max_positions = 256usize;
+        let max_positions = n_tokens.next_multiple_of(128);
         let eps = 1.0e-5f32;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let q_dim = n_heads * head_dim;
@@ -46834,7 +47052,11 @@ mod tests {
             let mut w: Vec<u8> = Vec::new();
             for r in 0..rows {
                 for b in 0..bpr {
-                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    let s = if with_qk_norm {
+                        0.002 + ((r * bpr + b + seed) as f32 % 7.0) * 0.0002
+                    } else {
+                        0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01
+                    };
                     w.extend_from_slice(&s.to_le_bytes());
                     for l in 0..32 {
                         w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
@@ -46874,6 +47096,8 @@ mod tests {
                 }
             })
             .collect();
+        let q_norm: Vec<f32> = (0..head_dim).map(|i| 0.6 + (i % 7) as f32 * 0.04).collect();
+        let k_norm: Vec<f32> = (0..head_dim).map(|i| 0.7 + (i % 5) as f32 * 0.03).collect();
         let layers: Vec<ResidentLayerWeights> = data
             .iter()
             .map(|d| ResidentLayerWeights {
@@ -46881,8 +47105,8 @@ mod tests {
                 qk_l2_norm_after_rope: false,
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
-                q_norm: None,
-                k_norm: None,
+                q_norm: with_qk_norm.then_some(q_norm.as_slice()),
+                k_norm: with_qk_norm.then_some(k_norm.as_slice()),
                 post_attn_norm: None,
                 post_ffw_norm: None,
                 ffn_geglu: false,
@@ -46896,14 +47120,14 @@ mod tests {
             })
             .collect();
 
-        let embeddings: Vec<f32> = (0..N * hidden)
+        let embeddings: Vec<f32> = (0..n_tokens * hidden)
             .map(|i| ((i % 251) as f32 - 125.0) * 0.0078125 + 0.125)
             .collect();
         // Position-dependent RoPE, indexed by ABSOLUTE position.
-        let cos_all: Vec<f32> = (0..N * half)
+        let cos_all: Vec<f32> = (0..n_tokens * half)
             .map(|i| ((i / half) as f32 * 0.013 + (i % half) as f32 * 0.001).cos())
             .collect();
-        let sin_all: Vec<f32> = (0..N * half)
+        let sin_all: Vec<f32> = (0..n_tokens * half)
             .map(|i| ((i / half) as f32 * 0.013 + (i % half) as f32 * 0.001).sin())
             .collect();
 
@@ -46926,30 +47150,39 @@ mod tests {
 
         // Arm A: one cold prefill of the whole prompt.
         let mut cold = new_session();
-        cold.prefill_tokens(&embeddings, N, &layers, &cos_all, &sin_all, scale)
+        cold.prefill_tokens(&embeddings, n_tokens, &layers, &cos_all, &sin_all, scale)
             .expect("cold prefill");
-        assert_eq!(cold.filled(), N);
+        assert_eq!(cold.filled(), n_tokens);
+        assert_eq!(cold.has_qk_norm_matrix_prefix(), with_qk_norm);
 
         // Arm B: prefill the prefix, then CONTINUE over it.
         let mut cont = new_session();
         cont.prefill_tokens(
-            &embeddings[..SPLIT * hidden],
-            SPLIT,
+            &embeddings[..split * hidden],
+            split,
             &layers,
-            &cos_all[..SPLIT * half],
-            &sin_all[..SPLIT * half],
+            &cos_all[..split * half],
+            &sin_all[..split * half],
             scale,
         )
         .expect("prefix prefill");
-        assert_eq!(cont.filled(), SPLIT);
+        assert_eq!(cont.filled(), split);
+        assert_eq!(cont.has_qk_norm_matrix_prefix(), with_qk_norm);
+        if with_qk_norm {
+            assert!(cont.prepare_for_prefix_reuse(split));
+            assert!(
+                cont.has_qk_norm_matrix_prefix(),
+                "parking preserves provenance"
+            );
+        }
         cont.prefill_tokens_from(
-            &embeddings[SPLIT * hidden..],
-            N - SPLIT,
+            &embeddings[split * hidden..],
+            n_tokens - split,
             &layers,
-            &cos_all[SPLIT * half..],
-            &sin_all[SPLIT * half..],
+            &cos_all[split * half..],
+            &sin_all[split * half..],
             scale,
-            SPLIT,
+            split,
         )
         .expect(
             "continuation prefill declined — if the attention-as-matmul lane did not engage \
@@ -46957,13 +47190,14 @@ mod tests {
         );
         assert_eq!(
             cont.filled(),
-            N,
+            n_tokens,
             "continuation must leave the cache vouching for prefix + batch"
         );
+        assert_eq!(cont.has_qk_norm_matrix_prefix(), with_qk_norm);
 
         for layer in 0..n_layers {
-            let (ck, cv) = cold.read_kv_layer(layer, N).expect("cold KV");
-            let (nk, nv) = cont.read_kv_layer(layer, N).expect("continued KV");
+            let (ck, cv) = cold.read_kv_layer(layer, n_tokens).expect("cold KV");
+            let (nk, nv) = cont.read_kv_layer(layer, n_tokens).expect("continued KV");
             assert_eq!(ck.len(), nk.len());
             for (i, (&a, &b)) in ck.iter().zip(&nk).enumerate() {
                 assert_eq!(
@@ -46979,6 +47213,111 @@ mod tests {
                     "layer {layer} V element {i}: continuation {b} != cold prefill {a}"
                 );
             }
+        }
+
+        if with_qk_norm {
+            if n_tokens == 257 {
+                let mut declined = new_session();
+                declined
+                    .prefill_tokens_inner(
+                        &embeddings[..split * hidden],
+                        split,
+                        &layers,
+                        &cos_all[..split * half],
+                        &sin_all[..split * half],
+                        scale,
+                        &[],
+                        0,
+                        false,
+                    )
+                    .expect("ordinary Q/K norm row prefill still works with the opt-in off");
+                assert!(!declined.has_qk_norm_matrix_prefix());
+                assert!(
+                    declined
+                        .prefill_tokens_inner(
+                            &embeddings[split * hidden..],
+                            n_tokens - split,
+                            &layers,
+                            &cos_all[split * half..],
+                            &sin_all[split * half..],
+                            scale,
+                            &[],
+                            split,
+                            true,
+                        )
+                        .is_none(),
+                    "matrix continuation must reject a prefix actually produced by row attention"
+                );
+                assert_eq!(declined.filled(), split);
+                assert!(!declined.has_qk_norm_matrix_prefix());
+                assert!(
+                    declined
+                        .prefill_tokens_inner(
+                            &embeddings[split * hidden..],
+                            n_tokens - split,
+                            &layers,
+                            &cos_all[split * half..],
+                            &sin_all[split * half..],
+                            scale,
+                            &[],
+                            split,
+                            false,
+                        )
+                        .is_none(),
+                    "Q/K norm continuation must still decline without matrix attention"
+                );
+                assert_eq!(declined.filled(), split);
+
+                cont.set_filled(n_tokens);
+                assert!(
+                    !cont.has_qk_norm_matrix_prefix(),
+                    "a generic watermark update cannot assert matrix provenance"
+                );
+                let (keys, values) = cold.read_kv_layer(0, n_tokens).expect("cold KV to reseed");
+                assert!(cold.seed_layer(0, &keys, &values, n_tokens));
+                assert!(
+                    !cold.has_qk_norm_matrix_prefix(),
+                    "host reseeding invalidates provenance even when the bytes happen to match"
+                );
+            }
+            // Capture the stream after the first full attention+FFN layer, before
+            // the abbreviated final layer. Both controls use identical projection
+            // GEMMs, norm, RoPE and F16 KV. Only attention dispatch differs.
+            let capture = |matrix: bool| {
+                new_session()
+                    .prefill_tokens_inner(
+                        &embeddings,
+                        n_tokens,
+                        &layers,
+                        &cos_all,
+                        &sin_all,
+                        scale,
+                        &[1],
+                        0,
+                        matrix,
+                    )
+                    .expect("Q/K norm prefill capture")
+                    .remove(0)
+            };
+            let row = capture(false);
+            let matrix = capture(true);
+            let mut error_sq = 0.0f64;
+            let mut reference_sq = 0.0f64;
+            let mut max_error = 0.0f32;
+            for (&got, &want) in matrix.iter().zip(&row) {
+                assert!(got.is_finite() && want.is_finite());
+                max_error = max_error.max((got - want).abs());
+                error_sq += f64::from(got - want).powi(2);
+                reference_sq += f64::from(want).powi(2);
+            }
+            assert!(reference_sq > 1.0, "nonzero residual stream required");
+            let relative_l2 = (error_sq / reference_sq).sqrt();
+            assert!(relative_l2 < 0.005, "matrix/row relative L2 {relative_l2}");
+            assert!(max_error < 0.02, "matrix/row maximum error {max_error}");
+            eprintln!(
+                "QK_NORM_MM_PROOF tokens={n_tokens} split={split} kv_bit_identical=true \
+                 matrix_row_relative_l2={relative_l2:.6e} matrix_row_max_error={max_error:.6e}"
+            );
         }
     }
 
