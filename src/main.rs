@@ -11972,6 +11972,101 @@ fn eagle3_draft_expansions_histogram(counts: &[u64], min_expansions: usize) -> V
     histogram
 }
 
+include!("fp16_coding_probe.rs");
+include!("fp16_copy_probe.rs");
+
+/// Perfect-draft verifier cost on the model's own generated continuation. Every
+/// width sees the same prefix and token count. Prefill, the reference generation,
+/// drafting, and head updates are explicitly outside the measured interval.
+fn run_coding_oracle_verify(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt: &[u32],
+    reference: &[u32],
+    workload: &str,
+    model_sha256: &str,
+) -> anyhow::Result<()> {
+    let count = reference.len().saturating_sub(1) / 16 * 16;
+    anyhow::ensure!(count >= 16, "oracle needs at least 17 generated tokens");
+    anyhow::ensure!(prompt.len() + count + 1 <= 2048,
+        "oracle stays within the measured width-16 context boundary (2048)");
+    let binary = std::env::current_exe()?;
+    let binary_sha256 = camelid::receipt::sha256_file_hex(&binary)
+        .map_err(anyhow::Error::msg)?;
+    let widths: Vec<usize> = match std::env::var("CAMELID_BENCH_ORACLE_WIDTHS") {
+        Ok(value) => value.split(',').map(|v| v.trim().parse::<usize>())
+            .collect::<Result<_, _>>()?,
+        Err(std::env::VarError::NotPresent) => vec![1, 2, 4, 8, 16],
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(!widths.is_empty() && widths.iter().all(|v| [1, 2, 4, 8, 16].contains(v)),
+        "oracle widths must be selected from 1,2,4,8,16");
+    anyhow::ensure!(widths.iter().collect::<std::collections::BTreeSet<_>>().len() == widths.len(),
+        "oracle widths must be unique");
+    let mut records = Vec::new();
+    // Interleaved ascending/descending repetitions, first pass unreported warmup.
+    for rep in 0..=3 {
+        let order: Vec<usize> = if rep % 2 == 0 {
+            widths.iter().copied().rev().collect()
+        } else { widths.clone() };
+        for width in order {
+            let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+            let _ = session.prewarm_resident_weights();
+            session.set_resident_encode_ahead_enabled(false);
+            let first = session.generate_next_token_with_history_diagnostics(
+                prompt, LlamaSampler::Greedy, prompt, false, None,
+            )?.next_token_id;
+            anyhow::ensure!(first == reference[0], "oracle prefill anchor diverged");
+            let stream16_before = camelid::metal::metal_kquant_v4_stream16_projection_count();
+            let mut round_ms = Vec::new();
+            for offset in (1..=count).step_by(width) {
+                let started = Instant::now();
+                let predictions = if width == 1 {
+                    vec![session.generate_next_token_greedy_resident(reference[offset - 1])?
+                        .ok_or_else(|| anyhow::anyhow!("oracle single row left Metal"))?.0]
+                } else {
+                    session.verify_drafts_metal_with_layer_inputs(
+                        reference[offset - 1], &reference[offset..offset + width - 1], &[],
+                    )?.ok_or_else(|| anyhow::anyhow!("oracle width {width} left Metal"))?
+                        .predictions
+                };
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                anyhow::ensure!(predictions == reference[offset..offset + width],
+                    "oracle width {width} diverged at offset {offset}");
+                round_ms.push(elapsed);
+            }
+            if rep > 0 {
+                let total_ms: f64 = round_ms.iter().sum();
+                let stream16_projections = camelid::metal::metal_kquant_v4_stream16_projection_count()
+                    .saturating_sub(stream16_before);
+                eprintln!("[coding-oracle] rep={rep} width={width} rows={count} rate={:.2} verified rows/s", count as f64 * 1000.0 / total_ms);
+                records.push(serde_json::json!({
+                    "rep": rep, "width": width, "verified_rows": count,
+                    "rounds": round_ms.len(), "total_verify_ms": total_ms,
+                    "mean_round_ms": total_ms / round_ms.len() as f64,
+                    "verified_rows_per_second": count as f64 * 1000.0 / total_ms,
+                    "round_ms": round_ms, "exact_reference_match": true,
+                    "cpu_fallbacks": 0,
+                    "stream16_projections": stream16_projections,
+                }));
+            }
+        }
+    }
+    println!("{}", serde_json::json!({
+        "schema": "camelid.coding-perfect-draft-cost.v1",
+        "measurement_only": true, "achieved_generation_throughput": false,
+        "scope": "target-only perfect-draft replay; excludes reference generation, prefill, proposal and head maintenance",
+        "commit": benchmark_commit(), "binary_sha256": binary_sha256,
+        "model_sha256": model_sha256, "workload": workload,
+        "prompt_token_ids": prompt, "plain_token_ids": reference,
+        "prompt_tokens": prompt.len(), "verified_rows_per_arm": count,
+        "effective_env": speculative_effective_env(), "records": records,
+        "target_text": tokenizer.decode(reference, false)?,
+    }));
+    Ok(())
+}
+
 fn run_plain_resident_greedy(
     config: &LlamaModelConfig,
     weights: &Arc<LlamaLoadedWeights>,
@@ -16590,6 +16685,17 @@ fn eagle3_effective_env() -> BTreeMap<String, Option<String>> {
     // Preserve the legacy receipt shape byte-for-byte when benchmark-only knobs are absent.
     // Record explicitly supplied knobs; defaults are captured in dedicated receipt fields.
     for key in [
+        "CAMELID_KQUANT_V4_STREAM16",
+        "CAMELID_BENCH_FP16_VERIFY",
+        "CAMELID_BENCH_FP16_SG",
+        "CAMELID_BENCH_FP16_ATTN_BATCH",
+        "CAMELID_BENCH_FP16_ATTN_MM",
+        "CAMELID_BENCH_FP16_GATE_UP_FUSED",
+        "CAMELID_BENCH_FP16_PROPOSAL",
+        "CAMELID_BENCH_FP16_COPY_ROWS",
+        "CAMELID_BENCH_FP16_COPY_VARIANTS",
+        "CAMELID_BENCH_ORACLE_VERIFY",
+        "CAMELID_BENCH_ORACLE_WIDTHS",
         "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR",
         "CAMELID_BENCH_EAGLE3_WIDTH_SELECTOR_TRACE",
         "CAMELID_BENCH_EAGLE3_WIDTH5_TOTAL_MS",
@@ -17349,9 +17455,24 @@ fn run_bench_eagle3(
         );
     }
 
+    #[cfg(target_os = "macos")]
+    if std::env::var("CAMELID_BENCH_FP16_VERIFY").as_deref() == Ok("1") {
+        return run_fp16_coding_probe(
+            &config, &weights, &tokenizer, &prompt_token_ids, &input_text,
+            &prompt_text, &workload, &model_sha256, max_tokens,
+        );
+    }
     eprintln!("[bench-eagle3] plain resident Metal target lane...");
     let plain =
         run_plain_resident_greedy(&config, &weights, &tokenizer, &prompt_token_ids, max_tokens)?;
+    // Measurement-only upper bound: replay known target tokens as perfect proposals.
+    // Never report this as generated coding throughput or use it in serving.
+    if std::env::var("CAMELID_BENCH_ORACLE_VERIFY").as_deref() == Ok("1") {
+        return run_coding_oracle_verify(
+            &config, &weights, &tokenizer, &prompt_token_ids, &plain.generated,
+            &workload, &model_sha256,
+        );
+    }
     let head_capacity = prompt_token_ids
         .len()
         .checked_add(max_tokens)

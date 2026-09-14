@@ -2891,3 +2891,6 @@ mod eagle3_device_acceptance_shadow_tests {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+include!("metal_fp16_probe.rs");

@@ -21356,6 +21356,232 @@ fn trace_kquant_v4_shared_prep(
     }
 }
 
+#[cfg(target_os = "macos")]
+include!("metal_fp16_probe.rs");
+
+#[cfg(target_os = "macos")]
+fn kquant_v4_stream16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_KQUANT_V4_STREAM16")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+#[cfg(target_os = "macos")]
+static KQUANT_V4_STREAM16_PROJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Projection dispatches encoded through the opt-in stream16 route. This is
+/// route evidence, not a completion counter; receipts must also check GPU and
+/// full-model output completion before attributing throughput to the route.
+#[cfg(target_os = "macos")]
+pub fn metal_kquant_v4_stream16_projection_count() -> u64 {
+    KQUANT_V4_STREAM16_PROJECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn metal_kquant_v4_stream16_projection_count() -> u64 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+struct KquantV4Stream16Kernels {
+    q4: ComputePipelineState,
+    q6: ComputePipelineState,
+}
+
+/// Compile only when stream16 is actually attempted. Keeping this experimental
+/// source in a separate library leaves the default V2 library unchanged. The
+/// helper definitions and strict compiler options match the standalone probe.
+#[cfg(target_os = "macos")]
+fn kquant_v4_stream16_kernels(k: &MetalLinearKernel) -> Option<&'static KquantV4Stream16Kernels> {
+    static KERNELS: OnceLock<Option<KquantV4Stream16Kernels>> = OnceLock::new();
+    KERNELS
+        .get_or_init(|| {
+            let options = CompileOptions::new();
+            options.set_fast_math_enabled(false);
+            let source = [
+                KQUANT_V2_SHADER,
+                "\n",
+                include_str!("metal_kquant_v4_stream16.metal"),
+            ]
+            .concat();
+            let library = k
+                .device
+                .new_library_with_source(&source, &options)
+                .map_err(|err| eprintln!("[metal-stream16] compile failed, retaining V4: {err}"))
+                .ok()?;
+            let pipeline = |name: &str| -> Option<ComputePipelineState> {
+                let function = library.get_function(name, None).ok()?;
+                let pipeline = k
+                    .device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()?;
+                admitted_32_lane_pipeline(Some(&pipeline))?;
+                Some(pipeline)
+            };
+            Some(KquantV4Stream16Kernels {
+                q4: pipeline("q4k_token_tiles_stream_16")?,
+                q6: pipeline("q6k_token_tiles_stream_16")?,
+            })
+        })
+        .as_ref()
+}
+
+/// The width-16 experiment has its own staging ABI: two complete fragment-
+/// major eight-column panels, never a [position][16] panel. Each panel is
+/// written by the existing strict tiled quantizer with offset input/scale
+/// buffers. The stream body shares A across two independent C tiles without
+/// changing either tile's MMA sequence or ordered per-superblock f32 fold.
+///
+/// Routing gates live in the callers, so model-free tests exercise this exact
+/// helper without changing process-global environment state. Every rejection
+/// precedes GPU encoding. The verifier cap and standard prefill exclusion are
+/// unchanged, and unsupported inputs fall back to the established V4 path.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_kquant_v4_stream16_group(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    y: &Buffer,
+    projections: &[(&ResidentLinearWeight, &Buffer, &Buffer, usize)],
+    input_width: usize,
+    n_tokens: usize,
+) -> bool {
+    // Bounds include Llama-3.2-3B's hidden/FFN/vocabulary geometry and keep all
+    // shader byte offsets representable in uint. Ragged output rows are legal.
+    if !(9..=16).contains(&n_tokens)
+        || !(1..=3).contains(&projections.len())
+        || input_width == 0
+        || input_width > 8192
+        || !input_width.is_multiple_of(256)
+        || y.length() < (n_tokens * input_width * 4) as u64
+    {
+        return false;
+    }
+    let n_sb = input_width / 256;
+    if projections.iter().any(|(weight, out, _, rows)| {
+        !(1..=128256).contains(rows)
+            || !matches!(
+                weight.format,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+            )
+            || out.length() < (n_tokens * rows * 4) as u64
+            || weight.buffer.length() < (rows * n_sb * weight.format.wire_bytes_per_block()) as u64
+    }) {
+        return false;
+    }
+    let Some(prep) = k
+        .quantize_q8k_v4_stage_reg_tiled_pipeline
+        .as_ref()
+        .filter(|pipeline| {
+            pipeline.thread_execution_width() == 32
+                && pipeline.max_total_threads_per_threadgroup() >= 256
+        })
+    else {
+        return false;
+    };
+    let Some(stream) = kquant_v4_stream16_kernels(k) else {
+        return false;
+    };
+
+    let with_ysums = projections
+        .iter()
+        .any(|(weight, _, _, _)| weight.format == ResidentWeightFormat::Q4K);
+    let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
+    let stage = pool_get(k, (16 * input_width * 2) as u64);
+    let ysums = with_ysums.then(|| pool_get(k, (16 * n_sb * 16 * 2) as u64));
+    // Immutable geometry is retained until the command completes. Rewriting a
+    // shared host scalar between panel dispatches would make both see tile 1.
+    let geometry = pool_get(k, (24 + 12 * projections.len()) as u64);
+    unsafe {
+        let p = geometry.contents().cast::<u32>();
+        for tile in 0..2 {
+            *p.add(tile * 3) = n_sb as u32;
+            *p.add(tile * 3 + 1) = (n_tokens - tile * 8).min(8) as u32;
+            *p.add(tile * 3 + 2) = u32::from(with_ysums);
+        }
+        for (index, &(_, _, _, rows)) in projections.iter().enumerate() {
+            *p.add(6 + index * 3) = n_sb as u32;
+            *p.add(7 + index * 3) = rows as u32;
+            *p.add(8 + index * 3) = n_tokens as u32;
+        }
+    }
+    for tile in 0..2 {
+        e.set_compute_pipeline_state(prep);
+        e.set_buffer(0, Some(y), (tile * 8 * input_width * 4) as u64);
+        e.set_buffer(1, Some(&scales), (tile * 8 * n_sb * 4) as u64);
+        e.set_buffer(2, Some(&stage), (tile * 8 * input_width * 2) as u64);
+        e.set_buffer(
+            3,
+            Some(ysums.as_ref().unwrap_or(&stage)),
+            if with_ysums {
+                (tile * 8 * n_sb * 16 * 2) as u64
+            } else {
+                0
+            },
+        );
+        e.set_buffer(4, Some(&geometry), (tile * 12) as u64);
+        e.set_buffer(5, Some(&geometry), (tile * 12 + 4) as u64);
+        e.set_buffer(6, Some(&geometry), (tile * 12 + 8) as u64);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_sb as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    for (index, &(weight, out, _, rows)) in projections.iter().enumerate() {
+        e.set_compute_pipeline_state(if weight.format == ResidentWeightFormat::Q4K {
+            &stream.q4
+        } else {
+            &stream.q6
+        });
+        e.set_buffer(0, Some(&scales), 0);
+        e.set_buffer(2, Some(&weight.buffer), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_buffer(4, Some(&geometry), (24 + index * 12) as u64);
+        e.set_buffer(5, Some(&geometry), (28 + index * 12) as u64);
+        e.set_buffer(6, Some(&geometry), (32 + index * 12) as u64);
+        e.set_buffer(7, Some(&stage), 0);
+        if let Some(ysums) = ysums.as_ref() {
+            e.set_buffer(8, Some(ysums), 0);
+        }
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows.div_ceil(8) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    keep.extend([scales, stage, geometry]);
+    if let Some(ysums) = ysums {
+        keep.push(ysums);
+    }
+    let previous = KQUANT_V4_STREAM16_PROJECTIONS.fetch_add(
+        projections.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if previous == 0 {
+        eprintln!("[metal-stream16] route=two_fragment_panels n_tokens={n_tokens} input_width={input_width} projections={}", projections.len());
+    }
+    true
+}
+
 /// Encode a verifier projection group that reads the same activation rows.
 /// Returns false before emitting anything unless the complete group is eligible
 /// for the narrow V4 lane, so callers can safely fall back projection-by-
@@ -21375,6 +21601,21 @@ fn encode_resident_kquant_v4_shared_group(
     input_width: usize,
     n_tokens: usize,
 ) -> bool {
+    if kquant_v4_stream16_enabled()
+        && kquant_v4_enabled()
+        && kquant_v4_shared_prep_enabled()
+        && (9..=16).contains(&n_tokens)
+    {
+        if let Some(v4) = kquant_v2_kernels() {
+            if kquant_v4_register_exact_v2_route_active(v4)
+                && encode_kquant_v4_stream16_group(
+                    e, k, keep, y, projections, input_width, n_tokens,
+                )
+            {
+                return true;
+            }
+        }
+    }
     if projections.is_empty()
         || !kquant_v4_enabled()
         || !kquant_v4_shared_prep_enabled()
@@ -21942,6 +22183,23 @@ fn encode_resident_kquant_matmul_f32(
         return;
     }
     if let Some(v4) = v4 {
+        // Only the verifier's already-admitted wide window reaches this point.
+        // The process-wide narrow V2 lane remains the arithmetic comparator.
+        if kquant_v4_stream16_enabled()
+            && (9..=16).contains(&n_tokens)
+            && kquant_v4_register_exact_v2_route_active(v4)
+            && encode_kquant_v4_stream16_group(
+                e,
+                k,
+                keep,
+                y,
+                &[(weight, out, scalar, rows)],
+                input_width,
+                n_tokens,
+            )
+        {
+            return;
+        }
         let is_q6k = matches!(weight.format, ResidentWeightFormat::Q6K);
         let fragment_major = kquant_v4_stage_fragment_major(v4, n_tokens);
         let tiled_requested = fragment_major && kquant_v4_tiled_prep_fusion_enabled();
@@ -28130,8 +28388,44 @@ fn encode_attention_splitk_kv16_batch(
     position_counts: &[usize],
     tree: Option<&TreeAttn>,
 ) -> AttentionSplitkKv16BatchRoute {
+    encode_attention_splitk_kv16_batch_offset(
+        e, k, keep, query, keys, values, out, scalar, n_heads, n_kv_heads,
+        head_dim, position_counts, tree, 0, 0,
+    )
+}
+
+/// Same bounded attention geometry and arithmetic as the existing verifier;
+/// offsets select a contiguous diagnostic chunk without copying its queries.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_splitk_kv16_batch_offset(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_counts: &[usize],
+    tree: Option<&TreeAttn>,
+    query_offset: u64,
+    out_offset: u64,
+) -> AttentionSplitkKv16BatchRoute {
     let rows = position_counts.len();
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    let chunk_bytes = rows.checked_mul(n_heads).and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(4)).map(|v| v as u64);
+    if !query_offset.is_multiple_of(4) || !out_offset.is_multiple_of(4)
+        || chunk_bytes.is_none_or(|bytes| {
+            query_offset.checked_add(bytes).is_none_or(|end| end > query.length())
+                || out_offset.checked_add(bytes).is_none_or(|end| end > out.length())
+        }) {
+        return AttentionSplitkKv16BatchRoute::default();
+    }
     if !(2..=16).contains(&rows)
         || n_kv_heads == 0
         || n_heads % n_kv_heads != 0
@@ -28256,7 +28550,7 @@ fn encode_attention_splitk_kv16_batch(
     } else {
         &k.attention_decode_splitk_kv16_batch_pipeline
     });
-    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(0, Some(query), query_offset);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
     e.set_buffer(3, Some(&partials), 0);
@@ -28348,7 +28642,7 @@ fn encode_attention_splitk_kv16_batch(
     };
     e.set_compute_pipeline_state(merge_pipeline);
     e.set_buffer(0, Some(&partials), 0);
-    e.set_buffer(1, Some(out), 0);
+    e.set_buffer(1, Some(out), out_offset);
     e.set_buffer(2, Some(scalar), 0); // n_heads
     e.set_buffer(3, Some(scalar), 4); // head_dim
     e.set_buffer(4, Some(&batch_scalars), 0); // max_splits
@@ -54662,6 +54956,9 @@ mod tests {
             assert!(kquant_v4_tiled_prep_fusion_from_env(Some(value)));
         }
     }
+
+    #[cfg(target_os = "macos")]
+    include!("metal_stream16_tests.rs");
 
     /// Production-route qualification for the tiled fragment preparation. The
     /// current strict quantizer plus fragment staging is the oracle; the
