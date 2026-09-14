@@ -46803,8 +46803,7 @@ fn eagle3_rank_top_candidates_legacy_for_vocab(
             u32::try_from(draft).map_err(|_| format!("EAGLE-3 draft row {draft} exceeds u32"))?;
         if count < limit {
             let mut insert_idx = count;
-            for i in 0..count {
-                let (ranked_logit, ranked_token) = top_logits[i];
+            for (i, &(ranked_logit, ranked_token)) in top_logits.iter().take(count).enumerate() {
                 if logit > ranked_logit || (logit == ranked_logit && draft_token < ranked_token) {
                     insert_idx = i;
                     break;
@@ -46819,8 +46818,9 @@ fn eagle3_rank_top_candidates_legacy_for_vocab(
             let (minimum_logit, minimum_token) = top_logits[limit - 1];
             if logit > minimum_logit || (logit == minimum_logit && draft_token < minimum_token) {
                 let mut insert_idx = limit - 1;
-                for i in 0..limit - 1 {
-                    let (ranked_logit, ranked_token) = top_logits[i];
+                for (i, &(ranked_logit, ranked_token)) in
+                    top_logits.iter().take(limit - 1).enumerate()
+                {
                     if logit > ranked_logit || (logit == ranked_logit && draft_token < ranked_token)
                     {
                         insert_idx = i;

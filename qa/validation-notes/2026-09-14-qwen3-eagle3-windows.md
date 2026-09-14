@@ -1,78 +1,99 @@
-# Windows Qwen3-4B CUDA target-capture validation
+# Windows Qwen3-4B learned CUDA EAGLE validation
 
-Tested the Windows follow-up diff on #767 head
-`7642db46e81a1465e960a5f65a3af31b0a137822`, September 14, 2026.
-The PR targets `codex/qwen4b-eagle-chat`, which depends on #766.
+Tested September 14, 2026, as a follow-up to #767 head
+`7642db46e81a1465e960a5f65a3af31b0a137822`. The PR base remains
+`codex/qwen4b-eagle-chat` (stacked on #766); the source branch is preserved.
+This receipt supersedes the initial target-capture-only result in commit
+`5806978a`.
 
-**Result: CUDA target-capture foundation validated; learned EAGLE port incomplete.**
-No EAGLE head was loaded or executed, and no acceleration is claimed.
+**Result: the learned CUDA head and complete one-draft serving path execute and
+pass bounded numerical, token-parity, cache, and HTTP checks. No speedup was
+observed on this host.**
 
-## Host and target
+## Host and artifacts
 
-- Windows x86_64 MSVC, Rust 1.95.0.
+- Windows x86_64 MSVC, Rust 1.95.0, default Windows CUDA features.
 - NVIDIA GeForce RTX 3060 Laptop GPU, 6 GiB VRAM; driver 576.83, CUDA 12.9.
-- Qwen3-4B Q4_K_M target SHA-256:
+- Target: Qwen3-4B Q4_K_M, SHA-256
   `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5`.
-  This is #767's exact pinned Qwen target.
-- Default Windows features (CUDA enabled by the existing build configuration).
-- Successful dev/test builds used `CARGO_PROFILE_DEV_DEBUG=0`,
-  `CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_INCREMENTAL=0`, and tests used
-  `RUST_MIN_STACK=8388608`. A first build exhausted disk while writing its PDB;
-  only this worktree's generated Cargo artifacts were cleaned before rebuilding.
-  Disabling symbols does not enable `cfg(test)` in the production library.
+- Head: `AngelSlim/Qwen3-4B_eagle3`, revision
+  `fd331e59626c8e95c392381a16ee59d518727fbb`; weights SHA-256
+  `58ac5bbfdd71047ebaa5d5535b895c2af37004eb820ca2dda55bd7666658853e`;
+  config SHA-256
+  `1fc560b1fe78e79cd31255da282651f7802bb41a8dc42c7c79e7333f036c5195`.
+- Dev/test profiles, `CARGO_PROFILE_DEV_DEBUG=0`,
+  `CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_INCREMENTAL=0`,
+  `RUST_MIN_STACK=8388608`. NumPy 2.3.5 for independent head validation.
 
-## Passed checks
+## Learned-head and generation evidence
 
-- `cargo build --bin camelid`, executable `--version`, and `serve --help`.
-- Production executable integration test: EAGLE mode exits with an explicit
-  unsupported-backend error before model loading/listener binding.
-- `cargo test --lib eagle3`: 86 passed, 1 ignored.
-- Library executable `speculative` filter: 23 passed, 1 ignored, including the
-  original weak/strong suffix-confidence regression without weakening it.
-- Library executable `tree` filter: 58 passed, 4 ignored. This broad substring
-  filter includes other tree-related tests; counts across filters overlap.
-- Library executable `stream_step_deltas` filter: 3 passed.
-- Explicit CUDA `verify_batch_matches_sequential`: 1 passed, no skip. Verifies
-  capture-on/off greedy predictions, reversed caller layer order, raw layer-zero
-  embeddings, multi-row/single-row capture agreement (relative/absolute tolerance
-  1e-5), and invalid layer/capacity refusals.
-- Explicit live `qwen3_cuda_target_capture_acceptance_and_rollback`: 1 passed,
-  no skip, 24.39 seconds including cold engine upload. Every reference and
-  continuation forward required the resident GPU. All 36 layers were resident;
-  cache capacity was 512 positions.
+The independent Python implementation reads BF16 safetensors directly and
+implements all head operations in NumPy. Two recurrent rows produced 64,000
+logits with maximum absolute error 0.00000787 against CUDA; both mapped target
+argmax tokens matched (`320`, `11`). Reset followed by KV-only catch-up reproduced
+the stable logits. Cache exhaustion is checked before another row is appended.
 
-The live reference generated token IDs
+Full generation compared exact output token IDs with ordinary resident CUDA,
+requiring GPU execution on both paths. All 152 output tokens matched. The head
+was uploaded on the first request and reused on the next three; accepted and
+rejected drafts both exercised target-authoritative head updates.
+
+| Prompt | Tokens | Accepted drafts | Rejected drafts | Plain decode ms | EAGLE decode ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| The capital of France is | 40 | 15 | 9 | 1132 | 1628 |
+| Write a Python function that adds two numbers | 48 | 14 | 19 | 1370 | 2031 |
+| Count from one to ten: one, two, three, | 32 | 10 | 10 | 904 | 1260 |
+| Explain why water freezes when | 32 | 7 | 16 | 892 | 1409 |
+
+These are single-run debug-build measurements with prompt setup excluded, not a
+release benchmark. EAGLE took approximately 1.4-1.6 times the plain decode time.
+The existing Q4_K_M shared-memory limit permits only two verification rows, so
+CUDA uses one learned draft per round. No throughput improvement is claimed.
+
+The target-capture fixture independently checks layers `[33, 2, 18]`, finite
+nonzero `[2, 2560]` residuals, acceptance plus bonus, rejection rollback, and five
+subsequent resident tokens. Its greedy reference is
 `[12095, 13, 576, 6722, 315, 9856, 374, 19846, 13, 576]`.
-The capture call returned inputs to layers `[33, 2, 18]`, each `[2, 2560]`,
-with finite, nonzero residuals. One correct draft plus bonus matched the reference.
-A wrong draft committed only the bonus; all five subsequent tokens matched.
-Four-row verification was refused by the existing two-row K-quant shared-memory
-cap without changing the logical KV position. The synthetic test separately
-executes a four-row Q8 fixture; it does not widen the Qwen K-quant support claim.
+Four-row Qwen verification is rejected without advancing logical KV. The
+synthetic Q8 fixture separately checks capture-on/off predictions, layer-zero
+embeddings, reversed layer order, multi-row versus sequential captures, and
+invalid IDs/capacity. It does not widen the Qwen kernel support claim.
 
-## Production HTTP behavior
+## Production HTTP checks
 
-Started the ordinary `camelid serve` executable on a loopback address with the
-pinned model, GPU enabled, speculation unset, and resident context capped at 512.
-Health reached `generation_ready=true`; its selected backend was
-`cuda_resident_kquant_runtime`. Runtime logs confirmed all 36 layers on CUDA.
-An eight-token greedy completion for `The capital of France is` returned
-` Paris. The capital of Germany is Berlin`. A streaming request returned the
-same text and terminated with `[DONE]`. The test server was stopped afterward.
+Ran the ordinary `camelid serve` executable with the pinned target/head,
+`CAMELID_SPEC_DECODE=eagle3`, GPU on, and the default 2048-token EAGLE logical
+limit. No special CUDA context environment override was used. Health reported
+`generation_ready=true` and `cuda_resident_kquant_runtime`; all 36 target layers
+were resident.
 
-## Limits and upstream CI
+- Eight-token `/v1/completions` for `The capital of France is` returned
+  ` Paris. The capital of Germany is Berlin`, exactly matching the previously
+  measured ordinary CUDA response and token IDs. Streaming returned identical
+  text and `[DONE]`.
+- `/v1/chat/completions`, temperature zero and `camelid_enable_thinking=false`,
+  answered `Paris.` identically in streaming and nonstreaming modes.
+- Closed a longer chat stream after its first content chunk, then verified that
+  a fresh completion reproduced the original token IDs.
+- A one-token output budget returned the original first token.
+- A 2050-token prompt returned HTTP 413 with
+  `eagle3_context_limit_exceeded`; the next normal request again matched.
+- Stopped the owned test server after validation.
 
-The learned draft transformer, prompt capture, tree capture/commit, and EAGLE
-cache orchestration are still Metal-specific. Windows EAGLE serving now refuses
-startup explicitly rather than advertising a mode that fails during generation.
-No complete EAGLE parity, throughput comparison, full all-target suite, release
-build, or packaged desktop run was performed.
+## Regression and tooling checks
 
-At the inspected upstream head, public-scrub passed; Rust, frontend, and
-validation-script jobs failed. Besides the fixed production validator error,
-local `cargo clippy --lib --bin camelid --test eagle3_platform --test
-eagle3_cuda_target -- -D warnings` still fails on 15 inherited findings: literal
-casts in `eagle3.rs` and range-loop lints in `metal.rs`. Those unrelated cleanup
-changes are outside this draft. Formatting, diff whitespace, and public-scrub
-checks passed.
-See [port scope and reproduction](../../docs/qwen3-eagle3-windows.md).
+- Normal production server build; executable startup validation integration test.
+- EAGLE library filter: 86 passed, 1 ignored.
+- Speculative filter: 23 passed, 1 ignored; original suffix confidence regression
+  remains unchanged.
+- Tree filter: 58 passed, 4 ignored; streaming-delta filter: 3 passed.
+  Substring filters overlap and are not additive suite totals.
+- Explicit learned-head, target-capture, full learned-generation, and synthetic
+  CUDA tests require their device/artifacts and never count fallback as success.
+- Strict Clippy covers library, server, and all four EAGLE integration targets.
+  The inherited EAGLE literal casts and ranking-loop warnings were cleaned up.
+- Formatting, diff whitespace, and public-scrub checks.
+
+This is not a full all-target CI, release/package, Metal, or 4096-position runtime
+qualification. Metal's tree scheduler is retained; wider CUDA verification and
+head optimization remain performance work. See [scope and reproduction](../../docs/qwen3-eagle3-windows.md).

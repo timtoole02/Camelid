@@ -3921,13 +3921,112 @@ impl LlamaInferenceSession {
         drafts: &[u32],
         capture_layer_ids: &[usize],
     ) -> Result<Option<LlamaGreedyVerifyCapture>> {
+        if drafts.is_empty() {
+            return Ok(None);
+        }
+        self.cuda_verify_capture(last_token, drafts, capture_layer_ids, false)
+    }
+
+    /// Bound a fresh CUDA EAGLE session before admitting the target and head.
+    #[cfg(feature = "cuda")]
+    pub fn limit_cuda_eagle_context(&mut self, limit: usize) -> Result<()> {
+        if self.kv_position() != 0 || !(256..=4096).contains(&limit) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "CUDA EAGLE context must be set on a fresh session in 256..=4096".into(),
+            ));
+        }
+        let cap = self
+            .kv_cache
+            .plan
+            .max_sequence_length
+            .min(limit)
+            .min(resident_cuda_max_context());
+        self.kv_cache.plan.max_sequence_length = cap;
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let mut guard = self
+            .resident_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A startup warmup may have allocated native-context KV, consuming the
+        // memory needed by the learned head. Rebuild once at the serving rung.
+        if guard
+            .as_ref()
+            .is_some_and(|slot| slot.key == key && slot.engine.max_pos() != cap)
+        {
+            *guard = None;
+            crate::cuda::release_async_pool();
+        }
+        Ok(())
+    }
+
+    /// Fresh-prompt capture through the same batched CUDA kernels as decode
+    /// verification, using two rows per launch for the pinned K-quant target.
+    #[cfg(feature = "cuda")]
+    pub fn forward_greedy_cuda_prefill_with_layer_inputs(
+        &mut self,
+        tokens: &[u32],
+        capture_layer_ids: &[usize],
+    ) -> Result<LlamaGreedyVerifyCapture> {
+        if tokens.is_empty() || self.kv_position() != 0 || tokens.len() > self.remaining_context() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "CUDA EAGLE prefill requires a fresh session and a nonempty prompt within capacity"
+                    .into(),
+            ));
+        }
+        // Build/upload the target through its normal resident admission path,
+        // then overwrite that first row while capturing every prompt input.
+        self.generate_next_token_greedy_resident(tokens[0])?
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch("CUDA resident target is unavailable".into())
+            })?;
+        self.rollback_resident_to_position(0)?;
+        let mut data = vec![Vec::new(); capture_layer_ids.len()];
+        let mut last = None;
+        for chunk in tokens.chunks(2) {
+            let capture = self
+                .cuda_verify_capture(chunk[0], &chunk[1..], capture_layer_ids, true)?
+                .ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch("CUDA prompt capture is unavailable".into())
+                })?;
+            last = capture.predictions.last().copied();
+            for (out, tap) in data.iter_mut().zip(capture.layer_inputs) {
+                out.extend(tap.data);
+            }
+        }
+        Ok(LlamaGreedyVerifyCapture {
+            predictions: vec![last.expect("nonempty prompt")],
+            layer_inputs: data
+                .into_iter()
+                .map(|values| {
+                    CpuTensor::from_f32(
+                        "cuda_prompt_layer_input",
+                        vec![tokens.len(), self.config.embedding_length as usize],
+                        values,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+            timings: LlamaForwardTimings::default(),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_verify_capture(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+        capture_layer_ids: &[usize],
+        commit_all: bool,
+    ) -> Result<Option<LlamaGreedyVerifyCapture>> {
         // Capture ids are absolute target layer ids. A pipeline engine contains
         // only its owned range, so its local layer indices cannot satisfy this
         // contract. Preserve the existing no-capture verifier's dispatch.
         if !capture_layer_ids.is_empty() && self.weights.layer_range.is_some() {
             return Ok(None);
         }
-        if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
             return Ok(None);
         }
         let position = self.kv_cache.position;
@@ -4017,7 +4116,7 @@ impl LlamaInferenceSession {
             accepted.push(predicted[j + 1]);
             j += 1;
         }
-        let new_position = position + accepted.len();
+        let new_position = position + if commit_all { k } else { accepted.len() };
         slot.engine.set_filled(new_position);
         drop(guard);
         self.kv_cache.position = new_position;
