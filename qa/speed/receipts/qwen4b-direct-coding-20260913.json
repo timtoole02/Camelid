@@ -1,0 +1,1391 @@
+{
+  "schema": "camelid.direct-coding-receipt/v1",
+  "hardware": "mini2: Apple M4, 16 GB unified memory, macOS arm64",
+  "base_commit": "c4556bcefe4b14a8636bb74aecfb22364b4ead28",
+  "source_sha256": {
+    "src/metal.rs": "3a55dd9c7a69836f3734eb94eb912ad143cce9a333ce90a0104df39d415e96fc",
+    "src/inference/metal_resident.rs": "bfc69fc5f05df4c4e51e72abbe7e681e4dc8d2c52c4de344d70d7f5484c83db2",
+    "scripts/bench-qwen-coding.py": "75304f558348c8535f10b88d4d6d59b8980183b69b983a73aee35870eea60229",
+    "scripts/lib/qwen_coding_fixtures.py": "25130189a48f9d635c34376c780d45ab2e71c75e759384e5aca752c3fd3e82dd",
+    "qa/prompt-packs/qwen4b-coding-v1.json": "cb560eb5c716b8448bd933f14845bf3879c7c19da5571e3527ecaa74e030723b"
+  },
+  "experiments": [
+    {
+      "schema": "camelid.direct-coding-benchmark/v1",
+      "created_utc": "2026-09-14T00:55:39Z",
+      "machine": "arm64",
+      "binary_sha256": "a7f43698a6fdfa5567c70795be14739935d2ad73a4ef55907e5ef86e38cd3744",
+      "model_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+      "pack_sha256": "cb560eb5c716b8448bd933f14845bf3879c7c19da5571e3527ecaa74e030723b",
+      "harness_sha256": "75304f558348c8535f10b88d4d6d59b8980183b69b983a73aee35870eea60229",
+      "validator_sha256": "25130189a48f9d635c34376c780d45ab2e71c75e759384e5aca752c3fd3e82dd",
+      "case_ids": [
+        "merge_intervals",
+        "lower_bound",
+        "select_jobs"
+      ],
+      "warm_followup": true,
+      "temperature": 0,
+      "tools": false,
+      "name": "baseline"
+    },
+    {
+      "schema": "camelid.direct-coding-benchmark/v1",
+      "created_utc": "2026-09-14T01:08:10Z",
+      "machine": "arm64",
+      "binary_sha256": "42d5d6c19d2e45cbb01df8977dd5e0387257b4586b164e107777044d8c197386",
+      "model_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+      "pack_sha256": "cb560eb5c716b8448bd933f14845bf3879c7c19da5571e3527ecaa74e030723b",
+      "harness_sha256": "75304f558348c8535f10b88d4d6d59b8980183b69b983a73aee35870eea60229",
+      "validator_sha256": "25130189a48f9d635c34376c780d45ab2e71c75e759384e5aca752c3fd3e82dd",
+      "case_ids": [
+        "merge_intervals",
+        "lower_bound",
+        "select_jobs"
+      ],
+      "warm_followup": true,
+      "temperature": 0,
+      "tools": false,
+      "name": "candidate"
+    },
+    {
+      "schema": "camelid.direct-coding-benchmark/v1",
+      "created_utc": "2026-09-14T01:11:14Z",
+      "machine": "arm64",
+      "binary_sha256": "42d5d6c19d2e45cbb01df8977dd5e0387257b4586b164e107777044d8c197386",
+      "model_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+      "pack_sha256": "cb560eb5c716b8448bd933f14845bf3879c7c19da5571e3527ecaa74e030723b",
+      "harness_sha256": "75304f558348c8535f10b88d4d6d59b8980183b69b983a73aee35870eea60229",
+      "validator_sha256": "25130189a48f9d635c34376c780d45ab2e71c75e759384e5aca752c3fd3e82dd",
+      "case_ids": [
+        "select_jobs"
+      ],
+      "warm_followup": true,
+      "temperature": 0,
+      "tools": false,
+      "name": "repeat"
+    }
+  ],
+  "measurement_count": 32,
+  "measurements": [
+    {
+      "profile": "default",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 5.187031791999999,
+      "prompt_ms": 1147.744,
+      "decode_ms": 3969.2560000000003,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 17.635546812803206,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 5.291219791999999,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 104.188
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {}
+    },
+    {
+      "profile": "default",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 9.799383541000001,
+      "prompt_ms": 1095.816,
+      "decode_ms": 8604.184,
+      "prompt_tokens": 283,
+      "output_tokens": 154,
+      "decode_tokens_per_second": 17.782046502027388,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 9.889910541,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 90.527
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "fcbf4a640baa8d408a8135dbaf0df9afc1f54a414fd099151f2190d2d9200d59",
+      "profile_env": {}
+    },
+    {
+      "profile": "default",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 36.429266209000005,
+      "prompt_ms": 25956.603000000003,
+      "decode_ms": 10390.396999999997,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 14.821377854955882,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.332
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {}
+    },
+    {
+      "profile": "default",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 36.76570675,
+      "prompt_ms": 26256.759000000002,
+      "decode_ms": 10425.240999999998,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 14.771840766079174,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 88.695
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "e4dc039b4cca33fa2e58215d80720c1f585ad1941e529fd0c951e29c497a7e17",
+      "profile_env": {}
+    },
+    {
+      "profile": "v3",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 3.5759388330000093,
+      "prompt_ms": 1123.15,
+      "decode_ms": 2399.85,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 29.168489697272747,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 3.704445833000009,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 128.507
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      }
+    },
+    {
+      "profile": "v3",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 6.307752541999989,
+      "prompt_ms": 1096.615,
+      "decode_ms": 5130.385,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 29.627406130339146,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 6.422774541999988,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 115.022
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      }
+    },
+    {
+      "profile": "v3",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 32.5678035,
+      "prompt_ms": 25939.709,
+      "decode_ms": 6567.291000000001,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.449547157267734,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 86.632
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      }
+    },
+    {
+      "profile": "v3",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 32.876220292,
+      "prompt_ms": 26211.622,
+      "decode_ms": 6606.378000000001,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.31080661748389,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 89.037
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      }
+    },
+    {
+      "profile": "v4",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 5.357790666999989,
+      "prompt_ms": 1156.3929999999998,
+      "decode_ms": 4127.607,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 16.958978895035308,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 5.462951666999989,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 105.161
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1"
+      }
+    },
+    {
+      "profile": "v4",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 10.116626749999995,
+      "prompt_ms": 1128.694,
+      "decode_ms": 8886.306,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 17.10497027673816,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 10.209126749999994,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 92.5
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1"
+      }
+    },
+    {
+      "profile": "v4",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 36.477694291999995,
+      "prompt_ms": 25978.763,
+      "decode_ms": 10413.237000000001,
+      "prompt_tokens": 3293,
+      "output_tokens": 150,
+      "decode_tokens_per_second": 14.308711114517031,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 86.583
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "47ec6449a6af06ba5b1b1b61fd175c6973ef7c896133c228724a7a17e38eb9b1",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1"
+      }
+    },
+    {
+      "profile": "v4",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 37.12284862499999,
+      "prompt_ms": 26252.815,
+      "decode_ms": 10784.185000000001,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 14.280170453307319,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 90.324
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "d0bcc81a97dd716a715e28fbd7001cdfea0cb773b043b549b76d5e0ac053a62a",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1"
+      }
+    },
+    {
+      "profile": "v4suffix",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 2.5159044999999765,
+      "prompt_ms": 1153.2769999999998,
+      "decode_ms": 1346.7230000000002,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 51.97802369158319,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 2.6219184999999765,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 106.014
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1",
+        "CAMELID_SPEC_DECODE": "suffix",
+        "CAMELID_SPEC_GPU": "1",
+        "CAMELID_SPEC_DRAFT_TOKENS": "15"
+      }
+    },
+    {
+      "profile": "v4suffix",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 11.173437665999984,
+      "prompt_ms": 1123.112,
+      "decode_ms": 10007.887999999999,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 15.188019690068476,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 11.265900665999984,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 92.463
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1",
+        "CAMELID_SPEC_DECODE": "suffix",
+        "CAMELID_SPEC_GPU": "1",
+        "CAMELID_SPEC_DRAFT_TOKENS": "15"
+      }
+    },
+    {
+      "profile": "v4suffix",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 35.08493633400002,
+      "prompt_ms": 25985.207,
+      "decode_ms": 9079.793000000001,
+      "prompt_tokens": 3293,
+      "output_tokens": 150,
+      "decode_tokens_per_second": 16.410065736080103,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 88.102
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "47ec6449a6af06ba5b1b1b61fd175c6973ef7c896133c228724a7a17e38eb9b1",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1",
+        "CAMELID_SPEC_DECODE": "suffix",
+        "CAMELID_SPEC_GPU": "1",
+        "CAMELID_SPEC_DRAFT_TOKENS": "15"
+      }
+    },
+    {
+      "profile": "v4suffix",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 35.40081275,
+      "prompt_ms": 26275.983,
+      "decode_ms": 9103.017,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 16.917468131719406,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "baseline",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 88.713
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "d0bcc81a97dd716a715e28fbd7001cdfea0cb773b043b549b76d5e0ac053a62a",
+      "profile_env": {
+        "CAMELID_KQUANT_V4": "1",
+        "CAMELID_METAL_ATTN_BATCH_K": "1",
+        "CAMELID_SPEC_VERIFY_BATCH_GLUE": "1",
+        "CAMELID_SPEC_DECODE": "suffix",
+        "CAMELID_SPEC_GPU": "1",
+        "CAMELID_SPEC_DRAFT_TOKENS": "15"
+      }
+    },
+    {
+      "profile": "qwenmm",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 3.3911385829999983,
+      "prompt_ms": 962.9490000000001,
+      "decode_ms": 2376.051,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 29.460647098904865,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 3.5198245829999983,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 128.686
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenmm",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 6.123802041000001,
+      "prompt_ms": 965.9680000000001,
+      "decode_ms": 5081.032,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 29.915182584955183,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 6.2354480410000015,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 111.646
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenmm",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 15.23026075,
+      "prompt_ms": 8618.304999999998,
+      "decode_ms": 6552.6950000000015,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.50178056509573,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 88.37
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenmm",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 15.352601208000003,
+      "prompt_ms": 8703.917,
+      "decode_ms": 6590.0830000000005,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.368446194076764,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.668
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 3.3845989170000053,
+      "prompt_ms": 959.646,
+      "decode_ms": 2373.3540000000003,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 29.494125191606475,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 3.5125759170000053,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 127.977
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 6.147567583000004,
+      "prompt_ms": 941.876,
+      "decode_ms": 5129.124,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 29.634690056235726,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 6.2659735830000045,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 118.406
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 15.213968667000003,
+      "prompt_ms": 8606.416000000001,
+      "decode_ms": 6548.583999999999,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.516534261452556,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.567
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 7.045921666000012,
+      "prompt_ms": 443.501,
+      "decode_ms": 6545.499,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.52761798603896,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [
+        {
+          "reused": 3283,
+          "total": 3312,
+          "prefilled": 29
+        }
+      ],
+      "same_kernel_ids_match": true,
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 88.021
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    },
+    {
+      "profile": "v3",
+      "case": "lower_bound",
+      "variant": "cold",
+      "wall_seconds": 3.5644427499999978,
+      "prompt_ms": 1121.116,
+      "decode_ms": 2389.884,
+      "prompt_tokens": 311,
+      "output_tokens": 71,
+      "decode_tokens_per_second": 29.29012454160955,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 3.6922757499999976,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 95,
+        "tests_total": 95,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 127.833
+      },
+      "request_sha256": "ecdecf48d0fe1a56db6c3af7cc37c4e13fc8963fa1371b629f17cd0a2a4f0c85",
+      "output_token_ids_sha256": "61951592cbf2582e514c28e641e985160335d76928e0b81ac0c6b32990c8750e",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      },
+      "baseline_control_token_ids_match": true
+    },
+    {
+      "profile": "v3",
+      "case": "merge_intervals",
+      "variant": "cold",
+      "wall_seconds": 6.196498000000005,
+      "prompt_ms": 1103.926,
+      "decode_ms": 5016.0740000000005,
+      "prompt_tokens": 283,
+      "output_tokens": 153,
+      "decode_tokens_per_second": 30.302583255350694,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": true,
+      "time_to_tested_code_seconds": 6.309802000000006,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": null,
+        "passed": true,
+        "syntax_valid": true,
+        "tests_passed": 34,
+        "tests_total": 34,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 113.304
+      },
+      "request_sha256": "d1f8e90d8a8a29ed61e475bd6f046ac1a9c252d5b339dc1291a253ee258ce143",
+      "output_token_ids_sha256": "7366c9f09ec3f0f6728ea28bb25eb49e1df0affd42ef125e68a457c6027103b4",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      },
+      "baseline_control_token_ids_match": true
+    },
+    {
+      "profile": "v3",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 32.544796792,
+      "prompt_ms": 25940.42,
+      "decode_ms": 6545.580000000002,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.527326837346724,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.181
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      },
+      "baseline_control_token_ids_match": true
+    },
+    {
+      "profile": "v3",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 32.86074166700001,
+      "prompt_ms": 26233.203999999998,
+      "decode_ms": 6568.796000000002,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.444174548882316,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "candidate",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.018
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1"
+      },
+      "baseline_control_token_ids_match": true
+    },
+    {
+      "profile": "qwenmm",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 15.247178292000001,
+      "prompt_ms": 8605.784,
+      "decode_ms": 6552.216,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.503498663658217,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "repeat",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.688
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenmm",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 15.311581375,
+      "prompt_ms": 8683.163,
+      "decode_ms": 6567.8369999999995,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.447597740321513,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "experiment": "repeat",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.238
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "select_jobs",
+      "variant": "cold",
+      "wall_seconds": 15.247799750000006,
+      "prompt_ms": 8623.93,
+      "decode_ms": 6536.07,
+      "prompt_tokens": 3293,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.561559163228058,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [],
+      "same_kernel_ids_match": true,
+      "experiment": "repeat",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.273
+      },
+      "request_sha256": "22f50c3e080074d463abae8ce687f308caba7ea09312d644777645fff4a08724",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    },
+    {
+      "profile": "qwenreuse",
+      "case": "select_jobs",
+      "variant": "extension",
+      "wall_seconds": 7.044040875,
+      "prompt_ms": 447.853,
+      "decode_ms": 6539.147,
+      "prompt_tokens": 3313,
+      "output_tokens": 155,
+      "decode_tokens_per_second": 23.550472255785042,
+      "finish_reason": "stop",
+      "prompt_cache_hit": false,
+      "passed": false,
+      "time_to_tested_code_seconds": null,
+      "gpu_prefix_reuse": [
+        {
+          "reused": 3283,
+          "total": 3312,
+          "prefilled": 29
+        }
+      ],
+      "same_kernel_ids_match": true,
+      "experiment": "repeat",
+      "validation": {
+        "completion_without_truncation": true,
+        "contract_valid": true,
+        "failure": "jobs-01: output type or value differs from oracle",
+        "passed": false,
+        "syntax_valid": true,
+        "tests_passed": 1,
+        "tests_total": 30,
+        "validator_version": "qwen-coding-ast-v2",
+        "duration_ms": 87.287
+      },
+      "request_sha256": "522c9710ee28d49b445d0289efafb04f9fd1109285b8b295936c3b9db2baa153",
+      "output_token_ids_sha256": "f1352a9832f2f3d73327c99ebaa20503f4e8cb54ea9adc18276203dbaf4fefd2",
+      "profile_env": {
+        "CAMELID_KQUANT_V3": "1",
+        "CAMELID_METAL_KQUANT_ATTN_MM": "1",
+        "CAMELID_METAL_QK_NORM_ATTN_MM": "1",
+        "CAMELID_QWEN_PREFIX_REUSE": "1",
+        "CAMELID_QWEN_PREFIX_TRACE": "1"
+      }
+    }
+  ],
+  "verification": {
+    "matrix_prefill_gpu_proof": {
+      "passed": true,
+      "total_split_pairs": [
+        [
+          192,
+          64
+        ],
+        [
+          257,
+          131
+        ],
+        [
+          4137,
+          4099
+        ]
+      ],
+      "kv_bit_identical": true,
+      "matrix_row_max_absolute_error": 3.176928e-05,
+      "matrix_row_max_relative_l2_error": 1.170254e-05,
+      "incompatible_provenance_rejected": true
+    },
+    "pending_graph_gpu_proof": {
+      "passed": true,
+      "equal_and_rewound_watermarks": true,
+      "signaled_and_unsignaled_graphs": true
+    },
+    "resident_parking_tests": {
+      "passed": 2,
+      "failed": 0
+    },
+    "validator_self_check": {
+      "checks": [
+        {
+          "name": "golden-merge_intervals",
+          "passed": true
+        },
+        {
+          "name": "fenced-merge_intervals",
+          "passed": true
+        },
+        {
+          "name": "truncated-merge_intervals",
+          "passed": true
+        },
+        {
+          "name": "golden-lower_bound",
+          "passed": true
+        },
+        {
+          "name": "fenced-lower_bound",
+          "passed": true
+        },
+        {
+          "name": "truncated-lower_bound",
+          "passed": true
+        },
+        {
+          "name": "golden-select_jobs",
+          "passed": true
+        },
+        {
+          "name": "fenced-select_jobs",
+          "passed": true
+        },
+        {
+          "name": "truncated-select_jobs",
+          "passed": true
+        },
+        {
+          "name": "touching-must-merge",
+          "passed": true
+        },
+        {
+          "name": "normalize-reversed",
+          "passed": true
+        },
+        {
+          "name": "first-duplicate",
+          "passed": true
+        },
+        {
+          "name": "empty-and-tail",
+          "passed": true
+        },
+        {
+          "name": "stable-priorities",
+          "passed": true
+        },
+        {
+          "name": "zero-cost",
+          "passed": true
+        },
+        {
+          "name": "skip-oversized",
+          "passed": true
+        },
+        {
+          "name": "import-rejected",
+          "passed": true
+        },
+        {
+          "name": "host-call-rejected",
+          "passed": true
+        },
+        {
+          "name": "introspection-rejected",
+          "passed": true
+        },
+        {
+          "name": "recursion-rejected",
+          "passed": true
+        },
+        {
+          "name": "loop-bounded",
+          "passed": true
+        },
+        {
+          "name": "allocation-bounded",
+          "passed": true
+        },
+        {
+          "name": "input-mutation-rejected",
+          "passed": true
+        },
+        {
+          "name": "live-list-iteration",
+          "passed": true
+        },
+        {
+          "name": "live-enumerate-iteration",
+          "passed": true
+        },
+        {
+          "name": "live-zip-iteration",
+          "passed": true
+        },
+        {
+          "name": "lambda-late-binding",
+          "passed": true
+        },
+        {
+          "name": "generator-late-binding",
+          "passed": true
+        },
+        {
+          "name": "generator-short-circuit",
+          "passed": true
+        },
+        {
+          "name": "live-dict-view",
+          "passed": true
+        },
+        {
+          "name": "input-float-mutation",
+          "passed": true
+        },
+        {
+          "name": "input-bool-mutation",
+          "passed": true
+        },
+        {
+          "name": "nested-string-preflight",
+          "passed": true
+        }
+      ],
+      "checks_passed": 33,
+      "passed": true,
+      "validator_version": "qwen-coding-ast-v2"
+    },
+    "release_build": "passed on mini2 with CARGO_BUILD_JOBS=1"
+  },
+  "interpretation_limits": [
+    "Three direct Python tasks; extension repeats one task with a longer prompt.",
+    "No agent tools, project writes, repository test suite, or full agent loop.",
+    "Restricted AST interpreter is a narrow fixture, not general Python conformance.",
+    "Incorrect or truncated output has no time-to-tested-code value.",
+    "Matrix attention differs arithmetically from legacy row attention.",
+    "Cold excludes model load and server warm-up; SSE first-visible latency is not measured.",
+    "Raw responses remain in local ignored artifacts; public receipt retains hashes and validation."
+  ]
+}
