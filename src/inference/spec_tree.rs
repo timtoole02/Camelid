@@ -316,6 +316,13 @@ pub struct ScoredTokenTree {
     /// Stable expansion-lattice index for every verifier row.  Useful for gathering the
     /// corresponding recurrent state/KV row without relying on token ids being unique.
     pub source_node: Vec<usize>,
+    /// Verifier rows on the learned head's greedy primary spine, root first.
+    ///
+    /// The dynamic reranker deliberately selects this connected spine before spending its
+    /// remaining verifier budget on hedges.  Keeping the exact rows makes downstream,
+    /// benchmark-only hedge experiments preserve the learned primary proposal instead of trying
+    /// to reconstruct it from token ids or rounded scores.
+    pub primary_spine_rows: Vec<usize>,
 }
 
 impl ScoredTokenTree {
@@ -425,22 +432,67 @@ impl DynamicDraftLattice {
         if max_nodes == 0 {
             return Err("a verifier tree must retain at least its root".to_string());
         }
-        let mut selected: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| (usize::from(node.depth) <= max_depth).then_some(index))
-            .collect();
-        selected.sort_by(|&left, &right| {
-            self.nodes[right]
-                .cumulative_log_probability
-                .total_cmp(&self.nodes[left].cumulative_log_probability)
-                .then_with(|| self.nodes[left].depth.cmp(&self.nodes[right].depth))
-                .then_with(|| left.cmp(&right))
-        });
-        selected.truncate(max_nodes);
-        // The root is score 0/depth 0 and every child is <= it, so it must survive any
-        // non-empty truncation.  Keep this a checked contract rather than a debug-only claim.
+        let mut selected: Vec<usize> = Vec::with_capacity(max_nodes);
+        selected.push(0);
+
+        // 1. Trace the primary top-1 spine down to max_depth or max_nodes - 2 (leaving 2 hedge slots).
+        let spine_cap = max_nodes.saturating_sub(2).max(1).min(max_nodes);
+        let mut curr = 0usize;
+        while selected.len() < spine_cap && usize::from(self.nodes[curr].depth) < max_depth {
+            // Find child of curr with best probability
+            let best_child = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(idx, node)| {
+                    node.parent == Some(curr)
+                        && usize::from(node.depth) <= max_depth
+                        && !selected.contains(idx)
+                })
+                .max_by(|(_, a), (_, b)| {
+                    a.cumulative_log_probability
+                        .total_cmp(&b.cumulative_log_probability)
+                })
+                .map(|(idx, _)| idx);
+
+            if let Some(child) = best_child {
+                selected.push(child);
+                curr = child;
+            } else {
+                break;
+            }
+        }
+
+        // Capture the exact learned primary selection before hedge rows are added and before the
+        // verifier's BFS relayout.  Source-lattice ids are stable across both operations.
+        let primary_spine_sources = selected.clone();
+
+        // 2. Fill the remaining node budget with highest-scoring candidate nodes whose parents are in selected.
+        while selected.len() < max_nodes {
+            let next_best = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(idx, node)| {
+                    !selected.contains(idx)
+                        && usize::from(node.depth) <= max_depth
+                        && node.parent.is_some_and(|p| selected.contains(&p))
+                })
+                .max_by(|(_, a), (_, b)| {
+                    a.cumulative_log_probability
+                        .total_cmp(&b.cumulative_log_probability)
+                })
+                .map(|(idx, _)| idx);
+
+            if let Some(node) = next_best {
+                selected.push(node);
+            } else {
+                break;
+            }
+        }
+        // Upstream's checked contract, retained: the spine-first selection guarantees the root
+        // and parent closure by construction, but keep it a verified invariant rather than a
+        // debug-only claim so a future selector change cannot silently orphan a verifier row.
         if !selected.contains(&0) {
             return Err("dynamic draft rerank dropped the root".to_string());
         }
@@ -461,6 +513,10 @@ impl DynamicDraftLattice {
         for (row, &source) in selected.iter().enumerate() {
             remap[source] = row;
         }
+        let primary_spine_rows = primary_spine_sources
+            .iter()
+            .map(|&source| remap[source])
+            .collect();
 
         let mut tokens = Vec::with_capacity(selected.len());
         let mut parent = Vec::with_capacity(selected.len());
@@ -485,6 +541,7 @@ impl DynamicDraftLattice {
             },
             cumulative_log_probability,
             source_node: selected,
+            primary_spine_rows,
         })
     }
 }
@@ -806,6 +863,11 @@ mod tests {
         assert_eq!(
             plan.source_node,
             vec![0, first[0], first[1], under_11[0], under_12[0]]
+        );
+        assert_eq!(
+            plan.primary_spine_rows,
+            vec![0, 1, 3],
+            "the reranker must preserve its exact root -> 11 -> 13 primary selection"
         );
         for row in 1..plan.tree.nodes() {
             assert!(plan.tree.parent[row] < row as i32);

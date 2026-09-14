@@ -54,6 +54,13 @@ pub(crate) use server::{resolve_api_key, ApiAuth};
 pub use server::{ApiSurface, ServeOptions};
 
 use crate::{
+    eagle3::Eagle3DraftModel,
+    eagle3_serving::{
+        clamp_max_tokens_to_logical_budget as clamp_eagle3_max_tokens,
+        configured_logical_token_limit as configured_eagle3_logical_token_limit,
+        validate_logical_budget as validate_eagle3_logical_budget, Eagle3ServeHeadKey,
+        Eagle3ServingConfig, Eagle3ServingState, MAX_DRAFT_TOKENS as EAGLE3_MAX_DRAFT_TOKENS,
+    },
     embedding::{
         cosine_similarity, validate_bitnet_embedding_metadata, EmbeddingRuntime, EncoderConfig,
     },
@@ -104,6 +111,7 @@ const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
 const SPEC_DECODE_ENV: &str = "CAMELID_SPEC_DECODE";
 const SPEC_DRAFT_MODEL_ENV: &str = "CAMELID_SPEC_DRAFT_MODEL";
 const SPEC_DRAFT_TOKENS_ENV: &str = "CAMELID_SPEC_DRAFT_TOKENS";
+const EAGLE3_MODEL_ENV: &str = "CAMELID_EAGLE3_MODEL";
 const SPEC_NGRAM_MIN_ENV: &str = "CAMELID_SPEC_NGRAM_MIN";
 const SPEC_NGRAM_MAX_ENV: &str = "CAMELID_SPEC_NGRAM_MAX";
 const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
@@ -113,6 +121,22 @@ const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
 /// Reserved model id for the speculative draft model; loaded without becoming
 /// the active model.
 const SPEC_DRAFT_MODEL_ID: &str = "spec-draft";
+const EAGLE3_TARGET_SHA256: &str =
+    "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff";
+const EAGLE3_THOUGHTWORKS_SHA256: &str =
+    "c0713251464a9b6b5fcf9fb229587bbe59b6fd1521027aef32101d11b9ebbdaf";
+const EAGLE3_SHAREGPT_E8_SHA256: &str =
+    "0694d52a4c7ebf3d4f9bb833cf5f2610f0cc0d30bf62a2376e0b2ee06cbe3662";
+const EAGLE3_SHAREGPT_E8_CONFIG_SHA256: &str =
+    "1f6f8e7dcf67648757016925e28b09c40461e22b0ffe522b9abc9802ec14eff8";
+const EAGLE3_SHAREGPT_E9_SHA256: &str =
+    "0192ee37dff4b7a86d13011d40e9cf622b331fe76f637d7d1ea24c4b81574304";
+const EAGLE3_SHAREGPT_E9_CONFIG_SHA256: &str =
+    "a5b3a9b3674e3233cdc4f34d201a7c366a2b089ec00a41a9da6b430ca8fd3136";
+const EAGLE3_SHAREGPT_SW512_E9_SHA256: &str =
+    "cf879511aa0e931ac2cfdaf0cc3dfa2e1ec9773c41f3c093a967420222fa84d0";
+const EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256: &str =
+    "c7997a68fd0f2324b41ab779c13909115b67cac9a36f758cc5b542cba12c2568";
 const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
@@ -121,6 +145,18 @@ const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
 
 static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environment<'static>>>>> =
     OnceLock::new();
+
+struct CachedEagle3Checkpoint {
+    path: PathBuf,
+    sha256: String,
+    model: Arc<Eagle3DraftModel>,
+}
+
+/// Host-side EAGLE checkpoint cache: avoids re-reading and reallocating the
+/// checkpoint on every chat. The Metal-resident upload built from it is
+/// pooled separately (`eagle3_serving::Eagle3ServeHeadKey`), so a pool miss
+/// re-uploads from these bytes without touching disk.
+static EAGLE3_CHECKPOINT_CACHE: OnceLock<Mutex<Option<CachedEagle3Checkpoint>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -658,6 +694,24 @@ pub struct HealthResponse {
     /// up to the hard bound this server enforces.
     pub vision_token_allowance: Option<u32>,
     pub active_model_id: Option<String>,
+    /// Active speculative serving mode. Omitted for ordinary decode so older
+    /// clients retain their existing behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative_decode: Option<&'static str>,
+    /// Exact prompt-plus-output envelope for serving lanes with a narrower
+    /// verified context than the model metadata advertises.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_token_limit: Option<usize>,
+    /// Effective context exposed for WebUI budgeting. These are present for
+    /// EAGLE-3 because its explicitly selected serving rung can be narrower
+    /// than Llama's model-native metadata. Named separately from the
+    /// server-limit ceilings above, which they do NOT replace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eagle3_active_context_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eagle3_max_prompt_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eagle3_max_generation_tokens: Option<u32>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
     /// Which backend serves the active model: "gemma4-runtime", "runnable-runtime",
@@ -2263,6 +2317,21 @@ enum SpecDecodeMode {
     /// Suffix-decoding drafting, flattened to a chain so it rides the batched
     /// column verify rather than the (much more expensive) tree verify.
     Suffix,
+    /// Pinned Qwen3-4B / Llama-3.2-3B EAGLE-3 suffix-first verification with the
+    /// bounded N8/K4/X5 learned-tree fallback (operator-overridable through
+    /// `CAMELID_EAGLE3_SERVE_TREE_{NODES,TOP_K,EXPANSIONS}`).
+    Eagle3,
+}
+
+impl SpecDecodeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NGram => "ngram",
+            Self::DraftModel => "draft",
+            Self::Suffix => "suffix",
+            Self::Eagle3 => "eagle3",
+        }
+    }
 }
 
 fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
@@ -2270,6 +2339,7 @@ fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
         Ok(value) if value.eq_ignore_ascii_case("ngram") => Some(SpecDecodeMode::NGram),
         Ok(value) if value.eq_ignore_ascii_case("draft") => Some(SpecDecodeMode::DraftModel),
         Ok(value) if value.eq_ignore_ascii_case("suffix") => Some(SpecDecodeMode::Suffix),
+        Ok(value) if value.eq_ignore_ascii_case("eagle3") => Some(SpecDecodeMode::Eagle3),
         _ => None,
     }
 }
@@ -2309,6 +2379,213 @@ fn spec_draft_tokens_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn eagle3_draft_tokens_from_env() -> std::result::Result<usize, String> {
+    let draft_tokens = match env::var(SPEC_DRAFT_TOKENS_ENV) {
+        Ok(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{SPEC_DRAFT_TOKENS_ENV} must be an integer in 1..={EAGLE3_MAX_DRAFT_TOKENS}, got {value:?}"
+            )
+        })?,
+        Err(_) => EAGLE3_MAX_DRAFT_TOKENS,
+    };
+    if !(1..=EAGLE3_MAX_DRAFT_TOKENS).contains(&draft_tokens) {
+        return Err(format!(
+            "{SPEC_DRAFT_TOKENS_ENV} must be in 1..={EAGLE3_MAX_DRAFT_TOKENS}, got {draft_tokens}"
+        ));
+    }
+    Ok(draft_tokens)
+}
+
+fn eagle3_target_contract_error(config: &LlamaModelConfig, target_sha256: &str) -> Option<String> {
+    let geometry_matches = config.architecture == "llama"
+        && config.embedding_length == 3_072
+        && config.block_count == 28
+        && config.feed_forward_length == 8_192
+        && config.attention_head_count == 24
+        && config.attention_head_count_kv == 8
+        && config.vocab_size == Some(128_256);
+    let qwen_matches = target_sha256 == crate::eagle3::QWEN_TARGET_SHA256
+        && config.architecture == "qwen3"
+        && config.embedding_length == 2560
+        && config.block_count == 36
+        && config.feed_forward_length == 9728
+        && config.attention_head_count == 32
+        && config.attention_head_count_kv == 8
+        && config.vocab_size == Some(151936);
+    if (target_sha256.eq_ignore_ascii_case(EAGLE3_TARGET_SHA256) && geometry_matches)
+        || qwen_matches
+    {
+        None
+    } else {
+        Some(format!(
+            "EAGLE-3 serving requires a pinned Qwen3-4B or Llama-3.2-3B target; Llama SHA-256 {EAGLE3_TARGET_SHA256} and geometry llama/3072/28/8192/24/8/128256; got sha256={target_sha256}, arch={}, hidden={}, layers={}, ffn={}, heads={}/{}, vocab={:?}",
+            config.architecture,
+            config.embedding_length,
+            config.block_count,
+            config.feed_forward_length,
+            config.attention_head_count,
+            config.attention_head_count_kv,
+            config.vocab_size,
+        ))
+    }
+}
+
+/// Returns the host checkpoint and its weights SHA-256 (the serve head pool's
+/// identity component).
+fn load_eagle3_checkpoint_cached(
+    path: &std::path::Path,
+) -> crate::error::Result<(Arc<Eagle3DraftModel>, String)> {
+    let weights_path = path.join("model.safetensors");
+    let sha256 = receipt::sha256_file_hex_cached(&weights_path).map_err(|error| {
+        BackendError::InvalidModelMetadata(format!(
+            "could not hash EAGLE-3 checkpoint {}: {error}",
+            weights_path.display()
+        ))
+    })?;
+    let is_pinned_serving_artifact = sha256 == crate::eagle3::QWEN_WEIGHTS_SHA256
+        || sha256 == EAGLE3_THOUGHTWORKS_SHA256
+        || sha256 == EAGLE3_SHAREGPT_E8_SHA256
+        || sha256 == EAGLE3_SHAREGPT_E9_SHA256
+        || sha256 == EAGLE3_SHAREGPT_SW512_E9_SHA256;
+    let derived_provenance = if is_pinned_serving_artifact {
+        None
+    } else {
+        crate::eagle3::require_derived_opt_in()?;
+        Some(crate::eagle3::validate_derived_checkpoint(path, &sha256)?)
+    };
+    let pinned_sharegpt_config = match sha256.as_str() {
+        crate::eagle3::QWEN_WEIGHTS_SHA256 => Some(("Qwen3-4B", crate::eagle3::QWEN_CONFIG_SHA256)),
+        EAGLE3_SHAREGPT_E8_SHA256 => Some(("ShareGPT-E8", EAGLE3_SHAREGPT_E8_CONFIG_SHA256)),
+        EAGLE3_SHAREGPT_E9_SHA256 => Some(("ShareGPT-E9", EAGLE3_SHAREGPT_E9_CONFIG_SHA256)),
+        EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
+            Some(("ShareGPT-SW512-E9", EAGLE3_SHAREGPT_SW512_E9_CONFIG_SHA256))
+        }
+        _ => None,
+    };
+    if let Some((label, expected_config_sha256)) = pinned_sharegpt_config {
+        let config_path = path.join("config.json");
+        let config_sha256 = receipt::sha256_file_hex_cached(&config_path).map_err(|error| {
+            BackendError::InvalidModelMetadata(format!(
+                "could not hash EAGLE-3 config {}: {error}",
+                config_path.display()
+            ))
+        })?;
+        if config_sha256 != expected_config_sha256 {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{label} EAGLE-3 config SHA-256 is {config_sha256}, expected {expected_config_sha256}"
+            )));
+        }
+    }
+    let cache = EAGLE3_CHECKPOINT_CACHE.get_or_init(|| Mutex::new(None));
+    let cached_model = {
+        let guard = cache
+            .lock()
+            .expect("EAGLE-3 checkpoint cache mutex poisoned");
+        guard
+            .as_ref()
+            .filter(|hit| hit.path == path && hit.sha256 == sha256)
+            .map(|hit| Arc::clone(&hit.model))
+    };
+    if let Some(model) = cached_model {
+        return Ok((model, sha256));
+    }
+
+    let model = Arc::new(Eagle3DraftModel::load(path)?);
+    let config_contract_sha256 = derived_provenance
+        .as_ref()
+        .map(|provenance| provenance.source_weights_sha256.as_str())
+        .unwrap_or(sha256.as_str());
+    // One config contract per pinned checkpoint, re-checked against the config the full loader
+    // parsed. Only a pinned contract SHA-256 can reach this point: a pinned serving artifact
+    // carries one of the four pins itself, and a derived checkpoint is admitted only by
+    // `eagle3::validate_derived_checkpoint`, which rejects any training receipt whose
+    // `source_weights_sha256` is outside `eagle3::PINNED_WEIGHTS_SHA256` (the same four hashes).
+    // The default arm is the fail-closed backstop for a pin added to that set without a contract
+    // here: an unrecognized contract is rejected, never validated against the newest pin. This is
+    // the same table as `eagle3::config_matches_pinned_source` (whose `_ => false` it mirrors);
+    // the two must be updated together.
+    let config_variant_matches = match config_contract_sha256 {
+        crate::eagle3::QWEN_WEIGHTS_SHA256 => {
+            model.config.geometry() == crate::eagle3::Eagle3Geometry::QWEN
+                && model.config.architectures == ["Eagle3LlamaForCausalLM"]
+                && model.config.rope_theta == 1_000_000.0
+                && model.config.sliding_window.is_none()
+        }
+        EAGLE3_THOUGHTWORKS_SHA256 => {
+            model.config.architectures == ["LlamaForCausalLM"]
+                && model.config.rope_theta == crate::eagle3::ROPE_THETA
+                && model.config.sliding_window.is_none()
+        }
+        EAGLE3_SHAREGPT_E8_SHA256 => {
+            model.config.architectures == ["LlamaForCausalLMEagle3"]
+                && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+                && model.config.sliding_window.is_none()
+        }
+        EAGLE3_SHAREGPT_E9_SHA256 => {
+            model.config.architectures == ["LlamaForCausalLMEagle3"]
+                && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+                && model.config.sliding_window == Some(256)
+        }
+        EAGLE3_SHAREGPT_SW512_E9_SHA256 => {
+            model.config.architectures == ["LlamaForCausalLMEagle3"]
+                && model.config.rope_theta == crate::eagle3::SHAREGPT_ROPE_THETA
+                && model.config.sliding_window == Some(512)
+        }
+        unpinned => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "EAGLE-3 config contract SHA-256 {unpinned} is not a pinned EAGLE-3 contract (checkpoint SHA-256 {sha256})"
+            )));
+        }
+    };
+    if !config_variant_matches {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "EAGLE-3 checkpoint/config pairing is invalid for model SHA-256 {sha256} (config contract SHA-256 {config_contract_sha256}): architectures={:?}, rope_theta={}, sliding_window={:?}",
+            model.config.architectures, model.config.rope_theta, model.config.sliding_window
+        )));
+    }
+    *cache
+        .lock()
+        .expect("EAGLE-3 checkpoint cache mutex poisoned") = Some(CachedEagle3Checkpoint {
+        path: path.to_path_buf(),
+        sha256: sha256.clone(),
+        model: Arc::clone(&model),
+    });
+    Ok((model, sha256))
+}
+
+#[cfg(test)]
+mod eagle3_contract_pin_tests {
+    use super::{
+        EAGLE3_SHAREGPT_E8_SHA256, EAGLE3_SHAREGPT_E9_SHA256, EAGLE3_SHAREGPT_SW512_E9_SHA256,
+        EAGLE3_THOUGHTWORKS_SHA256,
+    };
+    use crate::eagle3::PINNED_WEIGHTS_SHA256;
+
+    /// `load_eagle3_checkpoint_cached` admits a checkpoint either as a pinned serving artifact
+    /// (matched on its own weights SHA-256) or as a derived checkpoint (matched on its receipt's
+    /// `source_weights_sha256`, which `eagle3::validate_derived_checkpoint` constrains to
+    /// `PINNED_WEIGHTS_SHA256`). Its per-variant config contract table covers exactly the four
+    /// hashes below and rejects anything else. Keeping the two sets equal is what keeps that
+    /// rejecting arm unreachable for a legitimately admitted checkpoint: a pin added on one side
+    /// only must be given a config contract on the other.
+    #[test]
+    fn serve_pin_set_matches_the_derived_source_pin_set() {
+        let mut serve_pins = [
+            EAGLE3_THOUGHTWORKS_SHA256,
+            EAGLE3_SHAREGPT_E8_SHA256,
+            EAGLE3_SHAREGPT_E9_SHA256,
+            EAGLE3_SHAREGPT_SW512_E9_SHA256,
+        ];
+        serve_pins.sort_unstable();
+        let mut derived_pins = PINNED_WEIGHTS_SHA256;
+        derived_pins.sort_unstable();
+        assert_eq!(
+            serve_pins, derived_pins,
+            "the serve config-contract table and eagle3::PINNED_WEIGHTS_SHA256 must pin the same checkpoints"
+        );
+    }
+}
+
 fn spec_ngram_min_from_env() -> usize {
     env::var(SPEC_NGRAM_MIN_ENV)
         .ok()
@@ -2336,12 +2613,43 @@ fn prompt_prefix_cache_min_tokens_from_env() -> usize {
 /// Per-request speculative decoding state: the drafter plus round counters
 /// for the end-of-request acceptance summary.
 struct PreparedSpeculative {
-    drafter: SpeculativeDrafter,
+    drafter: PreparedSpeculativeDrafter,
     draft_tokens: usize,
     latch: SpecLatch,
     rounds: u64,
     drafted: u64,
     accepted_drafts: u64,
+    verify_nodes: u64,
+    suffix_rounds: u64,
+    learned_rounds: u64,
+    suffix_candidate_rounds: u64,
+    suffix_confidence_declines: u64,
+    suffix_raw_depth_sum: u64,
+    suffix_confident_depth_sum: u64,
+    suffix_root_match_len_sum: u64,
+    suffix_root_support_sum: u64,
+    suffix_root_branch_count_sum: u64,
+    suffix_expected_accepted_q16_sum: u64,
+    suffix_terminal_survival_q16_sum: u64,
+}
+
+enum PreparedSpeculativeDrafter {
+    Standard(SpeculativeDrafter),
+    Eagle3(Box<Eagle3ServingState>),
+}
+
+impl PreparedSpeculative {
+    fn is_eagle3(&self) -> bool {
+        matches!(self.drafter, PreparedSpeculativeDrafter::Eagle3(_))
+    }
+}
+
+impl PreparedGeneration {
+    fn is_eagle3(&self) -> bool {
+        self.speculative
+            .as_ref()
+            .is_some_and(PreparedSpeculative::is_eagle3)
+    }
 }
 
 /// One token's logprob plus its decoded piece and raw UTF-8 bytes (OpenAI-shaped).
@@ -2993,6 +3301,14 @@ pub async fn serve(
     models_dir: Option<PathBuf>,
     options: ServeOptions,
 ) -> std::io::Result<()> {
+    // Reject a misspelled or unqualified EAGLE context rung before binding the
+    // listener. Health and request admission must never disagree about the
+    // active logical envelope.
+    if spec_decode_mode_from_env() == Some(SpecDecodeMode::Eagle3) {
+        configured_eagle3_logical_token_limit().map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+    }
     let policy = server::ServerPolicy::resolve(addr, options)?;
     let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
@@ -3665,6 +3981,15 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         crate::inference::deterministic_mode_enabled(),
     );
     let slot = state.engine.slot_snapshot();
+    let speculative_decode = spec_decode_mode_from_env();
+    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
+        Some(
+            configured_eagle3_logical_token_limit()
+                .expect("EAGLE-3 logical token rung was validated before server bind"),
+        )
+    } else {
+        None
+    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3679,6 +4004,17 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         vision_ready,
         vision_token_allowance: vision_ready.then_some(DEFAULT_MAX_IMAGE_TOKENS),
         active_model_id: active_id_lock.clone(),
+        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
+        logical_token_limit: eagle3_logical_limit,
+        eagle3_active_context_length: eagle3_logical_limit,
+        eagle3_max_prompt_tokens: eagle3_logical_limit.map(|limit| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(limit.saturating_sub(1))
+        }),
+        eagle3_max_generation_tokens: eagle3_logical_limit
+            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan,
         backend,
@@ -3787,6 +4123,15 @@ async fn purge_kv_cache(State(state): State<AppState>) -> Json<PurgeKvCacheRespo
 /// live. The process is alive and serving, so `ok` remains true.
 fn busy_health_response(state: &AppState) -> HealthResponse {
     let slot = state.engine.slot_snapshot();
+    let speculative_decode = spec_decode_mode_from_env();
+    let eagle3_logical_limit = if speculative_decode == Some(SpecDecodeMode::Eagle3) {
+        Some(
+            configured_eagle3_logical_token_limit()
+                .expect("EAGLE-3 logical token rung was validated before server bind"),
+        )
+    } else {
+        None
+    };
     HealthResponse {
         ok: true,
         engine: "camelid",
@@ -3803,6 +4148,17 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         // whether vision is ready — reporting an allowance here would be a guess.
         vision_token_allowance: None,
         active_model_id: None,
+        speculative_decode: speculative_decode.map(SpecDecodeMode::as_str),
+        logical_token_limit: eagle3_logical_limit,
+        eagle3_active_context_length: eagle3_logical_limit,
+        eagle3_max_prompt_tokens: eagle3_logical_limit.map(|limit| {
+            state
+                .server_limits
+                .max_prompt_tokens
+                .min(limit.saturating_sub(1))
+        }),
+        eagle3_max_generation_tokens: eagle3_logical_limit
+            .map(|limit| state.server_limits.max_generation_tokens.min(limit as u32)),
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
         backend: health_backend(false, false, false, false),
@@ -20345,6 +20701,110 @@ enum SpeculativeRound {
     Committed,
 }
 
+fn commit_target_tokens(
+    prepared: &PreparedGeneration,
+    emitted: &[u32],
+    generated: &mut Vec<u32>,
+    history: &mut Vec<u32>,
+    finish_reason: &mut &'static str,
+) -> std::result::Result<(), Box<Response>> {
+    for &token in emitted {
+        if generated.len() >= prepared.max_tokens as usize {
+            break;
+        }
+        generated.push(token);
+        history.push(token);
+        prepared.engine_progress.record_progress(generated.len());
+        if prepared.tokenizer.special.eog.contains(&token) {
+            *finish_reason = "stop";
+            break;
+        }
+        if !prepared.stop_sequences.is_empty() {
+            let text = prepared
+                .tokenizer
+                .decode(generated.as_slice(), true)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "token_decode_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
+            if contains_stop_sequence(&text, &prepared.stop_sequences) {
+                *finish_reason = "stop";
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bootstrap_eagle3_generation(
+    prepared: &mut PreparedGeneration,
+    input: &mut Vec<u32>,
+    generated: &mut Vec<u32>,
+    history: &mut Vec<u32>,
+    finish_reason: &mut &'static str,
+) -> std::result::Result<Option<LlamaForwardTimings>, Box<Response>> {
+    if !prepared.is_eagle3() {
+        return Ok(None);
+    }
+    let already_initialized =
+        prepared
+            .speculative
+            .as_ref()
+            .is_some_and(|spec| match &spec.drafter {
+                PreparedSpeculativeDrafter::Eagle3(state) => state.is_initialized(),
+                PreparedSpeculativeDrafter::Standard(_) => false,
+            });
+    if already_initialized {
+        return Ok(None);
+    }
+    if !generated.is_empty() || history.as_slice() != prepared.token_ids.as_slice() {
+        return Err(Box::new(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "eagle3_bootstrap_state_invalid",
+            "EAGLE-3 bootstrap requires untouched prompt history".to_string(),
+            None,
+        )));
+    }
+    let weights = Arc::clone(&prepared.session.weights);
+    let prompt_tokens = prepared.token_ids.clone();
+    let max_tokens = prepared.max_tokens as usize;
+    let bootstrap = {
+        let (session, speculative) = (&mut prepared.session, &mut prepared.speculative);
+        let spec = speculative
+            .as_mut()
+            .expect("EAGLE-3 speculative state checked above");
+        let PreparedSpeculativeDrafter::Eagle3(state) = &mut spec.drafter else {
+            unreachable!("EAGLE-3 variant changed during bootstrap")
+        };
+        state
+            .bootstrap(session, &weights, &prompt_tokens, max_tokens)
+            .map_err(|error| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "eagle3_bootstrap_failed",
+                    error.to_string(),
+                    None,
+                ))
+            })?
+    };
+    commit_target_tokens(
+        prepared,
+        &[bootstrap.first_token],
+        generated,
+        history,
+        finish_reason,
+    )?;
+    input.clear();
+    if *finish_reason == "length" {
+        input.push(bootstrap.first_token);
+    }
+    Ok(Some(bootstrap.timings))
+}
+
 /// One lossless speculative round: draft, verify in a single batched target
 /// forward, commit the accepted prefix.
 ///
@@ -20375,9 +20835,81 @@ fn run_speculative_round(
     if !eligible || input.len() != 1 {
         return Ok(SpeculativeRound::Declined);
     }
-    let Some(spec) = prepared.speculative.as_mut() else {
+    let Some(is_eagle3) = prepared
+        .speculative
+        .as_ref()
+        .map(PreparedSpeculative::is_eagle3)
+    else {
         return Ok(SpeculativeRound::Declined);
     };
+    if is_eagle3 {
+        let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
+        let weights = Arc::clone(&prepared.session.weights);
+        let round = {
+            let (session, speculative) = (&mut prepared.session, &mut prepared.speculative);
+            let spec = speculative.as_mut().expect("EAGLE-3 spec checked above");
+            let PreparedSpeculativeDrafter::Eagle3(state) = &mut spec.drafter else {
+                unreachable!("EAGLE-3 variant changed inside one round")
+            };
+            state
+                .run_round(session, &weights, history, remaining)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "eagle3_round_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?
+        }
+        .ok_or_else(|| {
+            Box::new(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "eagle3_context_exhausted",
+                "EAGLE-3 target context was exhausted before the requested output completed"
+                    .to_string(),
+                None,
+            ))
+        })?;
+        forward_timings.add_assign(&round.timings);
+        {
+            let spec = prepared
+                .speculative
+                .as_mut()
+                .expect("EAGLE-3 spec remains installed");
+            let evidence = round.suffix_evidence;
+            if evidence.raw_depth > 0 {
+                spec.suffix_candidate_rounds += 1;
+                spec.suffix_raw_depth_sum += evidence.raw_depth as u64;
+                spec.suffix_confident_depth_sum += evidence.confident_depth as u64;
+                spec.suffix_root_match_len_sum += evidence.root_match_len as u64;
+                spec.suffix_root_support_sum += evidence.root_support as u64;
+                spec.suffix_root_branch_count_sum += evidence.root_branch_count as u64;
+                spec.suffix_expected_accepted_q16_sum += evidence.expected_accepted_q16 as u64;
+                spec.suffix_terminal_survival_q16_sum += evidence.terminal_survival_q16 as u64;
+                if !evidence.admitted {
+                    spec.suffix_confidence_declines += 1;
+                }
+            }
+            if round.offered > 0 {
+                spec.rounds += 1;
+                spec.drafted += round.offered as u64;
+                spec.accepted_drafts += round.emitted.len().saturating_sub(1) as u64;
+                spec.verify_nodes += round.verify_nodes as u64;
+                if round.suffix {
+                    spec.suffix_rounds += 1;
+                } else {
+                    spec.learned_rounds += 1;
+                }
+            }
+        }
+        commit_target_tokens(prepared, &round.emitted, generated, history, finish_reason)?;
+        return Ok(SpeculativeRound::Committed);
+    }
+    let spec = prepared
+        .speculative
+        .as_mut()
+        .expect("standard speculative state checked above");
     if !spec.latch.should_speculate() {
         spec.latch.note_skip();
         return Ok(SpeculativeRound::Declined);
@@ -20389,7 +20921,10 @@ fn run_speculative_round(
             .draft_tokens
             .min(remaining.saturating_sub(1))
             .min(context_room.saturating_sub(1));
-        spec.drafter
+        let PreparedSpeculativeDrafter::Standard(drafter) = &mut spec.drafter else {
+            unreachable!("EAGLE-3 handled above")
+        };
+        drafter
             .draft(history.as_slice(), draft_budget)
             .map_err(|err| {
                 Box::new(api_error(
@@ -20436,6 +20971,7 @@ fn run_speculative_round(
         spec.rounds += 1;
         spec.drafted += drafts.len() as u64;
         spec.accepted_drafts += accepted_count;
+        spec.verify_nodes += (drafts.len() + 1) as u64;
         spec.latch.note_verified(accepted_count as u32);
         acc
     } else {
@@ -20512,6 +21048,7 @@ fn run_speculative_round(
         spec.rounds += 1;
         spec.drafted += drafts.len() as u64;
         spec.accepted_drafts += accepted as u64;
+        spec.verify_nodes += (drafts.len() + 1) as u64;
         spec.latch.note_verified(accepted as u32);
         forward_timings.add_assign(&round_timings);
         round_emitted
@@ -20519,32 +21056,7 @@ fn run_speculative_round(
     // A stop reason inside the accepted run truncates it: the tokens after the
     // stop are verified but never emitted, exactly as a sequential run would
     // have stopped there.
-    for &token in &emitted {
-        generated.push(token);
-        history.push(token);
-        prepared.engine_progress.record_progress(generated.len());
-        if prepared.tokenizer.special.eog.contains(&token) {
-            *finish_reason = "stop";
-            break;
-        }
-        if !prepared.stop_sequences.is_empty() {
-            let text = prepared
-                .tokenizer
-                .decode(generated.as_slice(), true)
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "token_decode_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?;
-            if contains_stop_sequence(&text, &prepared.stop_sequences) {
-                *finish_reason = "stop";
-                break;
-            }
-        }
-    }
+    commit_target_tokens(prepared, &emitted, generated, history, finish_reason)?;
     Ok(SpeculativeRound::Committed)
 }
 
@@ -20869,6 +21381,25 @@ async fn prepare_generation(
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens),
     };
+    // EAGLE-3 has a deliberately narrower verified logical envelope than the
+    // target GGUF's native context metadata. Apply the same API contract as the
+    // generic context clamp above: max_tokens is an upper bound, so shorten it
+    // to the exact room left after authoritative tokenization. Prompts that
+    // already fill the EAGLE envelope still fail closed.
+    let max_tokens = if speculative_mode == Some(SpecDecodeMode::Eagle3) {
+        clamp_eagle3_max_tokens(token_ids.len(), max_tokens as usize)
+            .map(|value| value as u32)
+            .map_err(|error| {
+                api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "eagle3_context_limit_exceeded",
+                    error.to_string(),
+                    Some("prompt"),
+                )
+            })?
+    } else {
+        max_tokens
+    };
     // Enforce the operator's ceiling against the effective generation budget,
     // after preserving the existing API contract that max_tokens is clamped to
     // the model's remaining context. A huge request on a tiny context therefore
@@ -21024,6 +21555,25 @@ async fn prepare_generation(
     // `speculation_admissible` for the remaining disqualifiers.
     let speculative = match speculative_mode {
         None => None,
+        Some(SpecDecodeMode::Eagle3)
+            if !speculation_admissible(
+                &sampling,
+                collect_dense_diagnostics,
+                !logit_diagnostic_token_ids.is_empty(),
+                session.weights.layer_range.is_some(),
+                &session.config,
+            ) || matches!(req.chat_logprobs, Some(true))
+                || req.completion_logprobs.is_some()
+                || req.constraint.is_some() =>
+        {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "eagle3_request_unsupported",
+                "CAMELID_SPEC_DECODE=eagle3 requires unconstrained greedy generation with no logprobs, dense/logit diagnostics, or pipeline sharding"
+                    .to_string(),
+                None,
+            ));
+        }
         Some(_)
             if !speculation_admissible(
                 &sampling,
@@ -21036,38 +21586,213 @@ async fn prepare_generation(
             None
         }
         Some(SpecDecodeMode::Suffix) => Some(PreparedSpeculative {
-            drafter: SpeculativeDrafter::suffix(),
+            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::suffix()),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
+            verify_nodes: 0,
+            suffix_rounds: 0,
+            learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
-            drafter: SpeculativeDrafter::NGram(NGramDrafter::new(
-                spec_ngram_min_from_env(),
-                spec_ngram_max_from_env(),
+            drafter: PreparedSpeculativeDrafter::Standard(SpeculativeDrafter::NGram(
+                NGramDrafter::new(spec_ngram_min_from_env(), spec_ngram_max_from_env()),
             )),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
+            verify_nodes: 0,
+            suffix_rounds: 0,
+            learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
         Some(SpecDecodeMode::DraftModel) => Some(PreparedSpeculative {
-            drafter: build_model_drafter(state, &model, &tokenizer).await?,
+            drafter: PreparedSpeculativeDrafter::Standard(
+                build_model_drafter(state, &model, &tokenizer).await?,
+            ),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_MODEL_DRAFT_TOKENS),
             latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
+            verify_nodes: 0,
+            suffix_rounds: 0,
+            learned_rounds: 0,
+            suffix_candidate_rounds: 0,
+            suffix_confidence_declines: 0,
+            suffix_raw_depth_sum: 0,
+            suffix_confident_depth_sum: 0,
+            suffix_root_match_len_sum: 0,
+            suffix_root_support_sum: 0,
+            suffix_root_branch_count_sum: 0,
+            suffix_expected_accepted_q16_sum: 0,
+            suffix_terminal_survival_q16_sum: 0,
         }),
+        Some(SpecDecodeMode::Eagle3) => {
+            validate_eagle3_logical_budget(token_ids.len(), max_tokens as usize).map_err(
+                |error| {
+                    api_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "eagle3_context_limit_exceeded",
+                        error.to_string(),
+                        Some("max_tokens"),
+                    )
+                },
+            )?;
+            if token_ids.len() < 3 {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "eagle3_prompt_too_short",
+                    format!(
+                        "EAGLE-3 resident activation capture needs at least 3 prompt tokens, got {}",
+                        token_ids.len()
+                    ),
+                    Some("prompt"),
+                ));
+            }
+            if let Some(message) = eagle3_target_contract_error(config, &model.lane.gguf_sha256) {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "eagle3_target_mismatch",
+                    message,
+                    Some("model"),
+                ));
+            }
+            let draft_tokens = eagle3_draft_tokens_from_env().map_err(|message| {
+                api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "eagle3_invalid_width",
+                    message,
+                    None,
+                )
+            })?;
+            let config = Eagle3ServingConfig::new(draft_tokens).map_err(|error| {
+                api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "eagle3_invalid_width",
+                    error.to_string(),
+                    None,
+                )
+            })?;
+            let sidecar_path = env::var_os(EAGLE3_MODEL_ENV)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "eagle3_model_missing",
+                        format!(
+                            "CAMELID_SPEC_DECODE=eagle3 requires {EAGLE3_MODEL_ENV} to point at a pinned EAGLE-3 checkpoint directory"
+                        ),
+                        None,
+                    )
+                })?;
+            let checkpoint_path = sidecar_path.clone();
+            let (checkpoint, checkpoint_sha256) =
+                tokio::task::spawn_blocking(move || load_eagle3_checkpoint_cached(&sidecar_path))
+                    .await
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "eagle3_model_load_failed",
+                            format!("EAGLE-3 checkpoint loader task failed: {error}"),
+                            None,
+                        )
+                    })?
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "eagle3_model_load_failed",
+                            error.to_string(),
+                            None,
+                        )
+                    })?;
+            let qwen_target = model.lane.gguf_sha256 == crate::eagle3::QWEN_TARGET_SHA256;
+            if qwen_target != (checkpoint.config.geometry() == crate::eagle3::Eagle3Geometry::QWEN)
+            {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "eagle3_target_head_mismatch",
+                    "EAGLE-3 checkpoint does not match the loaded target model".to_string(),
+                    None,
+                ));
+            }
+            // The uploaded draft wire is request-independent: the serving state
+            // checks it out of the serve-wide single-slot pool at bootstrap
+            // (keyed by head, target, wire gates and envelope) instead of
+            // re-uploading the checkpoint on every request.
+            let head_key = Eagle3ServeHeadKey::current(
+                &checkpoint_path,
+                &checkpoint_sha256,
+                &model.lane.gguf_sha256,
+            )
+            .map_err(|error| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "eagle3_model_load_failed",
+                    error.to_string(),
+                    None,
+                )
+            })?;
+            Some(PreparedSpeculative {
+                drafter: PreparedSpeculativeDrafter::Eagle3(Box::new(
+                    Eagle3ServingState::new(checkpoint, config).with_pooled_head(head_key),
+                )),
+                draft_tokens,
+                // EAGLE's hybrid scheduler is itself the measured admission
+                // policy; the generic acceptance latch would disable learned
+                // fallback on exactly the arbitrary prompts it is for.
+                latch: SpecLatch::default(),
+                rounds: 0,
+                drafted: 0,
+                accepted_drafts: 0,
+                verify_nodes: 0,
+                suffix_rounds: 0,
+                learned_rounds: 0,
+                suffix_candidate_rounds: 0,
+                suffix_confidence_declines: 0,
+                suffix_raw_depth_sum: 0,
+                suffix_confident_depth_sum: 0,
+                suffix_root_match_len_sum: 0,
+                suffix_root_support_sum: 0,
+                suffix_root_branch_count_sum: 0,
+                suffix_expected_accepted_q16_sum: 0,
+                suffix_terminal_survival_q16_sum: 0,
+            })
+        }
     };
+    let eagle3_active = speculative
+        .as_ref()
+        .is_some_and(PreparedSpeculative::is_eagle3);
     // CPU speculation needs CPU-authoritative KV for chunk-verify rollback. The GPU verifier
     // currently returns greedy token IDs rather than full target distributions, so stochastic
-    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled.
+    // speculation also uses the CPU verify path even when CAMELID_SPEC_GPU is enabled. EAGLE-3
+    // is a Metal-only lane and must keep resident target KV enabled regardless of that generic
+    // toggle.
     session.set_resident_paths_disabled(
-        speculative.is_some() && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
+        speculative.is_some()
+            && !eagle3_active
+            && (!spec_gpu_enabled() || sampling != SamplingConfig::default()),
     );
     // A speculative target's next GPU work is a batched verify. A pre-committed
     // next-token graph is unused and can block a model drafter behind its
@@ -22426,11 +23151,49 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
     } else {
         spec.accepted_drafts as f64 * 100.0 / spec.drafted as f64
     };
+    let (eagle3_head_reused, eagle3_early_exit_rounds, eagle3_tree) = match &spec.drafter {
+        PreparedSpeculativeDrafter::Eagle3(state) => (
+            state.head_reused(),
+            state.early_exit_rounds(),
+            Some(format!("{:?}", state.dynamic_tree())),
+        ),
+        PreparedSpeculativeDrafter::Standard(_) => (false, 0, None),
+    };
+    let phases = match &spec.drafter {
+        PreparedSpeculativeDrafter::Eagle3(state) => state.phase_timings(),
+        _ => Default::default(),
+    };
     tracing::info!(
+        head_bootstrap_us = phases.head_bootstrap_us,
+        draft_us = phases.draft_us,
+        target_verify_us = phases.verify_us,
+        head_update_us = phases.head_update_us,
         rounds = spec.rounds,
         drafted = spec.drafted,
         accepted_drafts = spec.accepted_drafts,
         acceptance_pct,
+        verify_nodes = spec.verify_nodes,
+        suffix_rounds = spec.suffix_rounds,
+        learned_rounds = spec.learned_rounds,
+        suffix_candidate_rounds = spec.suffix_candidate_rounds,
+        suffix_confidence_declines = spec.suffix_confidence_declines,
+        suffix_raw_depth_sum = spec.suffix_raw_depth_sum,
+        suffix_confident_depth_sum = spec.suffix_confident_depth_sum,
+        suffix_root_match_len_sum = spec.suffix_root_match_len_sum,
+        suffix_root_support_sum = spec.suffix_root_support_sum,
+        suffix_root_branch_count_sum = spec.suffix_root_branch_count_sum,
+        suffix_expected_accepted_q16_sum = spec.suffix_expected_accepted_q16_sum,
+        suffix_terminal_survival_q16_sum = spec.suffix_terminal_survival_q16_sum,
+        suffix_confidence_q16_scale = crate::inference::suffix_decoding::SUFFIX_CONFIDENCE_Q16_ONE,
+        suffix_min_prefix_survival_q16 =
+            crate::inference::suffix_decoding::SUFFIX_MIN_PREFIX_SURVIVAL_Q16,
+        suffix_min_expected_accepted_q16 =
+            crate::inference::suffix_decoding::SUFFIX_MIN_EXPECTED_ACCEPTED_Q16,
+        suffix_min_confident_depth = crate::inference::suffix_decoding::SUFFIX_MIN_CONFIDENT_DEPTH,
+        eagle3 = spec.is_eagle3(),
+        eagle3_head_reused,
+        eagle3_early_exit_rounds,
+        eagle3_tree,
         generated,
         "speculative decode summary"
     );
@@ -22489,7 +23252,21 @@ fn generate_token_ids(
     // and keeps the cache.
     let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
-    if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
+    if let Some(bootstrap_timings) = bootstrap_eagle3_generation(
+        &mut prepared,
+        &mut input,
+        &mut generated,
+        &mut history,
+        &mut finish_reason,
+    )? {
+        forward_timings.add_assign(&bootstrap_timings);
+    }
+
+    if !prepared.is_eagle3()
+        && !prepared.collect_dense_diagnostics
+        && !want_execution_trace
+        && !resident_cuda_active
+    {
         if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
             let mut cached_session = match_res.cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -22583,7 +23360,7 @@ fn generate_token_ids(
             && !collect_step_top_logits
             && prepared.logprobs_top_n.is_none()
             && grammar.is_none()
-            && !top_logits.is_empty();
+            && (prepared.is_eagle3() || !top_logits.is_empty());
         let spec_round = run_speculative_round(
             &mut prepared,
             &sampler,
@@ -23581,8 +24358,9 @@ fn stream_first_content_accounting_json(
 /// SSE layer needs to reproduce the pre-inversion byte stream (chunk shapes
 /// unchanged; only timing VALUES may differ).
 enum StreamDecodeEvent {
-    /// A non-empty text delta (already stop-sequence-truncated and diffed
-    /// against previously streamed text).
+    /// One committed token's non-empty text delta (already stop-sequence-
+    /// truncated and diffed against previously streamed text; a token whose
+    /// UTF-8 bytes are still pending produces none).
     Delta(String),
     /// Clean end of generation; terminal.
     Finished {
@@ -23677,7 +24455,17 @@ fn stream_prompt_cache_prologue(
         streamed_text,
         first_content_ms,
     } = state;
-    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
+    if let Err(response) =
+        bootstrap_eagle3_generation(prepared, input, generated, history, finish_reason)
+    {
+        let (code, message) = stream_error_parts(&response);
+        send(StreamDecodeEvent::Failed { code, message });
+        return StreamPrologue::Stop;
+    }
+    if !prepared.is_eagle3()
+        && !prepared.collect_dense_diagnostics
+        && !crate::inference::resident_decode_cuda_active()
+    {
         if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
             let mut cached_session = match_res.cached.session.clone();
             cached_session
@@ -23865,12 +24653,12 @@ fn run_stream_decode_job(
             return;
         }
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; the delta below is a text diff of the entire decoded
-        // output, so the client simply receives one larger delta.
+        // `generated`; `stream_step_deltas` below then streams that run as one
+        // delta per committed token.
         let spec_eligible = !collect_dense_for_step
             && prepared.logprobs_top_n.is_none()
             && prepared.constraint.is_none()
-            && !top_logits.is_empty();
+            && (prepared.is_eagle3() || !top_logits.is_empty());
         let spec_round = match run_speculative_round(
             &mut prepared,
             &sampler,
@@ -23941,8 +24729,16 @@ fn run_stream_decode_job(
             }
         }
 
-        let text = match prepared.tokenizer.decode(&generated, true) {
-            Ok(text) => text,
+        let tokenizer = Arc::clone(&prepared.tokenizer);
+        let deltas = match stream_step_deltas(
+            |ids| tokenizer.decode(ids, true),
+            &generated,
+            generated_index,
+            finish_reason != "length" || generated.len() >= prepared.max_tokens as usize,
+            &prepared.stop_sequences,
+            &mut streamed_text,
+        ) {
+            Ok(deltas) => deltas,
             Err(err) => {
                 send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -23951,13 +24747,9 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        // Whether the loop below will terminate on this step. Computed BEFORE the
-        // emit so the final step can release the hold-back in the same delta.
-        let is_final = finish_reason != "length" || generated.len() >= prepared.max_tokens as usize;
-        let text = stop_visible_text(text, &prepared.stop_sequences, is_final);
-        let delta = stream_delta(&text, &streamed_text, &prepared.stop_sequences);
-        streamed_text = text;
-        if !delta.is_empty() {
+        // One event per committed token, sent back to back so a speculative
+        // round still leaves the engine in a single burst.
+        for delta in deltas {
             if first_content_ms.is_none() {
                 first_content_ms = Some(generation_started.elapsed().as_millis());
             }
@@ -24285,12 +25077,12 @@ impl CooperativeStreamDecodeJob {
             LlamaSampler::Sampling(sampling)
         };
         // Speculation first. A committed round appends its whole accepted run to
-        // `generated`; the delta below is a text diff of the entire decoded
-        // output, so the client simply receives one larger delta.
+        // `generated`; `stream_step_deltas` below then streams that run as one
+        // delta per committed token.
         let spec_eligible = !collect_dense_for_step
             && self.prepared.logprobs_top_n.is_none()
             && self.prepared.constraint.is_none()
-            && !self.top_logits.is_empty();
+            && (self.prepared.is_eagle3() || !self.top_logits.is_empty());
         let spec_round = match run_speculative_round(
             &mut self.prepared,
             &sampler,
@@ -24353,8 +25145,17 @@ impl CooperativeStreamDecodeJob {
                 .record_progress(self.generated.len());
         }
 
-        let text = match self.prepared.tokenizer.decode(&self.generated, true) {
-            Ok(text) => text,
+        let tokenizer = Arc::clone(&self.prepared.tokenizer);
+        let deltas = match stream_step_deltas(
+            |ids| tokenizer.decode(ids, true),
+            &self.generated,
+            generated_index,
+            self.finish_reason != "length"
+                || self.generated.len() >= self.prepared.max_tokens as usize,
+            &self.prepared.stop_sequences,
+            &mut self.streamed_text,
+        ) {
+            Ok(deltas) => deltas,
             Err(err) => {
                 self.send(StreamDecodeEvent::Failed {
                     code: "token_decode_failed".to_string(),
@@ -24364,14 +25165,9 @@ impl CooperativeStreamDecodeJob {
                 return engine::StepOutcome::Complete;
             }
         };
-        // Whether this step terminates the job (same condition as the tail below).
-        // Computed BEFORE the emit so the final step releases the hold-back here.
-        let is_final = self.finish_reason != "length"
-            || self.generated.len() >= self.prepared.max_tokens as usize;
-        let text = stop_visible_text(text, &self.prepared.stop_sequences, is_final);
-        let delta = stream_delta(&text, &self.streamed_text, &self.prepared.stop_sequences);
-        self.streamed_text = text;
-        if !delta.is_empty() {
+        // One event per committed token, sent back to back so a speculative
+        // round still leaves the engine in a single burst.
+        for delta in deltas {
             if self.first_content_ms.is_none() {
                 self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
             }
@@ -24423,8 +25219,8 @@ fn stream_completion(
     // with it that call's resident-path decision. Forcing both off here meant a
     // spec-enabled server never speculated for streaming clients — i.e. never
     // for the agent traffic the lane exists to speed up. Both streaming jobs
-    // emit an accepted run through the same text-delta path a single token
-    // takes, so a committed round streams as one delta.
+    // stream an accepted run through `stream_step_deltas`, one delta per
+    // committed token, so clients counting events see real tokens.
     //
     // `CAMELID_SPEC_STREAM=0` is the narrow rollback lever: it restores the
     // previous streaming-only behaviour by dropping the drafter AND un-pinning
@@ -24735,6 +25531,74 @@ fn sse_json_event<T: Serialize>(value: &T) -> Result<Event, Infallible> {
     ))
 }
 
+/// Per-token SSE deltas for one streaming decode step.
+///
+/// A speculative round commits `generated[committed_before..]` in one step.
+/// Streaming used to diff the whole decoded output once per step, so a round
+/// of ~3.5 accepted tokens reached the client as ONE `delta.content` event;
+/// clients that count events as tokens (this UI's live tok/s counter, most
+/// OpenAI-style clients) then read ~25 tok/s while the receipt said ~97. This
+/// walks the step token by token: each prefix `generated[..k]` is decoded with
+/// the same whole-output decoder the single-token path uses, and each token's
+/// increment over the text streamed so far becomes its own delta, in order. A
+/// token whose UTF-8 bytes are still pending yields no text of its own (the
+/// tokenizer's `flush_bytes` holds an incomplete tail back; a lossy decoder
+/// would end in U+FFFD) and is skipped, so its bytes ride with the token that
+/// completes them.
+///
+/// Byte-exactness is enforced, not assumed: the returned deltas must
+/// concatenate to exactly the single delta the whole-step diff produces, and on
+/// any mismatch that single delta is returned instead. A single-token step is
+/// therefore unchanged, and `streamed_text` always ends up equal to the step's
+/// full (stop-truncated) text.
+fn stream_step_deltas<E>(
+    decode: impl Fn(&[u32]) -> std::result::Result<String, E>,
+    generated: &[u32],
+    committed_before: usize,
+    is_final: bool,
+    stop_sequences: &[String],
+    streamed_text: &mut String,
+) -> std::result::Result<Vec<String>, E> {
+    let step_text = stop_visible_text(decode(generated)?, stop_sequences, is_final);
+    let step_delta = stream_delta(&step_text, streamed_text, stop_sequences);
+
+    let first_new = committed_before.min(generated.len());
+    let mut deltas = Vec::new();
+    if generated.len() > first_new + 1 {
+        let mut streamed = streamed_text.clone();
+        for prefix_len in first_new + 1..generated.len() {
+            let prefix_text =
+                stop_visible_text(decode(&generated[..prefix_len])?, stop_sequences, false);
+            if prefix_text.ends_with('\u{FFFD}') {
+                continue;
+            }
+            let increment = prefix_text
+                .strip_prefix(streamed.as_str())
+                .filter(|increment| !increment.is_empty())
+                .map(str::to_owned);
+            if let Some(increment) = increment {
+                deltas.push(increment);
+                streamed = prefix_text;
+            }
+        }
+        match step_text.strip_prefix(streamed.as_str()) {
+            Some(increment) if !increment.is_empty() => deltas.push(increment.to_owned()),
+            Some(_) => {}
+            None => deltas.push(step_text.clone()),
+        }
+        if deltas.concat() != step_delta {
+            deltas.clear();
+            if !step_delta.is_empty() {
+                deltas.push(step_delta);
+            }
+        }
+    } else if !step_delta.is_empty() {
+        deltas.push(step_delta);
+    }
+    *streamed_text = step_text;
+    Ok(deltas)
+}
+
 fn contains_stop_sequence(text: &str, stop_sequences: &[String]) -> bool {
     stop_sequences
         .iter()
@@ -24900,6 +25764,45 @@ pub fn render_single_user_chat_prompt_for_benchmark(
     let rendered =
         render_chat_prompt_for_tokenization_for_model_result(&messages, tokenizer, None, false)
             .map_err(|error| error.to_string())?;
+    Ok((rendered.text, rendered.add_special, rendered.parse_special))
+}
+
+/// Render a deterministic Llama 3.x no-tools training conversation through the
+/// tokenizer's own pinned metadata template.
+///
+/// Unlike the general serving entry, this narrow offline-corpus entry is not
+/// controlled by `CAMELID_METADATA_CHAT_TEMPLATE`: materialization must produce
+/// the same bytes after a restart, so the GGUF template is always authoritative.
+/// The caller is responsible for pinning the GGUF/tokenizer hashes in its run
+/// manifest. Only the Llama header/EOT grammar is admitted; a neighboring model
+/// cannot silently borrow this prompt shape.
+pub fn render_llama3_training_chat_prompt(
+    messages: &[(String, String)],
+    tokenizer: &Tokenizer,
+) -> std::result::Result<(String, bool, bool), String> {
+    if messages.is_empty() {
+        return Err("Llama 3 training chat requires at least one message".to_string());
+    }
+    let template = tokenizer
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| "Llama 3 training chat requires tokenizer.chat_template".to_string())?;
+    if !is_llama3_instruct_template(template) {
+        return Err(
+            "Llama 3 training chat requires start-header, end-header, and EOT markers".to_string(),
+        );
+    }
+    let messages = messages
+        .iter()
+        .map(|(role, content)| ChatMessage {
+            role: role.clone(),
+            content: content.clone(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let rendered = render_metadata_jinja_chat_template_prompt(&messages, tokenizer, template, None)
+        .map_err(|error| error.to_string())?;
     Ok((rendered.text, rendered.add_special, rendered.parse_special))
 }
 
@@ -28010,6 +28913,135 @@ mod tests {
         // The usage frame is omitted from the wire on every non-terminal chunk
         // (stream_options.include_usage off), keeping the baseline byte-identical.
         assert!(value.get("usage").is_none());
+    }
+
+    /// Byte-level decoder stand-in: tokens are byte pieces and decoding follows
+    /// the tokenizer's own `flush_bytes` rule (valid UTF-8 prefix only; an
+    /// incomplete tail is held back for the token that completes it).
+    fn decode_byte_pieces<'a>(
+        pieces: &'a [&'a [u8]],
+    ) -> impl Fn(&[u32]) -> std::result::Result<String, String> + 'a {
+        move |ids: &[u32]| {
+            let bytes: Vec<u8> = ids
+                .iter()
+                .flat_map(|&id| pieces[id as usize].iter().copied())
+                .collect();
+            Ok(match std::str::from_utf8(&bytes) {
+                Ok(text) => text.to_owned(),
+                Err(err) => std::str::from_utf8(&bytes[..err.valid_up_to()])
+                    .unwrap_or("")
+                    .to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn stream_step_deltas_split_a_speculative_round_per_token_and_stay_byte_exact() {
+        // "Hi 😀日本語!" with the emoji and the CJK scalars split across byte
+        // tokens, the way a byte-level BPE vocabulary emits them.
+        let pieces: [&[u8]; 10] = [
+            b"Hi",
+            b" ",
+            &[0xF0, 0x9F],
+            &[0x98, 0x80],
+            &[0xE6, 0x97],
+            &[0xA5],
+            &[0xE6, 0x9C, 0xAC],
+            &[0xE8, 0xAA],
+            &[0x9E],
+            b"!",
+        ];
+        let decode = decode_byte_pieces(&pieces);
+        let generated: Vec<u32> = (0..10).collect();
+        let round_text = decode(&generated).unwrap();
+        assert_eq!(round_text, "Hi 😀日本語!");
+
+        // Token 0 was streamed by an earlier step; this round committed nine.
+        let mut streamed = "Hi".to_string();
+        let whole_round_delta = round_text.strip_prefix("Hi").unwrap().to_owned();
+        let deltas = stream_step_deltas(&decode, &generated, 1, false, &[], &mut streamed).unwrap();
+        assert_eq!(deltas, vec![" ", "😀", "日", "本", "語", "!"]);
+        assert_eq!(deltas.concat(), whole_round_delta);
+        assert_eq!(deltas.concat(), " 😀日本語!");
+        assert_eq!(streamed, round_text);
+
+        // A single-token step (the non-speculative path) is one delta, unchanged.
+        let mut streamed = "Hi ".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated[..4], 3, false, &[], &mut streamed).unwrap();
+        assert_eq!(deltas, vec!["😀"]);
+        assert_eq!(streamed, "Hi 😀");
+        // ...and a single token whose bytes are still pending yields nothing yet.
+        let mut streamed = "Hi ".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated[..3], 2, false, &[], &mut streamed).unwrap();
+        assert!(deltas.is_empty(), "{deltas:?}");
+        assert_eq!(streamed, "Hi ");
+    }
+
+    #[test]
+    fn stream_step_deltas_hold_partial_stops_across_rounds_and_flush_at_length() {
+        let pieces: [&[u8]; 4] = [b"A", b"<", b"/", b"s>"];
+        let decode = decode_byte_pieces(&pieces);
+        let stop = vec!["</s>".to_string()];
+        let ids = [0, 1, 2, 3];
+        let mut streamed = "A".to_string();
+        assert!(
+            stream_step_deltas(&decode, &ids[..3], 1, false, &stop, &mut streamed)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(streamed, "A");
+        assert!(
+            stream_step_deltas(&decode, &ids, 3, true, &stop, &mut streamed)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(streamed, "A");
+        assert_eq!(
+            stream_step_deltas(&decode, &ids[..2], 1, true, &stop, &mut streamed).unwrap(),
+            vec!["<"]
+        );
+        assert_eq!(streamed, "A<");
+    }
+
+    #[test]
+    fn stream_step_deltas_fall_back_to_the_whole_step_delta_when_a_split_would_differ() {
+        // A stop sequence completed by the round's last token truncates text its
+        // earlier tokens produced: the client must see exactly today's " world".
+        let pieces: [&[u8]; 4] = [b"Hello", b" wor", b"ld<", b"/s>"];
+        let decode = decode_byte_pieces(&pieces);
+        let generated: Vec<u32> = (0..4).collect();
+        let stop = vec!["</s>".to_string()];
+        let mut streamed = "Hello".to_string();
+        let deltas =
+            stream_step_deltas(&decode, &generated, 1, true, &stop, &mut streamed).unwrap();
+        assert_eq!(deltas, vec![" wor", "ld"]);
+        assert_eq!(deltas.concat(), " world");
+        assert_eq!(streamed, "Hello world");
+
+        // A decoder whose prefix text is not a prefix of the step text cannot be
+        // split without changing bytes; the whole-step delta wins.
+        let inconsistent = |ids: &[u32]| -> std::result::Result<String, String> {
+            Ok(match ids.len() {
+                2 => "AZ".to_string(),
+                n => "ABC"[..n].to_string(),
+            })
+        };
+        let generated = [0u32, 1, 2];
+        let mut streamed = "A".to_string();
+        let deltas =
+            stream_step_deltas(inconsistent, &generated, 1, false, &[], &mut streamed).unwrap();
+        assert_eq!(deltas, vec!["BC"]);
+        assert_eq!(streamed, "ABC");
+
+        // Decode errors surface instead of being swallowed into a delta.
+        let failing = |_: &[u32]| -> std::result::Result<String, String> { Err("bad id".into()) };
+        let mut streamed = String::new();
+        assert_eq!(
+            stream_step_deltas(failing, &generated, 0, false, &[], &mut streamed).unwrap_err(),
+            "bad id"
+        );
     }
 
     #[test]
@@ -33674,6 +34706,28 @@ mod tests {
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn eagle3_corpus_renderer_pins_full_llama32_template_and_generation_boundary() {
+        let _guard = crate::test_support::env_lock();
+        // The offline materializer must ignore this serving toggle and always
+        // execute the exact GGUF metadata template.
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+        let messages = vec![
+            ("system".to_string(), "  Be brief.  ".to_string()),
+            ("user".to_string(), "  hello  ".to_string()),
+        ];
+        let (rendered, add_special, parse_special) =
+            render_llama3_training_chat_prompt(&messages, &tokenizer).unwrap();
+        assert!(!add_special, "the metadata template already emits BOS");
+        assert!(parse_special);
+        assert_eq!(
+            rendered,
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        assert!(rendered.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]

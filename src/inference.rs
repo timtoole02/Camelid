@@ -562,6 +562,33 @@ impl LlamaLoadedWeights {
         self.output.as_ref().unwrap_or(&self.token_embedding)
     }
 
+    /// Whether the output projection reuses the token-embedding tensor's physical backing.
+    ///
+    /// The first indexed-output-head diagnostic is deliberately restricted to tied Q6_K. A
+    /// separately loaded but byte-equal output tensor is declined: physical Arc identity is a
+    /// simple fail-closed proof that the candidate token ids index the embedding/output rows.
+    pub fn output_projection_is_tied_embedding(&self) -> bool {
+        let Some(output) = self.output.as_ref() else {
+            return true;
+        };
+        match (
+            output.kquant_wire_pages.as_ref(),
+            self.token_embedding.kquant_wire_pages.as_ref(),
+        ) {
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding) => {
+                return true;
+            }
+            _ => {}
+        }
+        matches!(
+            (
+                output.q6_k_wire_bytes.as_ref(),
+                self.token_embedding.q6_k_wire_bytes.as_ref(),
+            ),
+            (Some(output), Some(embedding)) if std::sync::Arc::ptr_eq(output, embedding)
+        )
+    }
+
     /// Audit where this node's Q8_0 weights physically live. Every owned dense Q8_0 linear
     /// must hold plain RAM-resident blocks (`q8_0_blocks`); anything file-backed or
     /// runtime-repacked-without-blocks is reported as a violation so callers (the
@@ -1527,6 +1554,58 @@ pub struct LlamaGreedyVerifyCapture {
     pub predictions: Vec<u32>,
     pub layer_inputs: Vec<CpuTensor>,
     pub timings: LlamaForwardTimings,
+}
+
+/// Teacher-forced target features used to train a one-layer EAGLE-3 head.
+///
+/// All tensors retain the input-token row order. `output_norm_state` is the residual
+/// stream after the target's final RMSNorm and immediately before its output projection;
+/// `layer_inputs` are the selected pre-layer residual streams. The target predictions are
+/// the exact greedy argmax ids produced by the same Q4 resident forward.
+#[derive(Debug, Clone)]
+pub struct LlamaEagle3TrainingCapture {
+    pub predictions: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub output_norm_state: CpuTensor,
+    /// Full target-vocabulary logits in row-major `[rows, vocab]` order. The exporter
+    /// immediately gathers the fixed checkpoint d2t rows and releases this transient buffer.
+    pub logits: CpuTensor,
+    pub timings: LlamaForwardTimings,
+}
+
+/// Opt-in resident target verification result with compact top-8 candidates per verifier row.
+///
+/// `predictions` is still produced by the ordinary greedy verifier path. `target_top_k` is an
+/// additional deterministic readback in verifier-row order, and `emitted` is the target-approved
+/// sequence actually committed by the host acceptance rule.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerify {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub timings: LlamaForwardTimings,
+}
+
+/// EAGLE-capable target verification with both decoder captures and compact target candidates.
+///
+/// This remains opt-in: ordinary greedy, EAGLE, and Token Recycling callers keep their existing
+/// result types and Metal entry points. `layer_inputs` and `target_top_k` share verifier-row order,
+/// while `predictions` continues to come from the production greedy argmax buffer.
+#[derive(Debug, Clone)]
+pub struct LlamaTargetTopKVerifyCapture {
+    pub predictions: Vec<u32>,
+    pub target_top_k: Vec<[u32; 8]>,
+    pub emitted: Vec<u32>,
+    pub layer_inputs: Vec<CpuTensor>,
+    pub timings: LlamaForwardTimings,
+}
+
+/// Benchmark-only wrapper pairing the unchanged authoritative verifier result with indexed-head
+/// diagnostics computed after the full output head has already selected the target predictions.
+#[derive(Debug, Clone)]
+pub struct LlamaIndexedHeadShadowVerify<T> {
+    pub authoritative: T,
+    pub shadow: crate::metal::ResidentIndexedHeadShadow,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

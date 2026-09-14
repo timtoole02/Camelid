@@ -782,6 +782,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn suffix_variant_only_returns_confidence_admitted_chains() {
+        let weak_history = vec![1, 2, 3, 4, 5, 6, 7, 8, 90, 1, 2, 3, 4];
+        let mut weak = SpeculativeDrafter::Suffix(Box::default());
+        assert!(weak.draft(&weak_history, 6).unwrap().is_empty());
+
+        let strong_history = vec![1, 2, 3, 4, 5, 6, 7, 90, 1, 2, 3, 4, 5, 6, 7, 91, 1, 2, 3, 4];
+        let mut strong = SpeculativeDrafter::Suffix(Box::default());
+        assert_eq!(strong.draft(&strong_history, 3).unwrap(), [5, 6, 7]);
+    }
+
+    #[test]
     fn ngram_drafts_continuation_of_most_recent_match() {
         let drafter = NGramDrafter::default();
         // ... 1 2 3 4 | 9 9 | 1 2 3 4 | 7 8 | ... suffix [7, 8] has no
