@@ -125,7 +125,7 @@ fn qwen_eagle_cell_matches_independent_cpu_attention() {
         rope(&mut q, position, model.config.rope_theta);
         rope(&mut k, position, model.config.rope_theta);
         // The production cell stores its one-layer KV in half precision.
-        let half = |xs: Vec<f32>| xs.into_iter().map(|v| round_half(v)).collect::<Vec<_>>();
+        let half = |xs: Vec<f32>| xs.into_iter().map(round_half).collect::<Vec<_>>();
         keys.push(half(k));
         values.push(half(v));
         let mut context = vec![0.0; 4096];
