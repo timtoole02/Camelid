@@ -1,0 +1,16 @@
+{
+  "schema": "camelid.verify-report/v1",
+  "report_id": "aef2ecacf8e782ab60cdba4a0376082ec650468d3fd068c82c438af0edb7c3af",
+  "created_utc": "2026-08-22T13:10:30Z",
+  "outcome": "no_profile",
+  "model": {
+    "model_id": "Qwen3-0.6B-Q8_0.gguf",
+    "gguf_filename": "Qwen3-0.6B-Q8_0.gguf",
+    "gguf_sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+    "quantization": "unknown",
+    "architecture": "unknown"
+  },
+  "profile_id": null,
+  "comparison": null,
+  "detail": "No built-in verification profile matches this exact GGUF. Camelid abstained."
+}

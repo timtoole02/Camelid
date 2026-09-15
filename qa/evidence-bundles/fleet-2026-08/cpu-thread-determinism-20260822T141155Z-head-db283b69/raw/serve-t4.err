@@ -1,0 +1,12 @@
+[hw] GPU: Apple M4 | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 8.2 GiB free / 16.0 GiB total
+  Diagnostics log: [REDACTED]/.local/state/Camelid/logs/camelid.log
+
+  ðŸª Warming up the GPU (building the resident engine, one-time)â€¦
+[camelid] CAMELID_METAL_NOCOPY: loading Q8_0/K-quant/Prism Q1_0/Q2_0 weights as page-aligned wire pages (GPU reads them in place; requires the wire kernel stack)
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:18435
+  OpenAI-style API:  http://127.0.0.1:18435/v1/chat/completions
+
+  Workspace CLI: ready

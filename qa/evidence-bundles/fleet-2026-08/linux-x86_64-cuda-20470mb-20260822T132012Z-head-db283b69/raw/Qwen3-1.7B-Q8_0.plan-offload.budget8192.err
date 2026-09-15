@@ -1,0 +1,2 @@
+[hw] GPU: NVIDIA RTX A4500 (x2) | compute 8.6 | tensor-cores yes | VRAM 19.4 GiB free / 19.6 GiB total
+[hw] CPU: 44 logical cores | SIMD AVX2 (avx2=true avx512f=false fma=true neon=false) | RAM 244.4 GiB free / 251.6 GiB total
