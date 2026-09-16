@@ -12,6 +12,7 @@ import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseL
 import { getStoredApiKey, setStoredApiKey } from '../lib/apiAuth'
 import { appStorage } from '../lib/appStorage.js'
 import { isLanChatOnly } from '../lib/apiSurface.js'
+import { LanSharingCard } from '../components/settings/LanSharingCard'
 import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
@@ -234,6 +235,8 @@ export default function SettingsView({
           </div>
         </CardBody>
       </Card>
+
+      {!isLanChatOnly(apiSurface) && <LanSharingCard apiBase={apiBase} online={online} />}
 
       {gpu?.available && (
         <Card>

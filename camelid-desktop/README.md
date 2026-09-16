@@ -227,3 +227,19 @@ v1 deliberately keeps the native shell thin and ships the engine's real UI as-is
   a scoped native folder chooser plus Camelid-keyed UI-state commands confined to the app-data
   directory; it does not receive broad filesystem access. Local/catalog model loading still
   goes through the engine's existing API.
+
+### Share with devices on your network
+
+In **Settings → Share on local network**, turn on network sharing and copy the
+address and access key to the other device. Open that address in its browser and
+save the key in Settings. The desktop engine remains on loopback; a separate,
+key-protected LAN Chat listener shares its loaded models without restarting.
+Remote users can chat and switch local GGUF models, but cannot use desktop
+management or Workspace routes. Model switches also affect the desktop session.
+
+Sharing is off on launch and closes when toggled off or when Camelid exits. The
+port may change when enabled again. This mode uses HTTP on a trusted local
+network, so traffic is not encrypted. Allow Camelid through the host firewall if
+needed; a VPN can affect the address displayed. This setting requires rebuilding
+the engine and embedded frontend; older installed desktop bundles do not gain it
+from source edits alone.

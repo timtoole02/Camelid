@@ -34,6 +34,7 @@ mod continuous_batch;
 mod contract;
 pub(crate) mod documents;
 mod engine;
+mod lan_sharing;
 mod mcp;
 mod metrics;
 mod responses;
@@ -261,6 +262,7 @@ pub struct AppState {
     api_surface: ApiSurface,
     /// Lock-free process metrics shared by middleware and decode jobs.
     metrics: metrics::ServerMetrics,
+    lan_sharing: Arc<tokio::sync::Mutex<Option<lan_sharing::Listener>>>,
     /// Bounded public-web transport used only by `/api/web/research` before an
     /// ordinary chat generation. It never receives request headers or model
     /// state, so Camelid API credentials cannot be forwarded and model tool
@@ -311,6 +313,7 @@ impl Default for AppState {
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
             metrics: metrics::ServerMetrics::default(),
+            lan_sharing: Arc::default(),
             web_research_transport: web_research::default_transport(),
         }
     }
@@ -2770,6 +2773,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route(
+            "/api/runtime/lan-sharing",
+            get(lan_sharing::status).post(lan_sharing::set_enabled),
+        )
         .route("/api/runtime/gpu", get(gpu_runtime).post(set_gpu_runtime))
         .route("/api/runtime/memory", get(runtime_memory))
         .route("/api/runtime/kv-cache/purge", post(purge_kv_cache))

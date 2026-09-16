@@ -664,6 +664,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:lan-auth
 
+      - name: Frontend LAN sharing toggle smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:lan-sharing
+
       # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
       # settled-vs-retryable `unknown` split, grouping and search ranking. The
       # script shipped with the lane but was never wired here, so none of that

@@ -25,6 +25,7 @@
     "smoke:first-run-card": "node scripts/first-run-card-smoke.mjs",
     "smoke:offline-banner": "node scripts/offline-banner-smoke.mjs",
     "smoke:desktop-storage": "node scripts/desktop-storage-smoke.mjs",
+    "smoke:lan-sharing": "node scripts/lan-sharing-smoke.mjs",
     "smoke:lan-auth": "node scripts/lan-auth-smoke.mjs",
     "smoke:catalog-browse": "node scripts/catalog-browse-smoke.mjs",
     "smoke:model-families": "node scripts/model-families-smoke.mjs",
