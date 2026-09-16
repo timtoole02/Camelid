@@ -34,6 +34,7 @@
     "smoke:3b-closure": "node scripts/frontend-3b-closure-smoke.mjs",
     "smoke:structured-output": "node scripts/structured-output-smoke.mjs",
     "smoke:token-inspector": "node scripts/token-inspector-smoke.mjs",
+    "smoke:voice": "node scripts/voice-input-smoke.mjs",
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
     "smoke:retro-transitions": "node scripts/retro-transition-smoke.mjs",
     "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",

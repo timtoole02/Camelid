@@ -1,0 +1,9 @@
+.cxvoice { position: relative; }
+.cxvoice__mic { min-width: 40px; min-height: 40px; justify-content: center; }
+.cxvoice__mic.is-recording { color: var(--color-error, #e56b6f); outline: 1px solid currentColor; }
+.cxvoice__panel { position: absolute; bottom: calc(100% + 12px); right: 0; width: min(320px, calc(100vw - 48px)); padding: 16px; border-radius: 14px; border: 1px solid var(--color-border-strong, #555); background: var(--color-surface, #20252b); color: var(--color-text, #f3f4f6); box-shadow: 0 8px 28px #0004; z-index: 20; }
+.cxvoice__panel p { margin: 8px 0 12px; font-size: 13px; line-height: 1.5; }
+.cxvoice__panel > button { margin: 4px 6px 0 0; }
+@media (max-width: 480px) {
+  .cxvoice__panel { right: -40px; }
+}

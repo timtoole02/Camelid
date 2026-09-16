@@ -648,6 +648,10 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:first-run-card
 
+      - name: Frontend voice input smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:voice
+
       # Component-level: the offline banner is the only surface a user sees when
       # the engine dies with the tab still open, and its branch is chosen from a
       # live probe of the dev-server launch hook. Drives both server shapes so the

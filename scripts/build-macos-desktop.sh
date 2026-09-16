@@ -65,7 +65,7 @@ trap cleanup EXIT
 ditto --noextattr --noqtn "$app_path" "$stage_dir/Camelid Desktop.app"
 ln -s /Applications "$stage_dir/Applications"
 clean_bundle_metadata "$stage_dir/Camelid Desktop.app"
-codesign --force --deep --sign - --options runtime "$stage_dir/Camelid Desktop.app"
+codesign --force --deep --sign - --options runtime --entitlements "$desktop_dir/Entitlements.plist" "$stage_dir/Camelid Desktop.app"
 codesign --verify --deep --strict "$stage_dir/Camelid Desktop.app"
 
 mkdir -p "$dmg_dir"

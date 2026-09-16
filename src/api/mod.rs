@@ -40,6 +40,7 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod speech;
 mod tool_envelope;
 mod web_research;
 pub(crate) mod workspace;
@@ -253,6 +254,7 @@ pub struct AppState {
     /// paths never touch it, and a relative path that exists against the
     /// process CWD keeps its historical meaning — this only adds a fallback.
     models_dir: PathBuf,
+    speech_slot: Arc<tokio::sync::Semaphore>,
     /// Model digest agreed with the worker before a distributed coordinator starts.
     /// The worker cannot switch models, so every later local load must preserve it.
     distributed_model_sha256: Option<String>,
@@ -309,6 +311,7 @@ impl Default for AppState {
             configured_threads: None,
             default_enable_thinking: false,
             models_dir: resolve_models_dir(None),
+            speech_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             distributed_model_sha256: None,
             server_limits: server::ServerPolicy::loopback_default().limits,
             api_surface: ApiSurface::Full,
@@ -2773,6 +2776,14 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/api/speech/status", get(speech::status))
+        .route("/api/speech/install", post(speech::install))
+        .route(
+            "/api/speech/transcribe",
+            post(speech::transcribe).layer(DefaultBodyLimit::max(
+                crate::speech::MAX_UPLOAD_BYTES.min(body_limit),
+            )),
+        )
         .route(
             "/api/runtime/lan-sharing",
             get(lan_sharing::status).post(lan_sharing::set_enabled),

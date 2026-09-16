@@ -55,6 +55,7 @@ pub mod remote_chat;
 pub mod runnable;
 pub mod runtime_config;
 pub mod runtime_manifest;
+pub mod speech;
 pub mod telemetry;
 pub mod tensor;
 pub(crate) mod tls_pair;

@@ -54,6 +54,8 @@ impl ApiSurface {
             Self::LanChatOnly => matches!(
                 (method, path),
                 (&Method::GET, "/v1/models")
+                    | (&Method::GET, "/api/speech/status")
+                    | (&Method::POST, "/api/speech/transcribe")
                     | (&Method::GET, "/api/capabilities")
                     | (&Method::GET, "/api/models/current")
                     | (&Method::GET, "/api/models/local")
@@ -795,6 +797,8 @@ mod tests {
         let surface = ApiSurface::LanChatOnly;
         for (method, path) in [
             (Method::GET, "/v1/models"),
+            (Method::GET, "/api/speech/status"),
+            (Method::POST, "/api/speech/transcribe"),
             (Method::GET, "/api/capabilities"),
             (Method::GET, "/api/models/current"),
             (Method::GET, "/api/models/local"),
@@ -807,6 +811,8 @@ mod tests {
         }
         for (method, path) in [
             (Method::POST, "/v1/models"),
+            (Method::POST, "/api/speech/install"),
+            (Method::GET, "/api/speech/transcribe"),
             (Method::GET, "/v1/models/loaded-model"),
             (Method::POST, "/api/models/unload"),
             (Method::POST, "/api/models/local/delete"),

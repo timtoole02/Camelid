@@ -91,6 +91,17 @@ KaTeX and Mermaid are loaded on demand rather than in the main bundle, but on-de
 | [Inter](https://github.com/rsms/inter), [Space Grotesk](https://github.com/floriankarsten/space-grotesk), [IBM Plex Mono](https://github.com/IBM/plex) (via Fontsource) | OFL-1.1 | the WebUI's typefaces |
 
 The OFL-1.1 fonts are redistributed unmodified under their reserved names, which that licence permits; Camelid does not sell the fonts on their own.
+### Local speech input
+
+- Candle 0.9.2 (candle-core, candle-nn, candle-transformers):
+  <https://github.com/huggingface/candle>, MIT OR Apache-2.0.
+  Camelid uses the Rust CPU Whisper implementation with acceleration features disabled.
+- hound 3.5.1 (Rust WAV decoding): <https://github.com/ruuda/hound>, Apache-2.0.
+- ureq 3.3.0 (model downloads): <https://github.com/algesten/ureq>, MIT OR Apache-2.0.
+- OpenAI Whisper tiny.en model (downloaded on demand, not bundled):
+  <https://huggingface.co/openai/whisper-tiny.en>, Apache-2.0 as published by that
+  repository. Whisper project: <https://github.com/openai/whisper>, MIT.
+  The model revision and file checksums are pinned in `src/speech.rs`.
 
 ## Maintenance note
 

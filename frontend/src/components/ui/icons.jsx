@@ -127,3 +127,5 @@ export const IconShield = (p) => <Svg {...p} strokeIcon><path d="m12 3 8 3v6c0 5
 export const IconPlug = (p) => <Svg {...p} strokeIcon><path d="M9 3v5m6-5v5M7 8h10v3a5 5 0 0 1-10 0V8zm5 8v5" /></Svg>
 
 export const IconFolder = (p) => <Svg {...p} strokeIcon><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z" /></Svg>
+
+export const IconMicrophone = (p) => <Svg {...p} strokeIcon><rect x="9" y="2" width="6" height="13" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8" /></Svg>

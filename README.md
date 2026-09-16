@@ -89,6 +89,9 @@ Llama 3.2 3B and LFM2.5 have support limited to the documented exact-file smoke 
 
 For [image chat](docs/MODELS.md#multimodal-image-chat) and [embeddings and reranking](docs/MODELS.md#embeddings-and-reranking), see the model guide for supported files and setup.
 
+For [voice input](docs/voice-input.md), use the microphone beside Send. A one-time
+154 MB English speech-model download enables local Rust transcription into an editable prompt.
+
 ## Ways to use Camelid
 
 | Interface | Start it with | Best for |

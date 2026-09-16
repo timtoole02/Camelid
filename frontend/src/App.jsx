@@ -467,6 +467,7 @@ function App() {
           </div>}
           {tab === 'chat' && (chatMode === 'chat' || isLanChatOnly(apiSurface)) && (
             <ChatWorkspace
+              apiBase={apiBase}
               projects={projects} chatContext={chatContext} updateChatContext={updateChatContext} contextSources={contextSources}
               globalPrompt={globalPrompt} updateGlobalPrompt={updateGlobalPrompt}
               mcp={mcp} mcpSelectedKeys={mcpSelectedKeys} replaceMcpTools={replaceMcpTools}

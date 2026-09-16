@@ -35,6 +35,12 @@ async-stream = "0.3"
 axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
+# Speech inference uses Candle's Rust CPU kernels only. Never enable CUDA,
+# Metal, MKL, Accelerate, or whisper.cpp bindings for this dependency group.
+candle-core = { version = "=0.9.2", default-features = false }
+candle-nn = { version = "=0.9.2", default-features = false }
+candle-transformers = { version = "=0.9.2", default-features = false }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -44,6 +50,7 @@ process-wrap = { version = "10", features = ["tokio1"] }
 rmcp = { version = "=3.3.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 memmap2 = "0.9"
+hound = "=3.5.1"
 llguidance = "=1.7.6"
 toktrie = "=1.7.6"
 pdf-extract = "0.12"

@@ -1,6 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "resources": ["sidecar/*"]
+    "resources": [
+      "sidecar/*"
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    }
   }
 }
