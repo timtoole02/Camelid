@@ -20,7 +20,7 @@ try {
         if (fail) return request.respond({ status: 500, contentType: 'application/json', body: '{}' })
         enabled = JSON.parse(request.postData()).enabled
       }
-      return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled, url: enabled ? 'http://192.168.1.5:12345' : null, key: enabled ? 'test-key' : null }) })
+      return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled, url: enabled ? 'http://192.0.2.5:12345' : null, key: enabled ? 'test-key' : null }) })
     }
     return request.continue()
   })
@@ -29,7 +29,7 @@ try {
   assert.equal(await page.$eval('[role="switch"]', element => element.getAttribute('aria-checked')), 'false')
   await page.click('[role="switch"]')
   await page.waitForSelector('[aria-label="Network address"]')
-  assert.equal(await page.$eval('[aria-label="Network address"]', element => element.value), 'http://192.168.1.5:12345')
+  assert.equal(await page.$eval('[aria-label="Network address"]', element => element.value), 'http://192.0.2.5:12345')
   assert.equal(await page.$eval('[aria-label="Network access key"]', element => element.type), 'password')
   fail = true
   await page.click('[role="switch"]')
