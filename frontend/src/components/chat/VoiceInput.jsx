@@ -16,7 +16,7 @@ export function VoiceInput({ apiBase, disabled, onTranscript, onBusyChange }) {
   const locked = useRef(false)
   const callbacks = useRef({ onTranscript, onBusyChange })
   callbacks.current = { onTranscript, onBusyChange }
-  const base = String(apiBase || window.location.origin).replace(/\/$/, '')
+  const base = String(apiBase || globalThis.location?.origin || '').replace(/\/$/, '')
 
   async function api(path, init = {}, timeout = 150_000) {
     const controller = new AbortController()
