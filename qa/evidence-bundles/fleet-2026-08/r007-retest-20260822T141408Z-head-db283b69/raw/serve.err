@@ -1,0 +1,12 @@
+[hw] GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU (x1) | compute 8.6 | tensor-cores yes | VRAM 3.6 GiB free / 3.7 GiB total
+[hw] CPU: 16 logical cores | SIMD AVX-512 (avx2=true avx512f=true fma=true neon=false) | RAM 28.8 GiB free / 31.1 GiB total
+[cuda] selected device 0 of 1: "NVIDIA GeForce RTX 3050 Ti Laptop GPU" (compute capability 8.6) | VRAM 3667 MiB free / 3770 MiB total
+  Diagnostics log: [REDACTED]/.local/state/Camelid/logs/camelid.log
+
+  ðŸª Warming up the model (building the engine, one-time)â€¦
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:18434
+  OpenAI-style API:  http://127.0.0.1:18434/v1/chat/completions
+
+  Workspace CLI: ready

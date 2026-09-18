@@ -1,0 +1,2 @@
+[hw] GPU: NVIDIA GeForce RTX 5060 Ti (x1) | compute 12.0 | tensor-cores yes | VRAM 15.3 GiB free / 15.5 GiB total
+[hw] CPU: 32 logical cores | SIMD AVX2 (avx2=true avx512f=false fma=true neon=false) | RAM 60.5 GiB free / 62.7 GiB total
