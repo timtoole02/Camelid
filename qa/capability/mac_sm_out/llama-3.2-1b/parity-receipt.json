@@ -40,7 +40,7 @@
       }
     ],
     "max_tokens": 24,
-    "temperature": 0,
+    "temperature": 0.0,
     "top_p": null,
     "top_k": null,
     "seed": null,

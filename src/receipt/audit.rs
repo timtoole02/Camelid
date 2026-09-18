@@ -75,30 +75,6 @@ pub const BASELINE: &[BaselineEntry] = &[
         reason: "privacy scrub replaced the Windows home path with `<home>` after sealing (commit d2825069); never re-sealed",
     },
     BaselineEntry {
-        path: "qa/capability/mac_ctx_out/llama-3.2-1b/parity-receipt.json",
-        stored: "cdd822e1aa6423ba840d1ada6388eb54db59afa64f083496defc434d85f66c52",
-        computed: "e19c09f87dd01f8f262543e0becde221f7fbe72e231f9e19bffec49360d01ccd",
-        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
-    },
-    BaselineEntry {
-        path: "qa/capability/mac_ctx_out/llama-3.2-3b/parity-receipt.json",
-        stored: "60284b8bb73cb57f37ad4daee0b382c98c13aca83479fc9e7fa5aee80b4d028d",
-        computed: "65d810343fe424219d4448025a656c6c183f8dc1bccab02ed907127e349d4004",
-        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
-    },
-    BaselineEntry {
-        path: "qa/capability/mac_sm_out/llama-3.2-1b/parity-receipt.json",
-        stored: "adcf1be9953378aedd31490f81fd07656f51a5948dbca2744bc05e5e50839602",
-        computed: "48e79bb79f04d93cfeac0495db67c5f909251b641f90db31ba47590015adba80",
-        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
-    },
-    BaselineEntry {
-        path: "qa/capability/mac_sm_out/llama-3.2-3b/parity-receipt.json",
-        stored: "56a8a31ebb57303016cb4ca32401130ad535362a82260096dfd1aa66a4e3d912",
-        computed: "a7286ebdb7b5e2a4f4653108501b0599785f9d525325ed19e52bb2f926b7fad9",
-        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
-    },
-    BaselineEntry {
         path: "qa/distributed/hetero-mac-pi-tinyllama-q8.json",
         stored: "11bbe0e14f38030bf4c3f55b221c79875aaabdc60b39c816e686754f3645ec9d",
         computed: "236fe8fc23ed619a14f8c7e0356e2c6b86de701a7c83dd7af4911509ba59fced",
@@ -109,12 +85,6 @@ pub const BASELINE: &[BaselineEntry] = &[
         stored: "33b79d8d0b99c729946de405009d4f293e364736d72b3985d47b3ae3587483be",
         computed: "4e6276cb6e5fbca61bf1ba26242f31140de41a6ff32c07f2e76a04f2823e2004",
         reason: "privacy scrub redacted LAN IPs / SSH-key path after sealing (commit cfaed035); never re-sealed",
-    },
-    BaselineEntry {
-        path: "qa/evidence-bundles/engine-inversion-gate4-recert-20260709T154139Z-head-d50e0ab4/receipt/tinyllama-oracle-receipt.json",
-        stored: "2691f637929b7f8d23f8bd8c043dea49305a461fc7e66b694a88c6f9680e05bc",
-        computed: "78af89e4c1d661ae7072cf8739e851a1e56d42662b995f2fc26f395e0ba2958f",
-        reason: "redacted for public scrub after sealing; body no longer matches the stored digest",
     },
 ];
 
