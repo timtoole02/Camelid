@@ -1,6 +1,6 @@
 {
   "schema": "camelid.parity-receipt/v1",
-  "receipt_id": "2691f637929b7f8d23f8bd8c043dea49305a461fc7e66b694a88c6f9680e05bc",
+  "receipt_id": "78af89e4c1d661ae7072cf8739e851a1e56d42662b995f2fc26f395e0ba2958f",
   "created_utc": "2026-07-09T15:35:07.285Z",
   "lane": {
     "model_id": "tinyllama-q8",
