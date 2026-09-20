@@ -1,0 +1,36 @@
+{
+  "schema": "camelid.external-platform-receipts.v1",
+  "generated_utc": "2026-08-22T14:11:31Z",
+  "git_head": "db283b6958f5619f053f4568374885a0f9919331",
+  "git_head_short": "db283b69",
+  "camelid_version": "camelid v0.6.1-191-gdb283b69",
+  "validation_lane": "external_contributor_platform_run",
+  "privacy": "Public summary only. Operator paths, hostnames, addresses, ports, and key material are intentionally omitted; only file basenames and hashes appear.",
+  "scope": "Records what camelid inspect / plan-offload / runnable-smoke / verify / agent-eval did on this exact host with these exact files. runnable-smoke attests deterministic execution, NOT parity. verify proves one request for one file. agent-eval may return INCONCLUSIVE on a contended host and that is not a failure. This bundle promotes no support claim and extends no existing claim; it is a platform data point for comparison.",
+  "host": {
+    "os": "Linux 6.18.21-gentoo",
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "logical_cores": 32,
+    "physical_cores": 16,
+    "ram_bytes": 67354968064,
+    "chassis": "no-battery",
+    "thermal": {
+      "pl1_uw": null,
+      "pl2_uw": null,
+      "cpu_governor": "powersave",
+      "energy_performance_preference": "balance_performance",
+      "cooling": "liquid cooled desktop, stock",
+      "note": "PL1/PL2 are the RAPL package limits in microwatts, read from the MSR interface with an MMIO fallback; null means the interface is absent (normal on Apple silicon). Cooling is operator-supplied because external cooling reports nothing to the host. A bundle from a battery-capable chassis with a low PL1 is thermally bounded and its timings are not comparable to a desktop's."
+    },
+    "accelerator": {
+      "kind": "cuda",
+      "name": "NVIDIA GeForce RTX 5060 Ti",
+      "memory_mb": 16311,
+      "memory_kind": "discrete",
+      "driver": "595.58.03"
+    }
+  },
+  "quick_mode": false,
+  "models": [{"model_file":"Qwen3-0.6B-Q8_0.gguf","sha256":"9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031","bytes":639446688,"steps":[{"step":"Qwen3-0.6B-Q8_0.inspect","exit_code":0,"seconds":0,"stdout_bytes":7374700,"stderr_bytes":0},{"step":"Qwen3-0.6B-Q8_0.plan-offload.detected","exit_code":0,"seconds":1,"stdout_bytes":482,"stderr_bytes":236},{"step":"Qwen3-0.6B-Q8_0.plan-offload.budget4096","exit_code":0,"seconds":1,"stdout_bytes":519,"stderr_bytes":236},{"step":"Qwen3-0.6B-Q8_0.plan-offload.budget8192","exit_code":0,"seconds":1,"stdout_bytes":519,"stderr_bytes":236},{"step":"Qwen3-0.6B-Q8_0.runnable-smoke","exit_code":0,"seconds":30,"stdout_bytes":2054,"stderr_bytes":270},{"step":"Qwen3-0.6B-Q8_0.verify","exit_code":2,"seconds":0,"stdout_bytes":303,"stderr_bytes":0},{"step":"Qwen3-0.6B-Q8_0.agent-eval","exit_code":0,"seconds":26,"stdout_bytes":5,"stderr_bytes":607}]},{"model_file":"Qwen3-1.7B-Q8_0.gguf","sha256":"061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a","bytes":1834426016,"steps":[{"step":"Qwen3-1.7B-Q8_0.inspect","exit_code":0,"seconds":0,"stdout_bytes":7375119,"stderr_bytes":0},{"step":"Qwen3-1.7B-Q8_0.plan-offload.detected","exit_code":0,"seconds":1,"stdout_bytes":484,"stderr_bytes":236},{"step":"Qwen3-1.7B-Q8_0.plan-offload.budget4096","exit_code":0,"seconds":0,"stdout_bytes":521,"stderr_bytes":236},{"step":"Qwen3-1.7B-Q8_0.plan-offload.budget8192","exit_code":0,"seconds":1,"stdout_bytes":521,"stderr_bytes":236},{"step":"Qwen3-1.7B-Q8_0.runnable-smoke","exit_code":0,"seconds":101,"stdout_bytes":2052,"stderr_bytes":270},{"step":"Qwen3-1.7B-Q8_0.verify","exit_code":2,"seconds":1,"stdout_bytes":303,"stderr_bytes":0},{"step":"Qwen3-1.7B-Q8_0.agent-eval","exit_code":0,"seconds":31,"stdout_bytes":5,"stderr_bytes":607}]},{"model_file":"Qwen3-4B-Q8_0.gguf","sha256":"8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300","bytes":4280404704,"steps":[{"step":"Qwen3-4B-Q8_0.inspect","exit_code":0,"seconds":0,"stdout_bytes":7395878,"stderr_bytes":0},{"step":"Qwen3-4B-Q8_0.plan-offload.detected","exit_code":0,"seconds":1,"stdout_bytes":494,"stderr_bytes":236},{"step":"Qwen3-4B-Q8_0.plan-offload.budget4096","exit_code":0,"seconds":0,"stdout_bytes":559,"stderr_bytes":236},{"step":"Qwen3-4B-Q8_0.plan-offload.budget8192","exit_code":0,"seconds":1,"stdout_bytes":531,"stderr_bytes":236},{"step":"Qwen3-4B-Q8_0.runnable-smoke","exit_code":0,"seconds":255,"stdout_bytes":2048,"stderr_bytes":270},{"step":"Qwen3-4B-Q8_0.verify","exit_code":2,"seconds":2,"stdout_bytes":299,"stderr_bytes":0},{"step":"Qwen3-4B-Q8_0.agent-eval","exit_code":1,"seconds":2,"stdout_bytes":5,"stderr_bytes":1727}]}]
+}

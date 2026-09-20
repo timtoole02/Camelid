@@ -1,0 +1,6 @@
+[offload] forced VRAM budget: 8192 MiB
+model: layers=36 hidden=2560 ffn=9728 heads=32 kv_heads=8 head_dim=128 vocab=Some(151936) | KV reserved at context=4096
+[offload] 36 layers: 36 resident in VRAM, 0 offloaded to host (fits fully — no offload)
+[offload] budget (MiB): free 8192 = KV 1152 + ends 394 + safety 256 + scratch 0 + resident-layers 3682 (of total-layers 3682)
+[offload] per-layer ~102 MiB | resident-weights budget 6389 MiB | fully resident
+[offload] layer map (V=VRAM, H=host): VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV

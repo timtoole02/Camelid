@@ -1,0 +1,15 @@
+loading [REDACTED]/ai/Camelid/models/Qwen3-4B-Q8_0.gguf (timeout 90s)…
+loaded 'Qwen3 4B Instruct' in 4.0s
+== case: read_and_count
+  ▸ read_file(notes.txt, start_line=1, max_lines=200)
+  └ read_file ok
+== case: list_dir_find
+  ▸ list_dir(., offset=0, limit=200)
+  └ list_dir ok
+== case: write_greeting
+  ▸ write_file(greeting.txt, 11 bytes)
+  └ write_file ok
+
+PASS — battery complete
+receipt → qa/agent-eval/Qwen3-4B-Q8_0-1787406932-PASS.json (28f0a011d62bdafa9bbcc98ca6af18c15df4047b36ff9062b251d2df82b3ff0c)
+(eligible for promotion: set this row's tool_capable=true in the ledger)
