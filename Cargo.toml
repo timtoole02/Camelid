@@ -44,7 +44,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 rustls-pki-types = "1"
 libc = "0.2"
 rayon = "1"
-ratatui = "0.29"
+ratatui = "0.30"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = "14"
 thiserror = "1"
