@@ -1541,3 +1541,71 @@
   .cxchat__utility, .cxcomposer__option-chips { display: none; }
   .composer-menu__choices .composer-menu__files { display: flex; }
 }
+
+
+/* F2a: verification states for the citation viewer. */
+.citation-modal__badge {
+  font-size: var(--text-xs);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border, #334155);
+  color: var(--color-text-subtle, #cbd5e1);
+  white-space: nowrap;
+}
+
+.citation-modal__badge--verified {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.12);
+}
+
+.citation-modal__badge--refused {
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.citation-modal__body--pending {
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.citation-modal__context {
+  opacity: 0.55;
+}
+
+.citation-modal__span {
+  background: rgba(250, 204, 21, 0.28);
+  color: var(--color-text, #f8fafc);
+  border-radius: 3px;
+  padding: 1px 2px;
+  font-weight: 600;
+}
+
+.citation-modal__refusal {
+  margin: var(--space-3);
+  padding: var(--space-4);
+  border-radius: 8px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+.citation-modal__refusal-title {
+  margin: 0 0 var(--space-2);
+  font-weight: 600;
+  color: #f87171;
+}
+
+.citation-modal__refusal-message {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-subtle, #cbd5e1);
+}
+
+.citation-modal__refusal-code {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  opacity: 0.7;
+}

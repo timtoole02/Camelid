@@ -272,6 +272,7 @@ export default function ChatWorkspace({
   const [documentIngesting, setDocumentIngesting] = useState(false)
   const [documentError, setDocumentError] = useState('')
   const [activeCitation, setActiveCitation] = useState(null)
+  const [citationView, setCitationView] = useState(null)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const imageInputRef = useRef(null)
@@ -633,6 +634,69 @@ export default function ChatWorkspace({
     window.addEventListener('camelid-citation-click', handleCitationClick)
     return () => window.removeEventListener('camelid-citation-click', handleCitationClick)
   }, [])
+
+  // A citation is shown only after the server re-derives it from the stored
+  // source and every hash still matches. Failures are refused, never rendered.
+  useEffect(() => {
+    if (!activeCitation) {
+      setCitationView(null)
+      return undefined
+    }
+
+    const docId = activeCitation.doc_id
+    const chunkIndex = activeCitation.chunk_index
+    if (!docId || chunkIndex === null || chunkIndex === undefined) {
+      setCitationView({
+        status: 'refused',
+        code: 'citation_unverifiable',
+        message: 'This citation carries no source binding, so it cannot be verified.',
+      })
+      return undefined
+    }
+
+    let cancelled = false
+    setCitationView({ status: 'verifying' })
+
+    const verify = async () => {
+      try {
+        const res = await fetch('/api/documents/citation/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            doc_id: docId,
+            chunk_index: chunkIndex,
+            chunk_sha256: activeCitation.chunk_sha256 || null,
+            doc_sha256: activeCitation.doc_sha256 || null,
+          }),
+        })
+        const payload = await res.json().catch(() => null)
+        if (cancelled) return
+        if (res.ok && payload) {
+          setCitationView({ status: 'verified', data: payload })
+        } else {
+          setCitationView({
+            status: 'refused',
+            code: payload?.error?.code || 'citation_refused',
+            message:
+              payload?.error?.message ||
+              'This citation could not be verified against its source.',
+          })
+        }
+      } catch {
+        if (cancelled) return
+        setCitationView({
+          status: 'refused',
+          code: 'citation_unreachable',
+          message: 'The source could not be reached to verify this citation.',
+        })
+      }
+    }
+
+    verify()
+    return () => {
+      cancelled = true
+    }
+  }, [activeCitation])
 
   const handleDocumentFiles = async (files) => {
     if (!files || !files.length) return
@@ -1553,17 +1617,33 @@ export default function ChatWorkspace({
                 <IconFile size={16} />
                 <span>{activeCitation.filename || 'Source Document'}</span>
               </div>
-              {activeCitation.retrieval === 'attached' ? (
-                <span className="citation-modal__score">Attached context</span>
-              ) : activeCitation.score != null && (
-                <span className="citation-modal__score">
-                  Relevance: {(activeCitation.score * 100).toFixed(0)}%
+              {citationView?.status === 'verified' ? (
+                <span className="citation-modal__badge citation-modal__badge--verified">
+                  Verified &middot; bytes {citationView.data.byte_start}&ndash;{citationView.data.byte_end}
                 </span>
+              ) : citationView?.status === 'refused' ? (
+                <span className="citation-modal__badge citation-modal__badge--refused">Refused</span>
+              ) : (
+                <span className="citation-modal__badge">Verifying&hellip;</span>
               )}
             </div>
-            <div className="citation-modal__body">
-              <p>{activeCitation.excerpt}</p>
-            </div>
+            {citationView?.status === 'verified' ? (
+              <div className="citation-modal__body">
+                <span className="citation-modal__context">{citationView.data.before}</span>
+                <mark className="citation-modal__span">{citationView.data.span}</mark>
+                <span className="citation-modal__context">{citationView.data.after}</span>
+              </div>
+            ) : citationView?.status === 'refused' ? (
+              <div className="citation-modal__refusal">
+                <p className="citation-modal__refusal-title">Citation refused</p>
+                <p className="citation-modal__refusal-message">{citationView.message}</p>
+                <p className="citation-modal__refusal-code">{citationView.code}</p>
+              </div>
+            ) : (
+              <div className="citation-modal__body citation-modal__body--pending">
+                Verifying this passage against its source&hellip;
+              </div>
+            )}
             <div className="citation-modal__footer">
               <button type="button" className="button" onClick={() => setActiveCitation(null)}>
                 Close

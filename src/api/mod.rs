@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
 mod changes;
+mod citations;
 mod coding;
 #[allow(dead_code)]
 mod continuous_batch;
@@ -2927,6 +2928,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/documents/ingest", post(documents::ingest_document))
         .route("/api/documents/search", post(documents::search_documents))
+        .route(
+            "/api/documents/citation/resolve",
+            post(citations::resolve_citation),
+        )
         .route(
             "/api/documents/:id",
             axum::routing::delete(documents::delete_document),

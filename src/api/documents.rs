@@ -15,6 +15,7 @@ use axum::Json;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
+use super::citations::{chunk_text_with_spans, sha256_hex};
 use super::{api_error, AppState};
 
 const DEFAULT_CHUNK_CHARS: usize = 512;
@@ -23,7 +24,7 @@ const DOCUMENTS_DB_FILE: &str = "documents_rag.sqlite3";
 
 static DB_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn db_lock() -> &'static Mutex<()> {
+pub(crate) fn db_lock() -> &'static Mutex<()> {
     DB_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
@@ -61,10 +62,33 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             tokenize='porter unicode61'
         );",
     )?;
+    ensure_citation_columns(conn)?;
     Ok(())
 }
 
-fn open_connection() -> Result<Connection, rusqlite::Error> {
+/// Adds the citation-binding columns to databases created before F2a. The table
+/// and column names are compile-time constants, never caller input.
+fn ensure_citation_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    for (table, column, decl) in [
+        ("documents", "source_sha256", "TEXT"),
+        ("documents", "text_sha256", "TEXT"),
+        ("documents", "source_text", "TEXT"),
+        ("document_chunks", "byte_start", "INTEGER"),
+        ("document_chunks", "byte_end", "INTEGER"),
+        ("document_chunks", "chunk_sha256", "TEXT"),
+    ] {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !existing.iter().any(|name| name == column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
     let path = documents_db_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -73,76 +97,6 @@ fn open_connection() -> Result<Connection, rusqlite::Error> {
     conn.execute("PRAGMA foreign_keys = ON;", [])?;
     init_db(&conn)?;
     Ok(conn)
-}
-
-/// Chunks text using sliding window with sentence/paragraph awareness.
-pub fn chunk_text(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<String> {
-    let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = clean.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    if trimmed.chars().count() <= target_chars {
-        return vec![trimmed.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let paragraphs: Vec<&str> = trimmed.split("\n\n").collect();
-    let mut current = String::new();
-
-    for para in paragraphs {
-        let para = para.trim();
-        if para.is_empty() {
-            continue;
-        }
-
-        if current.chars().count() + para.chars().count() + 2 <= target_chars {
-            if !current.is_empty() {
-                current.push_str("\n\n");
-            }
-            current.push_str(para);
-        } else {
-            // If current is not empty, push it
-            if !current.is_empty() {
-                chunks.push(current.clone());
-                // Keep overlap tail
-                let current_chars: Vec<char> = current.chars().collect();
-                if current_chars.len() > overlap_chars {
-                    let tail: String = current_chars[current_chars.len() - overlap_chars..]
-                        .iter()
-                        .collect();
-                    current = tail;
-                    current.push_str("\n\n");
-                } else {
-                    current.clear();
-                }
-            }
-
-            // If a single paragraph is larger than target_chars, split by sentences or chunks
-            if para.chars().count() > target_chars {
-                let chars: Vec<char> = para.chars().collect();
-                let mut start = 0;
-                while start < chars.len() {
-                    let end = (start + target_chars).min(chars.len());
-                    let slice: String = chars[start..end].iter().collect();
-                    chunks.push(slice);
-                    if end >= chars.len() {
-                        break;
-                    }
-                    start += target_chars.saturating_sub(overlap_chars).max(1);
-                }
-            } else {
-                current.push_str(para);
-            }
-        }
-    }
-
-    if !current.trim().is_empty() {
-        chunks.push(current);
-    }
-
-    chunks
 }
 
 /// Extract clean textual tokens from supported document formats.
@@ -266,6 +220,12 @@ pub struct DocumentSearchResult {
     pub chunk_index: usize,
     pub excerpt: String,
     pub score: f32,
+    /// Byte range of `excerpt` within the document's canonical text plus the
+    /// hashes that bind it there. `None` for rows ingested before F2a.
+    pub byte_start: Option<usize>,
+    pub byte_end: Option<usize>,
+    pub chunk_sha256: Option<String>,
+    pub doc_sha256: Option<String>,
     /// `keyword` for an FTS hit, `attached` when an explicitly attached
     /// document is supplied as context because the user's wording had no
     /// lexical overlap with its contents.
@@ -297,7 +257,7 @@ pub async fn ingest_document(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let filename = payload.filename.trim().to_string();
 
-    let text_content = if payload.is_base64 {
+    let (text_content, source_sha256) = if payload.is_base64 {
         use base64::Engine;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(payload.content.trim())
@@ -309,14 +269,17 @@ pub async fn ingest_document(
                     None,
                 )
             })?;
-        extract_text_from_bytes(&filename, &decoded)
+        let digest = sha256_hex(&decoded);
+        (extract_text_from_bytes(&filename, &decoded), digest)
     } else {
-        payload.content
+        let digest = sha256_hex(payload.content.as_bytes());
+        (payload.content, digest)
     };
 
     let byte_size = text_content.len();
-    let chunks = chunk_text(&text_content, DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP);
+    let chunks = chunk_text_with_spans(&text_content, DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP);
     let chunk_count = chunks.len();
+    let text_sha256 = sha256_hex(text_content.as_bytes());
     if chunks.is_empty() {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -386,9 +349,20 @@ pub async fn ingest_document(
     // available for FTS cleanup; REPLACE can otherwise cascade-delete them
     // before the external-content index rows are found.
     tx.execute(
-        "INSERT OR REPLACE INTO documents (id, filename, file_type, byte_size, chunk_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![doc_id, filename, ext, byte_size as i64, chunk_count as i64, now],
+        "INSERT OR REPLACE INTO documents
+         (id, filename, file_type, byte_size, chunk_count, created_at, source_sha256, text_sha256, source_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            doc_id,
+            filename,
+            ext,
+            byte_size as i64,
+            chunk_count as i64,
+            now,
+            source_sha256,
+            text_sha256,
+            text_content
+        ],
     ).map_err(|e| {
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "insert_doc_error", e.to_string(), None)
     })?;
@@ -396,8 +370,17 @@ pub async fn ingest_document(
     // Insert chunks and index in FTS5
     for (idx, chunk) in chunks.iter().enumerate() {
         tx.execute(
-            "INSERT INTO document_chunks (doc_id, chunk_index, content) VALUES (?1, ?2, ?3)",
-            params![doc_id, idx as i64, chunk],
+            "INSERT INTO document_chunks
+             (doc_id, chunk_index, content, byte_start, byte_end, chunk_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                doc_id,
+                idx as i64,
+                chunk.text,
+                chunk.start as i64,
+                chunk.end as i64,
+                chunk.sha256()
+            ],
         )
         .map_err(|e| {
             api_error(
@@ -411,7 +394,7 @@ pub async fn ingest_document(
         let rowid = tx.last_insert_rowid();
         tx.execute(
             "INSERT INTO document_chunks_fts (rowid, content) VALUES (?1, ?2)",
-            params![rowid, chunk],
+            params![rowid, chunk.text],
         )
         .map_err(|e| {
             api_error(
@@ -465,7 +448,8 @@ fn attached_document_context(
     top_k: usize,
 ) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
     let mut statement = conn.prepare(
-        "SELECT c.doc_id, d.filename, c.chunk_index, c.content
+        "SELECT c.doc_id, d.filename, c.chunk_index, c.content,
+                c.byte_start, c.byte_end, c.chunk_sha256, d.text_sha256
          FROM document_chunks AS c
          JOIN documents AS d ON d.id = c.doc_id
          WHERE c.doc_id = ?1
@@ -485,6 +469,10 @@ fn attached_document_context(
                     chunk_index: row.get::<_, i64>(2)? as usize,
                     excerpt: row.get(3)?,
                     score: 0.0,
+                    byte_start: row.get::<_, Option<i64>>(4)?.map(|value| value as usize),
+                    byte_end: row.get::<_, Option<i64>>(5)?.map(|value| value as usize),
+                    chunk_sha256: row.get(6)?,
+                    doc_sha256: row.get(7)?,
                     retrieval: "attached",
                 })
             })?
@@ -548,7 +536,8 @@ pub async fn search_documents(
     // can discard all globally top-ranked rows even when an attached document
     // contains relevant matches just below them.
     let mut sql = String::from(
-        "SELECT c.doc_id, d.filename, c.chunk_index, c.content, bm25(document_chunks_fts) as score
+        "SELECT c.doc_id, d.filename, c.chunk_index, c.content, bm25(document_chunks_fts) as score,
+                c.byte_start, c.byte_end, c.chunk_sha256, d.text_sha256
          FROM document_chunks_fts AS f
          JOIN document_chunks AS c ON c.id = f.rowid
          JOIN documents AS d ON d.id = c.doc_id
@@ -586,7 +575,21 @@ pub async fn search_documents(
             let chunk_index: i64 = row.get(2)?;
             let content: String = row.get(3)?;
             let raw_bm25: f64 = row.get(4)?;
-            Ok((doc_id, filename, chunk_index as usize, content, raw_bm25))
+            let byte_start: Option<i64> = row.get(5)?;
+            let byte_end: Option<i64> = row.get(6)?;
+            let chunk_sha256: Option<String> = row.get(7)?;
+            let doc_sha256: Option<String> = row.get(8)?;
+            Ok((
+                doc_id,
+                filename,
+                chunk_index as usize,
+                content,
+                raw_bm25,
+                byte_start,
+                byte_end,
+                chunk_sha256,
+                doc_sha256,
+            ))
         })
         .map_err(|e| {
             api_error(
@@ -598,7 +601,17 @@ pub async fn search_documents(
         })?;
 
     for row_res in rows.flatten() {
-        let (doc_id, filename, chunk_index, content, raw_bm25) = row_res;
+        let (
+            doc_id,
+            filename,
+            chunk_index,
+            content,
+            raw_bm25,
+            byte_start,
+            byte_end,
+            chunk_sha256,
+            doc_sha256,
+        ) = row_res;
         // BM25 in sqlite returns negative values where lower/more negative is better match
         let normalized_score = (1.0 / (1.0 + raw_bm25.abs())) as f32;
         query_results.push(DocumentSearchResult {
@@ -607,6 +620,10 @@ pub async fn search_documents(
             chunk_index,
             excerpt: content,
             score: normalized_score,
+            byte_start: byte_start.map(|value| value as usize),
+            byte_end: byte_end.map(|value| value as usize),
+            chunk_sha256,
+            doc_sha256,
             retrieval: "keyword",
         });
     }
@@ -730,11 +747,14 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
-    fn test_chunk_text_basic() {
+    fn test_chunk_spans_are_exact_slices() {
         let text = "Hello world! This is a test paragraph.\n\nSecond paragraph has more content for testing.";
-        let chunks = chunk_text(text, 50, 10);
+        let chunks = chunk_text_with_spans(text, 50, 10);
         assert!(!chunks.is_empty());
-        assert!(chunks[0].contains("Hello world!"));
+        assert!(chunks[0].text.contains("Hello world!"));
+        for chunk in &chunks {
+            assert_eq!(chunk.text, text[chunk.start..chunk.end]);
+        }
     }
 
     #[test]
