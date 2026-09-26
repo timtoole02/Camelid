@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::documents::{db_lock, open_connection};
+use super::documents::{db_lock, open_connection, DocumentSearchResult};
 use super::{api_error, AppState};
 
 /// Lowercase hex SHA-256, the single hashing convention for citation binding.
@@ -341,6 +341,44 @@ fn context_after(text: &str, end: usize, budget: usize) -> String {
     text[end..stop].to_string()
 }
 
+/// Keeps only results whose citation resolves to exactly the served excerpt; pre-F2a rows pass.
+pub fn retain_verifiable(
+    conn: &Connection,
+    results: Vec<DocumentSearchResult>,
+) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    let mut kept = Vec::with_capacity(results.len());
+    for result in results {
+        if result.chunk_sha256.is_none() {
+            kept.push(result);
+            continue;
+        }
+        let request = ResolveCitationRequest {
+            doc_id: result.doc_id.clone(),
+            chunk_index: result.chunk_index,
+            chunk_sha256: result.chunk_sha256.clone(),
+            doc_sha256: result.doc_sha256.clone(),
+            context_chars: 0,
+        };
+        match resolve_citation_with(conn, &request)? {
+            CitationOutcome::Resolved(resolved) if resolved.span == result.excerpt => {
+                kept.push(result)
+            }
+            CitationOutcome::Resolved(_) => tracing::warn!(
+                doc_id = %result.doc_id,
+                chunk_index = result.chunk_index,
+                "withheld a search result whose stored excerpt drifted from its source"
+            ),
+            CitationOutcome::Refused { code, .. } => tracing::warn!(
+                doc_id = %result.doc_id,
+                chunk_index = result.chunk_index,
+                code,
+                "withheld a search result whose citation would be refused"
+            ),
+        }
+    }
+    Ok(kept)
+}
+
 /// Endpoint: `POST /api/documents/citation/resolve`
 pub async fn resolve_citation(
     State(_state): State<AppState>,
@@ -423,6 +461,138 @@ mod tests {
             doc_sha256: None,
             context_chars: 40,
         }
+    }
+
+    fn results_for(conn: &Connection, doc_id: &str) -> Vec<DocumentSearchResult> {
+        let mut statement = conn
+            .prepare(
+                "SELECT c.chunk_index, c.content, c.byte_start, c.byte_end, c.chunk_sha256,
+                        d.text_sha256
+                 FROM document_chunks AS c JOIN documents AS d ON d.id = c.doc_id
+                 WHERE c.doc_id = ?1 ORDER BY c.chunk_index",
+            )
+            .unwrap();
+        statement
+            .query_map(params![doc_id], |row| {
+                Ok(DocumentSearchResult {
+                    doc_id: doc_id.to_string(),
+                    filename: "terms.txt".to_string(),
+                    chunk_index: row.get::<_, i64>(0)? as usize,
+                    excerpt: row.get(1)?,
+                    score: 0.0,
+                    byte_start: row.get::<_, Option<i64>>(2)?.map(|value| value as usize),
+                    byte_end: row.get::<_, Option<i64>>(3)?.map(|value| value as usize),
+                    chunk_sha256: row.get(4)?,
+                    doc_sha256: row.get(5)?,
+                    retrieval: "keyword",
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn served(results: &[DocumentSearchResult]) -> Vec<(&str, usize)> {
+        results
+            .iter()
+            .map(|result| (result.doc_id.as_str(), result.chunk_index))
+            .collect()
+    }
+
+    #[test]
+    fn search_serves_every_intact_result() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let spans = seed(&conn, "doc", SAMPLE);
+        assert!(spans.len() > 1, "fixture must span several chunks");
+
+        let results = results_for(&conn, "doc");
+        let kept = retain_verifiable(&conn, results.clone()).unwrap();
+        assert_eq!(served(&kept), served(&results));
+    }
+
+    #[test]
+    fn search_withholds_an_excerpt_that_drifted_from_its_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let spans = seed(&conn, "doc", SAMPLE);
+        conn.execute(
+            "UPDATE document_chunks SET content = REPLACE(content, '60 days', '90 days')
+             WHERE doc_id = 'doc' AND chunk_index = 0",
+            [],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "doc")).unwrap();
+        let expected: Vec<_> = (1..spans.len()).map(|index| ("doc", index)).collect();
+        assert_eq!(served(&kept), expected);
+        assert!(kept
+            .iter()
+            .all(|result| !result.excerpt.contains("90 days")));
+    }
+
+    #[test]
+    fn search_withholds_an_excerpt_rehashed_to_match_its_drift() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "doc", SAMPLE);
+        let drifted = conn
+            .query_row(
+                "SELECT content FROM document_chunks WHERE doc_id = 'doc' AND chunk_index = 0",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .replace("60 days", "90 days");
+        conn.execute(
+            "UPDATE document_chunks SET content = ?1, chunk_sha256 = ?2
+             WHERE doc_id = 'doc' AND chunk_index = 0",
+            params![drifted, sha256_hex(drifted.as_bytes())],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "doc")).unwrap();
+        assert!(kept.iter().all(|result| result.chunk_index != 0));
+    }
+
+    #[test]
+    fn search_withholds_every_result_of_a_corrupted_document_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "corrupted", SAMPLE);
+        let healthy = seed(&conn, "healthy", SAMPLE);
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days')
+             WHERE id = 'corrupted'",
+            [],
+        )
+        .unwrap();
+
+        let mut results = results_for(&conn, "corrupted");
+        results.extend(results_for(&conn, "healthy"));
+        let kept = retain_verifiable(&conn, results).unwrap();
+        let expected: Vec<_> = (0..healthy.len()).map(|index| ("healthy", index)).collect();
+        assert_eq!(served(&kept), expected);
+    }
+
+    #[test]
+    fn search_passes_rows_without_a_citation_spine_through() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, filename, file_type, byte_size, chunk_count, created_at)
+             VALUES ('legacy', 'old.txt', 'txt', 5, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document_chunks (doc_id, chunk_index, content) VALUES ('legacy', 0, 'hello')",
+            [],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "legacy")).unwrap();
+        assert_eq!(served(&kept), vec![("legacy", 0)]);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use axum::Json;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 
-use super::citations::{chunk_text_with_spans, sha256_hex};
+use super::citations::{chunk_text_with_spans, retain_verifiable, sha256_hex};
 use super::{api_error, AppState};
 
 const DEFAULT_CHUNK_CHARS: usize = 512;
@@ -628,16 +628,27 @@ pub async fn search_documents(
         });
     }
 
+    query_results = retain_verifiable(&conn, query_results).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "citation_query_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+
     if query_results.is_empty() {
         if let Some(attached_ids) = payload.doc_ids.as_deref() {
-            query_results = attached_document_context(&conn, attached_ids, top_k).map_err(|e| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "attached_document_fallback_error",
-                    e.to_string(),
-                    None,
-                )
-            })?;
+            query_results = attached_document_context(&conn, attached_ids, top_k)
+                .and_then(|results| retain_verifiable(&conn, results))
+                .map_err(|e| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "attached_document_fallback_error",
+                        e.to_string(),
+                        None,
+                    )
+                })?;
         }
     }
 
