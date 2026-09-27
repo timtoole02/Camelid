@@ -1,0 +1,50 @@
+{
+  "question": "What is the refund window for enterprise customers? Also give it as a JSON object in a ```json code block.",
+  "remove_control": {
+    "label": "Remove support-policy.txt",
+    "width": 24,
+    "height": 24,
+    "hovered": true,
+    "hover_background": "rgba(148, 178, 209, 0.26)"
+  },
+  "viewer_from_composer": {
+    "title": "support-policy.txt",
+    "badge": "Verified · 1.5 KB",
+    "code": null,
+    "text_chars": 1535,
+    "scrollable_px": 104
+  },
+  "turn": {
+    "chips": [
+      "support-policy.txt4 passages used"
+    ],
+    "answer": "According to the retrieved document excerpts, the refund window for Enterprise customers is 60 days from the invoice date.\n\nHere is the answer in a JSON object format:\n\nCODE\nPreview\nDownload\nReview file change\nCopy\n{\n  \"refund_window\": 60,\n  \"refund_window_unit\": \"days\"\n}\n\nSource: [Citation 1 from support-policy.txt]: time of day, including weekends and public holidays.\n",
+    "tray": "1 file from this conversationoutput.txttext/plain · 58 bytes"
+  },
+  "files_panel": {
+    "filename": "output.txt",
+    "preview": "{\n  \"refund_window\": 60,\n  \"refund_window_unit\": \"days\"\n}\n"
+  },
+  "viewer_after_tampering": {
+    "title": "support-policy.txt",
+    "badge": "Refused",
+    "code": "document_source_corrupted",
+    "text_chars": null,
+    "scrollable_px": null
+  },
+  "viewer_after_restoring": {
+    "title": "support-policy.txt",
+    "badge": "Verified · 1.5 KB",
+    "code": null,
+    "text_chars": 1535,
+    "scrollable_px": 104
+  },
+  "viewer_after_deletion": {
+    "title": "support-policy.txt",
+    "badge": "Refused",
+    "code": "document_not_found",
+    "text_chars": null,
+    "scrollable_px": null
+  },
+  "page_errors": []
+}

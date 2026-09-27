@@ -1,0 +1,58 @@
+[
+  {
+    "request": "GET /api/documents/5d822205-7455-41b2-9ea6-3bcd1724edc4/source",
+    "status": 200,
+    "response": {
+      "doc_id": "5d822205-7455-41b2-9ea6-3bcd1724edc4",
+      "filename": "support-policy.txt",
+      "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+      "text_bytes": 1535,
+      "sha256_of_served_text": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+    }
+  },
+  {
+    "action": "stored text of 5d822205-7455-41b2-9ea6-3bcd1724edc4 edited in SQLite: '60 days' -> '30 days'"
+  },
+  {
+    "request": "GET /api/documents/5d822205-7455-41b2-9ea6-3bcd1724edc4/source",
+    "status": 409,
+    "response": {
+      "error": {
+        "message": "The stored text no longer matches its recorded hash, so it is not shown.",
+        "type": "invalid_request",
+        "code": "document_source_corrupted",
+        "param": null
+      }
+    }
+  },
+  {
+    "action": "stored text of 5d822205-7455-41b2-9ea6-3bcd1724edc4 edited in SQLite: '30 days' -> '60 days'"
+  },
+  {
+    "request": "GET /api/documents/5d822205-7455-41b2-9ea6-3bcd1724edc4/source",
+    "status": 200,
+    "response": {
+      "doc_id": "5d822205-7455-41b2-9ea6-3bcd1724edc4",
+      "filename": "support-policy.txt",
+      "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+      "text_bytes": 1535,
+      "sha256_of_served_text": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+    }
+  },
+  {
+    "request": "DELETE /api/documents/5d822205-7455-41b2-9ea6-3bcd1724edc4",
+    "status": 204
+  },
+  {
+    "request": "GET /api/documents/5d822205-7455-41b2-9ea6-3bcd1724edc4/source",
+    "status": 404,
+    "response": {
+      "error": {
+        "message": "This document is no longer in the library.",
+        "type": "invalid_request",
+        "code": "document_not_found",
+        "param": null
+      }
+    }
+  }
+]
