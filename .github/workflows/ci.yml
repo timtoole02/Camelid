@@ -519,6 +519,12 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:web-research-browser
 
+      # Real compiled-UI coverage for verifiable citations: the viewer shows only
+      # a span the server just re-derived, and shows no text when it refuses.
+      - name: Frontend citations browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:citations-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

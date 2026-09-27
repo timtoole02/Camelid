@@ -63,6 +63,7 @@
     "smoke:diagram-browser": "node scripts/diagram-browser-smoke.mjs",
     "smoke:web-research": "node scripts/web-research-smoke.mjs",
     "smoke:web-research-browser": "node scripts/web-research-browser-smoke.mjs",
+    "smoke:citations-browser": "node scripts/citations-browser-smoke.mjs",
     "smoke:byte-units": "node scripts/byte-units-smoke.mjs",
     "smoke:context-meter": "node scripts/context-meter-smoke.mjs",
     "smoke:context-compaction": "node scripts/context-compaction-smoke.mjs",

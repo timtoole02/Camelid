@@ -5,6 +5,8 @@
 //! anything drifted the citation is *refused* rather than rendered, so a stale
 //! or tampered source can never be quoted as if it were current.
 
+use std::collections::HashMap;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -191,65 +193,104 @@ fn refuse(code: &'static str, message: impl Into<String>) -> CitationOutcome {
     }
 }
 
-/// Re-derives a cited span and verifies every binding. Pure over a connection so
-/// it can be tested without a server.
-pub fn resolve_citation_with(
+/// A document whose stored source still hashes to its recorded digest.
+struct VerifiedSource {
+    filename: String,
+    doc_sha256: String,
+    text: String,
+}
+
+enum SourceState {
+    Verified(VerifiedSource),
+    /// Ingested before F2a: no citation binding exists anywhere on the document.
+    Legacy,
+    Refused {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+const LEGACY_MESSAGE: &str =
+    "This document predates verifiable citations. Re-ingest it to cite from it.";
+
+/// Loads a document and verifies its stored source once, for every chunk cited from it.
+fn load_source(
     conn: &Connection,
-    request: &ResolveCitationRequest,
-) -> Result<CitationOutcome, rusqlite::Error> {
+    doc_id: &str,
+    expected_doc_sha256: Option<&str>,
+) -> Result<SourceState, rusqlite::Error> {
     let document = conn
         .query_row(
-            "SELECT filename, text_sha256, source_text FROM documents WHERE id = ?1",
-            params![request.doc_id],
+            "SELECT filename, source_sha256, text_sha256, source_text FROM documents WHERE id = ?1",
+            params![doc_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((filename, stored_doc_sha, source_text)) = document else {
-        return Ok(refuse(
-            "citation_unknown_document",
-            "The cited document is no longer in the library.",
-        ));
+    let Some((filename, source_sha, stored_doc_sha, source_text)) = document else {
+        return Ok(SourceState::Refused {
+            code: "citation_unknown_document",
+            message: "The cited document is no longer in the library.",
+        });
     };
 
-    let (Some(stored_doc_sha), Some(source_text)) = (stored_doc_sha, source_text) else {
-        return Ok(refuse(
-            "citation_unverifiable",
-            "This document predates verifiable citations. Re-ingest it to cite from it.",
-        ));
-    };
+    // A partial binding is damage, not age: only a document with none of it is legacy.
+    let (stored_doc_sha, text) =
+        match (source_sha, stored_doc_sha, source_text) {
+            (None, None, None) => return Ok(SourceState::Legacy),
+            (_, Some(stored_doc_sha), Some(text)) => (stored_doc_sha, text),
+            _ => return Ok(SourceState::Refused {
+                code: "citation_unverifiable",
+                message:
+                    "This document's citation record is incomplete. Re-ingest it to cite from it.",
+            }),
+        };
 
     // A document re-ingested with different content gets a new text hash, so a
     // citation minted against the old content can no longer be resolved.
-    if let Some(expected) = request.doc_sha256.as_deref() {
-        if expected != stored_doc_sha {
-            return Ok(refuse(
-                "citation_document_changed",
-                "The source document changed after this citation was created.",
-            ));
-        }
+    if expected_doc_sha256.is_some_and(|expected| expected != stored_doc_sha) {
+        return Ok(SourceState::Refused {
+            code: "citation_document_changed",
+            message: "The source document changed after this citation was created.",
+        });
     }
 
     // The stored text is the canonical source. If it no longer hashes to the
     // recorded digest the row was tampered with underneath us.
-    if sha256_hex(source_text.as_bytes()) != stored_doc_sha {
-        return Ok(refuse(
-            "citation_source_corrupted",
-            "The stored source text no longer matches its recorded hash.",
-        ));
+    if sha256_hex(text.as_bytes()) != stored_doc_sha {
+        return Ok(SourceState::Refused {
+            code: "citation_source_corrupted",
+            message: "The stored source text no longer matches its recorded hash.",
+        });
     }
 
+    Ok(SourceState::Verified(VerifiedSource {
+        filename,
+        doc_sha256: stored_doc_sha,
+        text,
+    }))
+}
+
+fn resolve_chunk(
+    conn: &Connection,
+    doc_id: &str,
+    source: &VerifiedSource,
+    chunk_index: usize,
+    expected_chunk_sha256: Option<&str>,
+    context_chars: usize,
+) -> Result<CitationOutcome, rusqlite::Error> {
     let chunk = conn
         .query_row(
             "SELECT byte_start, byte_end, chunk_sha256 FROM document_chunks
              WHERE doc_id = ?1 AND chunk_index = ?2",
-            params![request.doc_id, request.chunk_index as i64],
+            params![doc_id, chunk_index as i64],
             |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,
@@ -276,22 +317,23 @@ pub fn resolve_citation_with(
         ));
     };
 
+    let text = source.text.as_str();
     let start = byte_start.max(0) as usize;
     let end = byte_end.max(0) as usize;
-    if start >= end || end > source_text.len() {
+    if start >= end || end > text.len() {
         return Ok(refuse(
             "citation_range_invalid",
             "The cited byte range falls outside the current source.",
         ));
     }
-    if !source_text.is_char_boundary(start) || !source_text.is_char_boundary(end) {
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
         return Ok(refuse(
             "citation_range_invalid",
             "The cited byte range does not land on character boundaries.",
         ));
     }
 
-    let span = &source_text[start..end];
+    let span = &text[start..end];
     let recomputed = sha256_hex(span.as_bytes());
     if recomputed != stored_chunk_sha {
         return Ok(refuse(
@@ -299,30 +341,48 @@ pub fn resolve_citation_with(
             "The cited passage no longer matches the text at that location.",
         ));
     }
-    if let Some(expected) = request.chunk_sha256.as_deref() {
-        if expected != recomputed {
-            return Ok(refuse(
-                "citation_chunk_mismatch",
-                "The quoted passage does not match the stored source.",
-            ));
-        }
+    if expected_chunk_sha256.is_some_and(|expected| expected != recomputed) {
+        return Ok(refuse(
+            "citation_chunk_mismatch",
+            "The quoted passage does not match the stored source.",
+        ));
     }
 
-    let budget = request.context_chars.min(2_000);
+    let budget = context_chars.min(2_000);
     Ok(CitationOutcome::Resolved(Box::new(
         ResolveCitationResponse {
-            doc_id: request.doc_id.clone(),
-            filename,
-            chunk_index: request.chunk_index,
+            doc_id: doc_id.to_string(),
+            filename: source.filename.clone(),
+            chunk_index,
             byte_start: start,
             byte_end: end,
             chunk_sha256: recomputed,
-            doc_sha256: stored_doc_sha,
-            before: context_before(&source_text, start, budget),
+            doc_sha256: source.doc_sha256.clone(),
+            before: context_before(text, start, budget),
             span: span.to_string(),
-            after: context_after(&source_text, end, budget),
+            after: context_after(text, end, budget),
         },
     )))
+}
+
+/// Re-derives a cited span and verifies every binding. Pure over a connection so
+/// it can be tested without a server.
+pub fn resolve_citation_with(
+    conn: &Connection,
+    request: &ResolveCitationRequest,
+) -> Result<CitationOutcome, rusqlite::Error> {
+    match load_source(conn, &request.doc_id, request.doc_sha256.as_deref())? {
+        SourceState::Verified(source) => resolve_chunk(
+            conn,
+            &request.doc_id,
+            &source,
+            request.chunk_index,
+            request.chunk_sha256.as_deref(),
+            request.context_chars,
+        ),
+        SourceState::Legacy => Ok(refuse("citation_unverifiable", LEGACY_MESSAGE)),
+        SourceState::Refused { code, message } => Ok(refuse(code, message)),
+    }
 }
 
 fn context_before(text: &str, start: usize, budget: usize) -> String {
@@ -341,38 +401,49 @@ fn context_after(text: &str, end: usize, budget: usize) -> String {
     text[end..stop].to_string()
 }
 
-/// Keeps only results whose citation resolves to exactly the served excerpt; pre-F2a rows pass.
+/// Keeps only results whose citation resolves to exactly the served excerpt. A result
+/// from a document with no citation binding at all (pre-F2a) passes through unchanged.
 pub fn retain_verifiable(
     conn: &Connection,
     results: Vec<DocumentSearchResult>,
 ) -> Result<Vec<DocumentSearchResult>, rusqlite::Error> {
+    let mut sources: HashMap<String, SourceState> = HashMap::new();
     let mut kept = Vec::with_capacity(results.len());
     for result in results {
-        if result.chunk_sha256.is_none() {
-            kept.push(result);
-            continue;
+        if !sources.contains_key(&result.doc_id) {
+            let state = load_source(conn, &result.doc_id, result.doc_sha256.as_deref())?;
+            sources.insert(result.doc_id.clone(), state);
         }
-        let request = ResolveCitationRequest {
-            doc_id: result.doc_id.clone(),
-            chunk_index: result.chunk_index,
-            chunk_sha256: result.chunk_sha256.clone(),
-            doc_sha256: result.doc_sha256.clone(),
-            context_chars: 0,
-        };
-        match resolve_citation_with(conn, &request)? {
-            CitationOutcome::Resolved(resolved) if resolved.span == result.excerpt => {
-                kept.push(result)
+        let verdict = match &sources[&result.doc_id] {
+            SourceState::Verified(source) => match resolve_chunk(
+                conn,
+                &result.doc_id,
+                source,
+                result.chunk_index,
+                result.chunk_sha256.as_deref(),
+                0,
+            )? {
+                CitationOutcome::Resolved(resolved) if resolved.span == result.excerpt => Ok(()),
+                CitationOutcome::Resolved(_) => Err("citation_excerpt_drifted"),
+                CitationOutcome::Refused { code, .. } => Err(code),
+            },
+            SourceState::Legacy
+                if result.chunk_sha256.is_none()
+                    && result.byte_start.is_none()
+                    && result.byte_end.is_none() =>
+            {
+                Ok(())
             }
-            CitationOutcome::Resolved(_) => tracing::warn!(
-                doc_id = %result.doc_id,
-                chunk_index = result.chunk_index,
-                "withheld a search result whose stored excerpt drifted from its source"
-            ),
-            CitationOutcome::Refused { code, .. } => tracing::warn!(
+            SourceState::Legacy => Err("citation_unverifiable"),
+            SourceState::Refused { code, .. } => Err(*code),
+        };
+        match verdict {
+            Ok(()) => kept.push(result),
+            Err(code) => tracing::warn!(
                 doc_id = %result.doc_id,
                 chunk_index = result.chunk_index,
                 code,
-                "withheld a search result whose citation would be refused"
+                "withheld a search result that does not resolve to its excerpt"
             ),
         }
     }
@@ -593,6 +664,85 @@ mod tests {
 
         let kept = retain_verifiable(&conn, results_for(&conn, "legacy")).unwrap();
         assert_eq!(served(&kept), vec![("legacy", 0)]);
+    }
+
+    #[test]
+    fn search_withholds_a_chunk_whose_hash_was_erased_from_a_verified_document() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let spans = seed(&conn, "doc", SAMPLE);
+        conn.execute(
+            "UPDATE document_chunks SET chunk_sha256 = NULL WHERE doc_id = 'doc' AND chunk_index = 0",
+            [],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "doc")).unwrap();
+        let expected: Vec<_> = (1..spans.len()).map(|index| ("doc", index)).collect();
+        assert_eq!(served(&kept), expected);
+    }
+
+    #[test]
+    fn search_withholds_a_chunk_stripped_of_its_whole_binding() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let spans = seed(&conn, "doc", SAMPLE);
+        conn.execute(
+            "UPDATE document_chunks SET chunk_sha256 = NULL, byte_start = NULL, byte_end = NULL
+             WHERE doc_id = 'doc' AND chunk_index = 0",
+            [],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "doc")).unwrap();
+        let expected: Vec<_> = (1..spans.len()).map(|index| ("doc", index)).collect();
+        assert_eq!(served(&kept), expected);
+    }
+
+    #[test]
+    fn a_document_with_its_hash_erased_is_damaged_not_legacy() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "doc", SAMPLE);
+        conn.execute(
+            "UPDATE documents SET text_sha256 = NULL WHERE id = 'doc'",
+            [],
+        )
+        .unwrap();
+
+        let kept = retain_verifiable(&conn, results_for(&conn, "doc")).unwrap();
+        assert!(kept.is_empty(), "served {:?}", served(&kept));
+        match resolve_citation_with(&conn, &request("doc", 0)).unwrap() {
+            CitationOutcome::Refused { code, .. } => assert_eq!(code, "citation_unverifiable"),
+            CitationOutcome::Resolved(_) => panic!("a damaged record must not resolve"),
+        }
+    }
+
+    #[test]
+    fn search_verifies_a_mix_of_documents_independently() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "corrupted", SAMPLE);
+        let healthy = seed(&conn, "healthy", SAMPLE);
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days')
+             WHERE id = 'corrupted'",
+            [],
+        )
+        .unwrap();
+
+        // Interleaved results exercise the per-document cache in both states.
+        let corrupted = results_for(&conn, "corrupted");
+        let mut mixed = Vec::new();
+        for (index, result) in results_for(&conn, "healthy").into_iter().enumerate() {
+            mixed.push(result);
+            if let Some(bad) = corrupted.get(index) {
+                mixed.push(bad.clone());
+            }
+        }
+        let kept = retain_verifiable(&conn, mixed).unwrap();
+        let expected: Vec<_> = (0..healthy.len()).map(|index| ("healthy", index)).collect();
+        assert_eq!(served(&kept), expected);
     }
 
     #[test]

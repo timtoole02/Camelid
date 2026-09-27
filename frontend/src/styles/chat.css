@@ -1565,6 +1565,10 @@
   background: rgba(248, 113, 113, 0.12);
 }
 
+.citation-modal__body {
+  overflow-wrap: anywhere;
+}
+
 .citation-modal__body--pending {
   opacity: 0.7;
   font-style: italic;
