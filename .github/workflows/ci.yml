@@ -525,6 +525,12 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:citations-browser
 
+      # Attached documents open in a viewer only once the server verifies their
+      # text; generated files stay listed in a tray above the composer.
+      - name: Frontend document viewer browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:document-viewer-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

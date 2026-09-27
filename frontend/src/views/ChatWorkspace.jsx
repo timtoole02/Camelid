@@ -3,11 +3,11 @@ import { toolActivityGroups } from '../lib/toolActivity.js'
 import { ComposerMenu } from '../components/chat/ComposerMenu'
 import { ConversationContext } from '../components/context/ContextEditors'
 import { contextSourceMessages, chatHistoryForRequest } from '../lib/projectContext.js'
-import { ConversationFiles } from '../components/outputs/ConversationFiles'
+import { ConversationFiles, ConversationFilesTray } from '../components/outputs/ConversationFiles'
 import { conversationFiles } from '../lib/conversationFiles.js'
 import { OutputPanelContext, OutputMessageContext, ToolOutputGallery } from '../components/outputs/OutputActions.jsx'
 import { ConnectedTools, McpRunPanel } from '../components/mcp/ConnectedTools'
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId } from '../lib/modelState'
 import { detectRepeatedCall, normalizeToolCalls } from '../lib/toolCalling'
@@ -22,6 +22,7 @@ import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { DocumentViewer } from '../components/chat/DocumentViewer'
 import { VoiceInput } from '../components/chat/VoiceInput'
 import { ChatControls } from '../components/chat/ChatControls'
 import { ContextMeter } from '../components/chat/ContextMeter'
@@ -273,6 +274,9 @@ export default function ChatWorkspace({
   const [documentError, setDocumentError] = useState('')
   const [activeCitation, setActiveCitation] = useState(null)
   const [citationView, setCitationView] = useState(null)
+  const [viewerDocument, setViewerDocument] = useState(null)
+  const openDocument = useCallback((doc) => setViewerDocument(doc), [])
+  const closeDocumentViewer = useCallback(() => setViewerDocument(null), [])
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const imageInputRef = useRef(null)
@@ -781,6 +785,10 @@ export default function ChatWorkspace({
       overrideImage: image,
       requestContent: contentToSend !== composer ? contentToSend : null,
       citations: requestCitations,
+      documents: attachedDocuments.map((doc) => ({
+        ...doc,
+        passages: requestCitations.filter((citation) => citation.doc_id === doc.doc_id).length,
+      })),
     })
   }
 
@@ -999,9 +1007,11 @@ export default function ChatWorkspace({
           <div className="cxcomposer__docs">
             {attachedDocuments.map((doc) => (
               <div key={doc.doc_id} className="cxcomposer__doc-pill">
-                <IconFile size={14} />
-                <span className="cxcomposer__doc-name" title={doc.filename}>{doc.filename}</span>
-                <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
+                <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
+                  <IconFile size={14} />
+                  <span className="cxcomposer__doc-name">{doc.filename}</span>
+                  <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
+                </button>
                 <button
                   type="button"
                   className="cxcomposer__doc-remove"
@@ -1549,6 +1559,7 @@ export default function ChatWorkspace({
                       onSelectVariant={selectMessageVariant ? (index) => selectMessageVariant(message.id, index) : null}
                       onDiscardVariant={discardMessageVariant && !requestActive ? () => discardMessageVariant(message.id) : null}
                       onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                      onOpenDocument={openDocument}
                       onContinue={canContinue ? () => continueFromMessage(message.id) : null}
                       tokenInspection={tokenInspections?.[message.id] || null}
                       structuredRecord={structuredRecords?.[message.id] || null}
@@ -1605,6 +1616,7 @@ export default function ChatWorkspace({
 
       <div className="cxchat__dock">
         <div className="cxchat__column">
+          {files.length > 0 && <ConversationFilesTray files={files} onOpen={(id) => { setSelectedFileId(id); setFilesOpen(true) }} />}
           {renderComposer()}
         </div>
       </div>
@@ -1652,6 +1664,7 @@ export default function ChatWorkspace({
           </div>
         </div>
       )}
+      {viewerDocument && <DocumentViewer key={viewerDocument.doc_id} document={viewerDocument} onClose={closeDocumentViewer} />}
     </section>
     {filesOpen && <ConversationFiles key={selectedConversation?.id || 'draft'} files={files} selectedId={selectedFileId} onSelect={setSelectedFileId} onClose={() => setFilesOpen(false)} conversationId={selectedConversation?.id || 'draft'} />}
     </div>

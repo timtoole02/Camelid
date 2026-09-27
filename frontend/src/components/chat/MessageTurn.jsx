@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay, IconTrash } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay, IconTrash, IconFile } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
 import { continuationCountOf } from '../../lib/chatContinuation'
@@ -222,12 +222,21 @@ function MessageMetaFooter({ message }) {
 /* User rows: copy + inline edit-and-resend. Editing truncates the thread at
    this message and resends through the normal gate-checked send path. Copy is
    always available — only "Edit & resend" is gated on resend being possible. */
-function UserTurn({ message, messageContent, onEditResend }) {
+const passagesLabel = (passages) => {
+  if (!Number.isInteger(passages)) return null
+  if (passages === 0) return 'no passages used'
+  return `${passages} passage${passages === 1 ? '' : 's'} used`
+}
+
+function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(messageContent)
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const sentAt = formatTimeOfDay(message.created_at)
+  const documents = Array.isArray(message.documents)
+    ? message.documents.filter((doc) => typeof doc?.doc_id === 'string' && typeof doc?.filename === 'string')
+    : []
   const submitEdit = () => {
     const next = draft.trim()
     setEditing(false)
@@ -247,6 +256,25 @@ function UserTurn({ message, messageContent, onEditResend }) {
   return (
     <article className="cxturn cxturn--user">
       <div className="cxturn__user-wrapper">
+        {documents.length > 0 && (
+          <ul className="cxturn__user-docs" aria-label="Documents attached to this message">
+            {documents.map((doc) => (
+              <li key={doc.doc_id}>
+                <button
+                  type="button"
+                  className="cxturn__user-doc"
+                  disabled={!onOpenDocument}
+                  onClick={() => onOpenDocument?.(doc)}
+                  title={`Open ${doc.filename}`}
+                >
+                  <IconFile size={13} />
+                  <span className="cxturn__user-doc-name">{doc.filename}</span>
+                  {passagesLabel(doc.passages) && <span className="cxturn__user-doc-meta">{passagesLabel(doc.passages)}</span>}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="cxturn__user-chip">
           {message.image?.data_url && (
             <img
@@ -317,7 +345,7 @@ function UserTurn({ message, messageContent, onEditResend }) {
   )
 }
 
-export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = false, message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
+export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = false, message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend, onOpenDocument = null, onContinue, onSelectVariant, onDiscardVariant, regenerateReplacesThread = false, tokenInspection = null, structuredRecord = null, toolCallRepeat = null }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -362,6 +390,7 @@ export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = fa
         message={message}
         messageContent={messageContent}
         onEditResend={onEditResend}
+        onOpenDocument={onOpenDocument}
       />
     )
   }

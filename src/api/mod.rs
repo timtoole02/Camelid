@@ -2936,6 +2936,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/documents/:id",
             axum::routing::delete(documents::delete_document),
         )
+        .route("/api/documents/:id/source", get(citations::document_source))
         .route("/api/documents", get(documents::list_documents))
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
@@ -479,6 +479,106 @@ pub async fn resolve_citation(
         CitationOutcome::Refused { code, message } => {
             Err(api_error(StatusCode::CONFLICT, code, message, None))
         }
+    }
+}
+
+/// A document's whole stored text, for the in-chat document viewer.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DocumentSourceResponse {
+    pub doc_id: String,
+    pub filename: String,
+    pub doc_sha256: String,
+    pub text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DocumentSourceOutcome {
+    Shown(DocumentSourceResponse),
+    Refused {
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+/// Shows a document only while its stored text still hashes to the recorded
+/// digest: the same bar a citation from it must clear.
+pub fn document_source_with(
+    conn: &Connection,
+    doc_id: &str,
+) -> Result<DocumentSourceOutcome, rusqlite::Error> {
+    let refused = |status, code, message| DocumentSourceOutcome::Refused {
+        status,
+        code,
+        message,
+    };
+    Ok(match load_source(conn, doc_id, None)? {
+        SourceState::Verified(source) => DocumentSourceOutcome::Shown(DocumentSourceResponse {
+            doc_id: doc_id.to_string(),
+            filename: source.filename,
+            doc_sha256: source.doc_sha256,
+            text: source.text,
+        }),
+        SourceState::Legacy => refused(
+            StatusCode::CONFLICT,
+            "document_source_unavailable",
+            "This document was indexed before Camelid kept its source text. Attach it again to view it.",
+        ),
+        SourceState::Refused {
+            code: "citation_unknown_document",
+            ..
+        } => refused(
+            StatusCode::NOT_FOUND,
+            "document_not_found",
+            "This document is no longer in the library.",
+        ),
+        SourceState::Refused {
+            code: "citation_source_corrupted",
+            ..
+        } => refused(
+            StatusCode::CONFLICT,
+            "document_source_corrupted",
+            "The stored text no longer matches its recorded hash, so it is not shown.",
+        ),
+        SourceState::Refused { .. } => refused(
+            StatusCode::CONFLICT,
+            "document_source_incomplete",
+            "This document's source record is incomplete. Attach it again to view it.",
+        ),
+    })
+}
+
+/// Endpoint: `GET /api/documents/:id/source`
+pub async fn document_source(
+    State(_state): State<AppState>,
+    AxumPath(doc_id): AxumPath<String>,
+) -> Result<Json<DocumentSourceResponse>, Response> {
+    let _lock = db_lock().lock().unwrap();
+    let conn = open_connection().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sqlite_open_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+
+    let outcome = document_source_with(&conn, &doc_id).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "document_source_query_error",
+            e.to_string(),
+            None,
+        )
+    })?;
+
+    match outcome {
+        DocumentSourceOutcome::Shown(source) => Ok(Json(source)),
+        DocumentSourceOutcome::Refused {
+            status,
+            code,
+            message,
+        } => Err(api_error(status, code, message.to_string(), None)),
     }
 }
 
@@ -1000,5 +1100,83 @@ Trial accounts are not eligible for refunds under any circumstance.\n";
             CitationOutcome::Refused { code, .. } => assert_eq!(code, "citation_unverifiable"),
             CitationOutcome::Resolved(_) => panic!("legacy rows cannot be verified"),
         }
+    }
+
+    fn source_refusal(conn: &Connection, doc_id: &str) -> (StatusCode, &'static str) {
+        match document_source_with(conn, doc_id).unwrap() {
+            DocumentSourceOutcome::Refused { status, code, .. } => (status, code),
+            DocumentSourceOutcome::Shown(source) => {
+                panic!(
+                    "{doc_id} must not be shown, got {} bytes",
+                    source.text.len()
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn document_source_shows_the_whole_verified_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "doc", SAMPLE);
+
+        match document_source_with(&conn, "doc").unwrap() {
+            DocumentSourceOutcome::Shown(source) => {
+                assert_eq!(source.doc_id, "doc");
+                assert_eq!(source.filename, "terms.txt");
+                assert_eq!(source.text, SAMPLE);
+                assert_eq!(source.doc_sha256, sha256_hex(SAMPLE.as_bytes()));
+            }
+            other => panic!("an intact document must be shown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_source_refuses_a_tampered_text_instead_of_showing_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed(&conn, "doc", SAMPLE);
+        conn.execute(
+            "UPDATE documents SET source_text = REPLACE(source_text, '60 days', '90 days') WHERE id = 'doc'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            source_refusal(&conn, "doc"),
+            (StatusCode::CONFLICT, "document_source_corrupted")
+        );
+    }
+
+    #[test]
+    fn document_source_names_why_it_cannot_show_a_document() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(
+            source_refusal(&conn, "missing"),
+            (StatusCode::NOT_FOUND, "document_not_found")
+        );
+
+        conn.execute(
+            "INSERT INTO documents (id, filename, file_type, byte_size, chunk_count, created_at)
+             VALUES ('legacy', 'old.txt', 'txt', 10, 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            source_refusal(&conn, "legacy"),
+            (StatusCode::CONFLICT, "document_source_unavailable")
+        );
+
+        seed(&conn, "damaged", SAMPLE);
+        conn.execute(
+            "UPDATE documents SET text_sha256 = NULL WHERE id = 'damaged'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            source_refusal(&conn, "damaged"),
+            (StatusCode::CONFLICT, "document_source_incomplete")
+        );
     }
 }
