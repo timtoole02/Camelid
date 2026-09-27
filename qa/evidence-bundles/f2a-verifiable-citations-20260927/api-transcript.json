@@ -1,0 +1,126 @@
+[
+  {
+    "request": {
+      "POST /api/documents/search": {
+        "query": "What is the refund window for enterprise customers?",
+        "doc_ids": [
+          "29f174d0-cb38-4865-8ac0-f5cab6651485"
+        ],
+        "top_k": 4
+      }
+    },
+    "status": 200,
+    "response": {
+      "results": [
+        {
+          "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+          "filename": "support-policy.txt",
+          "chunk_index": 2,
+          "excerpt": "time of day, including weekends and public holidays.\n\n3. Refunds\n\nEnterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method and processing takes five business days. Team plans are refundable within fourteen days of purchase. Trial accounts are not eligible for refunds under any circumstance.\n\n4. Data export",
+          "score": 0.9999939,
+          "byte_start": 628,
+          "byte_end": 1006,
+          "chunk_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc",
+          "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+          "retrieval": "keyword"
+        },
+        {
+          "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+          "filename": "support-policy.txt",
+          "chunk_index": 0,
+          "excerpt": "Camelid Support Policy\n\nVersion 4.2, effective 1 March 2026. This policy applies to every paid plan. Where an order form says something different, the order form wins.\n\n1. Scope\n\nThis document covers support hours, response targets, refunds, data export and incident handling for Team and Enterprise subscriptions. It does not cover the free tier, which is supported through the community forum only.\n\n2. Support hours and response targets",
+          "score": 0.9999948,
+          "byte_start": 0,
+          "byte_end": 439,
+          "chunk_sha256": "1848be31e47b8d5ee1d0ddea120bfb0179692f316543a8401773306a9b4edb8c",
+          "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+          "retrieval": "keyword"
+        },
+        {
+          "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+          "filename": "support-policy.txt",
+          "chunk_index": 3,
+          "excerpt": "not eligible for refunds under any circumstance.\n\n4. Data export\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.\n\n5. Incident handling\n\nSecurity incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation.\n\n6. Changes to this policy",
+          "score": 0.9999949,
+          "byte_start": 942,
+          "byte_end": 1433,
+          "chunk_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3",
+          "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+          "retrieval": "keyword"
+        },
+        {
+          "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+          "filename": "support-policy.txt",
+          "chunk_index": 1,
+          "excerpt": "the community forum only.\n\n2. Support hours and response targets\n\nSupport is staffed from 08:00 to 20:00 UTC on weekdays. Enterprise tickets receive a first response within four business hours. Priority incidents are acknowledged within one hour at any time of day, including weekends and public holidays.\n\n3. Refunds",
+          "score": 0.9999958,
+          "byte_start": 375,
+          "byte_end": 692,
+          "chunk_sha256": "8dcff1587f4c43893d3e41e6f97f10084e90c908b98586f1de4353eade98368a",
+          "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+          "retrieval": "keyword"
+        }
+      ]
+    }
+  },
+  {
+    "request": {
+      "POST /api/documents/citation/resolve": {
+        "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+        "chunk_index": 2,
+        "chunk_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc",
+        "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+      }
+    },
+    "status": 200,
+    "response": {
+      "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+      "filename": "support-policy.txt",
+      "chunk_index": 2,
+      "byte_start": 628,
+      "byte_end": 1006,
+      "chunk_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc",
+      "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a",
+      "before": "which is supported through the community forum only.\n\n2. Support hours and response targets\n\nSupport is staffed from 08:00 to 20:00 UTC on weekdays. Enterprise tickets receive a first response within four business hours. Priority incidents are acknowledged within one hour at any ",
+      "span": "time of day, including weekends and public holidays.\n\n3. Refunds\n\nEnterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method and processing takes five business days. Team plans are refundable within fourteen days of purchase. Trial accounts are not eligible for refunds under any circumstance.\n\n4. Data export",
+      "after": "\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.\n\n5. Incident handling\n\nSecurity incidents that affect customer data are "
+    }
+  },
+  {
+    "action": "stored source of 29f174d0-cb38-4865-8ac0-f5cab6651485 edited in SQLite: '60 days' -> '30 days'"
+  },
+  {
+    "request": {
+      "POST /api/documents/citation/resolve": {
+        "doc_id": "29f174d0-cb38-4865-8ac0-f5cab6651485",
+        "chunk_index": 2,
+        "chunk_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc",
+        "doc_sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+      }
+    },
+    "status": 409,
+    "response": {
+      "error": {
+        "message": "The stored source text no longer matches its recorded hash.",
+        "type": "invalid_request",
+        "code": "citation_source_corrupted",
+        "param": null
+      }
+    }
+  },
+  {
+    "request": {
+      "POST /api/documents/search": {
+        "query": "What is the refund window for enterprise customers?",
+        "doc_ids": [
+          "29f174d0-cb38-4865-8ac0-f5cab6651485"
+        ],
+        "top_k": 4
+      }
+    },
+    "status": 200,
+    "response": {
+      "results": []
+    }
+  }
+]
