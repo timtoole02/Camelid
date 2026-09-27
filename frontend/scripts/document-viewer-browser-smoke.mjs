@@ -13,6 +13,8 @@
  *     number of passages each contributed, and they survive a reload
  *   - generated files are listed in a tray above the composer that opens the
  *     files panel on the chosen file
+ *   - removing an attachment takes out only that one, returns focus to the
+ *     message box, and survives a reload
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -373,6 +375,26 @@ try {
   await settled()
   assertRefused(await viewer(), 'document_source_corrupted', 'a restored chip for a corrupted document')
   await closeWithEscape()
+
+  /* ---- 7. removing an attachment from the composer ---------------------- */
+  const remove = await page.$('.cxcomposer__doc-pill button[aria-label="Remove dropped.txt"]')
+  assert.ok(remove, 'each attachment has a remove control named for its file')
+  const removeBox = await remove.boundingBox()
+  const openBox = await (await composerChip('dropped.txt')).asElement().boundingBox()
+  assert.ok(removeBox.width >= 24 && removeBox.height >= 24, `the remove target is at least 24px (${removeBox.width}x${removeBox.height})`)
+  assert.ok(removeBox.x + removeBox.width <= openBox.x, 'and sits before the name, clear of the open target')
+  await remove.hover()
+  await sleep(300)
+  assert.notEqual(await remove.evaluate((node) => getComputedStyle(node).backgroundColor), 'rgba(0, 0, 0, 0)', 'hovering highlights the target')
+  await remove.click()
+  await page.waitForFunction(() => !document.querySelector('button[aria-label="Remove dropped.txt"]'), { timeout: 10000 })
+  const remaining = DOCS.filter((doc) => doc.doc_id !== 'doc-drop').map((doc) => `Open ${doc.filename}`)
+  assert.deepEqual(await page.$$eval('.cxcomposer__doc-open', (nodes) => nodes.map((node) => node.title)), remaining, 'only that attachment is removed')
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Message Camelid', 'focus moves to the message box')
+  assert.equal(await page.$$eval('.cxturn__user-doc', (nodes) => nodes.length), DOCS.length, 'the sent message still lists what it was sent with')
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 })
+  await page.waitForSelector('.cxcomposer__doc-open', { timeout: 30000 })
+  assert.deepEqual(await page.$$eval('.cxcomposer__doc-open', (nodes) => nodes.map((node) => node.title)), remaining, 'the removal survives a reload')
 
   assert.deepEqual(pageErrors, [], 'the page must not raise errors')
   assert.deepEqual(externalRequests, [], 'the smoke must not reach anything off-origin')

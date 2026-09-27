@@ -1007,18 +1007,22 @@ export default function ChatWorkspace({
           <div className="cxcomposer__docs">
             {attachedDocuments.map((doc) => (
               <div key={doc.doc_id} className="cxcomposer__doc-pill">
+                <button
+                  type="button"
+                  className="cxcomposer__doc-remove"
+                  aria-label={`Remove ${doc.filename}`}
+                  title="Remove attachment"
+                  onClick={() => {
+                    setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))
+                    composerRef.current?.focus()
+                  }}
+                >
+                  <IconClose size={14} />
+                </button>
                 <button type="button" className="cxcomposer__doc-open" title={`Open ${doc.filename}`} onClick={() => openDocument(doc)}>
                   <IconFile size={14} />
                   <span className="cxcomposer__doc-name">{doc.filename}</span>
                   <span className="cxcomposer__doc-chunks">{doc.chunk_count} chunks</span>
-                </button>
-                <button
-                  type="button"
-                  className="cxcomposer__doc-remove"
-                  title="Remove document"
-                  onClick={() => setAttachedDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id))}
-                >
-                  <IconClose size={12} />
                 </button>
               </div>
             ))}
