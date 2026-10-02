@@ -1,0 +1,7 @@
+mutation open_routes: exit 101, failing: folder_routes_answer_only_the_local_web_ui_on_loopback 
+mutation follow_links: exit 101, failing: a_scan_reads_documents_and_skips_hidden_entries_and_other_types 
+mutation read_hidden: exit 101, failing: a_scan_reads_documents_and_skips_hidden_entries_and_other_types 
+mutation drop_unreadable: exit 101, failing: an_unreadable_subfolder_keeps_its_documents 
+mutation rehash_ignored: exit 101, failing: a_new_time_on_unchanged_content_reindexes_nothing 
+mutation allow_overlap: exit 101, failing: folders_inside_around_or_equal_to_a_watched_one_are_refused 
+tree restored

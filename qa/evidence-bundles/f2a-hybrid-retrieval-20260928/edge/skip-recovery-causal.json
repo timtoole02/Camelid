@@ -1,0 +1,40 @@
+{
+  "wait_limit_s": 180,
+  "before_fix": {
+    "build": "v0.7.8-5-gc7ea906a-dirty",
+    "binary": "camelid-63746aa8",
+    "after_drift": {
+      "id": "skipdoc",
+      "indexable_chunks": 1,
+      "indexed_chunks": 0,
+      "skipped_chunks": 1
+    },
+    "after_restore": {
+      "id": "skipdoc",
+      "indexable_chunks": 1,
+      "indexed_chunks": 0,
+      "skipped_chunks": 1
+    },
+    "seconds_waited": 181.4,
+    "recovered": false
+  },
+  "with_fix": {
+    "build": "v0.7.8-9-g0477691e",
+    "binary": "camelid-head",
+    "after_drift": {
+      "id": "skipdoc",
+      "indexable_chunks": 1,
+      "indexed_chunks": 0,
+      "skipped_chunks": 1
+    },
+    "after_restore": {
+      "id": "skipdoc",
+      "indexable_chunks": 1,
+      "indexed_chunks": 1,
+      "skipped_chunks": 0
+    },
+    "seconds_waited": 3.0,
+    "recovered": true
+  },
+  "causal": true
+}

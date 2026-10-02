@@ -1,0 +1,8 @@
+{
+  "corpus": "corpus-subset-1000.jsonl",
+  "corpus_sha256": "36793476a9079f9aab9fdeb156d8faf0bedcd0a89b6487a88285ea4347342495",
+  "documents": 1000,
+  "chunks": 4406,
+  "failures": [],
+  "seconds": 15.5
+}

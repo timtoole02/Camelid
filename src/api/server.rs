@@ -825,6 +825,8 @@ mod tests {
             (Method::POST, "/v1/conversations"),
             (Method::GET, "/metrics"),
             (Method::GET, "/api/not-yet-invented"),
+            (Method::GET, "/api/folders"),
+            (Method::POST, "/api/folders"),
         ] {
             assert!(!surface.allows(&method, path), "allowed {method} {path}");
         }

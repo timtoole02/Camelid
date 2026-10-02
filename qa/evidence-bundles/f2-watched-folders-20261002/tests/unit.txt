@@ -1,0 +1,14 @@
+test api::document_folders::tests::a_document_deleted_from_the_library_returns_on_the_next_scan ... ok
+test api::document_folders::tests::a_file_that_turns_unreadable_loses_its_stale_document ... ok
+test api::document_folders::tests::a_folder_that_cannot_be_opened_changes_nothing ... ok
+test api::document_folders::tests::a_new_time_on_unchanged_content_reindexes_nothing ... ok
+test api::document_folders::tests::a_rescan_updates_changed_files_in_place_and_removes_deleted_ones ... ok
+test api::document_folders::tests::a_scan_reads_documents_and_skips_hidden_entries_and_other_types ... ok
+test api::document_folders::tests::a_watched_folder_is_an_existing_absolute_directory_below_the_root ... ok
+test api::document_folders::tests::an_unreadable_subfolder_keeps_its_documents ... ok
+test api::document_folders::tests::deleting_the_collection_stops_the_watch_and_keeps_the_documents ... ok
+test api::document_folders::tests::folder_routes_answer_only_the_local_web_ui_on_loopback ... ok
+test api::document_folders::tests::folders_inside_around_or_equal_to_a_watched_one_are_refused ... ok
+test api::document_folders::tests::oversized_and_unparseable_files_are_skipped_without_ending_the_scan ... ok
+test api::document_folders::tests::removing_a_folder_removes_its_documents_and_leaves_the_files ... ok
+test result: ok. 634 passed; 0 failed; 1 ignored; 0 measured; 2186 filtered out; finished in 10.05s

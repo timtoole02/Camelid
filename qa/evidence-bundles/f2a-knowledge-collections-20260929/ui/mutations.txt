@@ -1,0 +1,11 @@
+commit=d5732301 tree_clean=yes
+CAUGHT   the chat sends members instead of the collection: AssertionError [ERR_ASSERTION]: the chat sends the collection, not its members
+CAUGHT   a deleted collection is still searched: AssertionError [ERR_ASSERTION]: a deleted collection is not searched
+CAUGHT   the LAN surface asks for collections: AssertionError [ERR_ASSERTION]: no collections on the LAN chat surface
+CAUGHT   the LAN surface searches a chat's collections: AssertionError [ERR_ASSERTION]: the LAN chat surface never asks for collections
+CAUGHT   the sent message does not name its collections: AssertionError [ERR_ASSERTION]: the sent message names the collection and what it supplied
+CAUGHT   project collections do not reach the chat: TimeoutError: Waiting for selector `.cxcomposer__doc-pill--collection` failed
+CAUGHT   a per-chat opt-out of a project collection is ignored: TimeoutError: Waiting failed: 5000ms exceeded
+CAUGHT   an upload ignores its collection: TimeoutError: Waiting failed: 10000ms exceeded
+8/8 mutations caught
+tree after: 0 tracked changes

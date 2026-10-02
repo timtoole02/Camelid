@@ -1,0 +1,51 @@
+{
+  "before_fix": {
+    "build": "v0.7.8-8-g5fb64e0f",
+    "binary": "camelid-5fb64e0f",
+    "large_when_note_uploaded": {
+      "id": "46cc61aa-aedc-44ea-bafa-8abbe0451ed9",
+      "indexable_chunks": 111,
+      "indexed_chunks": 16,
+      "skipped_chunks": 0
+    },
+    "note_embedded_after_s": 141.0,
+    "note": {
+      "id": "9e488e1e-04b7-48a9-b633-4193a4700412",
+      "indexable_chunks": 1,
+      "indexed_chunks": 1,
+      "skipped_chunks": 0
+    },
+    "large_when_note_embedded": {
+      "id": "46cc61aa-aedc-44ea-bafa-8abbe0451ed9",
+      "indexable_chunks": 111,
+      "indexed_chunks": 111,
+      "skipped_chunks": 0
+    },
+    "note_went_first": false
+  },
+  "with_fix": {
+    "build": "v0.7.8-9-g0477691e",
+    "binary": "camelid-head",
+    "large_when_note_uploaded": {
+      "id": "b8255e2c-3356-4d68-b653-d1c7d3745b2e",
+      "indexable_chunks": 111,
+      "indexed_chunks": 16,
+      "skipped_chunks": 0
+    },
+    "note_embedded_after_s": 51.4,
+    "note": {
+      "id": "a675c801-083a-470a-ac9d-5d84194e611f",
+      "indexable_chunks": 1,
+      "indexed_chunks": 1,
+      "skipped_chunks": 0
+    },
+    "large_when_note_embedded": {
+      "id": "b8255e2c-3356-4d68-b653-d1c7d3745b2e",
+      "indexable_chunks": 111,
+      "indexed_chunks": 47,
+      "skipped_chunks": 0
+    },
+    "note_went_first": true
+  },
+  "causal": true
+}

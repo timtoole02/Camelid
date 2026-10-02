@@ -1,0 +1,9 @@
+commit=d5732301 tree_clean=yes
+BUILD_OK
+PASS knowledge-collections-browser
+PASS project-context
+PASS project-context-browser
+PASS semantic-index-browser
+PASS citations-browser
+PASS document-viewer-browser
+SMOKES_DONE

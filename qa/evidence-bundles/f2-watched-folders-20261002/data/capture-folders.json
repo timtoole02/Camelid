@@ -1,0 +1,46 @@
+{
+ "origin_is_loopback": true,
+ "folder_responses": [
+  "GET /api/folders 200",
+  "GET /api/agent/workspace/browse 200",
+  "GET /api/agent/workspace/browse 200",
+  "POST /api/folders 201",
+  "GET /api/folders 200",
+  "GET /api/folders 200",
+  "GET /api/folders 200",
+  "GET /api/folders 200",
+  "DELETE /api/folders/06694a9a-48f8-4efd-a0eb-5b60017d0389 204",
+  "GET /api/folders 200"
+ ],
+ "steps": [
+  {
+   "step": "watched",
+   "folder_status": [
+    "3 documents. Checked just now. Last check: 3 added."
+   ],
+   "documents": [
+    "escalation-guide.txt",
+    "support-policy.txt",
+    "team/notes.md"
+   ]
+  },
+  {
+   "step": "changed on disk",
+   "folder_status": [
+    "3 documents. Checked just now. Last check: 1 added, 1 updated, 1 removed."
+   ],
+   "documents": [
+    "onboarding.md",
+    "support-policy.txt",
+    "team/notes.md"
+   ]
+  },
+  {
+   "step": "stopped",
+   "folder_status": [],
+   "documents": []
+  }
+ ],
+ "seconds_until_ui_showed_change": 18.8,
+ "page_errors": []
+}

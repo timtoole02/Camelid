@@ -1,0 +1,27 @@
+Camelid Support Policy
+
+Version 4.2, effective 1 March 2026. This policy applies to every paid plan. Where an order form says something different, the order form wins.
+
+1. Scope
+
+This document covers support hours, response targets, refunds, data export and incident handling for Team and Enterprise subscriptions. It does not cover the free tier, which is supported through the community forum only.
+
+2. Support hours and response targets
+
+Support is staffed from 08:00 to 20:00 UTC on weekdays. Enterprise tickets receive a first response within four business hours. Priority incidents are acknowledged within one hour at any time of day, including weekends and public holidays.
+
+3. Refunds
+
+Enterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method and processing takes five business days. Team plans are refundable within fourteen days of purchase. Trial accounts are not eligible for refunds under any circumstance.
+
+4. Data export
+
+Customers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.
+
+5. Incident handling
+
+Security incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation.
+
+6. Changes to this policy
+
+We give thirty days of notice before any change that reduces a customer's rights under this policy.

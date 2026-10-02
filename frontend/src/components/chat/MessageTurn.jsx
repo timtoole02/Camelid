@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay, IconTrash, IconFile } from '../ui/icons'
+import { IconCopy, IconCheck, IconRefresh, IconEdit, IconSearch, IconExternal, IconPlay, IconTrash, IconFile, IconCollection } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { capabilityStatusLabel } from '../../lib/capabilities'
 import { continuationCountOf } from '../../lib/chatContinuation'
@@ -237,6 +237,10 @@ function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
   const documents = Array.isArray(message.documents)
     ? message.documents.filter((doc) => typeof doc?.doc_id === 'string' && typeof doc?.filename === 'string')
     : []
+  const collections = Array.isArray(message.collections)
+    ? message.collections.filter((collection) => typeof collection?.id === 'string' && typeof collection?.name === 'string')
+    : []
+  const library = Number.isInteger(message.library?.passages) ? message.library : null
   const submitEdit = () => {
     const next = draft.trim()
     setEditing(false)
@@ -256,6 +260,30 @@ function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
   return (
     <article className="cxturn cxturn--user">
       <div className="cxturn__user-wrapper">
+        {library && (
+          <ul className="cxturn__user-docs" aria-label="Whole library searched for this message">
+            <li>
+              <span className="cxturn__user-doc cxturn__user-doc--library" title="Searched every document in the library">
+                <IconSearch size={13} />
+                <span className="cxturn__user-doc-name">Whole library</span>
+                <span className="cxturn__user-doc-meta">{passagesLabel(library.passages)}</span>
+              </span>
+            </li>
+          </ul>
+        )}
+        {collections.length > 0 && (
+          <ul className="cxturn__user-docs" aria-label="Collections searched for this message">
+            {collections.map((collection) => (
+              <li key={collection.id}>
+                <span className="cxturn__user-doc cxturn__user-doc--collection" title={`Collection ${collection.name}`}>
+                  <IconCollection size={13} />
+                  <span className="cxturn__user-doc-name">{collection.name}</span>
+                  {passagesLabel(collection.passages) && <span className="cxturn__user-doc-meta">{passagesLabel(collection.passages)}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
         {documents.length > 0 && (
           <ul className="cxturn__user-docs" aria-label="Documents attached to this message">
             {documents.map((doc) => (

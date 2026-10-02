@@ -531,6 +531,28 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:document-viewer-browser
 
+      # Chat shows semantic indexing progress for attached documents, says when
+      # search is keyword-only, and says how each cited passage was found.
+      - name: Frontend semantic index browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:semantic-index-browser
+
+      # Knowledge collections: the library manages them, a chat or project
+      # searches them, and a deleted one is shown and left out of the search.
+      - name: Frontend knowledge collections browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:knowledge-collections-browser
+
+      # Whole-library search: a per-chat switch, what the message says it
+      # searched, and a clear fallback when search by meaning is unavailable.
+      - name: Frontend library search browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:library-search-browser
+
+      - name: Frontend watched folders browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:watched-folders-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

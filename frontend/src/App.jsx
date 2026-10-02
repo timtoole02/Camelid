@@ -531,7 +531,8 @@ function App() {
             />
           )}
 
-          {tab === 'projects' && <ProjectsView projects={projects} conversations={conversations} onSave={saveProject} onDelete={deleteProject} onNewChat={startNewChat} onOpenConversation={selectConversation} busy={sending} />}
+          {tab === 'projects' && <ProjectsView projects={projects} conversations={conversations} onSave={saveProject} onDelete={deleteProject} onNewChat={startNewChat} onOpenConversation={selectConversation} busy={sending}
+            knowledgeEnabled={!DEMO_UI && Boolean(runtime) && runtime.api_surface !== 'lan_chat_only'} />}
           {tab === 'changes' && <ChangesView apiBase={apiBase} draft={outputDraft} onConsumeDraft={() => setOutputDraft(null)} />}
           {tab === 'connections' && <ConnectionsView mcp={mcp} />}
 

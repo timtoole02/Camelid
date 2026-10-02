@@ -7,8 +7,10 @@ controls. Available options follow the loaded model and engine capabilities.
 Active settings appear as removable chips. Changes apply to the next message;
 settings that affect an active tool turn remain locked until it finishes.
 
-**Attach** offers documents for local retrieval and images when a vision model
-is ready. Conversation instructions and reference files remain under
+**Attach** offers documents for local retrieval, knowledge collections (named
+sets of library documents a chat searches together), **Whole library** (every
+library document, keeping only passages close in meaning to the message), and
+images when a vision model is ready. Conversation instructions and reference files remain under
 **Conversation context**. See [project context](PROJECT_CONTEXT.md).
 
 ## Context usage and trimming

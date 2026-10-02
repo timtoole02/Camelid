@@ -1,0 +1,37 @@
+{
+  "first_run": {
+    "phases": [
+      "ingest",
+      "index",
+      "search",
+      "verify"
+    ],
+    "build": "v0.7.8-5-gc7ea906a-dirty",
+    "build_note": "started before the first code commit existed, from a working tree whose Rust changes were exactly these three files; their git blob ids equal the blobs at 63746aa8 (git ls-tree 63746aa8 src/api)",
+    "rust_blobs": {
+      "src/api/documents.rs": "a1348b7af32c8c4ef63b047133b3aa54641e193e",
+      "src/api/document_vectors.rs": "1e48cc13a22fa27156449dfb41bf36fde71fad5e",
+      "src/api/mod.rs": "ff9c64ff2c793fda34e5facfbe5a5ef9d5d8e8a5"
+    },
+    "host_shared_with": "release builds, the library test suite and the live edge suite during part of the index phase",
+    "index_phase_host_idle_from_s": 5719,
+    "index_phase_host_idle_note": "the last other job on the host (the edge suite) had finished when the index phase reported 5719 s",
+    "per_query_sha256": "9d6499f6f92d8ad619a8541d4def858d88031d379134e41b765ca324cca8a459",
+    "server_rss_kib_at_end": 3006608,
+    "library_db_bytes_at_end": 25690112
+  },
+  "head_run": {
+    "phases": [
+      "index (confirms every chunk already indexed)",
+      "search",
+      "verify"
+    ],
+    "build": "v0.7.8-9-g0477691e",
+    "library": "the first run's library, served by the head build",
+    "uptime_before": "23:20:35 up 16:09,  0 users,  load average: 2.50, 2.14, 1.93",
+    "uptime_after": "23:25:41 up 16:14,  0 users,  load average: 2.18, 2.44, 2.14",
+    "per_query_sha256": "9d6499f6f92d8ad619a8541d4def858d88031d379134e41b765ca324cca8a459",
+    "server_rss_kib_at_end": 3055452,
+    "library_db_bytes_at_end": 25690112
+  }
+}

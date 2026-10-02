@@ -1,0 +1,225 @@
+{
+ "passed": 46,
+ "total": 46,
+ "servers": [
+  {
+   "build": "v0.7.8-27-gecee5ebf",
+   "api_surface": "full",
+   "args": []
+  },
+  {
+   "build": "v0.7.8-27-gecee5ebf",
+   "api_surface": "full",
+   "args": []
+  },
+  {
+   "build": "v0.7.8-27-gecee5ebf",
+   "api_surface": "lan_chat_only",
+   "args": [
+    "--lan-chat-only",
+    "--api-key-file",
+    "/tmp/f2r/fw-edge-out/lan.key",
+    "--no-open"
+   ]
+  }
+ ],
+ "timings": {
+  "first_scan_s": 0.51,
+  "poll_pickup_s": 21.23,
+  "check_now_s": 0.01,
+  "check_now_changes": {
+   "added": 0,
+   "updated": 1,
+   "removed": 0,
+   "unchanged": 2,
+   "skipped": 2
+  },
+  "after_restart_s": 0.0
+ },
+ "checks": [
+  {
+   "check": "a request without the web UI's origin is refused (403)",
+   "pass": true
+  },
+  {
+   "check": "a request from another origin is refused (403)",
+   "pass": true
+  },
+  {
+   "check": "another origin cannot add a folder (403)",
+   "pass": true
+  },
+  {
+   "check": "the web UI lists folders: none yet",
+   "pass": true
+  },
+  {
+   "check": "a relative path is refused (422 invalid_folder)",
+   "pass": true
+  },
+  {
+   "check": "a file is refused (422 invalid_folder)",
+   "pass": true
+  },
+  {
+   "check": "a missing folder is refused (422 invalid_folder)",
+   "pass": true
+  },
+  {
+   "check": "the filesystem root is refused (422 invalid_folder)",
+   "pass": true
+  },
+  {
+   "check": "an unknown collection is a 404",
+   "pass": true
+  },
+  {
+   "check": "watching the folder answers 201",
+   "pass": true
+  },
+  {
+   "check": "the first scan adds the three documents",
+   "pass": true
+  },
+  {
+   "check": "documents and skipped counts",
+   "pass": true
+  },
+  {
+   "check": "an empty file is skipped for having no text",
+   "pass": true
+  },
+  {
+   "check": "a broken PDF is skipped, not fatal",
+   "pass": true
+  },
+  {
+   "check": "the library holds exactly the folder's documents",
+   "pass": true
+  },
+  {
+   "check": "hidden files, other types and links were not read",
+   "pass": true
+  },
+  {
+   "check": "every document joined the collection",
+   "pass": true
+  },
+  {
+   "check": "a document's source text is the file's text",
+   "pass": true
+  },
+  {
+   "check": "searching the collection finds the incident section in the top three",
+   "pass": true
+  },
+  {
+   "check": "the timer picks up the changes without being asked (within 75 s)",
+   "pass": true
+  },
+  {
+   "check": "the changed file keeps its document id",
+   "pass": true
+  },
+  {
+   "check": "the deleted file's document is gone",
+   "pass": true
+  },
+  {
+   "check": "its source is gone too (404)",
+   "pass": true
+  },
+  {
+   "check": "the new text is searchable (top three)",
+   "pass": true
+  },
+  {
+   "check": "check now answers 202",
+   "pass": true
+  },
+  {
+   "check": "after check now, the edited file's document holds the new text",
+   "pass": true
+  },
+  {
+   "check": "a change made while the server was stopped is picked up when it starts",
+   "pass": true
+  },
+  {
+   "check": "and its document holds the new text",
+   "pass": true
+  },
+  {
+   "check": "the same folder is refused (409 folder_overlaps)",
+   "pass": true
+  },
+  {
+   "check": "a folder inside it is refused (409 folder_overlaps)",
+   "pass": true
+  },
+  {
+   "check": "the folder around it is refused (409 folder_overlaps)",
+   "pass": true
+  },
+  {
+   "check": "a folder that cannot be opened reports why",
+   "pass": true
+  },
+  {
+   "check": "and its documents are kept",
+   "pass": true
+  },
+  {
+   "check": "once it is back, the error clears and nothing changed",
+   "pass": true
+  },
+  {
+   "check": "stopping a watch needs the web UI too (403)",
+   "pass": true
+  },
+  {
+   "check": "stopping a watch answers 204",
+   "pass": true
+  },
+  {
+   "check": "its documents leave the library",
+   "pass": true
+  },
+  {
+   "check": "the files on disk stay",
+   "pass": true
+  },
+  {
+   "check": "the collection stays",
+   "pass": true
+  },
+  {
+   "check": "stopping it again is a 404",
+   "pass": true
+  },
+  {
+   "check": "deleting the collection stops the watch",
+   "pass": true
+  },
+  {
+   "check": "and leaves its documents in the library",
+   "pass": true
+  },
+  {
+   "check": "GET /api/folders is refused on the LAN chat surface (403)",
+   "pass": true
+  },
+  {
+   "check": "POST /api/folders is refused on the LAN chat surface (403)",
+   "pass": true
+  },
+  {
+   "check": "POST /api/folders/x/scan is refused on the LAN chat surface (403)",
+   "pass": true
+  },
+  {
+   "check": "DELETE /api/folders/x is refused on the LAN chat surface (403)",
+   "pass": true
+  }
+ ]
+}

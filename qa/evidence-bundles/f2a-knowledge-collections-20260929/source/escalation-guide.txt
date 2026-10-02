@@ -1,0 +1,15 @@
+Camelid Support Escalation Guide
+
+Version 1.3, for support engineers. This guide says when a ticket leaves the support queue and who takes it next.
+
+1. Outages
+
+Escalate an outage that blocks every user in a workspace to the on-call engineer at once. Page the incident commander if the outage lasts longer than thirty minutes.
+
+2. Security reports
+
+Forward a suspected data breach to the security team within one hour of the report. Do not confirm or deny a breach to the customer until the security team has reviewed it.
+
+3. Billing disputes
+
+A billing dispute above 5,000 euros goes to the finance lead before any refund is promised.

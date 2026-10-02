@@ -1,0 +1,202 @@
+{
+ "rule": "Choose a library-size-aware relevance floor, by a rule fixed before this script was run.\n\nWhy: the fixed floor (0.69) passed its held-out test on two 1,000-document libraries, then left out\nthe right passage for natural questions on a live 3-document library. The best chance match an\nunrelated message finds grows with how many passages a library holds, so a floor fitted at one size\nis too strict for smaller libraries. This script measures that and fits a floor that moves with size.\n\nRule (fixed before this script was first run):\n1. Data: every calibration query's vector (query-vectors.npz, checked against the server's own\n   scores by embed_queries.py) and every indexed chunk vector of the SciFact and FiQA libraries.\n   Query sets and the calibration/held-out split are analyze_floor.py's: per library, its own test\n   questions are positives, the other library's questions and the 405 off-topic messages negatives;\n   within each (library, set, source) group, queries sorted by id, shuffled with SEED 20260930, the\n   first half (rounded up) calibrates and the rest is held out.\n2. Simulated libraries: for sizes D in 3, 10, 30, 100, 300 and 1000 documents, each query gets R = 5\n   seeded samples (one at 1,000, the whole library). A positive's sample is its relevant documents\n   plus seeded others up to max(D, number of relevant documents); a negative's is D seeded documents.\n   N is the sample's number of indexed chunks, top its best cosine to the query, gold (positives) the\n   best cosine among relevant documents' chunks.\n3. At floor t, a positive is served when gold >= t and a negative stays quiet when top < t.\n4. For each D, t*_D is the floor on the grid 0.300 to 0.900 (step 0.005) with the highest TPR + TNR\n   - 1 over the calibration half, both libraries and all samples pooled; ties go to the smallest t.\n5. floor(N) = a + b * ln(N), with a and b fitted by ordinary least squares of t*_D on the mean ln(N)\n   of size D's calibration samples, rounded to 4 decimals, and clamped to [0.300, 0.900].\n6. Only the held-out half is reported as evidence: per size and pooled, TPR and TNR of floor(N) at\n   each sample's own N, beside the fixed 0.69 on the same samples.",
+ "seed": 20260930,
+ "a": 0.6408,
+ "b": 0.0058,
+ "clamp": [
+  0.3,
+  0.9
+ ],
+ "floor_at": {
+  "5": 0.6501,
+  "20": 0.6582,
+  "50": 0.6635,
+  "200": 0.6715,
+  "1000": 0.6809,
+  "2649": 0.6865,
+  "4406": 0.6895,
+  "20000": 0.6982,
+  "100000": 0.7076
+ },
+ "calibration_per_size": [
+  {
+   "size": 3,
+   "mean_ln_n": 2.2796,
+   "mean_chunks": 10.9,
+   "t_star": 0.655,
+   "j": 0.9537
+  },
+  {
+   "size": 10,
+   "mean_ln_n": 3.5114,
+   "mean_chunks": 35.3,
+   "t_star": 0.66,
+   "j": 0.9384
+  },
+  {
+   "size": 30,
+   "mean_ln_n": 4.6218,
+   "mean_chunks": 105.7,
+   "t_star": 0.67,
+   "j": 0.9135
+  },
+  {
+   "size": 100,
+   "mean_ln_n": 5.8318,
+   "mean_chunks": 352.8,
+   "t_star": 0.67,
+   "j": 0.8806
+  },
+  {
+   "size": 300,
+   "mean_ln_n": 6.9316,
+   "mean_chunks": 1058.1,
+   "t_star": 0.68,
+   "j": 0.8333
+  },
+  {
+   "size": 1000,
+   "mean_ln_n": 8.1363,
+   "mean_chunks": 3527.5,
+   "t_star": 0.69,
+   "j": 0.7889
+  }
+ ],
+ "held_out": {
+  "size_aware": {
+   "positives": 6500,
+   "negatives": 17004,
+   "tpr": 0.9168,
+   "tnr": 0.9507
+  },
+  "fixed_0_69": {
+   "positives": 6500,
+   "negatives": 17004,
+   "tpr": 0.876,
+   "tnr": 0.9713
+  },
+  "by_size": [
+   {
+    "size": 3,
+    "size_aware": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.94,
+     "tnr": 0.9887
+    },
+    "fixed_0_69": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.876,
+     "tnr": 0.9985
+    }
+   },
+   {
+    "size": 10,
+    "size_aware": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.924,
+     "tnr": 0.9777
+    },
+    "fixed_0_69": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.876,
+     "tnr": 0.9948
+    }
+   },
+   {
+    "size": 30,
+    "size_aware": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.916,
+     "tnr": 0.956
+    },
+    "fixed_0_69": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.876,
+     "tnr": 0.9832
+    }
+   },
+   {
+    "size": 100,
+    "size_aware": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.912,
+     "tnr": 0.9364
+    },
+    "fixed_0_69": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.876,
+     "tnr": 0.9636
+    }
+   },
+   {
+    "size": 300,
+    "size_aware": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.8968,
+     "tnr": 0.9104
+    },
+    "fixed_0_69": {
+     "positives": 1250,
+     "negatives": 3270,
+     "tpr": 0.876,
+     "tnr": 0.9339
+    }
+   },
+   {
+    "size": 1000,
+    "size_aware": {
+     "positives": 250,
+     "negatives": 654,
+     "tpr": 0.892,
+     "tnr": 0.8716
+    },
+    "fixed_0_69": {
+     "positives": 250,
+     "negatives": 654,
+     "tpr": 0.876,
+     "tnr": 0.8838
+    }
+   }
+  ],
+  "by_library_at_1000": {
+   "scifact": {
+    "size_aware": {
+     "positives": 150,
+     "negatives": 302,
+     "tpr": 0.94,
+     "tnr": 0.9007
+    },
+    "fixed_0_69": {
+     "positives": 150,
+     "negatives": 302,
+     "tpr": 0.94,
+     "tnr": 0.9073
+    }
+   },
+   "fiqa": {
+    "size_aware": {
+     "positives": 100,
+     "negatives": 352,
+     "tpr": 0.82,
+     "tnr": 0.8466
+    },
+    "fixed_0_69": {
+     "positives": 100,
+     "negatives": 352,
+     "tpr": 0.78,
+     "tnr": 0.8636
+    }
+   }
+  }
+ },
+ "samples": 47060
+}

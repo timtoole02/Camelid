@@ -1,0 +1,9 @@
+commit ecee5ebf, tracked changes 0
+$ cargo fmt --all -- --check
+FMT_EXIT=0
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 39.80s
+CLIPPY_DEFAULT_EXIT=0
+$ cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 39.56s
+CLIPPY_ALL_EXIT=0

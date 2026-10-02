@@ -1,0 +1,192 @@
+== frontend, folder branch, PUPPETEER_EXECUTABLE_PATH set
+OK           3.1s  Build frontend
+OK           0.2s  Code session state smoke
+OK          10.1s  Code browser smoke
+OK          12.0s  Chat and Code transition browser smoke
+OK           0.2s  Frontend support-contract smoke
+OK           0.2s  Frontend model-lanes smoke
+OK           1.7s  Frontend model-loading status smoke
+OK           0.2s  Frontend catalog activation smoke
+OK           0.2s  Frontend byte-units smoke
+OK           1.2s  Frontend web-research smoke
+OK           3.5s  Frontend web-research browser smoke
+OK           4.9s  Frontend citations browser smoke
+OK           5.6s  Frontend document viewer browser smoke
+OK          25.5s  Frontend semantic index browser smoke
+OK          12.5s  Frontend knowledge collections browser smoke
+OK          12.2s  Frontend library search browser smoke
+OK          16.9s  Frontend watched folders browser smoke
+OK           0.2s  Frontend streaming telemetry smoke
+OK           1.0s  Frontend markdown smoke
+OK           0.9s  Frontend math smoke
+OK           3.0s  Frontend math browser smoke
+OK           1.0s  Frontend diagram smoke
+OK           2.5s  Frontend diagram browser smoke
+OK           1.2s  Frontend chat continuation smoke
+OK           2.0s  Frontend chat continuation browser smoke
+OK           1.2s  Frontend reply variants smoke
+OK           2.2s  Frontend reply variants browser smoke
+OK           1.7s  Frontend conversation organization smoke
+OK           2.5s  Frontend conversation organization browser smoke
+OK           0.2s  Frontend project and conversation context smoke
+OK           0.9s  Frontend chat polish smoke
+OK           8.5s  Frontend output previews, downloads, and changes browser smoke
+OK           0.2s  Frontend connected tools and saved sets smoke
+OK          12.5s  Frontend composer tools browser smoke
+FAIL(1)      7.1s  Frontend project and conversation context browser smoke
+OK           0.2s  Frontend first-run activation smoke
+OK          20.1s  Frontend first-run card component smoke
+OK          40.1s  Frontend voice input smoke
+OK           6.6s  Frontend offline banner smoke
+OK           4.4s  Frontend LAN Chat authentication smoke
+OK           3.7s  Frontend LAN sharing toggle smoke
+OK           0.2s  Frontend catalog browse smoke
+OK           0.2s  Frontend catalog companion download smoke
+OK           0.2s  Frontend model deletion smoke
+OK           0.2s  Frontend 3B exact-row closure smoke
+OK           2.4s  Frontend integration smoke
+OK           0.2s  Workspace logic smoke
+OK           0.2s  Frontend fabric model smoke
+OK          10.3s  Frontend fabric view smoke
+OK           0.2s  Frontend divergence model smoke
+OK          10.8s  Frontend divergence view smoke
+OK           9.5s  Workspace read-only visual smoke
+OK           0.2s  Model Arena residency logic smoke
+OK           8.0s  Model Arena residency visual smoke
+OK           0.9s  Retrieval rerank smoke
+OK           0.8s  Engine metrics smoke
+OK           0.8s  Tool calling smoke
+OK           1.0s  Frontend UI regression smoke
+OK           0.9s  Structured output smoke
+OK           0.9s  Token inspector smoke
+OK           0.2s  Design token contrast audit
+JOB_DONE frontend steps=62 ok=60 skipped=1 failed=1
+== frontend, folder branch, PUPPETEER_EXECUTABLE_PATH unset
+OK           3.0s  Build frontend
+OK           0.2s  Code session state smoke
+OK          10.2s  Code browser smoke
+OK          12.3s  Chat and Code transition browser smoke
+OK           0.2s  Frontend support-contract smoke
+OK           0.2s  Frontend model-lanes smoke
+OK           3.0s  Frontend model-loading status smoke
+OK           0.2s  Frontend catalog activation smoke
+OK           0.2s  Frontend byte-units smoke
+OK           2.9s  Frontend web-research smoke
+OK           3.5s  Frontend web-research browser smoke
+OK           5.1s  Frontend citations browser smoke
+OK           5.5s  Frontend document viewer browser smoke
+OK          25.5s  Frontend semantic index browser smoke
+OK          12.4s  Frontend knowledge collections browser smoke
+OK          12.1s  Frontend library search browser smoke
+OK          16.8s  Frontend watched folders browser smoke
+OK           0.2s  Frontend streaming telemetry smoke
+OK           2.7s  Frontend markdown smoke
+OK           2.8s  Frontend math smoke
+OK           2.9s  Frontend math browser smoke
+OK           2.9s  Frontend diagram smoke
+OK           2.5s  Frontend diagram browser smoke
+OK           2.9s  Frontend chat continuation smoke
+OK           2.0s  Frontend chat continuation browser smoke
+OK           2.8s  Frontend reply variants smoke
+OK           2.2s  Frontend reply variants browser smoke
+OK           0.9s  Frontend conversation organization smoke
+OK           2.4s  Frontend conversation organization browser smoke
+OK           0.2s  Frontend project and conversation context smoke
+OK           2.8s  Frontend chat polish smoke
+OK           8.5s  Frontend output previews, downloads, and changes browser smoke
+OK           0.2s  Frontend connected tools and saved sets smoke
+OK          12.4s  Frontend composer tools browser smoke
+OK          10.5s  Frontend project and conversation context browser smoke
+OK           0.2s  Frontend first-run activation smoke
+OK          20.0s  Frontend first-run card component smoke
+OK          40.2s  Frontend voice input smoke
+OK           6.8s  Frontend offline banner smoke
+OK           4.5s  Frontend LAN Chat authentication smoke
+OK           3.8s  Frontend LAN sharing toggle smoke
+OK           0.2s  Frontend catalog browse smoke
+OK           0.2s  Frontend catalog companion download smoke
+OK           0.2s  Frontend model deletion smoke
+OK           0.2s  Frontend 3B exact-row closure smoke
+OK           2.4s  Frontend integration smoke
+OK           0.2s  Workspace logic smoke
+OK           0.2s  Frontend fabric model smoke
+OK          10.3s  Frontend fabric view smoke
+OK           0.2s  Frontend divergence model smoke
+FAIL(1)      0.4s  Frontend divergence view smoke
+OK           9.6s  Workspace read-only visual smoke
+OK           0.2s  Model Arena residency logic smoke
+OK           8.1s  Model Arena residency visual smoke
+OK           0.9s  Retrieval rerank smoke
+OK           1.7s  Engine metrics smoke
+OK           0.9s  Tool calling smoke
+OK           1.0s  Frontend UI regression smoke
+OK           1.0s  Structured output smoke
+OK           0.9s  Token inspector smoke
+OK           0.2s  Design token contrast audit
+JOB_DONE frontend steps=62 ok=60 skipped=1 failed=1
+== frontend, #788 (no folder changes), PUPPETEER_EXECUTABLE_PATH set
+OK           3.1s  Build frontend
+OK           0.2s  Code session state smoke
+OK          10.1s  Code browser smoke
+OK          12.3s  Chat and Code transition browser smoke
+OK           0.2s  Frontend support-contract smoke
+OK           0.2s  Frontend model-lanes smoke
+OK           3.0s  Frontend model-loading status smoke
+OK           0.2s  Frontend catalog activation smoke
+OK           0.2s  Frontend byte-units smoke
+OK           2.9s  Frontend web-research smoke
+OK           3.6s  Frontend web-research browser smoke
+OK           4.9s  Frontend citations browser smoke
+OK           5.5s  Frontend document viewer browser smoke
+OK          25.5s  Frontend semantic index browser smoke
+OK          12.5s  Frontend knowledge collections browser smoke
+OK          12.2s  Frontend library search browser smoke
+OK           0.2s  Frontend streaming telemetry smoke
+OK           2.7s  Frontend markdown smoke
+OK           2.9s  Frontend math smoke
+OK           2.9s  Frontend math browser smoke
+OK           2.7s  Frontend diagram smoke
+OK           2.5s  Frontend diagram browser smoke
+OK           2.9s  Frontend chat continuation smoke
+OK           1.9s  Frontend chat continuation browser smoke
+OK           2.9s  Frontend reply variants smoke
+OK           2.3s  Frontend reply variants browser smoke
+OK           0.9s  Frontend conversation organization smoke
+OK           2.4s  Frontend conversation organization browser smoke
+OK           0.2s  Frontend project and conversation context smoke
+OK           2.8s  Frontend chat polish smoke
+OK           8.5s  Frontend output previews, downloads, and changes browser smoke
+OK           0.2s  Frontend connected tools and saved sets smoke
+OK          12.5s  Frontend composer tools browser smoke
+FAIL(1)      7.0s  Frontend project and conversation context browser smoke
+OK           0.2s  Frontend first-run activation smoke
+OK          19.9s  Frontend first-run card component smoke
+OK          40.1s  Frontend voice input smoke
+OK           6.7s  Frontend offline banner smoke
+OK           4.5s  Frontend LAN Chat authentication smoke
+OK           3.8s  Frontend LAN sharing toggle smoke
+OK           0.2s  Frontend catalog browse smoke
+OK           0.2s  Frontend catalog companion download smoke
+OK           0.2s  Frontend model deletion smoke
+OK           0.2s  Frontend 3B exact-row closure smoke
+OK           2.4s  Frontend integration smoke
+OK           0.2s  Workspace logic smoke
+OK           0.2s  Frontend fabric model smoke
+OK          10.1s  Frontend fabric view smoke
+OK           0.2s  Frontend divergence model smoke
+OK          10.8s  Frontend divergence view smoke
+OK           9.5s  Workspace read-only visual smoke
+OK           0.2s  Model Arena residency logic smoke
+OK           8.0s  Model Arena residency visual smoke
+OK           0.9s  Retrieval rerank smoke
+OK           0.8s  Engine metrics smoke
+OK           0.8s  Tool calling smoke
+OK           1.1s  Frontend UI regression smoke
+OK           0.9s  Structured output smoke
+OK           0.9s  Token inspector smoke
+OK           0.2s  Design token contrast audit
+JOB_DONE frontend steps=61 ok=59 skipped=1 failed=1
+== public-scrub, validation-scripts, gates
+JOB_DONE public-scrub steps=13 ok=13 skipped=0 failed=0
+JOB_DONE validation-scripts steps=1 ok=1 skipped=0 failed=0
+validation gates: 47 passed, 0 failed
