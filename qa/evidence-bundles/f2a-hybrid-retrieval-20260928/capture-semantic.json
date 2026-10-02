@@ -1,0 +1,70 @@
+{
+  "phase": "semantic",
+  "question": "If hackers steal my information, when will you tell me?",
+  "build": "v0.7.8-9-g0477691e",
+  "progress_chip": "indexing 16/37",
+  "progress_status": {
+    "semantic": {
+      "available": true,
+      "encoder": "nomic-embed-text-v1.5.Q8_0.gguf",
+      "indexing": true
+    },
+    "document": {
+      "id": "67b5bc58-2641-4ac5-846f-b43b212fadca",
+      "indexable_chunks": 37,
+      "indexed_chunks": 16,
+      "skipped_chunks": 0
+    }
+  },
+  "policy_status": {
+    "id": "35e26154-a84a-47f8-beff-6c6d5d259bc5",
+    "indexable_chunks": 5,
+    "indexed_chunks": 5,
+    "skipped_chunks": 0
+  },
+  "answer": "According to the document excerpts, if security incidents that affect customer data occur, the account owner will be notified within seventy-two hours of confirmation, with a written summary of scope and remediation \n[1]\n. This implies that the company will inform the customer about the incident, but the exact timing of when they will notify the customer is not specified.",
+  "message_chips": [
+    "support-policy.txt4 passages used"
+  ],
+  "chat_citations": [
+    {
+      "chunk_index": 3,
+      "retrieval": "semantic",
+      "score": 0.016393442,
+      "holds_expected_passage": true,
+      "excerpt_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3"
+    },
+    {
+      "chunk_index": 4,
+      "retrieval": "semantic",
+      "score": 0.016129032,
+      "holds_expected_passage": false,
+      "excerpt_sha256": "65acd35694eefdf2e53b95926971023907f3c272e07cc7708ed684568f6a38f3"
+    },
+    {
+      "chunk_index": 1,
+      "retrieval": "semantic",
+      "score": 0.015873017,
+      "holds_expected_passage": false,
+      "excerpt_sha256": "8dcff1587f4c43893d3e41e6f97f10084e90c908b98586f1de4353eade98368a"
+    },
+    {
+      "chunk_index": 2,
+      "retrieval": "semantic",
+      "score": 0.015625,
+      "holds_expected_passage": false,
+      "excerpt_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc"
+    }
+  ],
+  "pills": [
+    "View source citation [1]",
+    "View source citation [1]"
+  ],
+  "expected_citation_number": 1,
+  "citation_modal": {
+    "badge": "Verified · bytes 942–1433",
+    "found": "Found by meaning",
+    "span": "not eligible for refunds under any circumstance.\n\n4. Data export\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.\n\n5. Incident handling\n\nSecurity incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation.\n\n6. Changes to this policy"
+  },
+  "page_errors": []
+}

@@ -49,6 +49,10 @@ target/release/camelid serve --model /path/to/model.gguf
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
 
+### Document search by meaning
+
+When `nomic-embed-text-v1.5.Q8_0.gguf` (the exact pinned artifact) is in the models directory, attached-document search ranks by keyword and by meaning, and indexes new uploads in the background on the CPU. Set `CAMELID_DOCUMENT_SEMANTIC=0` to keep it keyword-only. Details are in [`architecture/EMBEDDINGS.md`](architecture/EMBEDDINGS.md#knowledge-library-integration).
+
 ### CUDA continuous batching and model residency
 
 CUDA multi-sequence batching and two-main-model residency are explicit opt-ins. Defaults remain

@@ -1,0 +1,23 @@
+{
+  "dataset": "BEIR SciFact",
+  "archive": "scifact.zip",
+  "archive_sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
+  "archive_matches_fresh_download_of": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+  "files_sha256": {
+    "corpus.jsonl": "dec31c8182f3d744c7d2c09423756fd1d17cbef75808db13ba01cc0aab4d1ac6",
+    "queries.jsonl": "8ff84a7c903f722981cd8d595c022660140c51867b27608a6d4910db86080313",
+    "qrels/test.tsv": "0864bb985e0ca2367ba217977e72004d549054b2b06666ed9d4825ac7c21284c"
+  },
+  "corpus_documents": 5183,
+  "test_queries": 300,
+  "test_relevant_documents": 283,
+  "subset": {
+    "recipe": "every test-relevant document, plus random others (Python random.Random(20260929).shuffle of the sorted remaining ids) up to 1,000",
+    "documents": 1000,
+    "relevant_included": 283,
+    "file": "corpus-subset-1000.jsonl",
+    "file_sha256": "36793476a9079f9aab9fdeb156d8faf0bedcd0a89b6487a88285ea4347342495",
+    "ids_file": "subset-ids.txt"
+  },
+  "document_text": "title + blank line + abstract, ingested as one document per abstract"
+}

@@ -1,0 +1,449 @@
+{
+ "tag": "before",
+ "binary": "camelid-786",
+ "build": "v0.7.8-25-gcfa1e191",
+ "chunks": {
+  "support-policy.txt": 5,
+  "escalation-guide.txt": 2,
+  "PROJECT_CONTEXT.md": 22
+ },
+ "probes": [
+  {
+   "question": "If hackers steal my information, when will you tell me?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.69,
+     "he outage lasts longer than thirty minutes.\n\n2. Security rep"
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.6344,
+     "not eligible for refunds under any circumstance.\n\n4. Data ex"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.6204,
+     "ten summary of scope and remediation.\n\n6. Changes to this po"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.6204,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.5953,
+     "the community forum only.\n\n2. Support hours and response tar"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.5939,
+     "saved with the conversation, and a new chat starts with it o"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.69
+    ]
+   ]
+  },
+  {
+   "question": "When will you tell me about a data breach?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.7031,
+     "he outage lasts longer than thirty minutes.\n\n2. Security rep"
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.6578,
+     "not eligible for refunds under any circumstance.\n\n4. Data ex"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.6057,
+     "the community forum only.\n\n2. Support hours and response tar"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.5952,
+     "ten summary of scope and remediation.\n\n6. Changes to this po"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.583,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "escalation-guide.txt",
+     0,
+     0.5811,
+     "Camelid Support Escalation Guide\n\nVersion 1.3, for support e"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.7031
+    ]
+   ]
+  },
+  {
+   "question": "Who handles a billing dispute?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.6642,
+     "he outage lasts longer than thirty minutes.\n\n2. Security rep"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.6381,
+     "the community forum only.\n\n2. Support hours and response tar"
+    ],
+    [
+     "escalation-guide.txt",
+     0,
+     0.5936,
+     "Camelid Support Escalation Guide\n\nVersion 1.3, for support e"
+    ],
+    [
+     "support-policy.txt",
+     0,
+     0.5835,
+     "Camelid Support Policy\n\nVersion 4.2, effective 1 March 2026."
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.5769,
+     "not eligible for refunds under any circumstance.\n\n4. Data ex"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.5724,
+     "ten summary of scope and remediation.\n\n6. Changes to this po"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     1,
+     0.6642
+    ]
+   ]
+  },
+  {
+   "question": "How long do refunds take?",
+   "top_by_meaning": [
+    [
+     "support-policy.txt",
+     2,
+     0.8344,
+     "time of day, including weekends and public holidays.\n\n3. Ref"
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.7122,
+     "not eligible for refunds under any circumstance.\n\n4. Data ex"
+    ],
+    [
+     "escalation-guide.txt",
+     1,
+     0.7021,
+     "he outage lasts longer than thirty minutes.\n\n2. Security rep"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.6333,
+     "ten summary of scope and remediation.\n\n6. Changes to this po"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.6243,
+     "the community forum only.\n\n2. Support hours and response tar"
+    ],
+    [
+     "escalation-guide.txt",
+     0,
+     0.533,
+     "Camelid Support Escalation Guide\n\nVersion 1.3, for support e"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": [
+    [
+     "support-policy.txt",
+     2,
+     0.8344
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.7122
+    ],
+    [
+     "escalation-guide.txt",
+     1,
+     0.7021
+    ]
+   ]
+  },
+  {
+   "question": "hello",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     0,
+     0.5794,
+     "# Project and conversation context\n\n**Projects** groups rela"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     17,
+     0.5791,
+     "n is deleted and no replacement project is chosen automatica"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.5696,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     3,
+     0.5602,
+     "e for the conversation's instructions when preferences confl"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     8,
+     0.5581,
+     "er **Conversation context**,\nor remove its chip in the compo"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     2,
+     0.5542,
+     "* leaves the saved context unchanged.\n\n## What reaches the m"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": []
+  },
+  {
+   "question": "thanks!",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     2,
+     0.5942,
+     "* leaves the saved context unchanged.\n\n## What reaches the m"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5742,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5706,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     3,
+     0.5682,
+     "e for the conversation's instructions when preferences confl"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.564,
+     "the message is\nsent without them and says so.\n\n## Whole libr"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.562,
+     "saved with the conversation, and a new chat starts with it o"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": []
+  },
+  {
+   "question": "Tell me a joke about penguins.",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.559,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     16,
+     0.5528,
+     "uccessful save.\n- New chat clears conversation-specific cont"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.5514,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5487,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     0,
+     0.5477,
+     "# Project and conversation context\n\n**Projects** groups rela"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     18,
+     0.5446,
+     "uments they group; chats and projects store only collection "
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": []
+  },
+  {
+   "question": "What is 17 times 23?",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     14,
+     0.5136,
+     "md#knowledge-library-integration).\n\n## Files, storage, and s"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5061,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.5042,
+     "the community forum only.\n\n2. Support hours and response tar"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.501,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     8,
+     0.4907,
+     "er **Conversation context**,\nor remove its chip in the compo"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     9,
+     0.4832,
+     "ge searches each document once however many\ncollections hold"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": []
+  },
+  {
+   "question": "Write a haiku about autumn leaves.",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5852,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.5844,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     6,
+     0.5619,
+     "hile a response or tool run is active.\n\n## Knowledge collect"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.5594,
+     "the message is\nsent without them and says so.\n\n## Whole libr"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     8,
+     0.5581,
+     "er **Conversation context**,\nor remove its chip in the compo"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     1,
+     0.5527,
+     "; deleting a project leaves those conversations in Chat hist"
+    ]
+   ],
+   "floor": 0.6603303,
+   "library_served": []
+  }
+ ],
+ "calibration_libraries": {
+  "scifact": {
+   "documents": 1000,
+   "documents_with_changed_chunks": 0,
+   "chunks_before": 4406,
+   "chunks_after": 4406,
+   "changed_examples": []
+  },
+  "fiqa": {
+   "documents": 1000,
+   "documents_with_changed_chunks": 0,
+   "chunks_before": 2649,
+   "chunks_after": 2649,
+   "changed_examples": []
+  }
+ }
+}

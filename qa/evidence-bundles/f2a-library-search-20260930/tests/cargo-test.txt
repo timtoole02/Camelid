@@ -1,0 +1,19 @@
+# harness/full_test_build.sh: cargo test --all-targets --all-features --no-fail-fast -- --skip smoke_admits_tinyllama, the validation gates, the release eval build
+commit=d9318fa7 tracked_changes=0
+TEST_EXIT=101
+passed 3181 failed 1 ignored 159 binaries 70
+test spm_tokenizer_matches_hf ... FAILED
+validation gates: 47 passed, 0 failed
+FE_OK
+BUILD_EXIT=0
+camelid v0.7.8-17-gd9318fa7
+tracked changes after: 0
+FULL_DONE
+# the failing test's output, from the full cargo log
+thread 'spm_tokenizer_matches_hf' (262488) panicked at tests/runnable_tokenizer.rs:126:5:
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+---- spm_tokenizer_matches_hf stdout ----
+=== spm family: tinyllama-1.1b-chat-v1.0.Q8_0.gguf vs HF TinyLlama/TinyLlama-1.1B-Chat-v1.0 (30 cases) ===
+  ENCODE MISMATCH text=" leading space"
+    hf   = [29871, 8236, 2913]
+    cam  = [259, 25369, 2913]

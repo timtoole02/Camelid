@@ -1,0 +1,11 @@
+commit 50570094, tracked changes 0
+$ cargo fmt --all -- --check
+FMT_EXIT=0
+$ cargo clippy --all-targets -- -D warnings
+   Compiling camelid v0.7.8 (/tmp/f2r/wt-library)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.18s
+CLIPPY_DEFAULT_EXIT=0
+$ cargo clippy --all-targets --all-features -- -D warnings
+   Compiling camelid v0.7.8 (/tmp/f2r/wt-library)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.43s
+CLIPPY_ALL_EXIT=0

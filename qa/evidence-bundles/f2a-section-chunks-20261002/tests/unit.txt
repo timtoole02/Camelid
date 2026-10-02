@@ -1,0 +1,5 @@
+test api::citations::tests::each_section_gets_its_own_chunk_without_overlap ... ok
+test api::citations::tests::headings_are_short_lines_or_markdown_after_a_blank_line ... ok
+test api::citations::tests::prose_without_headings_still_overlaps ... ok
+test api::citations::tests::sections_shorter_than_a_quarter_window_share_a_chunk ... ok
+test result: ok. 621 passed; 0 failed; 1 ignored; 0 measured; 2186 filtered out; finished in 10.33s

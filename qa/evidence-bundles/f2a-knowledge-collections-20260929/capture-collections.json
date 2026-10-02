@@ -1,0 +1,159 @@
+{
+  "question": "If hackers steal my information, when will you tell me?",
+  "collection": "Customer support",
+  "project": "Support desk",
+  "build": "v0.7.8-12-gd5732301",
+  "library_README.md": {
+    "doc_id": "6613da5c-4c68-44e7-92e4-c3235fc49433",
+    "chunk_count": 37,
+    "sha256": "e4e08d63aa8c7a55698199916f1ce66a088377144b8942ddf2eb188870d8334a"
+  },
+  "library_support-policy.txt": {
+    "doc_id": "e767b29d-ad26-483e-88a9-3866faf370b3",
+    "chunk_count": 5,
+    "sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+  },
+  "library_picker": [
+    "README.md37 chunks",
+    "support-policy.txt5 chunks"
+  ],
+  "collection_api": {
+    "id": "70ad61fb-0fd5-4324-b54e-b0676d639d1b",
+    "name": "Customer support",
+    "created_at": 1790678612,
+    "doc_ids": [
+      "e767b29d-ad26-483e-88a9-3866faf370b3",
+      "8f40ca42-abd8-4028-abf1-3cd257e7daf2"
+    ]
+  },
+  "members_indexed": [
+    {
+      "id": "8f40ca42-abd8-4028-abf1-3cd257e7daf2",
+      "indexable_chunks": 2,
+      "indexed_chunks": 2,
+      "skipped_chunks": 0
+    },
+    {
+      "id": "e767b29d-ad26-483e-88a9-3866faf370b3",
+      "indexable_chunks": 5,
+      "indexed_chunks": 5,
+      "skipped_chunks": 0
+    }
+  ],
+  "library_members": [
+    "escalation-guide.txt2 chunksRemove",
+    "support-policy.txt5 chunksRemove"
+  ],
+  "composer_chips": [
+    "Customer support2 docs"
+  ],
+  "ui_search_requests": [
+    {
+      "query": "If hackers steal my information, when will you tell me?",
+      "collection_ids": [
+        "70ad61fb-0fd5-4324-b54e-b0676d639d1b"
+      ],
+      "top_k": 4
+    }
+  ],
+  "answer": "According to the Camelid Support Escalation Guide \n[1]\n, if a security incident affects customer data, the account owner will be notified within seventy-two hours of confirmation, with a written summary of scope and remediation \n[1]\n. However, the guide does not explicitly state when the customer will be informed of the breach.\n\nThe guide does mention that the security team will review the suspected data breach within one hour of the report, but it does not provide a timeline for informing the customer \n[2]\n. Additionally, the support policy states that the account owner will be notified within seventy-two hours, but it does not specify when the customer will be informed of the breach \n[3]\n.\n\nIt appears that the customer will not be informed of the breach immediately, but rather within a certain timeframe. However, the exact timeline is not specified in the provided excerpts.\n\nReferences\n\n[1]\n Camelid Support Escalation Guide, Version 1.3\n\n[2]\n Camelid Support Escalation Guide, Version 1.3\n\n[3]\n Support Policy, Version 1.3\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 372 · out 216\nfirst token 5.4s\n55 tok/s\n9.3s\n10:44 AM\nCLIENT-MEASURED\nDeveloper Diagnostics\n55.0 tok/s",
+  "message_chips": [
+    "Customer support4 passages used"
+  ],
+  "chat_citations": [
+    {
+      "filename": "escalation-guide.txt",
+      "chunk_index": 0,
+      "retrieval": "hybrid",
+      "holds_expected_passage": false,
+      "excerpt_sha256": "a58dd7d1e45714bca38ea8e1ad8a952c588e150382c24b22a44d81345be008f0"
+    },
+    {
+      "filename": "escalation-guide.txt",
+      "chunk_index": 1,
+      "retrieval": "semantic",
+      "holds_expected_passage": false,
+      "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+    },
+    {
+      "filename": "support-policy.txt",
+      "chunk_index": 3,
+      "retrieval": "semantic",
+      "holds_expected_passage": true,
+      "excerpt_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3"
+    },
+    {
+      "filename": "support-policy.txt",
+      "chunk_index": 4,
+      "retrieval": "semantic",
+      "holds_expected_passage": false,
+      "excerpt_sha256": "65acd35694eefdf2e53b95926971023907f3c272e07cc7708ed684568f6a38f3"
+    }
+  ],
+  "citations_all_members": true,
+  "search_replay": {
+    "status": 200,
+    "retrieval": {
+      "mode": "hybrid",
+      "semantic": {
+        "available": true,
+        "indexable_chunks": 7,
+        "indexed_chunks": 7,
+        "skipped_chunks": 0
+      }
+    },
+    "results": [
+      {
+        "filename": "escalation-guide.txt",
+        "chunk_index": 0,
+        "retrieval": "hybrid",
+        "holds_expected_passage": false,
+        "excerpt_sha256": "a58dd7d1e45714bca38ea8e1ad8a952c588e150382c24b22a44d81345be008f0"
+      },
+      {
+        "filename": "escalation-guide.txt",
+        "chunk_index": 1,
+        "retrieval": "semantic",
+        "holds_expected_passage": false,
+        "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+      },
+      {
+        "filename": "support-policy.txt",
+        "chunk_index": 3,
+        "retrieval": "semantic",
+        "holds_expected_passage": true,
+        "excerpt_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3"
+      },
+      {
+        "filename": "support-policy.txt",
+        "chunk_index": 4,
+        "retrieval": "semantic",
+        "holds_expected_passage": false,
+        "excerpt_sha256": "65acd35694eefdf2e53b95926971023907f3c272e07cc7708ed684568f6a38f3"
+      }
+    ]
+  },
+  "expected_citation_number": 3,
+  "pills": [
+    "View source citation [1]",
+    "View source citation [1]",
+    "View source citation [2]",
+    "View source citation [3]",
+    "View source citation [1]",
+    "View source citation [2]",
+    "View source citation [3]"
+  ],
+  "citation_modal": {
+    "badge": "Verified · bytes 942–1433",
+    "found": "Found by meaning",
+    "span": "not eligible for refunds under any circumstance.\n\n4. Data export\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.\n\n5. Incident handling\n\nSecurity incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation.\n\n6. Changes to this policy"
+  },
+  "project_editor_collections": [
+    "Customer support2 docs"
+  ],
+  "project_chat_chips": [
+    "Customer support2 docs · project",
+    "Collection unavailable"
+  ],
+  "page_errors": []
+}

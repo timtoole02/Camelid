@@ -1,0 +1,15 @@
+{
+  "phase": "keyword-only",
+  "question": "If hackers steal my information, when will you tell me?",
+  "build": "v0.7.8-9-g0477691e",
+  "note": "Keyword search only. Semantic document search needs nomic-embed-text-v1.5.Q8_0.gguf in the models directory.Open Models",
+  "chip": "5 chunks",
+  "index_status": {
+    "available": false,
+    "encoder": "nomic-embed-text-v1.5.Q8_0.gguf",
+    "indexing": false,
+    "reason": "encoder_not_installed",
+    "message": "Semantic document search needs nomic-embed-text-v1.5.Q8_0.gguf in the models directory."
+  },
+  "page_errors": []
+}

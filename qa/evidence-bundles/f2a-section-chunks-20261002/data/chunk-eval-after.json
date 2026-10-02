@@ -1,0 +1,449 @@
+{
+ "tag": "after",
+ "binary": "camelid-chunks",
+ "build": "v0.7.8-26-g50570094",
+ "chunks": {
+  "support-policy.txt": 7,
+  "escalation-guide.txt": 4,
+  "PROJECT_CONTEXT.md": 21
+ },
+ "probes": [
+  {
+   "question": "If hackers steal my information, when will you tell me?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     2,
+     0.7459,
+     "2. Security reports\n\nForward a suspected data breach to the "
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6773,
+     "5. Incident handling\n\nSecurity incidents that affect custome"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.6204,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "support-policy.txt",
+     6,
+     0.6204,
+     "6. Changes to this policy\n\nWe give thirty days of notice bef"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.6048,
+     "4. Data export\n\nCustomers can export their data at any time "
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5932,
+     "saved with the conversation, and a new chat starts with it o"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     2,
+     0.7459
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6773
+    ]
+   ]
+  },
+  {
+   "question": "When will you tell me about a data breach?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     2,
+     0.7789,
+     "2. Security reports\n\nForward a suspected data breach to the "
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6826,
+     "5. Incident handling\n\nSecurity incidents that affect custome"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.6256,
+     "4. Data export\n\nCustomers can export their data at any time "
+    ],
+    [
+     "support-policy.txt",
+     2,
+     0.5944,
+     "2. Support hours and response targets\n\nSupport is staffed fr"
+    ],
+    [
+     "escalation-guide.txt",
+     1,
+     0.5863,
+     "1. Outages\n\nEscalate an outage that blocks every user in a w"
+    ],
+    [
+     "support-policy.txt",
+     6,
+     0.5843,
+     "6. Changes to this policy\n\nWe give thirty days of notice bef"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     2,
+     0.7789
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6826
+    ]
+   ]
+  },
+  {
+   "question": "Who handles a billing dispute?",
+   "top_by_meaning": [
+    [
+     "escalation-guide.txt",
+     3,
+     0.7743,
+     "3. Billing disputes\n\nA billing dispute above 5,000 euros goe"
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6592,
+     "5. Incident handling\n\nSecurity incidents that affect custome"
+    ],
+    [
+     "support-policy.txt",
+     2,
+     0.626,
+     "2. Support hours and response targets\n\nSupport is staffed fr"
+    ],
+    [
+     "support-policy.txt",
+     1,
+     0.6146,
+     "1. Scope\n\nThis document covers support hours, response targe"
+    ],
+    [
+     "escalation-guide.txt",
+     1,
+     0.574,
+     "1. Outages\n\nEscalate an outage that blocks every user in a w"
+    ],
+    [
+     "support-policy.txt",
+     3,
+     0.5646,
+     "3. Refunds\n\nEnterprise customers may request a refund within"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": [
+    [
+     "escalation-guide.txt",
+     3,
+     0.7743
+    ]
+   ]
+  },
+  {
+   "question": "How long do refunds take?",
+   "top_by_meaning": [
+    [
+     "support-policy.txt",
+     3,
+     0.8386,
+     "3. Refunds\n\nEnterprise customers may request a refund within"
+    ],
+    [
+     "support-policy.txt",
+     5,
+     0.6556,
+     "5. Incident handling\n\nSecurity incidents that affect custome"
+    ],
+    [
+     "support-policy.txt",
+     6,
+     0.6282,
+     "6. Changes to this policy\n\nWe give thirty days of notice bef"
+    ],
+    [
+     "support-policy.txt",
+     4,
+     0.6234,
+     "4. Data export\n\nCustomers can export their data at any time "
+    ],
+    [
+     "escalation-guide.txt",
+     2,
+     0.6218,
+     "2. Security reports\n\nForward a suspected data breach to the "
+    ],
+    [
+     "escalation-guide.txt",
+     3,
+     0.6204,
+     "3. Billing disputes\n\nA billing dispute above 5,000 euros goe"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": [
+    [
+     "support-policy.txt",
+     3,
+     0.8386
+    ]
+   ]
+  },
+  {
+   "question": "hello",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     0,
+     0.5794,
+     "# Project and conversation context\n\n**Projects** groups rela"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     16,
+     0.5791,
+     "n is deleted and no replacement project is chosen automatica"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5753,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     3,
+     0.5649,
+     "off\ninheritance to omit global or project instructions entir"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     2,
+     0.559,
+     "## What reaches the model\n\nThe panel's **Included in the nex"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5498,
+     "g send-time preflight, where the final request is checked ag"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": []
+  },
+  {
+   "question": "thanks!",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     2,
+     0.5851,
+     "## What reaches the model\n\nThe panel's **Included in the nex"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.574,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     3,
+     0.5732,
+     "off\ninheritance to omit global or project instructions entir"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.5706,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5655,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     10,
+     0.5639,
+     "## Whole library\n\n**Attach → Whole library** makes a chat se"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": []
+  },
+  {
+   "question": "Tell me a joke about penguins.",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.559,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5561,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     15,
+     0.5528,
+     "uccessful save.\n- New chat clears conversation-specific cont"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     0,
+     0.5477,
+     "# Project and conversation context\n\n**Projects** groups rela"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5464,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     17,
+     0.5446,
+     "uments they group; chats and projects store only collection "
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": []
+  },
+  {
+   "question": "What is 17 times 23?",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     5,
+     0.5054,
+     "g send-time preflight, where the final request is checked ag"
+    ],
+    [
+     "support-policy.txt",
+     2,
+     0.5017,
+     "2. Support hours and response targets\n\nSupport is staffed fr"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     9,
+     0.5014,
+     "s' results, as quoted source excerpts with verifiable citati"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.501,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     8,
+     0.4846,
+     "the\nlibrary. A chat or project searches at most 16 collectio"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     13,
+     0.4845,
+     "## Files, storage, and scope\n\n- Reference files are static U"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": []
+  },
+  {
+   "question": "Write a haiku about autumn leaves.",
+   "top_by_meaning": [
+    [
+     "PROJECT_CONTEXT.md",
+     12,
+     0.5875,
+     "saved with the conversation, and a new chat starts with it o"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     11,
+     0.5852,
+     "uments and the chat's\ncollections are searched as well, in f"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     6,
+     0.5812,
+     "## Knowledge collections\n\nA knowledge collection is a named "
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     9,
+     0.5691,
+     "s' results, as quoted source excerpts with verifiable citati"
+    ],
+    [
+     "escalation-guide.txt",
+     1,
+     0.552,
+     "1. Outages\n\nEscalate an outage that blocks every user in a w"
+    ],
+    [
+     "PROJECT_CONTEXT.md",
+     10,
+     0.5501,
+     "## Whole library\n\n**Attach → Whole library** makes a chat se"
+    ]
+   ],
+   "floor": 0.66090125,
+   "library_served": []
+  }
+ ],
+ "calibration_libraries": {
+  "scifact": {
+   "documents": 1000,
+   "documents_with_changed_chunks": 0,
+   "chunks_before": 4406,
+   "chunks_after": 4406,
+   "changed_examples": []
+  },
+  "fiqa": {
+   "documents": 1000,
+   "documents_with_changed_chunks": 0,
+   "chunks_before": 2649,
+   "chunks_after": 2649,
+   "changed_examples": []
+  }
+ }
+}

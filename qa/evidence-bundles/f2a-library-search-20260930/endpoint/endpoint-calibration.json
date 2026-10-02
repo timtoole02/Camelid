@@ -1,0 +1,64 @@
+{
+ "build": "camelid v0.7.8-17-gd9318fa7",
+ "floors": {
+  "scifact": 0.6894662,
+  "fiqa": 0.6865152
+ },
+ "queries": 1810,
+ "results_below_the_floor": 0,
+ "endpoint_agrees_with_calibration": 1810,
+ "disagreements": [],
+ "chat_top_k": 4,
+ "held_out": {
+  "positives": 250,
+  "positives_with_a_relevant_passage_in_the_4": 207,
+  "negatives": 654,
+  "negatives_with_no_passage": 570,
+  "negatives_mean_passages": 0.32
+ },
+ "held_out_by_library": {
+  "scifact": {
+   "positives": 150,
+   "positives_with_a_relevant_passage_in_the_4": 131,
+   "negatives": 302,
+   "negatives_with_no_passage": 272,
+   "negatives_mean_passages": 0.245
+  },
+  "fiqa": {
+   "positives": 100,
+   "positives_with_a_relevant_passage_in_the_4": 76,
+   "negatives": 352,
+   "negatives_with_no_passage": 298,
+   "negatives_mean_passages": 0.384
+  }
+ },
+ "latency": {
+  "scifact": {
+   "library": {
+    "p50_ms": 422.6,
+    "p95_ms": 1273.2
+   },
+   "plain_whole_library": {
+    "p50_ms": 414.1,
+    "p95_ms": 1268.5
+   },
+   "n": 905
+  },
+  "fiqa": {
+   "library": {
+    "p50_ms": 403.1,
+    "p95_ms": 1272.2
+   },
+   "plain_whole_library": {
+    "p50_ms": 400.5,
+    "p95_ms": 1264.1
+   },
+   "n": 905
+  }
+ },
+ "load_at_end": [
+  "2.35",
+  "2.36",
+  "2.40"
+ ]
+}

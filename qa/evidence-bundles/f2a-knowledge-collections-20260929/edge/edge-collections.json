@@ -1,0 +1,271 @@
+{
+  "passed": 51,
+  "total": 51,
+  "servers": [
+    {
+      "binary": "camelid-collections",
+      "build": "v0.7.8-12-gd5732301",
+      "pid": 193180,
+      "library": "lib-edge",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 193230,
+      "library": "lib-upgrade",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "binary": "camelid-collections",
+      "build": "v0.7.8-12-gd5732301",
+      "pid": 193270,
+      "library": "lib-upgrade",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 193310,
+      "library": "lib-upgrade",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "binary": "camelid-collections",
+      "build": "v0.7.8-12-gd5732301",
+      "pid": 193355,
+      "library": "lib-upgrade",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "binary": "camelid-collections",
+      "build": "v0.7.8-12-gd5732301",
+      "pid": 193394,
+      "library": "lib-lan",
+      "api_surface": "lan_chat_only",
+      "args": [
+        "--lan-chat-only",
+        "--api-key-file",
+        "/tmp/f2c/lib-lan/api.key",
+        "--no-open"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "check": "a new library has no collections",
+      "pass": true
+    },
+    {
+      "check": "create trims the name and answers 201 with no members",
+      "pass": true
+    },
+    {
+      "check": "a name differing only in ASCII case is taken (409)",
+      "pass": true
+    },
+    {
+      "check": "an empty name is rejected (422)",
+      "pass": true
+    },
+    {
+      "check": "a blank name is rejected (422)",
+      "pass": true
+    },
+    {
+      "check": "81 characters is rejected (422)",
+      "pass": true
+    },
+    {
+      "check": "a control character is rejected (422)",
+      "pass": true
+    },
+    {
+      "check": "80 characters (not bytes) are accepted",
+      "pass": true
+    },
+    {
+      "check": "non-ASCII letters are compared exactly (SQLite NOCASE folds ASCII only)",
+      "pass": true
+    },
+    {
+      "check": "the list is ordered by name ignoring case",
+      "pass": true
+    },
+    {
+      "check": "an upload into an unknown collection is refused and stores nothing",
+      "pass": true
+    },
+    {
+      "check": "an upload can join several collections at once",
+      "pass": true
+    },
+    {
+      "check": "adding documents keeps the order added and ignores repeats",
+      "pass": true
+    },
+    {
+      "check": "adding with one unknown document adds none of them (404)",
+      "pass": true
+    },
+    {
+      "check": "adding to an unknown collection is a 404",
+      "pass": true
+    },
+    {
+      "check": "rename answers the renamed collection with its members",
+      "pass": true
+    },
+    {
+      "check": "rename to a taken name is a 409 and changes nothing",
+      "pass": true
+    },
+    {
+      "check": "rename to a different case of its own name is allowed",
+      "pass": true
+    },
+    {
+      "check": "rename of an unknown collection is a 404",
+      "pass": true
+    },
+    {
+      "check": "the whole library holds matches outside any collection",
+      "pass": true
+    },
+    {
+      "check": "keyword: a collection search returns only its members",
+      "pass": true
+    },
+    {
+      "check": "keyword: it ranks exactly like naming its members as doc_ids",
+      "pass": true
+    },
+    {
+      "check": "hybrid: a collection search returns only its members",
+      "pass": true
+    },
+    {
+      "check": "hybrid: it ranks exactly like naming its members as doc_ids",
+      "pass": true
+    },
+    {
+      "check": "doc_ids and collection_ids together search both",
+      "pass": true
+    },
+    {
+      "check": "an empty collection searches nothing",
+      "pass": true
+    },
+    {
+      "check": "an empty collection list searches nothing",
+      "pass": true
+    },
+    {
+      "check": "an unknown collection in the scope is a 404, not a silent partial search",
+      "pass": true
+    },
+    {
+      "check": "a document in two searched collections is searched once",
+      "pass": true
+    },
+    {
+      "check": "removing a member is a 204, idempotent, and keeps the document",
+      "pass": true
+    },
+    {
+      "check": "removing from an unknown collection is a 404",
+      "pass": true
+    },
+    {
+      "check": "re-ingesting a member keeps its memberships and serves the new text",
+      "pass": true
+    },
+    {
+      "check": "re-ingesting into another collection adds, never drops",
+      "pass": true
+    },
+    {
+      "check": "deleting a document removes it from every collection",
+      "pass": true
+    },
+    {
+      "check": "deleting a collection keeps its documents; a second delete is a 404",
+      "pass": true
+    },
+    {
+      "check": "a deleted collection cannot be searched",
+      "pass": true
+    },
+    {
+      "check": "keyword: a scope of exactly 30,000 documents is searched",
+      "pass": true
+    },
+    {
+      "check": "hybrid: a scope of exactly 30,000 documents is searched",
+      "pass": true
+    },
+    {
+      "check": "one more is a 422 search_scope_too_large, not a database error",
+      "pass": true
+    },
+    {
+      "check": "deleting a 30,001-member collection removes its memberships",
+      "pass": true
+    },
+    {
+      "check": "the database is intact",
+      "pass": true
+    },
+    {
+      "check": "a library written by the previous build opens with no collections",
+      "pass": true
+    },
+    {
+      "check": "its documents can be collected and searched",
+      "pass": true
+    },
+    {
+      "check": "the previous build still searches the library",
+      "pass": true
+    },
+    {
+      "check": "and ingests into it",
+      "pass": true
+    },
+    {
+      "check": "a delete by the previous build also removes the membership (the cascade is in the schema)",
+      "pass": true
+    },
+    {
+      "observation": "previous build re-ingest (INSERT OR REPLACE) and memberships",
+      "status": 200,
+      "memberships_after": [],
+      "member_before": "43e63ff6-ad34-4bc5-b742-d25ef87afe42"
+    },
+    {
+      "check": "back on this build the collection is intact, less what the previous build deleted",
+      "pass": true
+    },
+    {
+      "check": "the database is intact after the round trip",
+      "pass": true
+    },
+    {
+      "check": "LAN surface: GET /api/collections is a 403 lan_chat_only",
+      "pass": true
+    },
+    {
+      "check": "LAN surface: POST /api/collections is a 403 lan_chat_only",
+      "pass": true
+    },
+    {
+      "check": "LAN surface: POST /api/documents/search is a 403 lan_chat_only",
+      "pass": true
+    }
+  ]
+}

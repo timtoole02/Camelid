@@ -1,0 +1,384 @@
+{
+ "before": {
+  "PROJECT_CONTEXT.md": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 359,
+    "text": "# Project and conversation context\n\n**Projects** groups related chats with reusable instructions and reference files.\nOpen **Projects → New project**, add a name, instructions, and optional text files,\nthen choose **New chat** on the project card. Its conversation list includes\narchived chats; deleting a project leaves those conversations in Chat history."
+   },
+   {
+    "index": 1,
+    "start": 295,
+    "end": 787,
+    "text": "; deleting a project leaves those conversations in Chat history.\n\nUse **Conversation context** above the chat composer to assign an existing chat\nto a project, choose which instructions and project files it inherits, or add\ninstructions and files just for that conversation. On short landscape screens,\nthe same panel opens from **Context** in the composer toolbar. Changes are explicit:\n**Save context** applies them; **Cancel** leaves the saved context unchanged.\n\n## What reaches the model"
+   },
+   {
+    "index": 2,
+    "start": 723,
+    "end": 1187,
+    "text": "* leaves the saved context unchanged.\n\n## What reaches the model\n\nThe panel's **Included in the next request** list shows the exact instruction and\nreference messages, in order. Global instructions come from Generation controls;\nCamelid's existing automatic code instructions are shown when the draft triggers\nthem. Project instructions follow, then conversation instructions, with a stated\npreference for the conversation's instructions when preferences conflict."
+   },
+   {
+    "index": 3,
+    "start": 1123,
+    "end": 1621,
+    "text": "e for the conversation's instructions when preferences conflict. Turn off\ninheritance to omit global or project instructions entirely.\n\nSelected reference files follow as labelled user-role data messages, with their\nnames and contents quoted as JSON strings. They are not executed or rendered as\nHTML and are not promoted into system instructions. The chat history and current\nquestion follow the reference messages. As with other model instructions, actual\nadherence depends on the selected model."
+   },
+   {
+    "index": 4,
+    "start": 1557,
+    "end": 2029,
+    "text": "el instructions, actual\nadherence depends on the selected model.\n\nThe context meter and send-time compaction use the composed messages, including\nthese sources and the newest image. Selected context is retained during compaction;\ncompaction only removes eligible earlier assistant/tool turns. The meter reports\nestimates, not tokenizer measurements. Document retrieval and Web Auto can add\nmore context during send-time preflight, where the final request is checked again."
+   },
+   {
+    "index": 5,
+    "start": 1965,
+    "end": 2290,
+    "text": "g send-time preflight, where the final request is checked again.\n\nContext is composed in the shared send path, including regenerate, edit/resend,\nand continue. An MCP run freezes its context for all approval and continuation\nrounds. Context edits are disabled while a response or tool run is active.\n\n## Knowledge collections"
+   },
+   {
+    "index": 6,
+    "start": 2226,
+    "end": 2591,
+    "text": "hile a response or tool run is active.\n\n## Knowledge collections\n\nA knowledge collection is a named set of documents from the Knowledge Library.\nOpen **Attach → Collections** in the composer to create, rename, or delete a\ncollection, add library documents to it or remove them, or upload files straight\ninto it. A document can belong to any number of collections."
+   },
+   {
+    "index": 7,
+    "start": 2527,
+    "end": 2938,
+    "text": "ght\ninto it. A document can belong to any number of collections. Removing it from a\ncollection, or deleting the collection, leaves the document in the library;\ndeleting the document removes it from every collection.\n\nA project searches the collections chosen in its editor, and its chats search\nthem too unless the chat turns one off: clear it under **Conversation context**,\nor remove its chip in the composer."
+   },
+   {
+    "index": 8,
+    "start": 2874,
+    "end": 3369,
+    "text": "er **Conversation context**,\nor remove its chip in the composer. A chat can also search collections of its\nown, from the same panel or with **Search this collection in this chat** in the\nlibrary. A chat or project searches at most 16 collections.\n\nWhen a message is sent, the chat reads the collections again and runs one\ndocument search over its attached documents and the members of every searched\ncollection together, so a message searches each document once however many\ncollections hold it."
+   },
+   {
+    "index": 9,
+    "start": 3305,
+    "end": 3722,
+    "text": "ge searches each document once however many\ncollections hold it. The results reach the model the same way as attached\ndocuments' results, as quoted source excerpts with verifiable citations. The\ncomposer shows a chip for each searched collection with its size, or its\nindexing progress while its documents are embedded; the sent message names each\ncollection and how many of the passages used came from its documents."
+   },
+   {
+    "index": 10,
+    "start": 3658,
+    "end": 3929,
+    "text": "ction and how many of the passages used came from its documents.\n\nA deleted collection shows as **Collection unavailable** and is not searched;\nremove its chip to clear it. If the collections cannot be read, the message is\nsent without them and says so.\n\n## Whole library"
+   },
+   {
+    "index": 11,
+    "start": 3866,
+    "end": 4281,
+    "text": "the message is\nsent without them and says so.\n\n## Whole library\n\n**Attach → Whole library** makes a chat search every document in the library,\nwith nothing to attach or collect first. Only passages close enough in meaning\nto the message are used, so a message about something the library does not\ncover is sent without document context; attached documents and the chat's\ncollections are searched as well, in full."
+   },
+   {
+    "index": 12,
+    "start": 4217,
+    "end": 4615,
+    "text": "uments and the chat's\ncollections are searched as well, in full. The composer shows a **Whole\nlibrary** chip with the library's size, or its indexing progress, since a\ndocument is found this way only once it is indexed. The sent message says how\nmany passages came from the library beyond what was attached or collected. The\nswitch is saved with the conversation, and a new chat starts with it off."
+   },
+   {
+    "index": 13,
+    "start": 4552,
+    "end": 4908,
+    "text": "saved with the conversation, and a new chat starts with it off. It\nneeds search by meaning: without the embedding model the composer says so, and\na message is sent without the library, still searching what is attached. How\n\"close enough\" was chosen is in\n[embeddings](architecture/EMBEDDINGS.md#knowledge-library-integration).\n\n## Files, storage, and scope"
+   },
+   {
+    "index": 14,
+    "start": 4844,
+    "end": 5329,
+    "text": "md#knowledge-library-integration).\n\n## Files, storage, and scope\n\n- Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.\n  Re-add a file to update its contents. PDF and DOCX extraction continue to use\n  the separate document attachment controls.\n- Each project and conversation can have eight files, at most 32 KiB each, with\n  a combined 96 KiB limit for its instructions and files. Instructions have a\n  12,000-character limit. Up to 24 projects can be saved."
+   },
+   {
+    "index": 15,
+    "start": 5265,
+    "end": 5752,
+    "text": "have a\n  12,000-character limit. Up to 24 projects can be saved.\n- Projects and unsent draft context use `camelid.projects` and\n  `camelid.draftContext` in Camelid's UI storage. Saved conversations carry their\n  context configuration. Desktop uses its existing native UI storage document;\n  browser sessions use local storage for that origin. Browser quota failures\n  during context saves appear as an error rather than a successful save.\n- New chat clears conversation-specific context."
+   },
+   {
+    "index": 16,
+    "start": 5688,
+    "end": 6172,
+    "text": "uccessful save.\n- New chat clears conversation-specific context. New chat from a project card\n  starts with that project's context. Older conversations without a context field\n  keep global defaults and never inherit an unrelated new-chat draft.\n- Updating a project affects future messages in its linked chats. Removing a\n  project displays **Project unavailable** in those chats and omits its context.\n  No conversation is deleted and no replacement project is chosen automatically."
+   },
+   {
+    "index": 17,
+    "start": 6108,
+    "end": 6554,
+    "text": "n is deleted and no replacement project is chosen automatically.\n- Context is sent to the selected chat endpoint. Instructions and reference\n  files work on the LAN chat surface because they are entirely local to the UI\n  and add no engine filesystem, tool-execution, indexing, or synchronization API.\n- Knowledge collections live in the engine's library database, next to the\n  documents they group; chats and projects store only collection ids."
+   },
+   {
+    "index": 18,
+    "start": 6490,
+    "end": 7002,
+    "text": "uments they group; chats and projects store only collection ids. They are\n  part of the library API, which the LAN chat surface does not serve, so that\n  surface neither offers nor searches them and never requests them. A chat's\n  saved collections apply again on the full surface. The same holds for\n  whole-library search.\n- Conversation exports retain their existing transcript-only field whitelist.\n  Project and conversation context are excluded, and imports do not activate\n  context from an imported file."
+   },
+   {
+    "index": 19,
+    "start": 6938,
+    "end": 7272,
+    "text": "ed, and imports do not activate\n  context from an imported file. Clearing UI storage removes saved context.\n\n## Validation\n\nRun `npm run smoke:project-context` and, after `npm run build`,\n`npm run smoke:project-context-browser`,\n`npm run smoke:knowledge-collections-browser` and\n`npm run smoke:library-search-browser` from `frontend`."
+   },
+   {
+    "index": 20,
+    "start": 7208,
+    "end": 7718,
+    "text": "ser` and\n`npm run smoke:library-search-browser` from `frontend`. The browser suites use\nlocal deterministic API fixtures to verify actual request payloads, inheritance,\nfile selection, persistence, project isolation, MCP continuation, the context\nbudget gate, project deletion, and desktop/mobile layouts, and that collections\nare managed, searched per chat and per project, left out once deleted, and absent\nfrom the LAN chat surface, and that whole-library search is saved per chat,\nreported on each message,"
+   },
+   {
+    "index": 21,
+    "start": 7654,
+    "end": 7862,
+    "text": "hole-library search is saved per chat,\nreported on each message, and falls back plainly without search by meaning. These checks verify\nUI behavior and request composition; they are not model-quality evidence."
+   }
+  ],
+  "escalation-guide.txt": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 347,
+    "text": "Camelid Support Escalation Guide\n\nVersion 1.3, for support engineers. This guide says when a ticket leaves the support queue and who takes it next.\n\n1. Outages\n\nEscalate an outage that blocks every user in a workspace to the on-call engineer at once. Page the incident commander if the outage lasts longer than thirty minutes.\n\n2. Security reports"
+   },
+   {
+    "index": 1,
+    "start": 283,
+    "end": 635,
+    "text": "he outage lasts longer than thirty minutes.\n\n2. Security reports\n\nForward a suspected data breach to the security team within one hour of the report. Do not confirm or deny a breach to the customer until the security team has reviewed it.\n\n3. Billing disputes\n\nA billing dispute above 5,000 euros goes to the finance lead before any refund is promised."
+   }
+  ],
+  "support-policy.txt": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 439,
+    "text": "Camelid Support Policy\n\nVersion 4.2, effective 1 March 2026. This policy applies to every paid plan. Where an order form says something different, the order form wins.\n\n1. Scope\n\nThis document covers support hours, response targets, refunds, data export and incident handling for Team and Enterprise subscriptions. It does not cover the free tier, which is supported through the community forum only.\n\n2. Support hours and response targets"
+   },
+   {
+    "index": 1,
+    "start": 375,
+    "end": 692,
+    "text": "the community forum only.\n\n2. Support hours and response targets\n\nSupport is staffed from 08:00 to 20:00 UTC on weekdays. Enterprise tickets receive a first response within four business hours. Priority incidents are acknowledged within one hour at any time of day, including weekends and public holidays.\n\n3. Refunds"
+   },
+   {
+    "index": 2,
+    "start": 628,
+    "end": 1006,
+    "text": "time of day, including weekends and public holidays.\n\n3. Refunds\n\nEnterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method and processing takes five business days. Team plans are refundable within fourteen days of purchase. Trial accounts are not eligible for refunds under any circumstance.\n\n4. Data export"
+   },
+   {
+    "index": 3,
+    "start": 942,
+    "end": 1433,
+    "text": "not eligible for refunds under any circumstance.\n\n4. Data export\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest.\n\n5. Incident handling\n\nSecurity incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation.\n\n6. Changes to this policy"
+   },
+   {
+    "index": 4,
+    "start": 1369,
+    "end": 1534,
+    "text": "ten summary of scope and remediation.\n\n6. Changes to this policy\n\nWe give thirty days of notice before any change that reduces a customer's rights under this policy."
+   }
+  ]
+ },
+ "after": {
+  "PROJECT_CONTEXT.md": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 359,
+    "text": "# Project and conversation context\n\n**Projects** groups related chats with reusable instructions and reference files.\nOpen **Projects → New project**, add a name, instructions, and optional text files,\nthen choose **New chat** on the project card. Its conversation list includes\narchived chats; deleting a project leaves those conversations in Chat history."
+   },
+   {
+    "index": 1,
+    "start": 295,
+    "end": 760,
+    "text": "; deleting a project leaves those conversations in Chat history.\n\nUse **Conversation context** above the chat composer to assign an existing chat\nto a project, choose which instructions and project files it inherits, or add\ninstructions and files just for that conversation. On short landscape screens,\nthe same panel opens from **Context** in the composer toolbar. Changes are explicit:\n**Save context** applies them; **Cancel** leaves the saved context unchanged."
+   },
+   {
+    "index": 2,
+    "start": 762,
+    "end": 1257,
+    "text": "## What reaches the model\n\nThe panel's **Included in the next request** list shows the exact instruction and\nreference messages, in order. Global instructions come from Generation controls;\nCamelid's existing automatic code instructions are shown when the draft triggers\nthem. Project instructions follow, then conversation instructions, with a stated\npreference for the conversation's instructions when preferences conflict. Turn off\ninheritance to omit global or project instructions entirely."
+   },
+   {
+    "index": 3,
+    "start": 1193,
+    "end": 1621,
+    "text": "off\ninheritance to omit global or project instructions entirely.\n\nSelected reference files follow as labelled user-role data messages, with their\nnames and contents quoted as JSON strings. They are not executed or rendered as\nHTML and are not promoted into system instructions. The chat history and current\nquestion follow the reference messages. As with other model instructions, actual\nadherence depends on the selected model."
+   },
+   {
+    "index": 4,
+    "start": 1557,
+    "end": 2029,
+    "text": "el instructions, actual\nadherence depends on the selected model.\n\nThe context meter and send-time compaction use the composed messages, including\nthese sources and the newest image. Selected context is retained during compaction;\ncompaction only removes eligible earlier assistant/tool turns. The meter reports\nestimates, not tokenizer measurements. Document retrieval and Web Auto can add\nmore context during send-time preflight, where the final request is checked again."
+   },
+   {
+    "index": 5,
+    "start": 1965,
+    "end": 2264,
+    "text": "g send-time preflight, where the final request is checked again.\n\nContext is composed in the shared send path, including regenerate, edit/resend,\nand continue. An MCP run freezes its context for all approval and continuation\nrounds. Context edits are disabled while a response or tool run is active."
+   },
+   {
+    "index": 6,
+    "start": 2266,
+    "end": 2742,
+    "text": "## Knowledge collections\n\nA knowledge collection is a named set of documents from the Knowledge Library.\nOpen **Attach → Collections** in the composer to create, rename, or delete a\ncollection, add library documents to it or remove them, or upload files straight\ninto it. A document can belong to any number of collections. Removing it from a\ncollection, or deleting the collection, leaves the document in the library;\ndeleting the document removes it from every collection."
+   },
+   {
+    "index": 7,
+    "start": 2678,
+    "end": 3120,
+    "text": "library;\ndeleting the document removes it from every collection.\n\nA project searches the collections chosen in its editor, and its chats search\nthem too unless the chat turns one off: clear it under **Conversation context**,\nor remove its chip in the composer. A chat can also search collections of its\nown, from the same panel or with **Search this collection in this chat** in the\nlibrary. A chat or project searches at most 16 collections."
+   },
+   {
+    "index": 8,
+    "start": 3057,
+    "end": 3495,
+    "text": "the\nlibrary. A chat or project searches at most 16 collections.\n\nWhen a message is sent, the chat reads the collections again and runs one\ndocument search over its attached documents and the members of every searched\ncollection together, so a message searches each document once however many\ncollections hold it. The results reach the model the same way as attached\ndocuments' results, as quoted source excerpts with verifiable citations."
+   },
+   {
+    "index": 9,
+    "start": 3431,
+    "end": 3911,
+    "text": "s' results, as quoted source excerpts with verifiable citations. The\ncomposer shows a chip for each searched collection with its size, or its\nindexing progress while its documents are embedded; the sent message names each\ncollection and how many of the passages used came from its documents.\n\nA deleted collection shows as **Collection unavailable** and is not searched;\nremove its chip to clear it. If the collections cannot be read, the message is\nsent without them and says so."
+   },
+   {
+    "index": 10,
+    "start": 3913,
+    "end": 4281,
+    "text": "## Whole library\n\n**Attach → Whole library** makes a chat search every document in the library,\nwith nothing to attach or collect first. Only passages close enough in meaning\nto the message are used, so a message about something the library does not\ncover is sent without document context; attached documents and the chat's\ncollections are searched as well, in full."
+   },
+   {
+    "index": 11,
+    "start": 4217,
+    "end": 4615,
+    "text": "uments and the chat's\ncollections are searched as well, in full. The composer shows a **Whole\nlibrary** chip with the library's size, or its indexing progress, since a\ndocument is found this way only once it is indexed. The sent message says how\nmany passages came from the library beyond what was attached or collected. The\nswitch is saved with the conversation, and a new chat starts with it off."
+   },
+   {
+    "index": 12,
+    "start": 4552,
+    "end": 4878,
+    "text": "saved with the conversation, and a new chat starts with it off. It\nneeds search by meaning: without the embedding model the composer says so, and\na message is sent without the library, still searching what is attached. How\n\"close enough\" was chosen is in\n[embeddings](architecture/EMBEDDINGS.md#knowledge-library-integration)."
+   },
+   {
+    "index": 13,
+    "start": 4880,
+    "end": 5329,
+    "text": "## Files, storage, and scope\n\n- Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.\n  Re-add a file to update its contents. PDF and DOCX extraction continue to use\n  the separate document attachment controls.\n- Each project and conversation can have eight files, at most 32 KiB each, with\n  a combined 96 KiB limit for its instructions and files. Instructions have a\n  12,000-character limit. Up to 24 projects can be saved."
+   },
+   {
+    "index": 14,
+    "start": 5265,
+    "end": 5752,
+    "text": "have a\n  12,000-character limit. Up to 24 projects can be saved.\n- Projects and unsent draft context use `camelid.projects` and\n  `camelid.draftContext` in Camelid's UI storage. Saved conversations carry their\n  context configuration. Desktop uses its existing native UI storage document;\n  browser sessions use local storage for that origin. Browser quota failures\n  during context saves appear as an error rather than a successful save.\n- New chat clears conversation-specific context."
+   },
+   {
+    "index": 15,
+    "start": 5688,
+    "end": 6172,
+    "text": "uccessful save.\n- New chat clears conversation-specific context. New chat from a project card\n  starts with that project's context. Older conversations without a context field\n  keep global defaults and never inherit an unrelated new-chat draft.\n- Updating a project affects future messages in its linked chats. Removing a\n  project displays **Project unavailable** in those chats and omits its context.\n  No conversation is deleted and no replacement project is chosen automatically."
+   },
+   {
+    "index": 16,
+    "start": 6108,
+    "end": 6554,
+    "text": "n is deleted and no replacement project is chosen automatically.\n- Context is sent to the selected chat endpoint. Instructions and reference\n  files work on the LAN chat surface because they are entirely local to the UI\n  and add no engine filesystem, tool-execution, indexing, or synchronization API.\n- Knowledge collections live in the engine's library database, next to the\n  documents they group; chats and projects store only collection ids."
+   },
+   {
+    "index": 17,
+    "start": 6490,
+    "end": 7002,
+    "text": "uments they group; chats and projects store only collection ids. They are\n  part of the library API, which the LAN chat surface does not serve, so that\n  surface neither offers nor searches them and never requests them. A chat's\n  saved collections apply again on the full surface. The same holds for\n  whole-library search.\n- Conversation exports retain their existing transcript-only field whitelist.\n  Project and conversation context are excluded, and imports do not activate\n  context from an imported file."
+   },
+   {
+    "index": 18,
+    "start": 6938,
+    "end": 7272,
+    "text": "ed, and imports do not activate\n  context from an imported file. Clearing UI storage removes saved context.\n\n## Validation\n\nRun `npm run smoke:project-context` and, after `npm run build`,\n`npm run smoke:project-context-browser`,\n`npm run smoke:knowledge-collections-browser` and\n`npm run smoke:library-search-browser` from `frontend`."
+   },
+   {
+    "index": 19,
+    "start": 7208,
+    "end": 7718,
+    "text": "ser` and\n`npm run smoke:library-search-browser` from `frontend`. The browser suites use\nlocal deterministic API fixtures to verify actual request payloads, inheritance,\nfile selection, persistence, project isolation, MCP continuation, the context\nbudget gate, project deletion, and desktop/mobile layouts, and that collections\nare managed, searched per chat and per project, left out once deleted, and absent\nfrom the LAN chat surface, and that whole-library search is saved per chat,\nreported on each message,"
+   },
+   {
+    "index": 20,
+    "start": 7654,
+    "end": 7862,
+    "text": "hole-library search is saved per chat,\nreported on each message, and falls back plainly without search by meaning. These checks verify\nUI behavior and request composition; they are not model-quality evidence."
+   }
+  ],
+  "escalation-guide.txt": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 147,
+    "text": "Camelid Support Escalation Guide\n\nVersion 1.3, for support engineers. This guide says when a ticket leaves the support queue and who takes it next."
+   },
+   {
+    "index": 1,
+    "start": 149,
+    "end": 326,
+    "text": "1. Outages\n\nEscalate an outage that blocks every user in a workspace to the on-call engineer at once. Page the incident commander if the outage lasts longer than thirty minutes."
+   },
+   {
+    "index": 2,
+    "start": 328,
+    "end": 521,
+    "text": "2. Security reports\n\nForward a suspected data breach to the security team within one hour of the report. Do not confirm or deny a breach to the customer until the security team has reviewed it."
+   },
+   {
+    "index": 3,
+    "start": 523,
+    "end": 635,
+    "text": "3. Billing disputes\n\nA billing dispute above 5,000 euros goes to the finance lead before any refund is promised."
+   }
+  ],
+  "support-policy.txt": [
+   {
+    "index": 0,
+    "start": 0,
+    "end": 167,
+    "text": "Camelid Support Policy\n\nVersion 4.2, effective 1 March 2026. This policy applies to every paid plan. Where an order form says something different, the order form wins."
+   },
+   {
+    "index": 1,
+    "start": 169,
+    "end": 400,
+    "text": "1. Scope\n\nThis document covers support hours, response targets, refunds, data export and incident handling for Team and Enterprise subscriptions. It does not cover the free tier, which is supported through the community forum only."
+   },
+   {
+    "index": 2,
+    "start": 402,
+    "end": 680,
+    "text": "2. Support hours and response targets\n\nSupport is staffed from 08:00 to 20:00 UTC on weekdays. Enterprise tickets receive a first response within four business hours. Priority incidents are acknowledged within one hour at any time of day, including weekends and public holidays."
+   },
+   {
+    "index": 3,
+    "start": 682,
+    "end": 990,
+    "text": "3. Refunds\n\nEnterprise customers may request a refund within 60 days of the invoice date. Refunds are issued to the original payment method and processing takes five business days. Team plans are refundable within fourteen days of purchase. Trial accounts are not eligible for refunds under any circumstance."
+   },
+   {
+    "index": 4,
+    "start": 992,
+    "end": 1213,
+    "text": "4. Data export\n\nCustomers can export their data at any time from the admin console. A full export requested in writing is fulfilled within thirty days. Exports are delivered as a compressed archive with a signed manifest."
+   },
+   {
+    "index": 5,
+    "start": 1215,
+    "end": 1406,
+    "text": "5. Incident handling\n\nSecurity incidents that affect customer data are reported to the account owner within seventy-two hours of confirmation, with a written summary of scope and remediation."
+   },
+   {
+    "index": 6,
+    "start": 1408,
+    "end": 1534,
+    "text": "6. Changes to this policy\n\nWe give thirty days of notice before any change that reduces a customer's rights under this policy."
+   }
+  ]
+ }
+}

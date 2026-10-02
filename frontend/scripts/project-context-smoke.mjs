@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { buildContextSources, estimateContextTokens, chatHistoryForRequest, contextSourceMessages, MAX_REFERENCE_BYTES, normalizeChatContext, normalizeProjects, persistContextValue, readContextFile, validateContextDraft } from '../src/lib/projectContext.js'
+import { buildContextSources, contextCollectionRefs, estimateContextTokens, chatHistoryForRequest, contextSourceMessages, MAX_COLLECTIONS, MAX_REFERENCE_BYTES, normalizeChatContext, normalizeProjects, persistContextValue, readContextFile, validateContextDraft, withCollection, withoutCollection } from '../src/lib/projectContext.js'
+import { documentsCoverage, normalizeCollections } from '../src/lib/knowledgeCollections.js'
 import { codePolicyForMessages } from '../src/lib/chatPolicy.js'
 import { compactForSend } from '../src/lib/conversationCompaction.js'
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
@@ -102,5 +103,52 @@ await check('source estimates include Unicode and request framing', () => {
 await check('browser-local projects remain available on LAN chat', () => {
   assert.equal(apiSurfaceAllowsTab('lan_chat_only', 'projects'), true)
   assert.equal(apiSurfaceAllowsTab('lan_chat_only', 'changes'), false)
+})
+await check('collection ids are stored as a bounded, de-duplicated list', () => {
+  const stored = normalizeChatContext({ collection_ids: ['a', 'a', '', 7, null, 'b', ...Array.from({ length: 30 }, (_, n) => `c${n}`)], excluded_collection_ids: 'a' })
+  assert.deepEqual(stored.collection_ids.slice(0, 3), ['a', 'b', 'c0'])
+  assert.equal(stored.collection_ids.length, MAX_COLLECTIONS)
+  assert.deepEqual(stored.excluded_collection_ids, [])
+  assert.deepEqual(normalizeChatContext({}).collection_ids, [], 'contexts saved before collections still load')
+  assert.deepEqual(normalizeProjects([{ id: 'p', name: 'P' }])[0].collection_ids, [])
+  assert.throws(() => validateContextDraft({ collection_ids: Array.from({ length: MAX_COLLECTIONS + 1 }, (_, n) => `c${n}`) }), /at most 16 collections/)
+})
+await check('a chat searches its project collections, less opt-outs, then its own', () => {
+  const withCollections = normalizeProjects([{ id: 'p', name: 'Website', collection_ids: ['hr', 'fin'] }])
+  const refs = contextCollectionRefs({ project_id: 'p', excluded_collection_ids: ['fin'], collection_ids: ['hr', 'eng'] }, withCollections)
+  assert.deepEqual(refs, [{ id: 'hr', from: 'project' }, { id: 'eng', from: 'conversation' }])
+  assert.deepEqual(contextCollectionRefs({ project_id: 'gone', collection_ids: ['eng'] }, withCollections), [{ id: 'eng', from: 'conversation' }], 'a missing project adds nothing')
+})
+await check('turning collections off and on edits the right list', () => {
+  const withCollections = normalizeProjects([{ id: 'p', name: 'Website', collection_ids: ['hr'] }])
+  const base = { project_id: 'p', collection_ids: ['eng'] }
+  const offProject = withoutCollection(base, withCollections, 'hr')
+  assert.deepEqual([offProject.collection_ids, offProject.excluded_collection_ids], [['eng'], ['hr']], 'a project collection is opted out, not deleted')
+  const offOwn = withoutCollection(base, withCollections, 'eng')
+  assert.deepEqual([offOwn.collection_ids, offOwn.excluded_collection_ids], [[], []])
+  assert.deepEqual(withCollection(offProject, withCollections, 'hr').excluded_collection_ids, [], 'turning it back on clears the opt-out')
+  assert.deepEqual(withCollection(base, withCollections, 'fin').collection_ids, ['eng', 'fin'])
+  const stale = { project_id: 'p', excluded_collection_ids: Array.from({ length: MAX_COLLECTIONS }, (_, n) => `old${n}`) }
+  assert.deepEqual(withoutCollection(stale, withCollections, 'hr').excluded_collection_ids, ['hr'], 'stale opt-outs never crowd out a new one')
+  const full = { collection_ids: Array.from({ length: MAX_COLLECTIONS }, (_, n) => `c${n}`) }
+  assert.throws(() => withCollection(full, [], 'one-more'), /at most 16 collections/)
+  assert.equal(withCollection(full, [], 'c3').collection_ids.length, MAX_COLLECTIONS, 'an existing one is not a new one')
+})
+await check('whole-library search is a saved per-chat switch that is off unless set', () => {
+  assert.equal(normalizeChatContext({}).search_library, false, 'contexts saved before it existed stay off')
+  assert.equal(normalizeChatContext({ search_library: 'yes' }).search_library, false, 'only true turns it on')
+  assert.equal(normalizeChatContext({ search_library: true }).search_library, true)
+  assert.equal(normalizeChatContext(withoutCollection({ search_library: true, collection_ids: ['a'] }, [], 'a')).search_library, true, 'editing collections keeps it')
+})
+await check('collections from the server are read defensively', () => {
+  assert.deepEqual(normalizeCollections([{ id: 'c', name: 'HR', created_at: '5', doc_ids: ['d', 3] }, { id: '', name: 'x' }, null, { id: 'n' }]),
+    [{ id: 'c', name: 'HR', created_at: 5, doc_ids: ['d'] }])
+  assert.deepEqual(normalizeCollections({ error: 'no' }), [])
+})
+await check('collection indexing progress counts only its known documents', () => {
+  const coverage = { a: { indexable_chunks: 4, indexed_chunks: 3, skipped_chunks: 1 }, b: { indexable_chunks: 6, indexed_chunks: 2, skipped_chunks: 0 } }
+  assert.deepEqual(documentsCoverage(['a', 'b', 'unknown'], coverage), { indexable: 10, done: 6, pending: true })
+  assert.deepEqual(documentsCoverage(['a'], coverage), { indexable: 4, done: 4, pending: false })
+  assert.deepEqual(documentsCoverage([], coverage), { indexable: 0, done: 0, pending: false })
 })
 console.log(`${checks} project context checks passed.`)

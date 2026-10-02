@@ -1,0 +1,50 @@
+{
+  "queries": 300,
+  "metrics": {
+    "keyword": {
+      "ndcg10": 0.7855,
+      "recall10": 0.8641,
+      "mrr10": 0.7652
+    },
+    "semantic": {
+      "ndcg10": 0.8154,
+      "recall10": 0.9027,
+      "mrr10": 0.7918
+    },
+    "hybrid": {
+      "ndcg10": 0.8499,
+      "recall10": 0.9282,
+      "mrr10": 0.8306
+    }
+  },
+  "latency_ms": {
+    "keyword": {
+      "p50": 17.8,
+      "p95": 25.3
+    },
+    "semantic": {
+      "p50": 432.8,
+      "p95": 724.5
+    },
+    "hybrid": {
+      "p50": 441.0,
+      "p95": 735.3
+    }
+  },
+  "ranked_by": {
+    "keyword": {
+      "keyword": 300
+    },
+    "semantic": {
+      "semantic": 300
+    },
+    "hybrid": {
+      "hybrid": 300
+    }
+  },
+  "hybrid_vs_keyword_ndcg10": {
+    "better": 63,
+    "worse": 15,
+    "same": 222
+  }
+}

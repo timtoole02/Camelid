@@ -1,0 +1,187 @@
+{
+  "passed": 32,
+  "total": 32,
+  "servers": [
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 121992,
+      "env": {},
+      "models_dir": "default"
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 122066,
+      "env": {},
+      "models_dir": "default"
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 122122,
+      "env": {},
+      "models_dir": "default"
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 122179,
+      "env": {
+        "CAMELID_DOCUMENT_SEMANTIC": "0"
+      },
+      "models_dir": "default"
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 122220,
+      "env": {},
+      "models_dir": "foreign"
+    },
+    {
+      "binary": "camelid-base",
+      "build": "v0.7.8-5-gc7ea906a",
+      "pid": 122259,
+      "env": {},
+      "models_dir": "default"
+    },
+    {
+      "binary": "camelid-head",
+      "build": "v0.7.8-9-g0477691e",
+      "pid": 122298,
+      "env": {},
+      "models_dir": "default"
+    }
+  ],
+  "checks": [
+    {
+      "check": "a new upload is indexed in the background",
+      "pass": true
+    },
+    {
+      "check": "every vector is bound to its chunk hash, the pinned encoder and 768 dims",
+      "pass": true
+    },
+    {
+      "check": "a question sharing no word with the passage finds it first, by meaning",
+      "pass": true
+    },
+    {
+      "check": "keyword mode alone falls back to the opening passages",
+      "pass": true
+    },
+    {
+      "check": "an unknown mode is rejected",
+      "pass": true
+    },
+    {
+      "check": "semantic mode ranks by meaning only",
+      "pass": true
+    },
+    {
+      "check": "a tampered source serves nothing, not even a meaning match",
+      "pass": true
+    },
+    {
+      "check": "restoring the source restores the meaning match",
+      "pass": true
+    },
+    {
+      "check": "a drifted chunk excerpt is withheld while the rest still serve",
+      "pass": true
+    },
+    {
+      "check": "re-ingesting a document drops the old chunks' vectors",
+      "pass": true
+    },
+    {
+      "check": "the re-ingested text is indexed and served",
+      "pass": true
+    },
+    {
+      "check": "a small upload gets its vector",
+      "pass": true
+    },
+    {
+      "check": "deleting a document leaves no vector behind",
+      "pass": true
+    },
+    {
+      "check": "a pre-citation document is not indexable but still found by keyword",
+      "pass": true
+    },
+    {
+      "check": "an upload made while a large file is indexing is embedded before the rest of it",
+      "pass": true
+    },
+    {
+      "check": "deleting a document while it is being indexed leaves no vector behind",
+      "pass": true
+    },
+    {
+      "check": "a chunk whose text does not match its hash is skipped, not embedded",
+      "pass": true
+    },
+    {
+      "check": "restoring that text gets it embedded",
+      "pass": true
+    },
+    {
+      "check": "vectors written before a shutdown persist",
+      "pass": true
+    },
+    {
+      "check": "indexing resumes after a restart and completes",
+      "pass": true
+    },
+    {
+      "check": "disabled: status says so",
+      "pass": true
+    },
+    {
+      "check": "disabled: auto search is keyword-only",
+      "pass": true
+    },
+    {
+      "check": "disabled: an explicit hybrid request is refused, not degraded",
+      "pass": true
+    },
+    {
+      "check": "disabled: uploads are not embedded",
+      "pass": true
+    },
+    {
+      "check": "a foreign file under the encoder's name is refused",
+      "pass": true
+    },
+    {
+      "check": "and semantic search says why",
+      "pass": true
+    },
+    {
+      "check": "the previous build opens the library",
+      "pass": true
+    },
+    {
+      "check": "and searches it",
+      "pass": true
+    },
+    {
+      "check": "and ingests into it",
+      "pass": true
+    },
+    {
+      "check": "a delete by the previous build still removes the vectors",
+      "pass": true
+    },
+    {
+      "check": "back on this build, documents written meanwhile are indexed on first status",
+      "pass": true
+    },
+    {
+      "check": "the database is intact",
+      "pass": true
+    }
+  ]
+}

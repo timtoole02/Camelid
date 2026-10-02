@@ -1,0 +1,10 @@
+{
+  "url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/fiqa.zip",
+  "sha256": "32c7df99ed21252fdfb2cf3f5673502a8d245ee0c44c4a133570d92ce2b3ad02",
+  "bytes": 17948027,
+  "counts": {
+    "corpus.jsonl": 57638,
+    "queries.jsonl": 6648,
+    "qrels/test.tsv": 1706
+  }
+}

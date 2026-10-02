@@ -1,7 +1,8 @@
 import { useCallback, useRef, useState } from 'react'
 import { Modal } from '../ui/Modal'
 import { IconFolder, IconFile } from '../ui/icons'
-import { buildContextSources, contextBytes, estimateContextTokens, MAX_INSTRUCTION_CHARS, MAX_REFERENCES, normalizeChatContext, readContextFile, validateContextDraft } from '../../lib/projectContext.js'
+import { buildContextSources, contextBytes, estimateContextTokens, MAX_INSTRUCTION_CHARS, MAX_REFERENCES, normalizeChatContext, readContextFile, validateContextDraft, withCollection, withoutCollection } from '../../lib/projectContext.js'
+import { CollectionChecklist } from '../knowledge/CollectionChecklist'
 import '../../styles/project-context.css'
 
 export function ReferenceEditor({ references, onChange, disabled = false, onReadingChange = () => {} }) {
@@ -51,7 +52,7 @@ export function ContextSourceList({ sources }) {
   </section>
 }
 
-function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, onSave, onClose, busy }) {
+function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, onSave, onClose, busy, collections }) {
   const [draft, setDraft] = useState(() => normalizeChatContext(context))
   const [readingFiles, setReadingFiles] = useState(false)
   const [error, setError] = useState('')
@@ -66,7 +67,7 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
     <div className="context-form">
       <p className="context-muted">Saved on this device. Changes apply to future messages; previous replies stay as they are.</p>
       <fieldset disabled={busy}>
-        <label className="context-field">Project<select aria-label="Conversation project" value={draft.project_id} onChange={event => patch({ project_id: event.target.value, excluded_reference_ids: [] })}>
+        <label className="context-field">Project<select aria-label="Conversation project" value={draft.project_id} onChange={event => patch({ project_id: event.target.value, excluded_reference_ids: [], excluded_collection_ids: [] })}>
           <option value="">No project</option>
           {draft.project_id && !project && <option value={draft.project_id}>Project unavailable</option>}
           {projects.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
@@ -82,6 +83,20 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
         <label className="context-field">Conversation instructions<textarea aria-label="Conversation instructions" rows={4} maxLength={MAX_INSTRUCTION_CHARS} value={draft.instructions} onChange={event => patch({ instructions: event.target.value })} placeholder="Goals, constraints, tone, or decisions to keep in mind for this chat…" /></label>
         <p className="context-muted">Conversation instructions take precedence over project and global preferences. Turn off inheritance above to replace those instructions.</p>
         <ReferenceEditor references={draft.references} disabled={busy} onReadingChange={setReadingFiles} onChange={references => patch({ references })} />
+        {collections !== undefined && <section className="context-collections" aria-label="Knowledge collections">
+          <h3>Knowledge collections</h3>
+          <p className="context-muted">Searched when you send a message. Passages they supply are cited in the reply.</p>
+          {collections === null ? <p className="context-muted">Loading collections…</p> : <>
+            {project?.collection_ids.length > 0 && <div className="context-inheritance"><h3>From {project.name}</h3>
+              <CollectionChecklist collections={collections.filter(item => project.collection_ids.includes(item.id))}
+                checkedIds={project.collection_ids.filter(id => !draft.excluded_collection_ids.includes(id))}
+                onToggle={(id, on) => patch({ excluded_collection_ids: (on ? withCollection : withoutCollection)(draft, projects, id).excluded_collection_ids })} />
+            </div>}
+            <CollectionChecklist collections={collections} excludeIds={project?.collection_ids || []} checkedIds={draft.collection_ids}
+              onToggle={(id, on) => patch({ collection_ids: on ? [...draft.collection_ids, id] : draft.collection_ids.filter(item => item !== id) })} />
+            {!collections.length && <p className="context-muted">No collections yet. Create one from Attach → Collections.</p>}
+          </>}
+        </section>}
       </fieldset>
       <ContextSourceList sources={sources} />
       <p className="context-muted">Context is sent to the selected chat endpoint. Conversation exports contain the transcript only; project and conversation context are kept on this device.</p>
@@ -90,7 +105,7 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
   </Modal>
 }
 
-export function ConversationContext({ context, projects, sources, globalPrompt, onSave, onManageProjects, busy, compact = false }) {
+export function ConversationContext({ context, projects, sources, globalPrompt, onSave, onManageProjects, busy, compact = false, collections }) {
   const [open, setOpen] = useState(false)
   const close = useCallback(() => setOpen(false), [])
   const project = projects.find(item => item.id === context.project_id)
@@ -101,6 +116,6 @@ export function ConversationContext({ context, projects, sources, globalPrompt, 
       <span>{sources.length ? `${sources.length} sources · ~${tokens.toLocaleString()} tokens` : 'Add instructions or files'}</span>
     </button>
     <button type="button" className="cxturn__action" onClick={onManageProjects}>Projects</button>
-    {open && <ContextDialog key={context.project_id} context={context} projects={projects} globalPrompt={globalPrompt} automaticCodePrompt={sources.find(source => source.id === 'automatic-code')?.content || ''} onSave={onSave} onClose={close} busy={busy} />}
+    {open && <ContextDialog key={context.project_id} context={context} projects={projects} globalPrompt={globalPrompt} automaticCodePrompt={sources.find(source => source.id === 'automatic-code')?.content || ''} onSave={onSave} onClose={close} busy={busy} collections={collections} />}
   </div>
 }

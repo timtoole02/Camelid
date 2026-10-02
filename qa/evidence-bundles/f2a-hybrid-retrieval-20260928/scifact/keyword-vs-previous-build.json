@@ -1,0 +1,10 @@
+{
+  "previous_build": "v0.7.8-5-gc7ea906a",
+  "queries": 300,
+  "identical_top10_documents": 300,
+  "differing": [],
+  "previous_build_latency_ms": {
+    "p50": 17.6,
+    "p95": 23.9
+  }
+}
