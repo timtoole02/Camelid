@@ -6,6 +6,7 @@
 //! hashes to what was embedded. Retrieval scores with the same cosine function
 //! as `/v1/rerank`, which is why a separate rerank stage would add nothing.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,32 @@ const DISABLE_ENV: &str = "CAMELID_DOCUMENT_SEMANTIC";
 /// Chunks per encoder call. Small batches keep the database lock free for
 /// searches between batches.
 const INDEX_BATCH: usize = 16;
+
+/// The cosine similarity below which a library-wide search leaves a passage
+/// out. It rises with the library's indexed chunks, because the best chance
+/// match an unrelated message finds does; fitted for the pinned encoder, see
+/// docs/architecture/EMBEDDINGS.md.
+pub(crate) fn library_relevance_floor(indexed_chunks: usize) -> f32 {
+    const AT_ONE_CHUNK: f64 = 0.6408;
+    const PER_LN_CHUNK: f64 = 0.0058;
+    (AT_ONE_CHUNK + PER_LN_CHUNK * (indexed_chunks.max(1) as f64).ln()).clamp(0.3, 0.9) as f32
+}
+
+/// Chunks across the library with a current vector from the pinned encoder.
+pub(crate) fn indexed_chunk_count(
+    conn: &Connection,
+    dims: usize,
+) -> Result<usize, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM document_chunk_vectors AS v
+         JOIN document_chunks AS c ON c.id = v.chunk_id
+         WHERE v.vector IS NOT NULL AND v.encoder_sha256 = ?1 AND v.dims = ?2
+           AND v.chunk_sha256 = c.chunk_sha256",
+        params![ENCODER_SHA256, dims as i64],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
+}
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // `vector IS NULL` records a chunk that was skipped because its stored
@@ -296,6 +323,69 @@ pub(crate) fn semantic_ranked(
     ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
     ranked.truncate(limit);
     Ok(ranked)
+}
+
+/// Where a candidate chunk sits, and its cosine similarity to the query when
+/// it has a current vector from the pinned encoder.
+pub(crate) struct ChunkRelevance {
+    pub doc_id: String,
+    pub chunk_index: usize,
+    pub similarity: Option<f32>,
+}
+
+pub(crate) fn chunk_relevance(
+    conn: &Connection,
+    query: &[f32],
+    chunk_ids: &[i64],
+) -> Result<HashMap<i64, ChunkRelevance>, rusqlite::Error> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut binds = vec![
+        Value::Text(ENCODER_SHA256.to_string()),
+        Value::Integer(query.len() as i64),
+    ];
+    let placeholders = chunk_ids
+        .iter()
+        .map(|id| {
+            binds.push(Value::Integer(*id));
+            format!("?{}", binds.len())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT c.id, c.doc_id, c.chunk_index, v.vector
+         FROM document_chunks AS c
+         LEFT JOIN document_chunk_vectors AS v
+           ON v.chunk_id = c.id AND v.vector IS NOT NULL AND v.encoder_sha256 = ?1
+          AND v.dims = ?2 AND v.chunk_sha256 = c.chunk_sha256
+         WHERE c.id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(binds.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as usize,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+        ))
+    })?;
+    let mut relevance = HashMap::new();
+    for row in rows {
+        let (id, doc_id, chunk_index, blob) = row?;
+        let similarity = blob
+            .and_then(|blob| from_blob(&blob, query.len()))
+            .and_then(|vector| cosine_similarity(query, &vector).ok());
+        relevance.insert(
+            id,
+            ChunkRelevance {
+                doc_id,
+                chunk_index,
+                similarity,
+            },
+        );
+    }
+    Ok(relevance)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]

@@ -50,6 +50,9 @@
 .cxcomposer__doc-pill--collection .cxcomposer__doc-open svg { color: var(--color-accent); }
 .cxcomposer__doc-pill--collection.is-unavailable { border-style: dashed; color: var(--color-text-muted); }
 .cxturn__user-doc--collection { cursor: default; }
+.cxcomposer__doc-pill--library .cxcomposer__doc-open svg { color: var(--color-accent); }
+.cxturn__user-doc--library { cursor: default; }
+.cxturn__user-doc--library svg { color: var(--color-accent); flex-shrink: 0; }
 .cxturn__user-doc--collection svg { color: var(--color-accent); flex-shrink: 0; }
 
 @media (max-width: 640px) {

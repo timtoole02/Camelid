@@ -1,0 +1,36 @@
+If hackers steal my information, when will you tell me?
+   0.6900  escalation-guide.txt#1  'he outage lasts longer than thirty minutes.\n\n2. Security reports\n\nForw'
+   0.6344  support-policy.txt#3  'not eligible for refunds under any circumstance.\n\n4. Data export\n\nCust'
+   0.6204  support-policy.txt#4  'ten summary of scope and remediation.\n\n6. Changes to this policy\n\nWe g'
+   0.6204  PROJECT_CONTEXT.md#12  "uments and the chat's\ncollections are searched as well, in full. The c"
+   0.5953  support-policy.txt#1  'the community forum only.\n\n2. Support hours and response targets\n\nSupp'
+When will you tell me about a data breach?
+   0.7031  escalation-guide.txt#1  'he outage lasts longer than thirty minutes.\n\n2. Security reports\n\nForw'
+   0.6578  support-policy.txt#3  'not eligible for refunds under any circumstance.\n\n4. Data export\n\nCust'
+   0.6057  support-policy.txt#1  'the community forum only.\n\n2. Support hours and response targets\n\nSupp'
+   0.5952  support-policy.txt#4  'ten summary of scope and remediation.\n\n6. Changes to this policy\n\nWe g'
+   0.5830  PROJECT_CONTEXT.md#12  "uments and the chat's\ncollections are searched as well, in full. The c"
+Who handles a billing dispute?
+   0.6642  escalation-guide.txt#1  'he outage lasts longer than thirty minutes.\n\n2. Security reports\n\nForw'
+   0.6381  support-policy.txt#1  'the community forum only.\n\n2. Support hours and response targets\n\nSupp'
+   0.5936  escalation-guide.txt#0  'Camelid Support Escalation Guide\n\nVersion 1.3, for support engineers. '
+   0.5835  support-policy.txt#0  'Camelid Support Policy\n\nVersion 4.2, effective 1 March 2026. This poli'
+   0.5769  support-policy.txt#3  'not eligible for refunds under any circumstance.\n\n4. Data export\n\nCust'
+How long do refunds take?
+   0.8344  support-policy.txt#2  'time of day, including weekends and public holidays.\n\n3. Refunds\n\nEnte'
+   0.7122  support-policy.txt#3  'not eligible for refunds under any circumstance.\n\n4. Data export\n\nCust'
+   0.7021  escalation-guide.txt#1  'he outage lasts longer than thirty minutes.\n\n2. Security reports\n\nForw'
+   0.6333  support-policy.txt#4  'ten summary of scope and remediation.\n\n6. Changes to this policy\n\nWe g'
+   0.6243  support-policy.txt#1  'the community forum only.\n\n2. Support hours and response targets\n\nSupp'
+Tell me a joke about penguins.
+   0.5590  PROJECT_CONTEXT.md#12  "uments and the chat's\ncollections are searched as well, in full. The c"
+   0.5528  PROJECT_CONTEXT.md#16  'uccessful save.\n- New chat clears conversation-specific context. New c'
+   0.5514  PROJECT_CONTEXT.md#13  'saved with the conversation, and a new chat starts with it off. It\nnee'
+   0.5487  PROJECT_CONTEXT.md#5  'g send-time preflight, where the final request is checked again.\n\nCont'
+   0.5477  PROJECT_CONTEXT.md#0  '# Project and conversation context\n\n**Projects** groups related chats '
+hello
+   0.5794  PROJECT_CONTEXT.md#0  '# Project and conversation context\n\n**Projects** groups related chats '
+   0.5791  PROJECT_CONTEXT.md#17  'n is deleted and no replacement project is chosen automatically.\n- Con'
+   0.5696  PROJECT_CONTEXT.md#13  'saved with the conversation, and a new chat starts with it off. It\nnee'
+   0.5602  PROJECT_CONTEXT.md#3  "e for the conversation's instructions when preferences conflict. Turn "
+   0.5581  PROJECT_CONTEXT.md#8  'er **Conversation context**,\nor remove its chip in the composer. A cha'

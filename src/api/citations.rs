@@ -656,6 +656,7 @@ mod tests {
                     chunk_sha256: row.get(4)?,
                     doc_sha256: row.get(5)?,
                     retrieval: "keyword",
+                    similarity: None,
                 })
             })
             .unwrap()

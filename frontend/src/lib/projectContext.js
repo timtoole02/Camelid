@@ -43,6 +43,7 @@ export function normalizeChatContext(raw = {}) {
     references: normalizeReferences(raw?.references),
     collection_ids: normalizeIds(raw?.collection_ids, MAX_COLLECTIONS),
     excluded_collection_ids: normalizeIds(raw?.excluded_collection_ids, MAX_COLLECTIONS),
+    search_library: raw?.search_library === true,
   }
 }
 

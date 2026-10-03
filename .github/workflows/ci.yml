@@ -543,6 +543,12 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:knowledge-collections-browser
 
+      # Whole-library search: a per-chat switch, what the message says it
+      # searched, and a clear fallback when search by meaning is unavailable.
+      - name: Frontend library search browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:library-search-browser
+
       # Keeps the stream event boundary used to separate research latency,
       # model TTFT, and post-first-content decode rate gated in CI. The Web Auto
       # smoke above covers cancellation; this lane covers SSE usage/fallbacks.

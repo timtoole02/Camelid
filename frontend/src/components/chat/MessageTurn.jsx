@@ -240,6 +240,7 @@ function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
   const collections = Array.isArray(message.collections)
     ? message.collections.filter((collection) => typeof collection?.id === 'string' && typeof collection?.name === 'string')
     : []
+  const library = Number.isInteger(message.library?.passages) ? message.library : null
   const submitEdit = () => {
     const next = draft.trim()
     setEditing(false)
@@ -259,6 +260,17 @@ function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
   return (
     <article className="cxturn cxturn--user">
       <div className="cxturn__user-wrapper">
+        {library && (
+          <ul className="cxturn__user-docs" aria-label="Whole library searched for this message">
+            <li>
+              <span className="cxturn__user-doc cxturn__user-doc--library" title="Searched every document in the library">
+                <IconSearch size={13} />
+                <span className="cxturn__user-doc-name">Whole library</span>
+                <span className="cxturn__user-doc-meta">{passagesLabel(library.passages)}</span>
+              </span>
+            </li>
+          </ul>
+        )}
         {collections.length > 0 && (
           <ul className="cxturn__user-docs" aria-label="Collections searched for this message">
             {collections.map((collection) => (

@@ -6,7 +6,7 @@
 //! the whole library, named documents, or named collections
 //! (see `document_collections`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -227,6 +227,11 @@ pub struct SearchDocumentsRequest {
     pub top_k: usize,
     #[serde(default)]
     pub mode: SearchMode,
+    /// Search the whole library. Passages from outside `doc_ids` and
+    /// `collection_ids` count only when similar enough to the query, so this
+    /// needs the encoder.
+    #[serde(default)]
+    pub library: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -265,6 +270,9 @@ pub struct DocumentSearchResult {
     /// `hybrid` when both rankers found it, and `attached` when an explicitly
     /// attached document is supplied as context because nothing matched.
     pub retrieval: &'static str,
+    /// Cosine similarity to the query, reported by library-wide searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +292,10 @@ pub struct RetrievalSummary {
     /// or `none` when nothing was searched.
     pub mode: &'static str,
     pub semantic: SemanticSummary,
+    /// The similarity floor a library-wide search held passages from outside
+    /// its documents and collections to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance_floor: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -545,6 +557,7 @@ fn attached_document_context(
                     chunk_sha256: row.get(6)?,
                     doc_sha256: row.get(7)?,
                     retrieval: "attached",
+                    similarity: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -707,6 +720,7 @@ fn fetch_results(
                     chunk_sha256: row.get(7)?,
                     doc_sha256: row.get(8)?,
                     retrieval: "keyword",
+                    similarity: None,
                 },
             ))
         },
@@ -730,6 +744,26 @@ pub(crate) struct SearchPlan<'a> {
     pub top_k: usize,
     pub keyword: bool,
     pub query_vector: Option<&'a [f32]>,
+    pub library: Option<LibraryPlan<'a>>,
+}
+
+/// A whole-library search, in which a passage from outside `pinned` counts
+/// only when its similarity to the query is at least `floor`.
+pub(crate) struct LibraryPlan<'a> {
+    pub pinned: &'a [String],
+    pub floor: f32,
+}
+
+/// Two rankings merged best first, without repeats; ties go to the lower id.
+fn merge_ranked<S: Copy>(
+    mut ranked: Vec<(i64, S)>,
+    more: Vec<(i64, S)>,
+    better: impl Fn(&S, &S) -> std::cmp::Ordering,
+) -> Vec<(i64, S)> {
+    let seen = ranked.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+    ranked.extend(more.into_iter().filter(|(id, _)| !seen.contains(id)));
+    ranked.sort_by(|left, right| better(&left.1, &right.1).then(left.0.cmp(&right.0)));
+    ranked
 }
 
 /// Ranks, fuses and citation-checks one search. Returns the verified results
@@ -739,17 +773,65 @@ pub(crate) fn run_search(
     conn: &Connection,
     plan: &SearchPlan<'_>,
 ) -> Result<(Vec<DocumentSearchResult>, &'static str), rusqlite::Error> {
-    let keyword = if plan.keyword {
+    let mut keyword = if plan.keyword {
         keyword_ranked(conn, plan.query, plan.doc_ids, CANDIDATE_POOL)?
     } else {
         Vec::new()
     };
-    let semantic = match plan.query_vector {
+    let mut semantic = match plan.query_vector {
         Some(vector) => {
             document_vectors::semantic_ranked(conn, vector, plan.doc_ids, CANDIDATE_POOL)?
         }
         None => Vec::new(),
     };
+    let mut similarities = HashMap::new();
+    if let (Some(library), Some(vector)) = (&plan.library, plan.query_vector) {
+        if !library.pinned.is_empty() {
+            // Pinned documents get pools of their own, so the rest of the
+            // library cannot crowd them out before the floor is applied.
+            if plan.keyword {
+                let pinned =
+                    keyword_ranked(conn, plan.query, Some(library.pinned), CANDIDATE_POOL)?;
+                keyword = merge_ranked(keyword, pinned, |left, right| left.total_cmp(right));
+            }
+            let pinned = document_vectors::semantic_ranked(
+                conn,
+                vector,
+                Some(library.pinned),
+                CANDIDATE_POOL,
+            )?;
+            semantic = merge_ranked(semantic, pinned, |left, right| right.total_cmp(left));
+        }
+        let candidates = keyword
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(semantic.iter().map(|(id, _)| *id))
+            .collect::<Vec<_>>();
+        let relevance = document_vectors::chunk_relevance(conn, vector, &candidates)?;
+        let pinned = library
+            .pinned
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let eligible = |id: &i64| {
+            relevance.get(id).is_some_and(|chunk| {
+                pinned.contains(chunk.doc_id.as_str())
+                    || chunk
+                        .similarity
+                        .is_some_and(|similarity| similarity >= library.floor)
+            })
+        };
+        keyword.retain(|(id, _)| eligible(id));
+        semantic.retain(|(id, _)| eligible(id));
+        similarities = relevance
+            .into_values()
+            .filter_map(|chunk| {
+                chunk
+                    .similarity
+                    .map(|similarity| ((chunk.doc_id, chunk.chunk_index), similarity))
+            })
+            .collect();
+    }
     let (mode, ranked): (&'static str, Vec<(i64, f32, &'static str)>) =
         if plan.query_vector.is_some() && !plan.keyword {
             (
@@ -759,7 +841,7 @@ pub(crate) fn run_search(
                     .map(|(id, score)| (id, score, "semantic"))
                     .collect(),
             )
-        } else if !semantic.is_empty() {
+        } else if !semantic.is_empty() || (plan.library.is_some() && plan.query_vector.is_some()) {
             let keyword_ids = keyword.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             let semantic_ids = semantic.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             (
@@ -783,7 +865,12 @@ pub(crate) fn run_search(
                     .collect(),
             )
         };
-    let results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
+    let mut results = first_verified(conn, fetch_results(conn, &ranked)?, plan.top_k)?;
+    for result in &mut results {
+        result.similarity = similarities
+            .get(&(result.doc_id.clone(), result.chunk_index))
+            .copied();
+    }
     Ok((results, mode))
 }
 
@@ -886,13 +973,14 @@ pub async fn search_documents(
                     reason: None,
                     coverage: None,
                 },
+                relevance_floor: None,
             },
         })
     };
     if query.is_empty() {
         return Ok(nothing_to_search());
     }
-    let scope = {
+    let mut scope = {
         let _lock = db_lock().lock().unwrap();
         let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
         document_collections::resolve_scope(
@@ -902,11 +990,27 @@ pub async fn search_documents(
         )
         .map_err(CollectionError::into_response)?
     };
+    // A library-wide search covers everything; its named documents and
+    // collections only decide which passages skip the similarity floor.
+    let pinned = if payload.library {
+        scope.take().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if scope.as_ref().is_some_and(Vec::is_empty) {
         return Ok(nothing_to_search());
     }
     let top_k = payload.top_k.clamp(1, 20);
     let mode = payload.mode;
+    if payload.library && mode == SearchMode::Keyword {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "library_search_needs_meaning",
+            "Library-wide search keeps only passages close in meaning to the question, so it cannot run in keyword mode.".to_string(),
+            Some("mode"),
+        ));
+    }
+    let refuse_param = if payload.library { "library" } else { "mode" };
 
     let mut unavailable = None;
     let mut query_vector = None;
@@ -929,35 +1033,45 @@ pub async fn search_documents(
                 }
             }
             Err(reason) => {
-                if mode != SearchMode::Auto {
+                if mode != SearchMode::Auto || payload.library {
                     return Err(api_error(
                         StatusCode::CONFLICT,
                         reason.code(),
                         reason.message().to_string(),
-                        Some("mode"),
+                        Some(refuse_param),
                     ));
                 }
                 unavailable = Some(reason.code());
             }
         }
-        if query_vector.is_none() && mode != SearchMode::Auto {
+        if query_vector.is_none() && (mode != SearchMode::Auto || payload.library) {
             return Err(api_error(
                 StatusCode::CONFLICT,
                 Unavailable::QueryFailed.code(),
                 Unavailable::QueryFailed.message().to_string(),
-                Some("mode"),
+                Some(refuse_param),
             ));
         }
     }
 
-    let SearchOutcome {
-        results,
-        ranked_by,
-        coverage,
-    } = {
+    let (
+        SearchOutcome {
+            results,
+            ranked_by,
+            coverage,
+        },
+        relevance_floor,
+    ) = {
         let _lock = db_lock().lock().unwrap();
         let conn = open_connection().map_err(internal_error("sqlite_open_error"))?;
-        search_locked(
+        let relevance_floor = match (payload.library, query_vector.as_deref()) {
+            (true, Some(vector)) => Some(document_vectors::library_relevance_floor(
+                document_vectors::indexed_chunk_count(&conn, vector.len())
+                    .map_err(internal_error("search_error"))?,
+            )),
+            _ => None,
+        };
+        let outcome = search_locked(
             &conn,
             &SearchPlan {
                 query: &query,
@@ -965,10 +1079,15 @@ pub async fn search_documents(
                 top_k,
                 keyword: mode != SearchMode::Semantic,
                 query_vector: query_vector.as_deref(),
+                library: relevance_floor.map(|floor| LibraryPlan {
+                    pinned: &pinned,
+                    floor,
+                }),
             },
             payload.doc_ids.as_deref(),
         )
-        .map_err(|(code, error)| internal_error(code)(error))?
+        .map_err(|(code, error)| internal_error(code)(error))?;
+        (outcome, relevance_floor)
     };
     if coverage
         .as_ref()
@@ -986,6 +1105,7 @@ pub async fn search_documents(
                 reason: unavailable,
                 coverage,
             },
+            relevance_floor,
         },
     }))
 }
@@ -1197,7 +1317,123 @@ mod tests {
             top_k: 5,
             keyword: true,
             query_vector: vector,
+            library: None,
         }
+    }
+
+    fn library_plan<'a>(
+        query: &'a str,
+        vector: &'a [f32],
+        pinned: &'a [String],
+        floor: f32,
+    ) -> SearchPlan<'a> {
+        SearchPlan {
+            library: Some(LibraryPlan { pinned, floor }),
+            ..plan(query, Some(vector))
+        }
+    }
+
+    #[test]
+    fn a_library_search_keeps_only_passages_that_clear_the_floor() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        // Cosine 0.8 to the refund passage, 0.6 to support, 0 to exports.
+        let query = unit(&[0.8, 0.6, 0.0]);
+        let (results, mode) = run_search(&conn, &library_plan("refund", &query, &[], 0.5)).unwrap();
+        assert_eq!(mode, "hybrid");
+        assert_eq!(found(&results), [(0, "hybrid"), (1, "semantic")]);
+        let similarities = results
+            .iter()
+            .map(|result| result.similarity)
+            .collect::<Vec<_>>();
+        assert!((similarities[0].unwrap() - 0.8).abs() < 1e-6);
+        assert!((similarities[1].unwrap() - 0.6).abs() < 1e-6);
+
+        let (results, mode) = run_search(&conn, &library_plan("refund", &query, &[], 0.9)).unwrap();
+        assert_eq!(
+            mode, "hybrid",
+            "the search ranked by meaning even though nothing cleared the floor"
+        );
+        assert!(
+            results.is_empty(),
+            "a keyword match below the floor is left out too"
+        );
+    }
+
+    #[test]
+    fn pinned_documents_skip_the_floor_and_the_rest_of_the_library_does_not() {
+        let conn = library();
+        index_policy(&conn, "attached");
+        index_policy(&conn, "elsewhere");
+        let pinned = vec!["attached".to_string()];
+        let query = unit(&[0.0, 1.0, 0.0]);
+        let (results, _) =
+            run_search(&conn, &library_plan("refund", &query, &pinned, 0.9)).unwrap();
+        let mut served = results
+            .iter()
+            .map(|result| (result.doc_id.as_str(), result.chunk_index))
+            .collect::<Vec<_>>();
+        served.sort();
+        assert_eq!(
+            served,
+            [
+                ("attached", 0),
+                ("attached", 1),
+                ("attached", 2),
+                ("elsewhere", 1)
+            ],
+            "every attached passage counts; elsewhere only the support passage clears 0.9"
+        );
+    }
+
+    #[test]
+    fn a_chunk_without_a_current_vector_counts_only_when_pinned() {
+        let conn = library();
+        index_policy(&conn, "indexed");
+        seed_passages(&conn, "plain", &POLICY);
+        let query = unit(&[1.0, 0.0, 0.0]);
+        let (results, _) = run_search(&conn, &library_plan("refund", &query, &[], 0.5)).unwrap();
+        assert!(results.iter().all(|result| result.doc_id == "indexed"));
+        assert!(!results.is_empty());
+
+        let pinned = vec!["plain".to_string()];
+        let (results, _) =
+            run_search(&conn, &library_plan("refund", &query, &pinned, 0.5)).unwrap();
+        assert!(results.iter().any(|result| result.doc_id == "plain"
+            && result.chunk_index == 0
+            && result.similarity.is_none()));
+    }
+
+    #[test]
+    fn the_library_floor_rises_with_its_indexed_chunks() {
+        let conn = library();
+        index_policy(&conn, "policy");
+        seed_passages(&conn, "plain", &POLICY);
+        assert_eq!(
+            document_vectors::indexed_chunk_count(&conn, 3).unwrap(),
+            3,
+            "only chunks with a current vector count"
+        );
+        assert_eq!(
+            document_vectors::indexed_chunk_count(&conn, 768).unwrap(),
+            0
+        );
+        let floor = document_vectors::library_relevance_floor;
+        assert!((floor(0) - 0.6408).abs() < 1e-6 && (floor(1) - 0.6408).abs() < 1e-6);
+        assert!((floor(4406) - 0.6895).abs() < 1e-4);
+        assert!(floor(22) < floor(1_000) && floor(1_000) < floor(100_000));
+    }
+
+    #[test]
+    fn merged_rankings_keep_each_chunk_once_in_score_order() {
+        assert_eq!(
+            merge_ranked(
+                vec![(3, -2.0), (9, -1.0)],
+                vec![(9, -1.0), (4, -3.0), (5, -1.0)],
+                |l: &f64, r: &f64| l.total_cmp(r)
+            ),
+            vec![(4, -3.0), (3, -2.0), (5, -1.0), (9, -1.0)]
+        );
     }
 
     fn found(results: &[DocumentSearchResult]) -> Vec<(usize, &'static str)> {

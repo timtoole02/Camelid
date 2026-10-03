@@ -206,6 +206,48 @@ collection when either is deleted and survive re-ingesting a document.
 `POST /api/documents/ingest` also accepts `collection_ids`: every one must
 exist before anything is stored, and the new document joins them all.
 
+**Whole library.** `library: true` searches every document and keeps a passage
+from outside `doc_ids` and `collection_ids` only when its cosine similarity to
+the query reaches a floor that rises with the number of chunks the library has
+indexed: 0.6408 + 0.0058 × ln(chunks), clamped to 0.3–0.9. That is 0.659 at 25
+chunks, 0.681 at 1,000 and 0.689 at 4,406. The named documents and collections
+are still searched in full and skip the floor, so an attached document is never
+crowded out by the rest of the library. Keyword matches are held to the floor
+too, which means a passage without a current vector from the pinned encoder
+counts only when its document is named. The floor is a similarity, so this
+needs the encoder: without it the request is a `409` with the encoder's reason
+code and `param` `library`, and `mode` `keyword` is a `422`
+(`library_search_needs_meaning`). Each result carries its `similarity`, and
+`retrieval.relevance_floor` reports the floor applied. When nothing clears it,
+the search returns no results. A search with neither list and no `library`
+flag still covers the whole library with no floor, as before.
+
+**How the floor was chosen.** By two rules, each written down and its script
+hashed before it was run (`qa/evidence-bundles/f2a-library-search-20260930/calibration/`).
+The data: two libraries of 1,000 documents, BEIR SciFact (science claims) and
+BEIR FiQA-2018 (financial questions). Each library's own test questions (300
+and 200) should find a passage; the other library's questions and 405
+unrelated chat messages (MT-Bench prompts, seeded samples of Alpaca
+instructions and GSM8K problems, and 25 short chit-chat lines) should not. Half
+of every group chose, by the highest true-positive plus true-negative rate;
+the other half was held out.
+
+The first rule picked a single floor, 0.69. On the held-out half it served
+85.2% of questions and kept 88.4% of unrelated messages quiet, but a live check
+on a three-document library found it too strict there: the more chunks a
+library holds, the closer its best chance match to an unrelated message, so a
+floor fitted on 1,000 documents is higher than a small library needs. The
+second rule simulated libraries of 3 to 1,000 documents from the same data
+(each question's relevant documents kept), chose the best floor at each size,
+and fitted it against ln(chunks). On the held-out half, over all sizes, it
+serves 91.7% of questions (a relevant passage above the floor) and keeps 95.1%
+of unrelated messages quiet, against 87.6% and 97.1% for 0.69 on the same
+samples; at three documents 94.0% and 98.9%, at 1,000 documents 89.2% and
+87.2%. Some messages that should find nothing still bring passages, which
+reach the model as ordinary cited excerpts, and a natural question whose
+answer shares a chunk with other topics can still fall below the floor. The
+floor belongs to this encoder; another encoder would need its own.
+
 There is no separate rerank stage: `/v1/rerank` is the same bi-encoder cosine
 over the same encoder, so it would rescore candidates with the function the
 semantic ranker already used.

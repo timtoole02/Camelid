@@ -1,0 +1,19 @@
+baseline: all 338 claims hold exit 0
+CAUGHT a held-out rate in the README -> README does not state the first rule's held-out result: 'served 85.2% of questions and kept 88.4% of unrelated messages quiet'
+CAUGHT the incident score in the README -> README does not state the incident and billing scores: 'the incident passage scored 0.6344, the billing passage 0.6642'
+CAUGHT an endpoint table cell -> README does not state the FiQA chat rates: '| FiQA | 76 of 100 (76.0%) | 298 of 352 (84.7%) |'
+CAUGHT a latency cell -> README does not state SciFact latency: '| SciFact | 422.6 / 1,273.2 | 414.1 / 1,268.5 |'
+CAUGHT a mutation bullet dropped -> README does not state mutation 'CAUGHT   the switch is not saved with the chat: AssertionError [ERR_ASSERTION]: Expected values to be strict
+CAUGHT an edge check dropped from the README -> README does not state edge check 'top_k still bounds a library search': 'top_k still bounds a library search'
+CAUGHT the fitted rule -> README does not state the fitted rule: '**floor = 0.6408 + 0.0058 × ln(indexed chunks)**, clamped to 0.3–0.9'
+CAUGHT the Rust count -> README does not state the Rust run: '3,181 passed, 1 failed, 159 ignored, across 70 test binaries'
+CAUGHT a pre-registered script edited -> harness/analyze_floor.py matches the hash recorded before it ran: ('1d754618682e2e07c5765f8ef98a744804419b1c14bbd00b83286ee6ab40b3c5', 'aca8
+CAUGHT an endpoint row disagrees -> the endpoint agreed on every query
+CAUGHT an endpoint row below the floor -> no passage below the floor
+CAUGHT an edge check fails -> the edge counts are consistent
+CAUGHT the answer gets a citation pill -> no citation pills and no citation screenshot
+CAUGHT the UI sends doc_ids too -> the UI sent only the library flag: [{'query': 'How long do refunds take?', 'top_k': 4, 'library': True, 'doc_ids': ['x']}]
+CAUGHT the hard question gets the incident passage -> the hard question's search
+CAUGHT a screenshot removed -> the screenshots: ['01-attach-menu.png', '02-composer-whole-library.png', '03-answer-from-the-library.png', '05-question-below-the-floor.png'
+CAUGHT an unlisted file -> SHA256SUMS lists every file: {'extra.txt'}
+17/17 checker mutations caught

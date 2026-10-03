@@ -66,6 +66,23 @@ A deleted collection shows as **Collection unavailable** and is not searched;
 remove its chip to clear it. If the collections cannot be read, the message is
 sent without them and says so.
 
+## Whole library
+
+**Attach → Whole library** makes a chat search every document in the library,
+with nothing to attach or collect first. Only passages close enough in meaning
+to the message are used, so a message about something the library does not
+cover is sent without document context; attached documents and the chat's
+collections are searched as well, in full. The composer shows a **Whole
+library** chip with the library's size, or its indexing progress (indexing,
+waiting to index, or indexing stopped, with the error), since a document is
+found this way only once it is indexed. The sent message says how
+many passages came from the library beyond what was attached or collected. The
+switch is saved with the conversation, and a new chat starts with it off. It
+needs search by meaning: without the embedding model the composer says so, and
+a message is sent without the library, still searching what is attached. How
+"close enough" was chosen is in
+[embeddings](architecture/EMBEDDINGS.md#knowledge-library-integration).
+
 ## Files, storage, and scope
 
 - Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.
@@ -92,7 +109,8 @@ sent without them and says so.
   documents they group; chats and projects store only collection ids. They are
   part of the library API, which the LAN chat surface does not serve, so that
   surface neither offers nor searches them and never requests them. A chat's
-  saved collections apply again on the full surface.
+  saved collections apply again on the full surface. The same holds for
+  whole-library search.
 - Conversation exports retain their existing transcript-only field whitelist.
   Project and conversation context are excluded, and imports do not activate
   context from an imported file. Clearing UI storage removes saved context.
@@ -100,11 +118,13 @@ sent without them and says so.
 ## Validation
 
 Run `npm run smoke:project-context` and, after `npm run build`,
-`npm run smoke:project-context-browser` and
-`npm run smoke:knowledge-collections-browser` from `frontend`. The browser suites use
+`npm run smoke:project-context-browser`,
+`npm run smoke:knowledge-collections-browser` and
+`npm run smoke:library-search-browser` from `frontend`. The browser suites use
 local deterministic API fixtures to verify actual request payloads, inheritance,
 file selection, persistence, project isolation, MCP continuation, the context
 budget gate, project deletion, and desktop/mobile layouts, and that collections
 are managed, searched per chat and per project, left out once deleted, and absent
-from the LAN chat surface. These checks verify
+from the LAN chat surface, and that whole-library search is saved per chat,
+reported on each message, and falls back plainly without search by meaning. These checks verify
 UI behavior and request composition; they are not model-quality evidence.

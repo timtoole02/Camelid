@@ -134,6 +134,12 @@ await check('turning collections off and on edits the right list', () => {
   assert.throws(() => withCollection(full, [], 'one-more'), /at most 16 collections/)
   assert.equal(withCollection(full, [], 'c3').collection_ids.length, MAX_COLLECTIONS, 'an existing one is not a new one')
 })
+await check('whole-library search is a saved per-chat switch that is off unless set', () => {
+  assert.equal(normalizeChatContext({}).search_library, false, 'contexts saved before it existed stay off')
+  assert.equal(normalizeChatContext({ search_library: 'yes' }).search_library, false, 'only true turns it on')
+  assert.equal(normalizeChatContext({ search_library: true }).search_library, true)
+  assert.equal(normalizeChatContext(withoutCollection({ search_library: true, collection_ids: ['a'] }, [], 'a')).search_library, true, 'editing collections keeps it')
+})
 await check('collections from the server are read defensively', () => {
   assert.deepEqual(normalizeCollections([{ id: 'c', name: 'HR', created_at: '5', doc_ids: ['d', 3] }, { id: '', name: 'x' }, null, { id: 'n' }]),
     [{ id: 'c', name: 'HR', created_at: 5, doc_ids: ['d'] }])

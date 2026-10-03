@@ -1323,6 +1323,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       citations = [],
       documents = [],
       collections = [],
+      library = null,
       truncateFromMessageId = null,
       continueFromMessageId = null,
       variantOfMessageId = null,
@@ -1406,6 +1407,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         ...(overrideImage ? { image: overrideImage } : {}),
         ...(Array.isArray(documents) && documents.length ? { documents } : {}),
         ...(Array.isArray(collections) && collections.length ? { collections } : {}),
+        ...(library ? { library } : {}),
         model_id: selectedModelId,
         created_at: nowIso(),
       }

@@ -1,0 +1,30 @@
+{
+  "phase": "no-encoder",
+  "question": "How long do refunds take?",
+  "hard_question": "If hackers steal my information, when will you tell me?",
+  "unrelated": "Tell me a joke about penguins.",
+  "build": "v0.7.8-17-gd9318fa7",
+  "library_support-policy.txt": {
+    "doc_id": "f48eb2a5-8436-4e41-9ec6-ab2147862b0f",
+    "chunk_count": 5,
+    "bytes": 1535,
+    "sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+  },
+  "attach_menu": [
+    "Documents",
+    "Collections",
+    "Whole library"
+  ],
+  "note": "Whole-library search needs search by meaning. Semantic document search needs nomic-embed-text-v1.5.Q8_0.gguf in the models directory.Open Models",
+  "chip": [
+    "Whole library1 doc"
+  ],
+  "index_status": {
+    "available": false,
+    "encoder": "nomic-embed-text-v1.5.Q8_0.gguf",
+    "indexing": false,
+    "reason": "encoder_not_installed",
+    "message": "Semantic document search needs nomic-embed-text-v1.5.Q8_0.gguf in the models directory."
+  },
+  "page_errors": []
+}

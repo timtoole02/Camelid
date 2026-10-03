@@ -1,0 +1,245 @@
+{
+  "passed": 32,
+  "total": 33,
+  "floor": 0.69,
+  "servers": [
+    {
+      "build": "v0.7.8-16-g89b1c282",
+      "library": "lib-edge-empty",
+      "env": {},
+      "models_dir": "default",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "build": "v0.7.8-16-g89b1c282",
+      "library": "lib-edge",
+      "env": {},
+      "models_dir": "default",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "build": "v0.7.8-16-g89b1c282",
+      "library": "lib-edge",
+      "env": {},
+      "models_dir": "without encoder",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "build": "v0.7.8-16-g89b1c282",
+      "library": "lib-edge",
+      "env": {
+        "CAMELID_DOCUMENT_SEMANTIC": "0"
+      },
+      "models_dir": "default",
+      "api_surface": "full",
+      "args": []
+    },
+    {
+      "build": "v0.7.8-16-g89b1c282",
+      "library": "lib-edge",
+      "env": {},
+      "models_dir": "default",
+      "api_surface": "lan_chat_only",
+      "args": [
+        "--lan-chat-only",
+        "--api-key-file",
+        "/tmp/f2l/lib-edge/api.key",
+        "--no-open"
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "query": "If hackers steal my information, when will you tell me?",
+      "library_results": 1,
+      "library_similarities": [
+        0.69
+      ],
+      "plain_results": 20
+    },
+    {
+      "query": "How long do refunds take?",
+      "library_results": 3,
+      "library_similarities": [
+        0.8344,
+        0.7122,
+        0.7021
+      ],
+      "plain_results": 20
+    },
+    {
+      "query": "Who handles a billing dispute?",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    },
+    {
+      "query": "hello",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    },
+    {
+      "query": "thanks!",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    },
+    {
+      "query": "Tell me a joke about penguins.",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    },
+    {
+      "query": "What is 17 times 23?",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    },
+    {
+      "query": "Write a haiku about autumn leaves.",
+      "library_results": 0,
+      "library_similarities": [],
+      "plain_results": 20
+    }
+  ],
+  "checks": [
+    {
+      "check": "an empty library answers a library search with nothing",
+      "pass": true
+    },
+    {
+      "check": "three documents are indexed",
+      "pass": true
+    },
+    {
+      "check": "a library search reports the floor it applied",
+      "pass": true
+    },
+    {
+      "check": "the paraphrased question finds the incident passage first",
+      "pass": false,
+      "detail": "{'doc_id': '829833f0-c3e0-4aa9-bb59-02a5b4c71d63', 'filename': 'escalation-guide.txt', 'chunk_index': 1, 'excerpt': 'he outage lasts longer than thirty minutes.\\n\\n2. Security reports\\n\\nForward a suspected data breach to the security team within one hour of the report. Do not confirm or deny a breach to the customer until the security team has reviewed it.\\n\\n3. Billing disputes\\n\\nA billing dispute above 5,000 euros goes to the finance lead before any refund is promised.', 'score': 0.016393442, 'byte_start': 283, 'byte_end': 635, 'chunk_sha256': '00b8039883c074da1189a3ef503b29cf481184ba8a9f8"
+    },
+    {
+      "check": "every library result for 'If hackers steal my information, when will you tell me?' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'If hackers steal my information, when will you tell me?' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'How long do refunds take?' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'How long do refunds take?' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'Who handles a billing dispute?' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'Who handles a billing dispute?' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'hello' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'hello' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'thanks!' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'thanks!' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'Tell me a joke about penguins.' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'Tell me a joke about penguins.' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'What is 17 times 23?' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'What is 17 times 23?' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "every library result for 'Write a haiku about autumn leaves.' carries a similarity at or above the floor",
+      "pass": true
+    },
+    {
+      "check": "without the flag, 'Write a haiku about autumn leaves.' is searched as before, with no similarity reported",
+      "pass": true
+    },
+    {
+      "check": "semantic mode holds to the floor as well",
+      "pass": true
+    },
+    {
+      "check": "keyword mode is refused: the floor needs meaning (422)",
+      "pass": true
+    },
+    {
+      "check": "top_k still bounds a library search",
+      "pass": true
+    },
+    {
+      "check": "an attached document is searched in full: its passages count below the floor",
+      "pass": true
+    },
+    {
+      "check": "while the rest of the library is still held to the floor",
+      "pass": true
+    },
+    {
+      "check": "a collection's members skip the floor the same way",
+      "pass": true
+    },
+    {
+      "check": "an unknown collection is still a 404",
+      "pass": true
+    },
+    {
+      "check": "a passage the encoder never indexed is not found by the library search",
+      "pass": true
+    },
+    {
+      "check": "but is found when its document is attached, with no similarity to report",
+      "pass": true
+    },
+    {
+      "check": "a library search without the encoder is a 409 naming why",
+      "pass": true
+    },
+    {
+      "check": "an attached-document search still works by keyword",
+      "pass": true
+    },
+    {
+      "check": "with search by meaning turned off it is a 409 semantic_disabled",
+      "pass": true
+    },
+    {
+      "check": "the LAN chat surface refuses a library search (403)",
+      "pass": true
+    }
+  ]
+}

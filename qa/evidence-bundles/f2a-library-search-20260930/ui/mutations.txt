@@ -1,0 +1,11 @@
+commit=d9318fa7 tree_clean=yes
+CAUGHT   the library flag is never sent: AssertionError [ERR_ASSERTION]: only the library flag, nothing pinned
+CAUGHT   the switch is not saved with the chat: AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+CAUGHT   the LAN surface searches the library: AssertionError [ERR_ASSERTION]: a saved library search is not offered on the LAN chat surface
+CAUGHT   the library claims the attached document's passages: AssertionError [ERR_ASSERTION]: the library counts only what it added
+CAUGHT   a failed library search is claimed on the message: AssertionError [ERR_ASSERTION]: a library search that did not run is not claimed
+CAUGHT   without the encoder, attached documents go unsearched: AssertionError [ERR_ASSERTION]: tried the library, then searched what is attached
+CAUGHT   the sent message does not say the library was searched: AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+CAUGHT   the missing encoder is not explained: TimeoutError: Waiting for selector `.cxcomposer__semantic-note--library` failed
+8/8 mutations caught
+tree after: 0 tracked changes

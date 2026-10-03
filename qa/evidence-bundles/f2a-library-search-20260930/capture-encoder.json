@@ -1,0 +1,223 @@
+{
+  "phase": "encoder",
+  "question": "How long do refunds take?",
+  "hard_question": "If hackers steal my information, when will you tell me?",
+  "unrelated": {
+    "searches": [
+      {
+        "query": "Tell me a joke about penguins.",
+        "top_k": 4,
+        "library": true
+      }
+    ],
+    "replay": {
+      "status": 200,
+      "retrieval": {
+        "mode": "hybrid",
+        "semantic": {
+          "available": true,
+          "indexable_chunks": 29,
+          "indexed_chunks": 29,
+          "skipped_chunks": 0
+        },
+        "relevance_floor": 0.6603303
+      },
+      "results": []
+    },
+    "citations": [],
+    "message_chips": [
+      "Whole libraryno passages used"
+    ],
+    "answer": "Here's one:\n\nWhy did the penguin take his credit card to the Antarctic?\n\nBecause he wanted to freeze his assets! (get it?)\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 255 · out 30\nfirst token 2.2s\n62 tok/s\n2.7s\n01:33 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n61.6 tok/s"
+  },
+  "build": "v0.7.8-17-gd9318fa7",
+  "library_support-policy.txt": {
+    "doc_id": "7cddd3a7-4bf8-4b22-9df1-34acfe23d32b",
+    "chunk_count": 5,
+    "bytes": 1535,
+    "sha256": "df85653c7c4940858c185c1c5235284df9f9c1ab96484e60e007154d18a32d1a"
+  },
+  "library_escalation-guide.txt": {
+    "doc_id": "9ef3f839-bdd3-4c1e-b76e-6eb90095ca91",
+    "chunk_count": 2,
+    "bytes": 636,
+    "sha256": "e0a034689baa27e6e18446501899005bc91298a10833677084823b9e587eac19"
+  },
+  "library_PROJECT_CONTEXT.md": {
+    "doc_id": "59e13d80-e755-47fc-bdaa-8472d6ca0f14",
+    "chunk_count": 22,
+    "bytes": 7863,
+    "sha256": "3cc096ff3dfcd5a9d59d33d3a26813b59772ac910ecba8b41d43aebf81530fe7"
+  },
+  "index_status": {
+    "semantic": {
+      "available": true,
+      "encoder": "nomic-embed-text-v1.5.Q8_0.gguf",
+      "indexing": false
+    },
+    "documents": [
+      {
+        "id": "59e13d80-e755-47fc-bdaa-8472d6ca0f14",
+        "indexable_chunks": 22,
+        "indexed_chunks": 22,
+        "skipped_chunks": 0
+      },
+      {
+        "id": "7cddd3a7-4bf8-4b22-9df1-34acfe23d32b",
+        "indexable_chunks": 5,
+        "indexed_chunks": 5,
+        "skipped_chunks": 0
+      },
+      {
+        "id": "9ef3f839-bdd3-4c1e-b76e-6eb90095ca91",
+        "indexable_chunks": 2,
+        "indexed_chunks": 2,
+        "skipped_chunks": 0
+      }
+    ]
+  },
+  "attach_menu": [
+    "Documents",
+    "Collections",
+    "Whole library"
+  ],
+  "chip": [
+    "Whole library3 docs"
+  ],
+  "answered": {
+    "searches": [
+      {
+        "query": "How long do refunds take?",
+        "top_k": 4,
+        "library": true
+      }
+    ],
+    "replay": {
+      "status": 200,
+      "retrieval": {
+        "mode": "hybrid",
+        "semantic": {
+          "available": true,
+          "indexable_chunks": 29,
+          "indexed_chunks": 29,
+          "skipped_chunks": 0
+        },
+        "relevance_floor": 0.6603303
+      },
+      "results": [
+        {
+          "filename": "support-policy.txt",
+          "chunk_index": 2,
+          "retrieval": "hybrid",
+          "similarity": 0.8343758,
+          "holds_expected_passage": true,
+          "holds_hard_passage": false,
+          "excerpt_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc"
+        },
+        {
+          "filename": "support-policy.txt",
+          "chunk_index": 3,
+          "retrieval": "hybrid",
+          "similarity": 0.71220833,
+          "holds_expected_passage": false,
+          "holds_hard_passage": true,
+          "excerpt_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3"
+        },
+        {
+          "filename": "escalation-guide.txt",
+          "chunk_index": 1,
+          "retrieval": "hybrid",
+          "similarity": 0.70212775,
+          "holds_expected_passage": false,
+          "holds_hard_passage": false,
+          "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+        }
+      ]
+    },
+    "citations": [
+      {
+        "filename": "support-policy.txt",
+        "chunk_index": 2,
+        "retrieval": "hybrid",
+        "similarity": 0.8343758,
+        "holds_expected_passage": true,
+        "holds_hard_passage": false,
+        "excerpt_sha256": "5f439e8ab837c9b2db1b08899d2b75306a9292c3369b03163233ed4319de57dc"
+      },
+      {
+        "filename": "support-policy.txt",
+        "chunk_index": 3,
+        "retrieval": "hybrid",
+        "similarity": 0.71220833,
+        "holds_expected_passage": false,
+        "holds_hard_passage": true,
+        "excerpt_sha256": "2b7d5e6d3a68f4977ef23560ed61ca0fcaa1feca44bdc01689bc91df31460ac3"
+      },
+      {
+        "filename": "escalation-guide.txt",
+        "chunk_index": 1,
+        "retrieval": "hybrid",
+        "similarity": 0.70212775,
+        "holds_expected_passage": false,
+        "holds_hard_passage": false,
+        "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+      }
+    ],
+    "message_chips": [
+      "Whole library3 passages used"
+    ],
+    "answer": "According to the document excerpts, refunds are processed as follows:\n\nEnterprise customers: Refunds are issued to the original payment method within 5 business days.\nTeam plans: Refunds are refundable within 14 days of purchase.\nTrial accounts: Not eligible for refunds under any circumstance.\n\nNote that the timeframes for refunds are not explicitly stated in the excerpts, but rather in the context of the refund process.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 318 · out 85\nfirst token 4.5s\n61 tok/s\n5.8s\n01:32 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n61.1 tok/s"
+  },
+  "expected_citation_number": 1,
+  "pills": [],
+  "citation_modal": null,
+  "hard": {
+    "searches": [
+      {
+        "query": "If hackers steal my information, when will you tell me?",
+        "top_k": 4,
+        "library": true
+      }
+    ],
+    "replay": {
+      "status": 200,
+      "retrieval": {
+        "mode": "hybrid",
+        "semantic": {
+          "available": true,
+          "indexable_chunks": 29,
+          "indexed_chunks": 29,
+          "skipped_chunks": 0
+        },
+        "relevance_floor": 0.6603303
+      },
+      "results": [
+        {
+          "filename": "escalation-guide.txt",
+          "chunk_index": 1,
+          "retrieval": "semantic",
+          "similarity": 0.69000167,
+          "holds_expected_passage": false,
+          "holds_hard_passage": false,
+          "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+        }
+      ]
+    },
+    "citations": [
+      {
+        "filename": "escalation-guide.txt",
+        "chunk_index": 1,
+        "retrieval": "semantic",
+        "similarity": 0.69000167,
+        "holds_expected_passage": false,
+        "holds_hard_passage": false,
+        "excerpt_sha256": "00b8039883c074da1189a3ef503b29cf481184ba8a9f8b553b5fa38350f09f03"
+      }
+    ],
+    "message_chips": [
+      "Whole library1 passage used"
+    ],
+    "answer": "Unfortunately, the document excerpts do not provide information on refund processing times. The excerpts discuss security protocols and billing disputes, but do not mention refunds at all.\n\nIn fact, the excerpts do not provide any information on when a customer would be notified of a data breach or when a refund would be processed. The excerpt on billing disputes mentions that a dispute above 5,000 euros goes to the finance lead, but it does not provide a timeframe for when a refund would be issued.\n\nTherefore, I must answer that the document excerpts do not provide any information on refund processing times.\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 241 · out 116\nfirst token 3.4s\n61 tok/s\n5.3s\n01:33 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n60.8 tok/s"
+  },
+  "page_errors": []
+}
