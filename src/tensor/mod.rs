@@ -5,10 +5,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -3483,21 +3480,97 @@ pub(crate) fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 const DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 
-static Q8_0_FILE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_MISS_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_INSERTS: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_INSERT_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_MERGES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_MERGED_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_DECODED_SCALE_HITS: AtomicU64 = AtomicU64::new(0);
-static Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS: AtomicU64 = AtomicU64::new(0);
-static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
+// Q8 file-read counters and the Q8 file cache are process-global in real builds.
+// Unit tests run concurrently on threads of one process, so under `cfg(test)` each
+// test thread gets its own counters and its own cache: a test's
+// `saturating_delta_since` window then only sees its own reads, and an unrelated
+// test's default capacity-0 read can no longer clear entries out from under it.
+macro_rules! q8_file_stat_counters {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[cfg(not(test))]
+            static $name: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+        )*
+        #[cfg(test)]
+        thread_local! {
+            $(static $name: Cell<u64> = const { Cell::new(0) };)*
+        }
+    };
+}
+
+q8_file_stat_counters!(
+    Q8_0_FILE_READ_CALLS,
+    Q8_0_FILE_READ_BYTES,
+    Q8_0_FILE_CACHE_HITS,
+    Q8_0_FILE_CACHE_HIT_BYTES,
+    Q8_0_FILE_CACHE_MISSES,
+    Q8_0_FILE_CACHE_MISS_BYTES,
+    Q8_0_FILE_CACHE_INSERTS,
+    Q8_0_FILE_CACHE_INSERT_BYTES,
+    Q8_0_FILE_CACHE_EVICTIONS,
+    Q8_0_FILE_CACHE_EVICTED_BYTES,
+    Q8_0_FILE_CACHE_MERGES,
+    Q8_0_FILE_CACHE_MERGED_BYTES,
+    Q8_0_FILE_CACHE_DECODED_SCALE_HITS,
+    Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS,
+);
+
+#[cfg(not(test))]
+type Q8FileStatCounter = std::sync::atomic::AtomicU64;
+#[cfg(test)]
+type Q8FileStatCounter = std::thread::LocalKey<Cell<u64>>;
+
+#[cfg(not(test))]
+fn q8_file_stat_add(counter: &'static Q8FileStatCounter, value: u64) {
+    counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn q8_file_stat_add(counter: &'static Q8FileStatCounter, value: u64) {
+    counter.with(|cell| cell.set(cell.get().wrapping_add(value)));
+}
+
+#[cfg(not(test))]
+fn q8_file_stat_load(counter: &'static Q8FileStatCounter) -> u64 {
+    counter.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn q8_file_stat_load(counter: &'static Q8FileStatCounter) -> u64 {
+    counter.with(Cell::get)
+}
+
+#[cfg(not(test))]
+fn q8_file_cache() -> &'static OnceLock<Mutex<Q8FileCache>> {
+    static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
+    &Q8_FILE_CACHE
+}
+
+#[cfg(test)]
+fn q8_file_cache() -> &'static OnceLock<Mutex<Q8FileCache>> {
+    // The cell itself is leaked so callers keep the `&'static` shape of the real
+    // build; its entries are released when the owning test thread exits.
+    struct ThreadQ8FileCache(&'static OnceLock<Mutex<Q8FileCache>>);
+
+    impl Drop for ThreadQ8FileCache {
+        fn drop(&mut self) {
+            if let Some(cache) = self.0.get() {
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.entries = Vec::new();
+                cache.bytes = 0;
+            }
+        }
+    }
+
+    thread_local! {
+        static THREAD_Q8_FILE_CACHE: ThreadQ8FileCache =
+            ThreadQ8FileCache(Box::leak(Box::default()));
+    }
+    THREAD_Q8_FILE_CACHE.with(|cache| cache.0)
+}
 
 thread_local! {
     static Q8_FILE_CACHE_CAPACITY_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
@@ -3559,26 +3632,27 @@ impl Q8_0FileReadStats {
 }
 
 pub(crate) fn record_q8_0_file_read(bytes: usize) {
-    Q8_0_FILE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_READ_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_READ_CALLS, 1);
+    q8_file_stat_add(&Q8_0_FILE_READ_BYTES, bytes as u64);
 }
 
 fn record_q8_file_cache_decoded_scale_reuse(blocks: usize) {
     if blocks == 0 {
         return;
     }
-    Q8_0_FILE_CACHE_DECODED_SCALE_HITS.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS.fetch_add(blocks as u64, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_DECODED_SCALE_HITS, 1);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS, blocks as u64);
 }
 
-/// Serializes every test that measures the process-global Q8 file-read counters
-/// or mutates the process-global Q8 file cache.
+/// Serializes the tests that set the process-global `CAMELID_Q8_0_FILE_CACHE_BYTES`
+/// environment variable while measuring Q8 file reads.
 ///
-/// Those tests span two modules (`tensor::tests` and `inference::tests`), so the
-/// lock has to live beside the state it guards rather than inside either test
-/// module. Concurrent runs corrupt each other's `saturating_delta_since` deltas —
-/// typically an off-by-one read count — which made them intermittently red under
-/// `cargo test`'s default parallelism.
+/// The read counters and the cache itself are per-thread under `cfg(test)` (see
+/// `q8_file_stat_counters!`), so concurrent tests no longer corrupt each other's
+/// `saturating_delta_since` deltas; that isolation does not depend on this lock.
+/// The environment, however, is still shared by every thread, and one test's
+/// capacity setting would otherwise leak into another's. Those tests span two
+/// modules (`tensor::tests` and `inference::tests`), so the lock lives here.
 ///
 /// Poisoning is deliberately ignored: one genuinely failing test must not cascade
 /// into spurious failures across the rest of the family.
@@ -3592,21 +3666,22 @@ pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
     let cache_capacity_bytes = q8_file_cache_capacity_bytes();
     let (cache_entries, cache_bytes) = q8_file_cache_snapshot(cache_capacity_bytes);
     Q8_0FileReadStats {
-        read_calls: Q8_0_FILE_READ_CALLS.load(Ordering::Relaxed),
-        read_bytes: Q8_0_FILE_READ_BYTES.load(Ordering::Relaxed),
-        cache_hits: Q8_0_FILE_CACHE_HITS.load(Ordering::Relaxed),
-        cache_hit_bytes: Q8_0_FILE_CACHE_HIT_BYTES.load(Ordering::Relaxed),
-        cache_misses: Q8_0_FILE_CACHE_MISSES.load(Ordering::Relaxed),
-        cache_miss_bytes: Q8_0_FILE_CACHE_MISS_BYTES.load(Ordering::Relaxed),
-        cache_inserts: Q8_0_FILE_CACHE_INSERTS.load(Ordering::Relaxed),
-        cache_insert_bytes: Q8_0_FILE_CACHE_INSERT_BYTES.load(Ordering::Relaxed),
-        cache_evictions: Q8_0_FILE_CACHE_EVICTIONS.load(Ordering::Relaxed),
-        cache_evicted_bytes: Q8_0_FILE_CACHE_EVICTED_BYTES.load(Ordering::Relaxed),
-        cache_merges: Q8_0_FILE_CACHE_MERGES.load(Ordering::Relaxed),
-        cache_merged_bytes: Q8_0_FILE_CACHE_MERGED_BYTES.load(Ordering::Relaxed),
-        cache_decoded_scale_hits: Q8_0_FILE_CACHE_DECODED_SCALE_HITS.load(Ordering::Relaxed),
-        cache_decoded_scale_hit_blocks: Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS
-            .load(Ordering::Relaxed),
+        read_calls: q8_file_stat_load(&Q8_0_FILE_READ_CALLS),
+        read_bytes: q8_file_stat_load(&Q8_0_FILE_READ_BYTES),
+        cache_hits: q8_file_stat_load(&Q8_0_FILE_CACHE_HITS),
+        cache_hit_bytes: q8_file_stat_load(&Q8_0_FILE_CACHE_HIT_BYTES),
+        cache_misses: q8_file_stat_load(&Q8_0_FILE_CACHE_MISSES),
+        cache_miss_bytes: q8_file_stat_load(&Q8_0_FILE_CACHE_MISS_BYTES),
+        cache_inserts: q8_file_stat_load(&Q8_0_FILE_CACHE_INSERTS),
+        cache_insert_bytes: q8_file_stat_load(&Q8_0_FILE_CACHE_INSERT_BYTES),
+        cache_evictions: q8_file_stat_load(&Q8_0_FILE_CACHE_EVICTIONS),
+        cache_evicted_bytes: q8_file_stat_load(&Q8_0_FILE_CACHE_EVICTED_BYTES),
+        cache_merges: q8_file_stat_load(&Q8_0_FILE_CACHE_MERGES),
+        cache_merged_bytes: q8_file_stat_load(&Q8_0_FILE_CACHE_MERGED_BYTES),
+        cache_decoded_scale_hits: q8_file_stat_load(&Q8_0_FILE_CACHE_DECODED_SCALE_HITS),
+        cache_decoded_scale_hit_blocks: q8_file_stat_load(
+            &Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS,
+        ),
         cache_entries,
         cache_bytes,
         cache_capacity_bytes: cache_capacity_bytes as u64,
@@ -3693,7 +3768,7 @@ fn q8_file_cache_prepare_read(
         record_q8_file_cache_miss(out_len);
         return q8_file_cache_missing_all(out_len);
     };
-    let Some(cache) = Q8_FILE_CACHE.get() else {
+    let Some(cache) = q8_file_cache().get() else {
         record_q8_file_cache_miss(out_len);
         return q8_file_cache_missing_all(out_len);
     };
@@ -3781,8 +3856,8 @@ fn q8_file_cache_prepare_read(
         return q8_file_cache_missing_all(out_len);
     }
     q8_file_cache_mark_used(&mut cache, &touched_indices);
-    Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_CACHE_HIT_BYTES.fetch_add(hit_bytes as u64, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_HITS, 1);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_HIT_BYTES, hit_bytes as u64);
     if missing_ranges.is_empty() {
         return Q8FileCacheRead::Hit {
             decoded_scales_reused,
@@ -3790,8 +3865,8 @@ fn q8_file_cache_prepare_read(
         };
     }
     let miss_bytes = missing_ranges.iter().map(|range| range.len as u64).sum();
-    Q8_0_FILE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_CACHE_MISS_BYTES.fetch_add(miss_bytes, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_MISSES, 1);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_MISS_BYTES, miss_bytes);
     Q8FileCacheRead::Missing {
         ranges: missing_ranges,
         decoded_scales_reused,
@@ -3864,7 +3939,7 @@ fn q8_file_cache_store_decoded_scales(path: &Path, offset: u64, scales: &[f32]) 
         q8_file_cache_apply_capacity(0);
         return;
     }
-    let Some(cache) = Q8_FILE_CACHE.get() else {
+    let Some(cache) = q8_file_cache().get() else {
         return;
     };
 
@@ -4018,7 +4093,7 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
         q8_file_cache_apply_capacity(0);
         return false;
     }
-    let Some(cache) = Q8_FILE_CACHE.get() else {
+    let Some(cache) = q8_file_cache().get() else {
         record_q8_file_cache_miss(out.len());
         return false;
     };
@@ -4036,14 +4111,14 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     let start = (offset - entry.offset) as usize;
     out.copy_from_slice(&entry.bytes[start..start + out.len()]);
     cache.entries.push(entry);
-    Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_CACHE_HIT_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_HITS, 1);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_HIT_BYTES, out.len() as u64);
     true
 }
 
 fn record_q8_file_cache_miss(bytes: usize) {
-    Q8_0_FILE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    Q8_0_FILE_CACHE_MISS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_MISSES, 1);
+    q8_file_stat_add(&Q8_0_FILE_CACHE_MISS_BYTES, bytes as u64);
 }
 
 fn q8_file_cache_entry_covers(
@@ -4079,7 +4154,7 @@ fn q8_file_cache_insert_with_decoded_scales(
         }
         return;
     }
-    let cache = Q8_FILE_CACHE.get_or_init(|| Mutex::new(Q8FileCache::default()));
+    let cache = q8_file_cache().get_or_init(|| Mutex::new(Q8FileCache::default()));
     let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
     cache.apply_capacity(capacity);
     cache.insert(path, offset, bytes.to_vec(), decoded_q8_0_scales, capacity);
@@ -4096,7 +4171,7 @@ fn q8_file_cache_capacity_bytes() -> usize {
 }
 
 fn q8_file_cache_apply_capacity(capacity: usize) {
-    if let Some(cache) = Q8_FILE_CACHE.get() {
+    if let Some(cache) = q8_file_cache().get() {
         cache
             .lock()
             .expect("q8 file cache mutex poisoned")
@@ -4143,7 +4218,7 @@ fn parse_byte_count(value: &str) -> Option<usize> {
 }
 
 fn q8_file_cache_snapshot(capacity: usize) -> (u64, u64) {
-    let Some(cache) = Q8_FILE_CACHE.get() else {
+    let Some(cache) = q8_file_cache().get() else {
         return (0, 0);
     };
     let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
@@ -4282,9 +4357,8 @@ impl Q8FileCache {
             {
                 let old = self.entries.remove(pos);
                 self.bytes = self.bytes.saturating_sub(old.bytes.len());
-                Q8_0_FILE_CACHE_MERGES.fetch_add(1, Ordering::Relaxed);
-                Q8_0_FILE_CACHE_MERGED_BYTES
-                    .fetch_add(merged.bytes.len() as u64, Ordering::Relaxed);
+                q8_file_stat_add(&Q8_0_FILE_CACHE_MERGES, 1);
+                q8_file_stat_add(&Q8_0_FILE_CACHE_MERGED_BYTES, merged.bytes.len() as u64);
                 entry = merged;
                 pos = 0;
             } else {
@@ -4292,8 +4366,8 @@ impl Q8FileCache {
             }
         }
         self.bytes = self.bytes.saturating_add(entry.bytes.len());
-        Q8_0_FILE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
-        Q8_0_FILE_CACHE_INSERT_BYTES.fetch_add(entry.bytes.len() as u64, Ordering::Relaxed);
+        q8_file_stat_add(&Q8_0_FILE_CACHE_INSERTS, 1);
+        q8_file_stat_add(&Q8_0_FILE_CACHE_INSERT_BYTES, entry.bytes.len() as u64);
         self.entries.push(entry);
         while self.bytes > capacity {
             self.evict_oldest();
@@ -4307,8 +4381,8 @@ impl Q8FileCache {
         }
         let entry = self.entries.remove(0);
         self.bytes = self.bytes.saturating_sub(entry.bytes.len());
-        Q8_0_FILE_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        Q8_0_FILE_CACHE_EVICTED_BYTES.fetch_add(entry.bytes.len() as u64, Ordering::Relaxed);
+        q8_file_stat_add(&Q8_0_FILE_CACHE_EVICTIONS, 1);
+        q8_file_stat_add(&Q8_0_FILE_CACHE_EVICTED_BYTES, entry.bytes.len() as u64);
     }
 }
 
@@ -7637,15 +7711,9 @@ mod bf16_dequant_parity_tests {
 mod tests {
     /// Serializes the `q8_file_*` tests against each other.
     ///
-    /// They assert on DELTAS of the process-global `q8_0_file_read_stats()` counter
-    /// and share the process-global Q8 file cache, so any two running concurrently
-    /// corrupt each other's measurements — typically surfacing as an off-by-one
-    /// read count (`left: 2, right: 1`). That made them intermittently red under
-    /// `cargo test`'s default parallelism.
-    ///
-    /// The flakiness is latent and order-dependent, not random: adding unrelated
-    /// tests to this module changed the scheduling enough to make it fire on almost
-    /// every run, which is what motivated fixing it here rather than deferring.
+    /// Their read-count deltas and cache contents are already isolated per test
+    /// thread under `cfg(test)`; the lock still guards the process-global
+    /// `CAMELID_Q8_0_FILE_CACHE_BYTES` variable they set and remove.
     ///
     /// Poisoning is deliberately ignored — one genuinely failing test must not
     /// cascade into spurious failures across the rest of the family.
