@@ -137,7 +137,10 @@ fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
     source.busy_timeout(std::time::Duration::from_secs(5))?;
     // SQLite takes a consistent snapshot, including committed WAL content.
     // Publish only a complete snapshot; never replace an existing library.
-    let snapshot = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
+    // VACUUM inherits NOFOLLOW for its output, so its directory must also
+    // resolve system aliases such as macOS /var before SQLite opens it.
+    let snapshot_dir = parent.canonicalize().map_err(io_error)?;
+    let snapshot = tempfile::NamedTempFile::new_in(snapshot_dir).map_err(io_error)?;
     let snapshot_path = snapshot
         .path()
         .to_str()
@@ -238,7 +241,7 @@ mod tests {
         source
             .execute_batch("CREATE TABLE notes (text TEXT); INSERT INTO notes VALUES ('saved');")
             .unwrap();
-        let destination = root.path().join(DB_FILE);
+        let destination = alias.join(DB_FILE);
         migrate(&alias.join("legacy.sqlite3"), &destination).unwrap();
         let saved = Connection::open(destination).unwrap();
         assert_eq!(
