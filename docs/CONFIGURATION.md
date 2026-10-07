@@ -163,6 +163,12 @@ origins are refused. The bundled browser UI stores an entered key in that browse
 only for the configured API origin. A fresh browser that reaches an authenticated listener opens
 the Settings credential field; a wrong key remains there instead of reporting the server offline.
 
+For an unauthenticated listener, browser requests that change state must come from the
+server's own origin or an origin explicitly listed with `--cors-origin`. This check also
+applies to simple browser POSTs that do not require a CORS preflight. Origin-less
+command-line clients remain supported; requests carrying a valid explicit API key use
+the normal authenticated policy.
+
 ### Optional GitHub quota credential for Web Auto
 
 `CAMELID_WEB_GITHUB_TOKEN` optionally supplies a GitHub token to the bounded
