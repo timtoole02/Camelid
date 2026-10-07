@@ -36,12 +36,12 @@ function ProjectEditor({ project, onSave, onClose, busy, collections }) {
   </Modal>
 }
 
-export default function ProjectsView({ projects, conversations, onSave, onDelete, onNewChat, onOpenConversation, busy, knowledgeEnabled = false }) {
+export default function ProjectsView({ projects, conversations, onSave, onDelete, onNewChat, onOpenConversation, busy, knowledgeEnabled = false, apiBase }) {
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
-  const knowledge = useKnowledgeCollections(knowledgeEnabled)
+  const knowledge = useKnowledgeCollections(knowledgeEnabled, apiBase)
   const closeEditor = useCallback(() => setEditing(null), [])
   const filtered = projects.filter(project => `${project.name} ${project.instructions}`.toLowerCase().includes(search.toLowerCase()))
   return <section className="cxv projects-view" aria-label="Projects">

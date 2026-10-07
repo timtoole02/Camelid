@@ -16,6 +16,6 @@ export function normalizeApiBase(value) {
   return (value || defaultApiBase()).trim().replace(/\/$/, '')
 }
 
-export function apiUrl(path) {
-  return `${normalizeApiBase(getApiBase())}${path}`
+export function apiUrl(path, apiBase = getApiBase()) {
+  return `${normalizeApiBase(apiBase)}${path}`
 }

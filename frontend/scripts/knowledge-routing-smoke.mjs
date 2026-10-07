@@ -63,6 +63,15 @@ try {
   values.set('camelid.apiBase', 'http://second.example')
   await collections.listCollections()
   assert.equal(requests.at(-1).url.href, 'http://second.example/api/collections', 'requests follow a backend change immediately')
+  await collections.listCollections('https://backend.example/engine')
+  assert.equal(requests.at(-1).url.href, 'https://backend.example/engine/api/collections', 'a view retains the backend selected alongside its chat request')
+  assert.equal(new Headers(requests.at(-1).init.headers).get('x-api-key'), null, 'another connection\'s saved key is not sent to the retained backend')
+  await collections.ingestLibraryFile({ name: 'delayed.txt', text: async () => {
+    values.set('camelid.apiBase', 'http://third.example')
+    return 'notes'
+  } })
+  assert.equal(requests.at(-1).url.href, 'http://second.example/api/documents/ingest', 'reading a file asynchronously does not change its upload destination')
+  assert.equal(new Headers(requests.at(-1).init.headers).get('x-api-key'), null)
   await fetch('https://unrelated.example/resource')
   assert.equal(new Headers(requests.at(-1).init.headers).get('x-api-key'), null, 'the global wrapper does not send the key to another origin')
   console.log('knowledge routing smoke passed')

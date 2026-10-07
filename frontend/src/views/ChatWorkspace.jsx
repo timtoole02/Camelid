@@ -298,7 +298,7 @@ export default function ChatWorkspace({
   const openDocument = useCallback((doc) => setViewerDocument(doc), [])
   // Collections are a full-API feature; wait for health to say which surface this is.
   const knowledgeEnabled = !demoMode && Boolean(runtime) && runtime.api_surface !== 'lan_chat_only'
-  const knowledge = useKnowledgeCollections(knowledgeEnabled)
+  const knowledge = useKnowledgeCollections(knowledgeEnabled, apiBase)
   const [library, setLibrary] = useState(null)
   const [collectionError, setCollectionError] = useState('')
   const collectionRefs = knowledgeEnabled ? contextCollectionRefs(chatContext, projects) : []
@@ -569,7 +569,7 @@ export default function ChatWorkspace({
   useEffect(() => {
     let cancelled = false
     if (attachedDocuments.length) {
-      apiFetch('/api/documents')
+      apiFetch('/api/documents', {}, apiBase)
         .then((response) => (response.ok ? response.json() : null))
         .then((documents) => {
           if (cancelled || !Array.isArray(documents)) return
@@ -613,7 +613,7 @@ export default function ChatWorkspace({
     let timer = null
     const poll = async () => {
       try {
-        const res = await apiFetch('/api/documents/index-status')
+        const res = await apiFetch('/api/documents/index-status', {}, apiBase)
         const status = res.ok ? await res.json() : null
         if (cancelled || !status?.semantic) return
         const byId = Object.fromEntries((status.documents || []).map((doc) => [doc.id, doc]))
@@ -749,7 +749,7 @@ export default function ChatWorkspace({
             chunk_sha256: activeCitation.chunk_sha256 || null,
             doc_sha256: activeCitation.doc_sha256 || null,
           }),
-        })
+        }, apiBase)
         const payload = await res.json().catch(() => null)
         if (cancelled) return
         if (res.ok && payload) {
@@ -785,7 +785,7 @@ export default function ChatWorkspace({
     setDocumentIngesting(true)
     for (const file of Array.from(files)) {
       try {
-        const doc = await ingestLibraryFile(file)
+        const doc = await ingestLibraryFile(file, [], file.name, apiBase)
         setAttachedDocuments((prev) => [
           ...prev.filter((item) => item.doc_id !== doc.doc_id && item.filename !== doc.filename),
           doc,
@@ -831,7 +831,7 @@ export default function ChatWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      })
+      }, apiBase)
       try {
         let res = null
         if (searchLibrary) {
@@ -1914,9 +1914,10 @@ export default function ChatWorkspace({
           </div>
         </div>
       )}
-      {viewerDocument && <DocumentViewer key={viewerDocument.doc_id} document={viewerDocument} onClose={closeDocumentViewer} />}
+      {viewerDocument && <DocumentViewer key={viewerDocument.doc_id} document={viewerDocument} onClose={closeDocumentViewer} apiBase={apiBase} />}
       {library && (
         <KnowledgeLibrary
+          apiBase={apiBase}
           collections={knowledge.collections}
           refresh={knowledge.refresh}
           initialCollectionId={library.collectionId}

@@ -22,8 +22,9 @@ const changedSomething = changes => Boolean(changes && (changes.added || changes
    and calls `onChanged` when a poll shows a finished check that changed the
    library, so the collection's document list catches up. A check the server's
    timer runs usually starts and ends between two polls. */
-export function WatchedFolders({ collection, onChanged, disabled = false }) {
-  const apiBase = getApiBase()
+export function WatchedFolders({ collection, onChanged, disabled = false, apiBase = getApiBase() }) {
+  const currentBase = useRef(apiBase)
+  currentBase.current = apiBase
   const [folders, setFolders] = useState(null)
   const [error, setError] = useState('')
   // Kept apart from `error` so the next successful poll clears a failed one
@@ -41,12 +42,12 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
 
   const load = useCallback(async () => {
     try {
-      const next = await listFolders()
-      if (getApiBase() !== apiBase) return
+      const next = await listFolders(apiBase)
+      if (currentBase.current !== apiBase) return
       setFolders(next)
       setLoadError('')
     } catch (failure) {
-      if (getApiBase() === apiBase) setLoadError(failure.message)
+      if (currentBase.current === apiBase) setLoadError(failure.message)
     }
   }, [apiBase])
   useEffect(() => { setFolders(null); seenChecks.current = null; load() }, [load])
@@ -73,7 +74,7 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
     try { await action() } catch (failure) { setError(failure.message) } finally { setWorking('') }
   }
   const browse = path => run('browse', async () => {
-    const view = await browseFolders(path)
+    const view = await browseFolders(path, apiBase)
     setBrowser(view)
     if (view.path) setDraft(view.path)
   })
@@ -82,7 +83,7 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
     const path = draft.trim()
     if (!path) return
     run('watch', async () => {
-      await watchFolder(path, collection.id)
+      await watchFolder(path, collection.id, apiBase)
       setAdding(false)
       setBrowser(null)
       setDraft('')
@@ -90,12 +91,12 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
     })
   }
   const checkNow = folder => run(`scan:${folder.id}`, async () => {
-    await scanFolder(folder.id)
+    await scanFolder(folder.id, apiBase)
     await load()
   })
   const stopWatching = folder => run(`remove:${folder.id}`, async () => {
     setConfirmId('')
-    await unwatchFolder(folder.id)
+    await unwatchFolder(folder.id, apiBase)
     await load()
     onChanged?.()
   })

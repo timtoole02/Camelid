@@ -3,6 +3,7 @@
    and project context store only collection ids. */
 
 import { apiFetch } from './apiRequest.js'
+import { getApiBase } from './apiBase.js'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -30,7 +31,7 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
 /** Uploads one file into the library, optionally straight into collections.
     `name` defaults to the file's own; a file from a dropped folder passes its
     path inside that folder. */
-export async function ingestLibraryFile(file, collectionIds = [], name = file.name) {
+export async function ingestLibraryFile(file, collectionIds = [], name = file.name, apiBase = getApiBase()) {
   const lowerName = name.toLowerCase()
   const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
   const response = await apiFetch('/api/documents/ingest', {
@@ -42,7 +43,7 @@ export async function ingestLibraryFile(file, collectionIds = [], name = file.na
       is_base64: isBinary,
       ...(collectionIds.length ? { collection_ids: collectionIds } : {}),
     }),
-  })
+  }, apiBase)
   if (!response.ok) {
     const failure = await response.json().catch(() => null)
     throw new Error(failure?.error?.message || failure?.message || `Could not index ${name}.`)
@@ -78,8 +79,8 @@ export async function filesFromDrop(dataTransfer) {
   return found
 }
 
-async function request(path, options = {}) {
-  const response = await apiFetch(path, options)
+async function request(path, options = {}, apiBase = getApiBase()) {
+  const response = await apiFetch(path, options, apiBase)
   if (response.status === 204) return null
   const body = await response.json().catch(() => null)
   if (!response.ok) throw new Error(body?.error?.message || `The library request failed (${response.status}).`)
@@ -102,26 +103,26 @@ export function normalizeCollection(value) {
 
 export const normalizeCollections = value => (Array.isArray(value) ? value : []).map(normalizeCollection).filter(Boolean)
 
-export const listCollections = async () => normalizeCollections(await request('/api/collections'))
+export const listCollections = async (apiBase = getApiBase()) => normalizeCollections(await request('/api/collections', {}, apiBase))
 
-export const createCollection = async name => normalizeCollection(await request('/api/collections', {
+export const createCollection = async (name, apiBase = getApiBase()) => normalizeCollection(await request('/api/collections', {
   method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ name }),
-}))
+}, apiBase))
 
-export const renameCollection = async (id, name) => normalizeCollection(await request(collectionPath(id), {
+export const renameCollection = async (id, name, apiBase = getApiBase()) => normalizeCollection(await request(collectionPath(id), {
   method: 'PATCH', headers: JSON_HEADERS, body: JSON.stringify({ name }),
-}))
+}, apiBase))
 
-export const deleteCollection = id => request(collectionPath(id), { method: 'DELETE' })
+export const deleteCollection = (id, apiBase = getApiBase()) => request(collectionPath(id), { method: 'DELETE' }, apiBase)
 
-export const addCollectionDocuments = async (id, docIds) => normalizeCollection(await request(collectionPath(id, '/documents'), {
+export const addCollectionDocuments = async (id, docIds, apiBase = getApiBase()) => normalizeCollection(await request(collectionPath(id, '/documents'), {
   method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ doc_ids: docIds }),
-}))
+}, apiBase))
 
-export const removeCollectionDocument = (id, docId) => request(collectionPath(id, `/documents/${encodeURIComponent(docId)}`), { method: 'DELETE' })
+export const removeCollectionDocument = (id, docId, apiBase = getApiBase()) => request(collectionPath(id, `/documents/${encodeURIComponent(docId)}`), { method: 'DELETE' }, apiBase)
 
-export async function listLibraryDocuments() {
-  const documents = await request('/api/documents')
+export async function listLibraryDocuments(apiBase = getApiBase()) {
+  const documents = await request('/api/documents', {}, apiBase)
   return (Array.isArray(documents) ? documents : []).filter(doc => typeof doc?.id === 'string' && typeof doc?.filename === 'string')
 }
 

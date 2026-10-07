@@ -7,8 +7,7 @@ const formatBytes = (bytes) => (bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB
 
 /* The text is shown only after the server confirms it still hashes to the
    digest recorded at ingest -- the same bar a citation from it must clear. */
-export function DocumentViewer({ document: doc, onClose }) {
-  const apiBase = getApiBase()
+export function DocumentViewer({ document: doc, onClose, apiBase = getApiBase() }) {
   const [view, setView] = useState({ status: 'loading' })
 
   useEffect(() => {
@@ -17,7 +16,7 @@ export function DocumentViewer({ document: doc, onClose }) {
     const refuse = (code, message) => {
       if (!controller.signal.aborted) setView({ status: 'refused', code, message })
     }
-    apiFetch(`/api/documents/${encodeURIComponent(doc.doc_id)}/source`, { signal: controller.signal })
+    apiFetch(`/api/documents/${encodeURIComponent(doc.doc_id)}/source`, { signal: controller.signal }, apiBase)
       .then(async (res) => {
         const payload = await res.json().catch(() => null)
         if (controller.signal.aborted) return
