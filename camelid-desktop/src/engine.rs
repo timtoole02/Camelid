@@ -5,10 +5,13 @@
 // then points the WebView at the sidecar's already-embedded UI. Behavior is therefore
 // byte-identical to running `camelid serve` + the web UI manually. See DECISIONS.md D11.
 
-use std::io::{Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Resolved engine binary stem. The crate/binary is `camelid`; the legacy
@@ -30,6 +33,66 @@ pub fn engine_binary_file() -> String {
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(40);
 /// Backoff between health polls (model load can dominate; keep polls cheap and patient).
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(350);
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// Drain for the entire child lifetime, retaining only a bounded diagnostic tail.
+struct StderrCapture {
+    tail: Arc<Mutex<VecDeque<u8>>>,
+    done: Option<mpsc::Receiver<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StderrCapture {
+    fn start(child: &mut Child) -> io::Result<Self> {
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("engine stderr pipe is missing"))?;
+        let tail = Arc::new(Mutex::new(VecDeque::new()));
+        let reader_tail = Arc::clone(&tail);
+        let (tx, done) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("camelid-engine-stderr".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let mut tail = reader_tail.lock().unwrap_or_else(|e| e.into_inner());
+                            tail.extend(&buffer[..count]);
+                            let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                            tail.drain(..excess);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send(());
+            })?;
+        Ok(Self {
+            tail,
+            done: Some(done),
+            worker: Some(worker),
+        })
+    }
+
+    /// Called after reaping the engine. A descendant may still hold stderr open;
+    /// never let that prevent the splash from reporting failure or the app exiting.
+    fn finish(&mut self) -> Option<String> {
+        if let Some(done) = self.done.take() {
+            if done.recv_timeout(Duration::from_millis(500)).is_ok() {
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes: Vec<u8> = tail.iter().copied().collect();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (!text.trim().is_empty()).then_some(text)
+    }
+}
 
 /// Stable startup-failure classes rendered by the bundled splash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +174,7 @@ impl EngineError {
 pub struct Engine {
     child: Child,
     port: u16,
+    stderr: StderrCapture,
     #[cfg(windows)]
     _job: Option<JobObject>,
 }
@@ -125,8 +189,7 @@ impl Engine {
     /// holds no external state, so `TerminateProcess` (via `Child::kill`) is the clean stop.
     /// The kill-on-close job object (set in `spawn`) is the backstop if the parent crashes.
     pub fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = terminate_and_collect_stderr(&mut self.child, &mut self.stderr);
     }
 }
 
@@ -277,14 +340,27 @@ fn spawn_on_port(
     #[cfg(windows)]
     let job = JobObject::assign(&child).ok();
 
+    let mut stderr = match StderrCapture::start(&mut child) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(EngineError::new(
+                EngineErrorKind::StartupFailed,
+                format!("could not capture engine diagnostics: {error}"),
+            ));
+        }
+    };
+
     match wait_for_health(port, &mut child) {
         Ok(()) => Ok(Engine {
             child,
             port,
+            stderr,
             #[cfg(windows)]
             _job: job,
         }),
-        Err(err) => Err(finish_startup_failure(&mut child, err)),
+        Err(err) => Err(finish_startup_failure(&mut child, &mut stderr, err)),
     }
 }
 
@@ -383,28 +459,18 @@ fn http_health_ok(port: u16) -> bool {
     }
 }
 
-/// Best-effort read of engine stderr after the child has been reaped.
-fn drain_stderr(child: &mut Child) -> Option<String> {
-    let mut stderr = child.stderr.take()?;
-    let mut buf = String::new();
-    let _ = stderr.read_to_string(&mut buf);
-    if buf.trim().is_empty() {
-        None
-    } else {
-        Some(buf)
-    }
-}
-
-fn terminate_and_collect_stderr(child: &mut Child) -> Option<String> {
+fn terminate_and_collect_stderr(child: &mut Child, capture: &mut StderrCapture) -> Option<String> {
     let _ = child.kill();
     let _ = child.wait();
-    drain_stderr(child)
+    capture.finish()
 }
 
-fn finish_startup_failure(child: &mut Child, error: EngineError) -> EngineError {
-    // A timed-out child still owns the stderr pipe. Reap it before a blocking read so the
-    // startup worker cannot get stuck and leave the splash spinner visible indefinitely.
-    let stderr = terminate_and_collect_stderr(child);
+fn finish_startup_failure(
+    child: &mut Child,
+    capture: &mut StderrCapture,
+    error: EngineError,
+) -> EngineError {
+    let stderr = terminate_and_collect_stderr(child, capture);
     let EngineError {
         mut kind,
         message,
@@ -495,6 +561,7 @@ mod tests {
     use super::{
         finish_startup_failure, sidecar_models_dir, spawn, stderr_is_bind_failure,
         terminate_and_collect_stderr, wait_for_health_with_timeout, EngineError, EngineErrorKind,
+        StderrCapture, STDERR_TAIL_BYTES,
     };
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -569,6 +636,7 @@ mod tests {
         let mut command = long_lived_stderr_command("sidecar remains alive");
         command.stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("start test sidecar");
+        let mut capture = StderrCapture::start(&mut child).unwrap();
         assert!(child.try_wait().expect("query child state").is_none());
 
         let started = Instant::now();
@@ -581,7 +649,8 @@ mod tests {
         .expect_err("live child without health endpoint must time out");
         assert_eq!(error.kind, EngineErrorKind::StartupTimeout);
 
-        let stderr = terminate_and_collect_stderr(&mut child).expect("captured test stderr");
+        let stderr =
+            terminate_and_collect_stderr(&mut child, &mut capture).expect("captured test stderr");
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(stderr.contains("sidecar remains alive"));
         assert!(child.try_wait().expect("query reaped child").is_some());
@@ -592,10 +661,12 @@ mod tests {
         let mut bind_command = long_lived_stderr_command("address already in use");
         bind_command.stdout(Stdio::null()).stderr(Stdio::piped());
         let mut bind_child = bind_command.spawn().expect("start bind-failure test child");
+        let mut bind_capture = StderrCapture::start(&mut bind_child).unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
         let bind_error = finish_startup_failure(
             &mut bind_child,
+            &mut bind_capture,
             EngineError::new(EngineErrorKind::StartupFailed, "sidecar exited"),
         );
         assert_eq!(
@@ -610,10 +681,12 @@ mod tests {
         let mut generic_child = generic_command
             .spawn()
             .expect("start generic-failure test child");
+        let mut generic_capture = StderrCapture::start(&mut generic_child).unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
         let generic_error = finish_startup_failure(
             &mut generic_child,
+            &mut generic_capture,
             EngineError::new(EngineErrorKind::StartupFailed, "sidecar exited"),
         );
         assert_eq!(generic_error.kind, EngineErrorKind::StartupFailed);
@@ -624,6 +697,43 @@ mod tests {
         let port = listener.local_addr().expect("read reserved port").port();
         drop(listener);
         port
+    }
+
+    #[test]
+    fn running_engine_drains_large_stderr_output_and_retains_a_bounded_tail() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/C", "for /L %i in (1,1,16384) do @echo 0123456789012345678901234567890123456789012345678901234567890123456789 1>&2"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "i=0; while [ $i -lt 16384 ]; do printf '%s\\n' 0123456789012345678901234567890123456789012345678901234567890123456789 >&2; i=$((i+1)); done"]);
+            command
+        };
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stderr = StderrCapture::start(&mut child).unwrap();
+        let mut engine = super::Engine {
+            child,
+            port: 0,
+            stderr,
+            #[cfg(windows)]
+            _job: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "sidecar blocked while writing stderr"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tail = engine.stderr.finish().expect("retained diagnostics");
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(tail.contains("0123456789"));
     }
 
     #[cfg(windows)]
