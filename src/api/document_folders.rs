@@ -867,7 +867,7 @@ pub(crate) fn start_polling(models_dir: PathBuf) {
             interval.tick().await;
             // Opening the database would create it for someone who has never
             // used the library, and then nothing is watched anyway.
-            if !documents::documents_db_path().exists() {
+            if !super::document_storage::library_exists() {
                 continue;
             }
             let ids = tokio::task::spawn_blocking(|| {

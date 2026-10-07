@@ -51,6 +51,15 @@ That startup path loads the model immediately and applies the default `auto` exe
 
 ### Document search by meaning
 
+The Knowledge Library stores documents, collections, and watched-folder settings in
+`documents_rag.sqlite3` under `%LOCALAPPDATA%/Camelid` on Windows,
+`~/Library/Application Support/Camelid` on macOS, and `$XDG_DATA_HOME/camelid`
+(or `~/.local/share/camelid`) on Linux. Set `CAMELID_DATA_DIR` to choose another directory.
+On the first use of the default persistent location, Camelid snapshots an existing
+temporary library into it without deleting the original. An existing persistent library
+always takes precedence. On Unix, migration accepts only a regular legacy file owned by
+the current user. Watched folders also resume from a migrated library at server startup.
+
 When `nomic-embed-text-v1.5.Q8_0.gguf` (the exact pinned artifact) is in the models directory, attached-document search ranks by keyword and by meaning, and indexes new uploads in the background on the CPU. Set `CAMELID_DOCUMENT_SEMANTIC=0` to keep it keyword-only. Details are in [`architecture/EMBEDDINGS.md`](architecture/EMBEDDINGS.md#knowledge-library-integration).
 
 ### CUDA continuous batching and model residency

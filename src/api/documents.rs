@@ -8,7 +8,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +26,6 @@ use super::{api_error, AppState};
 
 const DEFAULT_CHUNK_CHARS: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
-const DOCUMENTS_DB_FILE: &str = "documents_rag.sqlite3";
 /// Candidates each ranker contributes before fusion and citation checks.
 const CANDIDATE_POOL: usize = 50;
 /// The usual reciprocal-rank-fusion constant; it damps the weight of the very top ranks.
@@ -37,18 +35,6 @@ static DB_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn db_lock() -> &'static Mutex<()> {
     DB_MUTEX.get_or_init(|| Mutex::new(()))
-}
-
-pub(crate) fn documents_db_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("CAMELID_DATA_DIR") {
-        PathBuf::from(dir).join(DOCUMENTS_DB_FILE)
-    } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        PathBuf::from(local_app_data)
-            .join("Camelid")
-            .join(DOCUMENTS_DB_FILE)
-    } else {
-        std::env::temp_dir().join(DOCUMENTS_DB_FILE)
-    }
 }
 
 pub(crate) fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -103,10 +89,7 @@ fn ensure_citation_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
-    let path = documents_db_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let path = super::document_storage::prepare_path()?;
     let conn = Connection::open(&path)?;
     conn.execute("PRAGMA foreign_keys = ON;", [])?;
     init_db(&conn)?;
