@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { devRequestOriginAllowed } from './scripts/lib/dev-request-origin.mjs'
 
 const DEV_API_TARGET = process.env.VITE_CAMELID_PROXY_TARGET || 'http://127.0.0.1:8181'
 
@@ -11,7 +12,10 @@ function apiProxy() {
     target: DEV_API_TARGET,
     changeOrigin: true,
     configure(proxy) {
-      proxy.on('proxyReq', (request) => request.setHeader('Origin', DEV_API_TARGET))
+      proxy.on('proxyReq', (request, incoming) => {
+        // Preserve an untrusted origin so the backend can reject its mutation.
+        if (devRequestOriginAllowed(incoming)) request.setHeader('Origin', new URL(DEV_API_TARGET).origin)
+      })
     },
   }
 }
@@ -82,6 +86,7 @@ function camelidBackendLauncher() {
 
       server.middlewares.use('/__camelid/backend/launch', async (req, res) => {
         if (req.method !== 'POST') return json(res, 405, { error: 'POST only' })
+        if (!devRequestOriginAllowed(req)) return json(res, 403, { error: 'Use the local development UI to manage the backend.' })
         if (running()) return json(res, 200, { ...status(), note: 'already running' })
         let command = ''
         try { command = String(JSON.parse((await readBody(req)) || '{}').command || '').trim() } catch { /* noop */ }
@@ -105,6 +110,7 @@ function camelidBackendLauncher() {
 
       server.middlewares.use('/__camelid/backend/stop', (req, res) => {
         if (req.method !== 'POST') return json(res, 405, { error: 'POST only' })
+        if (!devRequestOriginAllowed(req)) return json(res, 403, { error: 'Use the local development UI to manage the backend.' })
         killChild()
         child = null
         return json(res, 200, { available: true, running: false, pid: null, logTail: logs.slice(-60).join('') })

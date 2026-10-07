@@ -168,6 +168,9 @@ server's own origin or an origin explicitly listed with `--cors-origin`. This ch
 applies to simple browser POSTs that do not require a CORS preflight. Origin-less
 command-line clients remain supported; requests carrying a valid explicit API key use
 the normal authenticated policy.
+The development proxy preserves untrusted browser origins rather than relabelling them
+as backend requests. Its launcher and stop controls accept only local development UI
+requests or local origin-less clients.
 
 ### Optional GitHub quota credential for Web Auto
 

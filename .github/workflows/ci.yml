@@ -700,7 +700,7 @@ jobs:
       # mobile geometry, restricted navigation, and credential reuse on reload.
       - name: Frontend LAN Chat authentication smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: npm run smoke:lan-auth
+        run: node scripts/dev-origin-smoke.mjs && npm run smoke:lan-auth
 
       - name: Frontend LAN sharing toggle smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
