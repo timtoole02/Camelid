@@ -3,17 +3,28 @@
 // responses to test cancellation, permissions, and conversation isolation.
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { createServer } from 'vite'
 import react from '@vitejs/plugin-react'
 import { launchBrowser } from './lib/launch-browser.mjs'
 
 const liveApi = process.env.CAMELID_SPEECH_LIVE_API
 const liveWav = process.env.CAMELID_SPEECH_LIVE_WAV
-const state = { installed: false, requests: [], delay: 0, text: 'This is a dictated prompt.' }
+const state = { installed: false, requests: [], abortedUploads: 0, onUploadAbort: null, delay: 0, text: 'This is a dictated prompt.' }
 const handler = async (req, res, next) => {
   if (req.url === '/__speech_fixture.wav' && liveWav) { res.writeHead(200, { 'Content-Type': 'audio/wav' }); res.end(readFileSync(liveWav)); return }
   if (req.url?.startsWith('/api/speech/')) {
-    const chunks = []; for await (const chunk of req) chunks.push(chunk)
+    const chunks = []
+    try {
+      for await (const chunk of req) chunks.push(chunk)
+    } catch (error) {
+      // Switching conversations can cancel fetch before the WAV body arrives.
+      // This is an expected disconnect, not a failed fixture server.
+      if (!req.aborted || error.code !== 'ECONNRESET') throw error
+      state.abortedUploads += 1
+      state.onUploadAbort?.()
+      return
+    }
     state.requests.push({ path: req.url, body: Buffer.concat(chunks) })
     if (liveApi) {
       if (req.url.endsWith('/transcribe')) writeFileSync('../target/voice-input-capture.wav', Buffer.concat(chunks))
@@ -47,6 +58,31 @@ const harness = `    import React, {useState} from 'react';
 const server = await createServer({ configFile: false, plugins: [react(), { name: 'speech-test', resolveId(id) { if (id === '/__voice_harness.js') return '\0voice-harness.js' }, load(id) { if (id === '\0voice-harness.js') return harness }, configureServer(server) { server.middlewares.use(handler) } }], optimizeDeps: { include: ['react', 'react-dom/client'] }, server: { port: 0, host: '127.0.0.1' } })
 await server.listen()
 const base = `http://127.0.0.1:${server.httpServer.address().port}`
+if (!liveApi) {
+  // Reproduce a canceled partial upload deterministically; faster machines
+  // otherwise finish sending the WAV before the browser's cancellation.
+  let upload
+  const cancelOnData = (req) => req.once('data', () => upload.destroy())
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        upload?.destroy()
+        reject(new Error('Fixture did not handle a canceled partial speech upload'))
+      }, 5000)
+      state.onUploadAbort = () => { clearTimeout(timer); resolve() }
+      server.httpServer.once('request', cancelOnData)
+      upload = httpRequest(`${base}/api/speech/transcribe`, { method: 'POST', headers: { 'Content-Length': '1024' } })
+      upload.on('error', (error) => { if (error.code !== 'ECONNRESET') { clearTimeout(timer); reject(error) } })
+      upload.write('partial WAV')
+    })
+    assert.equal(state.abortedUploads, 1)
+    assert.equal(state.requests.length, 0, 'an incomplete upload must not be accepted as a transcription')
+  } finally {
+    state.onUploadAbort = null
+    server.httpServer.removeListener('request', cancelOnData)
+    upload?.destroy()
+  }
+}
 const browser = await launchBrowser({ purpose: 'voice input', headless: true, args: ['--autoplay-policy=no-user-gesture-required', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] })
 const page = await browser.newPage()
 page.setDefaultTimeout(30000)
