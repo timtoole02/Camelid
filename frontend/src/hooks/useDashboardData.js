@@ -27,7 +27,7 @@ import {
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { CONTINUATION_INSTRUCTION, canContinueMessage, joinContinuation, mergeContinuedUsage } from '../lib/chatContinuation'
-import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withVariantAppended } from '../lib/messageVariants'
+import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withActiveVariantUpdated, withVariantAppended } from '../lib/messageVariants'
 import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
 import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
 import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
@@ -1348,6 +1348,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     if (variantOfMessageId && !canBranchMessage(variantMessage)) return
     const reusedMessage = continuedMessage || variantMessage
     const continuationPrefix = continuedMessage ? String(continuedMessage.content || '') : ''
+    const updateContinuedReply = (message, patch = {}) => (
+      continuedMessage ? withActiveVariantUpdated(message, patch) : { ...message, ...patch }
+    )
     const continuedCompletionTokens = continuedMessage
       ? Math.max(0, Number(continuedMessage.usage?.completion_tokens) || 0)
       : 0
@@ -1771,7 +1774,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // its own unverified verdict. Exact verified-but-limited rows still keep
       // their contract status in support_row.
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
-      const assistantMessageBase = {
+      const assistantMessageBase = updateContinuedReply({
         ...(continuedMessage || {}),
         /* A variant is a FRESH reply that only shares an id and a sibling
            list. Spreading the old reply here would carry its receipt, its web
@@ -1813,7 +1816,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         web_research_ms: webResearchMs,
         ...(Array.isArray(citations) && citations.length ? { citations } : {}),
         ...(researchAtSend ? { web_research: researchAtSend } : {}),
-      }
+      })
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
           ? {
@@ -1999,7 +2002,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 ...item,
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
-                    ? { ...message, ...patch, ...contentPatchForContinuation(patch) }
+                    ? updateContinuedReply(message, { ...patch, ...contentPatchForContinuation(patch) })
                     : message
                 )),
                 updated_at: nowIso(),
@@ -2252,7 +2255,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         }
       }
       const streamedContent = paceDrain(pacer, streamed.content || '')
-      const assistantMessage = {
+      const assistantMessage = updateContinuedReply({
         ...assistantMessageBase,
         // File format describes the saved text, not evidence of decoder enforcement.
         output_format: constraining ? (structuredMode === 'grammar' ? 'text' : 'json') : null,
@@ -2299,7 +2302,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         first_byte_ms: streamed.firstByteMs ?? null,
         first_event_ms: streamed.firstEventMs ?? null,
         first_content_ms: modelTtftMs,
-      }
+      })
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
           ? {
@@ -2357,14 +2360,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
                     ? (() => {
-                        const patchedMessage = { ...message, ...(pendingPatchAtFailure || {}) }
-                        return {
-                          ...patchedMessage,
-                          content: patchedMessage.content && patchedMessage.content !== '…' ? patchedMessage.content : '(generation stopped)',
+                        const patch = pendingPatchAtFailure || {}
+                        const content = continuedMessage && patch.content !== undefined
+                          ? joinContinuation(continuationPrefix, patch.content)
+                          : patch.content ?? message.content
+                        return updateContinuedReply(message, {
+                          ...patch,
+                          content: content && content !== '…' ? content : '(generation stopped)',
                           finish_reason: requestWasAborted ? 'interrupted' : 'error',
                           streaming: false,
                           streaming_phase: null,
-                        }
+                        })
                       })()
                     : message
                 )),

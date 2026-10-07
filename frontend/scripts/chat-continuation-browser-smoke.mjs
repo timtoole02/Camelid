@@ -222,6 +222,8 @@ const storedMessages = () => page.evaluate(() => {
       finish_reason: message.finish_reason || null,
       continuation_count: message.continuation_count || 0,
       usage: message.usage || null,
+      variants: message.variants || null,
+      active_variant: message.active_variant ?? null,
     }))
 })
 
@@ -334,6 +336,47 @@ try {
     0,
     'the continuation instruction must not be replayed on later turns',
   )
+
+  /* ---- 6. a regenerated reply can be continued and reloaded ------------- */
+  await sendPrompt(PROMPT)
+  await waitForIdleAnswer(TRUNCATED)
+  const regenerateButtons = await page.$$('button[aria-label^="Regenerate response"]')
+  await regenerateButtons.at(-1).click()
+  await page.waitForFunction(() => {
+    const records = JSON.parse(localStorage.getItem('camelid.conversations') || '[]')
+    const conversation = records.find((item) => item.id === localStorage.getItem('camelid.selectedConversationId')) || records[0]
+    const last = conversation?.messages?.at(-1)
+    return last?.variants?.length === 2 && !last.streaming
+  }, { timeout: 30000 })
+  const beforeContinue = (await storedMessages()).at(-1)
+  assert.equal(beforeContinue.finish_reason, 'length')
+  await page.click('.cxturn__warning-action')
+  await page.waitForFunction((expected) => {
+    const records = JSON.parse(localStorage.getItem('camelid.conversations') || '[]')
+    const conversation = records.find((item) => item.id === localStorage.getItem('camelid.selectedConversationId')) || records[0]
+    const last = conversation?.messages?.at(-1)
+    return last?.content === expected && last.finish_reason === 'stop' && !last.streaming
+  }, { timeout: 30000 }, MERGED)
+  const continuedVariant = (await storedMessages()).at(-1)
+  assert.equal(continuedVariant.variants.length, 2, 'continuing updates a sibling instead of creating one')
+  assert.deepEqual(continuedVariant.variants[0], beforeContinue.variants[0], 'the original reply is untouched')
+  assert.equal(continuedVariant.variants[1].content, MERGED)
+  assert.equal(continuedVariant.variants[1].continuation_count, 1)
+  assert.equal(continuedVariant.variants[1].usage.completion_tokens, 28)
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.waitForSelector('main[data-view="chat"]', { timeout: 30000 })
+  await page.waitForFunction((expected) => (
+    [...document.querySelectorAll('.cxturn--assistant .cxturn__body')].at(-1)?.textContent.includes(expected)
+  ), { timeout: 30000 }, MERGED)
+  assert.equal((await storedMessages()).at(-1).content, MERGED, 'reloading keeps the continued variant')
+  await page.click('button[aria-label="Previous version of this reply"]')
+  await page.waitForFunction((expected) => (
+    [...document.querySelectorAll('.cxturn--assistant .cxturn__body')].at(-1)?.textContent.includes(expected)
+  ), { timeout: 30000 }, TRUNCATED)
+  await page.click('button[aria-label="Next version of this reply"]')
+  await page.waitForFunction((expected) => (
+    [...document.querySelectorAll('.cxturn--assistant .cxturn__body')].at(-1)?.textContent.includes(expected)
+  ), { timeout: 30000 }, MERGED)
 
   assert.deepEqual(pageErrors, [], 'the page must not raise errors')
   assert.deepEqual(externalRequests, [], 'the smoke must not reach anything off-origin')
