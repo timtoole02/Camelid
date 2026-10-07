@@ -6,6 +6,8 @@
 //! the whole library, named documents, or named collections
 //! (see `document_collections`).
 
+mod storage;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::sync::{Mutex, OnceLock};
@@ -88,8 +90,12 @@ fn ensure_citation_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+pub(super) fn library_exists() -> bool {
+    storage::library_exists()
+}
+
 pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
-    let path = super::document_storage::prepare_path()?;
+    let path = storage::prepare_path()?;
     let conn = Connection::open(&path)?;
     conn.execute("PRAGMA foreign_keys = ON;", [])?;
     init_db(&conn)?;

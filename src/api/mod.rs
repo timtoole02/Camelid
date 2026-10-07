@@ -35,7 +35,6 @@ mod continuous_batch;
 mod contract;
 pub(crate) mod document_collections;
 pub(crate) mod document_folders;
-mod document_storage;
 pub(crate) mod document_vectors;
 pub(crate) mod documents;
 mod engine;

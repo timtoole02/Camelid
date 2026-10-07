@@ -115,8 +115,23 @@ fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
     if destination.exists() || !eligible_legacy(legacy) {
         return Ok(());
     }
+    // macOS aliases /var to /private/var. Resolve directory aliases while
+    // leaving the database filename unresolved so NOFOLLOW still guards it.
+    let source_path = legacy
+        .parent()
+        .ok_or_else(|| rusqlite::Error::InvalidPath(legacy.into()))?
+        .canonicalize()
+        .map_err(io_error)?
+        .join(
+            legacy
+                .file_name()
+                .ok_or_else(|| rusqlite::Error::InvalidPath(legacy.into()))?,
+        );
+    if !eligible_legacy(&source_path) {
+        return Ok(());
+    }
     let source = Connection::open_with_flags(
-        legacy,
+        source_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     source.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -174,7 +189,7 @@ mod tests {
         source
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
             .unwrap();
-        super::super::documents::init_db(&source).unwrap();
+        super::super::init_db(&source).unwrap();
         source.execute_batch(
             "INSERT INTO documents (id,filename,file_type,byte_size,chunk_count,created_at) VALUES ('doc','notes.txt','txt',5,1,1);
              INSERT INTO document_chunks (id,doc_id,chunk_index,content) VALUES (17,'doc',0,'hello');
@@ -209,6 +224,29 @@ mod tests {
         migrate(&legacy, &destination).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"current library");
         assert!(legacy.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_accepts_system_directory_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().canonicalize().unwrap().join("temporary");
+        fs::create_dir(&target).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let source = Connection::open(target.join("legacy.sqlite3")).unwrap();
+        source
+            .execute_batch("CREATE TABLE notes (text TEXT); INSERT INTO notes VALUES ('saved');")
+            .unwrap();
+        let destination = root.path().join(DB_FILE);
+        migrate(&alias.join("legacy.sqlite3"), &destination).unwrap();
+        let saved = Connection::open(destination).unwrap();
+        assert_eq!(
+            saved
+                .query_row("SELECT text FROM notes", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "saved"
+        );
     }
 
     #[cfg(unix)]
