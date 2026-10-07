@@ -14,6 +14,7 @@ import {
   renameCollection,
 } from '../../lib/knowledgeCollections.js'
 import { WatchedFolders } from './WatchedFolders.jsx'
+import { getApiBase } from '../../lib/apiBase.js'
 import '../../styles/project-context.css'
 import '../../styles/knowledge.css'
 
@@ -25,6 +26,7 @@ const byFilename = (a, b) => a.filename.localeCompare(b.filename, undefined, { s
 /* Manage collections and their documents. Opened from the chat, it can also
    turn searching a collection on or off for that chat. */
 export function KnowledgeLibrary({ collections, refresh, initialCollectionId = null, searchedIds = null, onToggleSearch = null, onClose, busy = false }) {
+  const apiBase = getApiBase()
   const [documents, setDocuments] = useState(null)
   const [selectedId, setSelectedId] = useState(initialCollectionId)
   const [newName, setNewName] = useState('')
@@ -38,9 +40,14 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
   const uploadRef = useRef(null)
 
   const loadDocuments = useCallback(async () => {
-    try { setDocuments(await listLibraryDocuments()) } catch (failure) { setError(failure.message) }
-  }, [])
-  useEffect(() => { loadDocuments() }, [loadDocuments])
+    try {
+      const next = await listLibraryDocuments()
+      if (getApiBase() === apiBase) setDocuments(next)
+    } catch (failure) {
+      if (getApiBase() === apiBase) setError(failure.message)
+    }
+  }, [apiBase])
+  useEffect(() => { setDocuments(null); loadDocuments() }, [loadDocuments])
   const refreshAll = useCallback(() => Promise.all([refresh(), loadDocuments()]), [refresh, loadDocuments])
 
   const list = collections || []

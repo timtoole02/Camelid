@@ -2,6 +2,8 @@
    or a project searches when a message is sent. The server owns them; the chat
    and project context store only collection ids. */
 
+import { apiFetch } from './apiRequest.js'
+
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 export const DOCUMENT_ACCEPT = '.pdf,.docx,.md,.txt,.csv,.json'
@@ -31,7 +33,7 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
 export async function ingestLibraryFile(file, collectionIds = [], name = file.name) {
   const lowerName = name.toLowerCase()
   const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
-  const response = await fetch('/api/documents/ingest', {
+  const response = await apiFetch('/api/documents/ingest', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
@@ -77,7 +79,7 @@ export async function filesFromDrop(dataTransfer) {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, options)
+  const response = await apiFetch(path, options)
   if (response.status === 204) return null
   const body = await response.json().catch(() => null)
   if (!response.ok) throw new Error(body?.error?.message || `The library request failed (${response.status}).`)

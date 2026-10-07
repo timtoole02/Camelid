@@ -3,11 +3,13 @@
    only this web UI on the computer running Camelid. */
 
 import { browseWorkspaceFolders } from './workspaceAgent.js'
+import { apiFetch } from './apiRequest.js'
+import { getApiBase } from './apiBase.js'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, options)
+  const response = await apiFetch(path, options)
   if (response.status === 204) return null
   const body = await response.json().catch(() => null)
   if (!response.ok) throw new Error(body?.error?.message || `The folder request failed (${response.status}).`)
@@ -63,7 +65,7 @@ export const scanFolder = async id => normalizeFolder(await request(`/api/folder
 
 export const unwatchFolder = id => request(`/api/folders/${encodeURIComponent(id)}`, { method: 'DELETE' })
 
-export const browseFolders = path => browseWorkspaceFolders('', path)
+export const browseFolders = path => browseWorkspaceFolders(getApiBase(), path)
 
 export const SKIP_REASONS = {
   too_large: 'larger than 64 MB',

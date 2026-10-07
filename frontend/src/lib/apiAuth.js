@@ -1,6 +1,7 @@
 import { appStorage } from './appStorage.js'
+import { getApiBase } from './apiBase.js'
 
-export const API_BASE_STORAGE_KEY = 'camelid.apiBase'
+export { API_BASE_STORAGE_KEY } from './apiBase.js'
 export const API_KEY_STORAGE_KEY = 'camelid.apiKey'
 
 export function getStoredApiKey() {
@@ -25,7 +26,7 @@ export function installApiAuthFetch() {
 
     try {
       const requestUrl = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, window.location.href)
-      const configuredBase = appStorage.getItem(API_BASE_STORAGE_KEY) || window.location.origin
+      const configuredBase = getApiBase()
       const apiOrigin = new URL(configuredBase, window.location.href).origin
       if (requestUrl.origin !== apiOrigin) return nativeFetch(input, init)
 

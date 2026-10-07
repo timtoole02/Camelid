@@ -18,6 +18,7 @@ import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
 import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
+import { API_BASE_STORAGE_KEY, getApiBase, normalizeApiBase } from '../lib/apiBase.js'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -70,20 +71,7 @@ const SELECTED_MODEL_STORAGE_KEY = 'camelid.selectedModelId'
 const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
-const API_BASE_STORAGE_KEY = 'camelid.apiBase'
 const VALID_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'divergence', 'compatibility', 'telemetry', 'arena', 'observatory'])
-// Where the UI looks for the camelid API by default:
-//   1. an explicit VITE_CAMELID_API_BASE override always wins;
-//   2. otherwise use the page origin. Production is served by Camelid directly;
-//      Vite development proxies API routes to the local backend.
-function defaultApiBase() {
-  if (import.meta.env?.VITE_CAMELID_API_BASE) return import.meta.env.VITE_CAMELID_API_BASE
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    return window.location.origin
-  }
-  return 'http://127.0.0.1:8181'
-}
-const DEFAULT_API_BASE = defaultApiBase()
 
 function getInitialTab() {
   if (typeof window === 'undefined') return 'chat'
@@ -99,15 +87,6 @@ function getInitialConversationId() {
 function getInitialModelId() {
   if (typeof window === 'undefined') return ''
   return appStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || ''
-}
-
-function getApiBase() {
-  if (typeof window === 'undefined') return DEFAULT_API_BASE
-  return appStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE
-}
-
-function normalizeApiBase(value) {
-  return (value || DEFAULT_API_BASE).trim().replace(/\/$/, '')
 }
 
 function readJsonStorage(key, fallback) {

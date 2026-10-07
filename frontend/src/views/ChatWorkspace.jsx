@@ -1,5 +1,6 @@
 import { ToolActivityCard } from '../components/mcp/ToolActivityCard'
 import { toolActivityGroups } from '../lib/toolActivity.js'
+import { apiFetch } from '../lib/apiRequest.js'
 import { ComposerMenu } from '../components/chat/ComposerMenu'
 import { ConversationContext } from '../components/context/ContextEditors'
 import { contextCollectionRefs, contextSourceMessages, chatHistoryForRequest, normalizeChatContext, withCollection, withoutCollection } from '../lib/projectContext.js'
@@ -564,11 +565,11 @@ export default function ChatWorkspace({
   // Document ids contain no file contents or local paths. Persist this small
   // association so an attached RAG source survives a reload, app navigation,
   // or a second browser tab. Reconcile it against the server when possible so
-  // a cleaned temporary database cannot leave a permanently stale pill.
+  // a removed document cannot leave a permanently stale pill.
   useEffect(() => {
     let cancelled = false
     if (attachedDocuments.length) {
-      fetch('/api/documents')
+      apiFetch('/api/documents')
         .then((response) => (response.ok ? response.json() : null))
         .then((documents) => {
           if (cancelled || !Array.isArray(documents)) return
@@ -590,10 +591,10 @@ export default function ChatWorkspace({
       cancelled = true
       window.removeEventListener('storage', handleStorage)
     }
-    // Reconcile the persisted initial snapshot once; later edits already come
-    // from successful ingest/remove actions in this component.
+    // Reconcile against each selected backend; later edits already come from
+    // successful ingest/remove actions in this component.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [apiBase])
 
   // Semantic indexing runs in the background after an upload. Poll only while
   // an attached document is still being indexed; keyword search needs none of it.
@@ -607,11 +608,12 @@ export default function ChatWorkspace({
       return undefined
     }
     const ids = watchedDocIdsKey ? watchedDocIdsKey.split('\n') : []
+    setIndexStatus(null)
     let cancelled = false
     let timer = null
     const poll = async () => {
       try {
-        const res = await fetch('/api/documents/index-status')
+        const res = await apiFetch('/api/documents/index-status')
         const status = res.ok ? await res.json() : null
         if (cancelled || !status?.semantic) return
         const byId = Object.fromEntries((status.documents || []).map((doc) => [doc.id, doc]))
@@ -630,7 +632,7 @@ export default function ChatWorkspace({
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [watchedDocIdsKey, searchLibrary])
+  }, [watchedDocIdsKey, searchLibrary, apiBase])
 
   useEffect(() => {
     if (!followActive) return undefined
@@ -738,7 +740,7 @@ export default function ChatWorkspace({
 
     const verify = async () => {
       try {
-        const res = await fetch('/api/documents/citation/resolve', {
+        const res = await apiFetch('/api/documents/citation/resolve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -775,7 +777,7 @@ export default function ChatWorkspace({
     return () => {
       cancelled = true
     }
-  }, [activeCitation])
+  }, [activeCitation, apiBase])
 
   const handleDocumentFiles = async (files) => {
     if (!files || !files.length) return
@@ -825,7 +827,7 @@ export default function ChatWorkspace({
         ...(searchedCollections.length > 0 ? { collection_ids: searchedCollections.map((c) => c.id) } : {}),
         top_k: 4,
       }
-      const search = (body) => fetch('/api/documents/search', {
+      const search = (body) => apiFetch('/api/documents/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /* Browser-level acceptance for knowledge collections.
  *
- * Requires `npm run build` first. One ephemeral loopback server serves the
- * compiled app and an in-memory collections API with the server's rules;
- * every cross-origin request is aborted.
+ * Requires `npm run build` first. Separate loopback UI and authenticated API
+ * fixtures verify the saved backend setting; every other origin is aborted.
  *
  *   - the knowledge library creates, renames, fills, empties and deletes a
  *     collection, and reports a clashing name
@@ -59,6 +58,9 @@ const ingestRequests = []
 const chatRequests = []
 const pageErrors = []
 const externalRequests = []
+const wrongBackendRequests = []
+let uiOrigin = ''
+const API_KEY = 'collections-fixture-key'
 
 const bind = (n) => ({ chunk_sha256: String(n).repeat(64).slice(0, 64), doc_sha256: 'd'.repeat(64) })
 const RESULTS = [
@@ -140,7 +142,14 @@ function collectionsApi(req, res, path, body) {
 
 const server = createServer(async (req, res) => {
   try {
+    res.setHeader('Access-Control-Allow-Origin', uiOrigin)
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-API-Key,Authorization')
+    if (req.method === 'OPTIONS') return res.writeHead(204).end()
     const path = new URL(req.url, 'http://127.0.0.1').pathname
+    if ((path.startsWith('/api/') || path.startsWith('/v1/')) && req.headers['x-api-key'] !== API_KEY) {
+      return apiError(res, 401, 'unauthorized', 'The fixture requires its API key.')
+    }
     if (path === '/v1/health') {
       return sendJson(res, 200, {
         ok: true, engine: 'camelid', api_surface: lanOnly ? 'lan_chat_only' : 'full',
@@ -216,7 +225,18 @@ const server = createServer(async (req, res) => {
 })
 
 await new Promise((done) => server.listen(0, '127.0.0.1', done))
-const origin = `http://127.0.0.1:${server.address().port}`
+const apiOrigin = `http://127.0.0.1:${server.address().port}`
+const uiServer = createServer((req, res) => {
+  const path = new URL(req.url, 'http://127.0.0.1').pathname
+  if (path.startsWith('/api/documents') || path.startsWith('/api/collections')) {
+    wrongBackendRequests.push(path)
+    return apiError(res, 404, 'wrong_backend', 'The library belongs to the configured API server.')
+  }
+  const filePath = resolve(distDir, `.${path}`)
+  return sendFile(res, path !== '/' && isFile(filePath) ? filePath : resolve(distDir, 'index.html'))
+})
+await new Promise((done) => uiServer.listen(0, '127.0.0.1', done))
+const origin = uiOrigin = `http://127.0.0.1:${uiServer.address().port}`
 
 const browser = await launchBrowser({ purpose: 'the knowledge collections browser smoke', headless: 'new' })
 const page = await browser.newPage()
@@ -226,15 +246,17 @@ await page.setRequestInterception(true)
 page.on('request', (request) => {
   const url = request.url()
   if (url.startsWith('data:') || url.startsWith('blob:')) return request.continue()
-  try { if (new URL(url).origin === origin) return request.continue() } catch { /* abort below */ }
+  try { if ([origin, apiOrigin].includes(new URL(url).origin)) return request.continue() } catch { /* abort below */ }
   externalRequests.push(url)
   return request.abort()
 })
-await page.evaluateOnNewDocument(() => {
+await page.evaluateOnNewDocument((apiBase, key) => {
   if (window.sessionStorage.getItem('camelid.collectionsSmokeInitialized')) return
   window.localStorage.clear()
+  window.localStorage.setItem('camelid.apiBase', apiBase)
+  window.localStorage.setItem('camelid.apiKey', key)
   window.sessionStorage.setItem('camelid.collectionsSmokeInitialized', 'true')
-})
+}, apiOrigin, API_KEY)
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 const composerReady = 'textarea[aria-label="Message Camelid"]:not([disabled])'
@@ -452,9 +474,11 @@ try {
   assert.equal(collectionsCalls.length, callsBefore, 'the LAN chat surface never asks for collections')
 
   assert.deepEqual(pageErrors, [], 'the page must not raise errors')
-  assert.deepEqual(externalRequests, [], 'the smoke must not reach anything off-origin')
+  assert.deepEqual(wrongBackendRequests, [], 'every library request reaches the configured backend')
+  assert.deepEqual(externalRequests, [], 'the smoke must not reach anything outside its two fixtures')
   console.log('knowledge collections browser smoke passed')
 } finally {
   await browser.close()
+  await new Promise((done) => uiServer.close(done))
   await new Promise((done) => server.close(done))
 }

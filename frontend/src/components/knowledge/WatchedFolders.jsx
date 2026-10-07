@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { IconFolder } from '../ui/icons'
+import { getApiBase } from '../../lib/apiBase.js'
 import {
   browseFolders,
   describeChanges,
@@ -22,6 +23,7 @@ const changedSomething = changes => Boolean(changes && (changes.added || changes
    library, so the collection's document list catches up. A check the server's
    timer runs usually starts and ends between two polls. */
 export function WatchedFolders({ collection, onChanged, disabled = false }) {
+  const apiBase = getApiBase()
   const [folders, setFolders] = useState(null)
   const [error, setError] = useState('')
   // Kept apart from `error` so the next successful poll clears a failed one
@@ -39,13 +41,15 @@ export function WatchedFolders({ collection, onChanged, disabled = false }) {
 
   const load = useCallback(async () => {
     try {
-      setFolders(await listFolders())
+      const next = await listFolders()
+      if (getApiBase() !== apiBase) return
+      setFolders(next)
       setLoadError('')
     } catch (failure) {
-      setLoadError(failure.message)
+      if (getApiBase() === apiBase) setLoadError(failure.message)
     }
-  }, [])
-  useEffect(() => { load() }, [load])
+  }, [apiBase])
+  useEffect(() => { setFolders(null); seenChecks.current = null; load() }, [load])
   useEffect(() => {
     const timer = window.setInterval(load, busy ? BUSY_POLL_MS : IDLE_POLL_MS)
     return () => window.clearInterval(timer)

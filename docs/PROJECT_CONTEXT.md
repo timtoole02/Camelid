@@ -38,6 +38,12 @@ rounds. Context edits are disabled while a response or tool run is active.
 
 ## Knowledge collections
 
+Uploads, library searches, collections, indexing status, and source verification use
+the backend selected under **Settings → API base URL**, with its configured API key.
+Changing that backend refreshes the library lists. A backend on another origin must
+allow the UI's origin with `--cors-origin`; local folder access keeps its existing
+same-origin loopback restrictions.
+
 A knowledge collection is a named set of documents from the Knowledge Library.
 Open **Attach → Collections** in the composer to create, rename, or delete a
 collection, add library documents to it or remove them, or upload files straight
