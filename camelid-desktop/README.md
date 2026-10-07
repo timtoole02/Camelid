@@ -50,6 +50,9 @@ The sidecar receives a new ephemeral port on each launch, so browser-origin stor
 the desktop app's durable authority. Before React starts, the shell hydrates Camelid-owned UI
 state from `ui-storage-v1.json` in the per-user application-data directory. Writes are mirrored
 there through scoped commands; the regular browser build continues to use `localStorage`.
+Launching Camelid Desktop again brings the running app's main window forward instead of
+opening another instance. Storage transactions also lock and reload the current document
+before updating a key, so a stale state cannot overwrite unrelated saved conversations or settings.
 
 ## Windows in-place upgrades
 
