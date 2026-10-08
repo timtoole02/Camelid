@@ -14,6 +14,7 @@ import {
   renameCollection,
 } from '../../lib/knowledgeCollections.js'
 import { WatchedFolders } from './WatchedFolders.jsx'
+import { getApiBase } from '../../lib/apiBase.js'
 import '../../styles/project-context.css'
 import '../../styles/knowledge.css'
 
@@ -24,7 +25,9 @@ const byFilename = (a, b) => a.filename.localeCompare(b.filename, undefined, { s
 
 /* Manage collections and their documents. Opened from the chat, it can also
    turn searching a collection on or off for that chat. */
-export function KnowledgeLibrary({ collections, refresh, initialCollectionId = null, searchedIds = null, onToggleSearch = null, onClose, busy = false }) {
+export function KnowledgeLibrary({ collections, refresh, initialCollectionId = null, searchedIds = null, onToggleSearch = null, onClose, busy = false, apiBase = getApiBase() }) {
+  const currentBase = useRef(apiBase)
+  currentBase.current = apiBase
   const [documents, setDocuments] = useState(null)
   const [selectedId, setSelectedId] = useState(initialCollectionId)
   const [newName, setNewName] = useState('')
@@ -38,9 +41,14 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
   const uploadRef = useRef(null)
 
   const loadDocuments = useCallback(async () => {
-    try { setDocuments(await listLibraryDocuments()) } catch (failure) { setError(failure.message) }
-  }, [])
-  useEffect(() => { loadDocuments() }, [loadDocuments])
+    try {
+      const next = await listLibraryDocuments(apiBase)
+      if (currentBase.current === apiBase) setDocuments(next)
+    } catch (failure) {
+      if (currentBase.current === apiBase) setError(failure.message)
+    }
+  }, [apiBase])
+  useEffect(() => { setDocuments(null); loadDocuments() }, [loadDocuments])
   const refreshAll = useCallback(() => Promise.all([refresh(), loadDocuments()]), [refresh, loadDocuments])
 
   const list = collections || []
@@ -62,7 +70,7 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
     const name = newName.trim()
     if (!name) return
     run('create', async () => {
-      const created = await createCollection(name)
+      const created = await createCollection(name, apiBase)
       await refresh()
       setSelectedId(created.id)
       setNewName('')
@@ -71,18 +79,18 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
   const saveRename = event => {
     event.preventDefault()
     run('rename', async () => {
-      await renameCollection(selected.id, renameDraft)
+      await renameCollection(selected.id, renameDraft, apiBase)
       await refresh()
       setRenameDraft(null)
     })
   }
   const addPicked = () => run('add', async () => {
-    await addCollectionDocuments(selected.id, [...picked])
+    await addCollectionDocuments(selected.id, [...picked], apiBase)
     await refresh()
     setPicked(new Set())
   })
   const remove = doc => run(`remove:${doc.id}`, async () => {
-    await removeCollectionDocument(selected.id, doc.id)
+    await removeCollectionDocument(selected.id, doc.id, apiBase)
     await refresh()
   })
   const upload = (items, skippedTypes = 0) => run('upload', async () => {
@@ -90,7 +98,7 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
     try {
       for (const [index, { file, name }] of items.entries()) {
         setUploadProgress({ done: index, total: items.length })
-        try { await ingestLibraryFile(file, [selected.id], name) } catch (failure) { failures.push(failure.message) }
+        try { await ingestLibraryFile(file, [selected.id], name, apiBase) } catch (failure) { failures.push(failure.message) }
       }
     } finally {
       setUploadProgress(null)
@@ -122,7 +130,7 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
   }
   const removeCollection = () => run('delete', async () => {
     setConfirmDelete(false)
-    await deleteCollection(selected.id)
+    await deleteCollection(selected.id, apiBase)
     const next = await refresh()
     setSelectedId(next?.[0]?.id || null)
   })
@@ -209,7 +217,7 @@ export function KnowledgeLibrary({ collections, refresh, initialCollectionId = n
             <input ref={uploadRef} type="file" multiple hidden accept={DOCUMENT_ACCEPT} aria-label={`Upload files into ${selected.name}`} onChange={event => { pickFiles(event.target.files); event.target.value = '' }} />
             <p className="context-muted knowledge-drop-hint">{dropping ? `Drop to add to ${selected.name}` : 'Or drop files or folders here.'}</p>
           </div>
-          <WatchedFolders collection={selected} onChanged={refreshAll} disabled={disabled} />
+          <WatchedFolders collection={selected} onChanged={refreshAll} disabled={disabled} apiBase={apiBase} />
         </section> : <section className="knowledge-detail knowledge-detail--empty">
           <p className="context-muted">Create a collection to group documents, then use it in a chat or a project.</p>
         </section>}

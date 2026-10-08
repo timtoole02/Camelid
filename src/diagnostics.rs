@@ -10,9 +10,8 @@
 //! lifecycle facts* — nothing else. The contract:
 //!
 //! * **The engine owns the file.** Nothing extra is written to stderr for the
-//!   desktop to scrape: `camelid-desktop` retains a piped stderr that it drains
-//!   only on a startup failure, so a chatty stderr would fill the OS pipe buffer
-//!   and block the engine — a hang caused by the diagnostics feature. The one
+//!   desktop to scrape: `camelid-desktop` continuously drains stderr into a
+//!   bounded in-memory tail, while this journal remains the durable authority. The one
 //!   deliberate exception is a single line at startup naming this file's path,
 //!   emitted next to the existing ready banner: without it the journal is
 //!   undiscoverable, and one bounded line per run cannot fill a pipe buffer.

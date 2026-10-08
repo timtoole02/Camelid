@@ -88,6 +88,21 @@ export function withVariantAppended(message, next) {
   }
 }
 
+/* Streaming and continuing a reply update the selected sibling in place.
+   Keep its snapshot current before storage normalization mirrors it back. */
+export function withActiveVariantUpdated(message, patch = {}) {
+  const updated = { ...message, ...patch }
+  if (!hasVariants(message)) return updated
+  const active = activeVariantIndexOf(message)
+  return {
+    ...updated,
+    variants: variantsOf(message).map((variant, index) => (
+      index === active ? snapshotVariant(updated) : variant
+    )),
+    active_variant: active,
+  }
+}
+
 /* Discard the active variant and select a neighbour. Returns the message
    unchanged when it is the last one standing: deleting it would leave a reply
    with no content, and the transcript has no way to render that. */

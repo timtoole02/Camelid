@@ -18,6 +18,7 @@ import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
 import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
+import { API_BASE_STORAGE_KEY, getApiBase, normalizeApiBase } from '../lib/apiBase.js'
 import { composeContextBudget } from '../lib/contextBudget.js'
 import {
   AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -27,7 +28,7 @@ import {
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { CONTINUATION_INSTRUCTION, canContinueMessage, joinContinuation, mergeContinuedUsage } from '../lib/chatContinuation'
-import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withVariantAppended } from '../lib/messageVariants'
+import { canBranchMessage, variantsOf, withActiveVariant, withActiveVariantRemoved, withActiveVariantUpdated, withVariantAppended } from '../lib/messageVariants'
 import { inspectionAbsenceReason, inspectionForcesNonStreaming, inspectionRequestFields, normalizeInspection, readInspectionContract } from '../lib/tokenInspection'
 import { STRUCTURED_MODES, DEFAULT_SCHEMA, DEFAULT_GRAMMAR, readStructuredOutputContract, structuredOutputForcesNonStreaming, structuredOutputRequestFields, structuredOutputReadiness } from '../lib/structuredOutput'
 import { DEFAULT_TOOLS, detectRepeatedCall, normalizeToolCalls, readModelToolCapability, readToolContract, toolCallSignature, toolReadiness, toolRequestFields } from '../lib/toolCalling'
@@ -70,20 +71,7 @@ const SELECTED_MODEL_STORAGE_KEY = 'camelid.selectedModelId'
 const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
-const API_BASE_STORAGE_KEY = 'camelid.apiBase'
 const VALID_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'divergence', 'compatibility', 'telemetry', 'arena', 'observatory'])
-// Where the UI looks for the camelid API by default:
-//   1. an explicit VITE_CAMELID_API_BASE override always wins;
-//   2. otherwise use the page origin. Production is served by Camelid directly;
-//      Vite development proxies API routes to the local backend.
-function defaultApiBase() {
-  if (import.meta.env?.VITE_CAMELID_API_BASE) return import.meta.env.VITE_CAMELID_API_BASE
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    return window.location.origin
-  }
-  return 'http://127.0.0.1:8181'
-}
-const DEFAULT_API_BASE = defaultApiBase()
 
 function getInitialTab() {
   if (typeof window === 'undefined') return 'chat'
@@ -99,15 +87,6 @@ function getInitialConversationId() {
 function getInitialModelId() {
   if (typeof window === 'undefined') return ''
   return appStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || ''
-}
-
-function getApiBase() {
-  if (typeof window === 'undefined') return DEFAULT_API_BASE
-  return appStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE
-}
-
-function normalizeApiBase(value) {
-  return (value || DEFAULT_API_BASE).trim().replace(/\/$/, '')
 }
 
 function readJsonStorage(key, fallback) {
@@ -1348,6 +1327,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     if (variantOfMessageId && !canBranchMessage(variantMessage)) return
     const reusedMessage = continuedMessage || variantMessage
     const continuationPrefix = continuedMessage ? String(continuedMessage.content || '') : ''
+    const updateContinuedReply = (message, patch = {}) => (
+      continuedMessage ? withActiveVariantUpdated(message, patch) : { ...message, ...patch }
+    )
     const continuedCompletionTokens = continuedMessage
       ? Math.max(0, Number(continuedMessage.usage?.completion_tokens) || 0)
       : 0
@@ -1771,7 +1753,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // its own unverified verdict. Exact verified-but-limited rows still keep
       // their contract status in support_row.
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
-      const assistantMessageBase = {
+      const assistantMessageBase = updateContinuedReply({
         ...(continuedMessage || {}),
         /* A variant is a FRESH reply that only shares an id and a sibling
            list. Spreading the old reply here would carry its receipt, its web
@@ -1813,7 +1795,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         web_research_ms: webResearchMs,
         ...(Array.isArray(citations) && citations.length ? { citations } : {}),
         ...(researchAtSend ? { web_research: researchAtSend } : {}),
-      }
+      })
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
           ? {
@@ -1999,7 +1981,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 ...item,
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
-                    ? { ...message, ...patch, ...contentPatchForContinuation(patch) }
+                    ? updateContinuedReply(message, { ...patch, ...contentPatchForContinuation(patch) })
                     : message
                 )),
                 updated_at: nowIso(),
@@ -2252,7 +2234,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         }
       }
       const streamedContent = paceDrain(pacer, streamed.content || '')
-      const assistantMessage = {
+      const assistantMessage = updateContinuedReply({
         ...assistantMessageBase,
         // File format describes the saved text, not evidence of decoder enforcement.
         output_format: constraining ? (structuredMode === 'grammar' ? 'text' : 'json') : null,
@@ -2299,7 +2281,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         first_byte_ms: streamed.firstByteMs ?? null,
         first_event_ms: streamed.firstEventMs ?? null,
         first_content_ms: modelTtftMs,
-      }
+      })
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
           ? {
@@ -2357,14 +2339,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
                     ? (() => {
-                        const patchedMessage = { ...message, ...(pendingPatchAtFailure || {}) }
-                        return {
-                          ...patchedMessage,
-                          content: patchedMessage.content && patchedMessage.content !== '…' ? patchedMessage.content : '(generation stopped)',
+                        const patch = pendingPatchAtFailure || {}
+                        const content = continuedMessage && patch.content !== undefined
+                          ? joinContinuation(continuationPrefix, patch.content)
+                          : patch.content ?? message.content
+                        return updateContinuedReply(message, {
+                          ...patch,
+                          content: content && content !== '…' ? content : '(generation stopped)',
                           finish_reason: requestWasAborted ? 'interrupted' : 'error',
                           streaming: false,
                           streaming_phase: null,
-                        }
+                        })
                       })()
                     : message
                 )),

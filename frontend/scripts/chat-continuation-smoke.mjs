@@ -106,6 +106,51 @@ try {
   assert.equal(continuationCountOf({}), 0, 'a reply that was never continued reports zero, not NaN')
   assert.match(CONTINUATION_INSTRUCTION, /Do not repeat any text/, 'the instruction must forbid restating')
 
+  /* ---- continuing a regenerated reply survives storage normalization ---- */
+  const { withVariantAppended, withActiveVariant, withActiveVariantUpdated } =
+    await server.ssrLoadModule('/src/lib/messageVariants.js')
+  const { normalizeStoredConversations } = await server.ssrLoadModule('/src/lib/conversationStorage.js')
+  const original = { id: 'variants', role: 'assistant', content: 'original answer', finish_reason: 'stop' }
+  const regenerated = withVariantAppended(original, {
+    ...original, content: 'partial reply', finish_reason: 'length',
+    usage: { prompt_tokens: 10, completion_tokens: 20 },
+  })
+  const roundTrip = (message) => normalizeStoredConversations(
+    JSON.parse(JSON.stringify([{ id: 'continuation', messages: [message] }])),
+  )[0].messages[0]
+  let continuing = roundTrip(withActiveVariantUpdated(regenerated, {
+    streaming: true, streaming_phase: 'preparing',
+  }))
+  assert.equal(continuing.streaming, true, 'the selected sibling enters streaming state')
+  continuing = roundTrip(withActiveVariantUpdated(continuing, {
+    content: joinContinuation(regenerated.content, ' completed'), streaming_phase: 'streaming',
+  }))
+  assert.equal(continuing.content, 'partial reply completed', 'streamed continuation survives normalization')
+  const completed = roundTrip(withActiveVariantUpdated(continuing, {
+    finish_reason: 'stop', streaming: false, streaming_phase: null, continuation_count: 1,
+    usage: mergeContinuedUsage(regenerated.usage, { prompt_tokens: 40, completion_tokens: 5 }),
+  }))
+  assert.equal(completed.content, 'partial reply completed', 'saving and reloading preserves the continuation')
+  assert.equal(completed.finish_reason, 'stop')
+  assert.equal(completed.continuation_count, 1)
+  assert.equal(completed.usage.completion_tokens, 25)
+  assert.deepEqual(completed.variants[0], regenerated.variants[0], 'the other reply remains untouched')
+  assert.equal(withActiveVariant(completed, 0).content, 'original answer')
+  assert.equal(withActiveVariant(withActiveVariant(completed, 0), 1).content, completed.content)
+  for (const reason of ['interrupted', 'error']) {
+    const stopped = roundTrip(withActiveVariantUpdated(continuing, {
+      finish_reason: reason, streaming: false, streaming_phase: null,
+    }))
+    assert.equal(stopped.content, 'partial reply completed', `${reason} preserves partial continuation text`)
+    assert.equal(stopped.finish_reason, reason)
+    assert.equal(stopped.streaming, false)
+  }
+  const older = withActiveVariant(regenerated, 0)
+  const updatedOlder = roundTrip(withActiveVariantUpdated(older, { content: 'updated first reply' }))
+  assert.equal(updatedOlder.active_variant, 0, 'updating an older selected sibling does not switch variants')
+  assert.deepEqual(updatedOlder.variants[1], regenerated.variants[1])
+  assert.equal(roundTrip(withActiveVariantUpdated(original, { content: 'legacy continued' })).content, 'legacy continued')
+
   /* ---- the button itself ------------------------------------------------ */
   const { MessageTurn } = await server.ssrLoadModule('/src/components/chat/MessageTurn.jsx')
   const renderTurn = (message, props = {}) =>
