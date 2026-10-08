@@ -126,6 +126,45 @@ fn embedding(session: &LlamaInferenceSession, token: u32) -> CpuTensor {
 #[test]
 fn cpu_prefix_rejects_per_projection_cuda_before_mutation() {
     let _lock = crate::test_support::env_lock();
+    const CHILD_ENV: &str = "CAMELID_TEST_CPU_PREFIX_PROJECTION_GUARD_CHILD";
+    const CHILD_VALUE: &str = "run-admission-assertions";
+    const COMPLETED: &str = "CPU_PREFIX_PROJECTION_GUARD_ASSERTIONS_PASSED";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // The shared mutex only covers participating tests. Isolate all flag
+        // changes from parallel inference tests that read them without it.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inference::cuda_cpu_prefix::integration_tests::cpu_prefix_rejects_per_projection_cuda_before_mutation",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, CHILD_VALUE)
+            .env(PREFIX_ENV, "0")
+            .env("CAMELID_CUDA_Q8", "0")
+            .env("CAMELID_CUDA_RESIDENT_DECODE", "0")
+            .output()
+            .expect("launch the isolated CPU-prefix admission regression");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated regression failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+        // An outdated exact-test name can exit successfully after zero tests.
+        // Only the end of the child assertion body emits this receipt.
+        assert!(
+            stdout.lines().any(|line| line == COMPLETED),
+            "isolated regression did not complete its assertions\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        return;
+    }
+    assert_eq!(
+        std::env::var(CHILD_ENV).as_deref(),
+        Ok(CHILD_VALUE),
+        "invalid subprocess sentinel",
+    );
     struct Restore {
         prefix: Option<std::ffi::OsString>,
         resident_decode: Option<std::ffi::OsString>,
@@ -184,6 +223,7 @@ fn cpu_prefix_rejects_per_projection_cuda_before_mutation() {
     let error = session.cuda_cpu_prefix_layers().unwrap_err().to_string();
     assert!(error.contains("requires one unsharded CUDA sequence"));
     assert!(!error.contains("per-projection CUDA Q8"));
+    println!("\n{COMPLETED}");
 }
 
 fn split_step(session: &mut LlamaInferenceSession, token: u32) -> Vec<u32> {
