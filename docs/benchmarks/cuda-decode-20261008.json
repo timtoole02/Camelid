@@ -1,0 +1,247 @@
+{
+  "schema": "camelid.cuda_decode_benchmark.v1",
+  "date": "2026-10-08",
+  "scope": "Historical saved-workload measurements; sanitized public summary, not a measurement of the rebased PR.",
+  "provenance": {
+    "historical_source_head": "d1c6338a98742fa42e4feff431c73900b4e5b23d",
+    "source_state": "Measured binaries came from historical workspace snapshots with uncommitted changes, not clean builds of the source HEAD.",
+    "rebased_pr_benchmarked": false,
+    "current_pr_performance_claim": false,
+    "qualification": "The PR was rebased onto main after these measurements. Its current code has not been rebenchmarked; historical rates must not be attributed to the rebased commit.",
+    "camelid_binaries": {
+      "before": {
+        "sha256": "2bb885d9d5599aeee72afa62cbfd718366664cd1c688059b54a3cec22b082520",
+        "source_diff_sha256": "f7b0e5a8f2ba1067478b2ef8138a2109d78c5f1aae703f65cc3076f8fe15d5dc"
+      },
+      "wave2": {
+        "sha256": "d10893789ef7b761215944bb930927c5d7b02607941a46b40c8d4546611bae87",
+        "source_diff_sha256": "f81f10be7edb2a6323ff72c70f873be04a58fdb32e7de72360fc60e36f576814"
+      },
+      "wave3": {
+        "sha256": "3f147dd0e83e44c798e88f2ab99778190e9c24ab4dc88232958e1f8d518c27fc",
+        "source_diff_sha256": "22a742c71903a19f89b73b134d3b3bfe10a4962721246fb4f3095b0c6958331c"
+      }
+    },
+    "reference_binaries": {
+      "upstream": {
+        "name": "llama.cpp",
+        "version": "b11429",
+        "commit": "d81235049",
+        "binary_sha256": "7e236243c9b670c6a49410c03186fd575c57a0efe3fd8a21d8727503d571d5b6"
+      },
+      "prism": {
+        "name": "Prism llama.cpp fork",
+        "version": "b10754",
+        "commit": "2459f68b5",
+        "binary_sha256": "1e1140d5d71da6eadc25c7e58720eae487ad02a7e01ac12a30526a0548302d4f"
+      },
+      "prism_legacy": {
+        "name": "Prism legacy llama.cpp fork",
+        "version": "b9596",
+        "commit": "9fcaed7",
+        "binary_sha256": "4e403b6524fb5613ac53c9d2a86fb9a7bc0a00fcfbe49578b61c89c4bc46552b",
+        "scope": "Pinned legacy comparator required for these exact Q2_0 files; not a claim about current upstream support."
+      }
+    }
+  },
+  "machine": {
+    "os": "Windows 11 x86_64",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "vram_gib": 6,
+    "gpu_compute_capability": "8.6",
+    "cpu": "Intel Core i7-11800H",
+    "cpu_cores": 8,
+    "cpu_logical_processors": 16,
+    "host_ram_gib": 16
+  },
+  "method": {
+    "generated_tokens": 128,
+    "timed_decode_intervals": 127,
+    "unmeasured_warmups": 1,
+    "measured_repetitions": 3,
+    "statistic": "median",
+    "formula": "127 * 1000 / decode_ms",
+    "temperature": 0,
+    "seed": 0,
+    "selection": "After is the fastest successful saved three-sample candidate per row across historical waves; reference is the fastest successful fresh saved reference if available, otherwise the original campaign.",
+    "offload": "Camelid and reference placement are recorded separately; streaming, CPU-prefix and resident modes are not interchangeable.",
+    "context": "Reference context512; per-configuration Camelid context flags are authoritative. Some original commands used runtime defaults.",
+    "gpu_serialization": "Benchmarks ran with exclusive GPU access, without overlapping compilation.",
+    "counts": {
+      "supported_catalog_rows": 35,
+      "attempted_rows": 25,
+      "valid_original_rows": 23,
+      "invalid_original_rows": 2,
+      "rows_with_after": 14,
+      "rows_without_comparable_after": 11,
+      "excluded_untested_rows": 10
+    },
+    "quality": "A short coherent or token-matching continuation does not certify broad accuracy, chat behavior, long context or support beyond existing exact-row contracts.",
+    "no_retest": "Null after means no comparable three-sample candidate measurement; it does not mean unchanged performance."
+  },
+  "portable_recipe": {
+    "raw_prompt": "Once upon a time, in a small village by the sea, there lived a young fisherman who discovered a mysterious map. The map showed a route to a distant island, and he decided to",
+    "prompt_file": "Write raw_prompt verbatim to PROMPT_TXT. Preserve model-specific tokenization and any required BOS handling when comparing engines.",
+    "command": "camelid bench-generate MODEL_GGUF --prompt-file PROMPT_TXT --max-tokens 128 --temperature 0 --iterations 3 --warmup --threads THREADS",
+    "configuration": "Apply the row's config.env before launch; choose the matching historical binary to reproduce these historical numbers. This is a portable recipe, not a rerun of the rebased PR.",
+    "gemma_scope": "Gemma4 rows used the gemma4-cuda-generate harness. Ghost used a rendered chat prompt and expert-cache sidecar; this raw-prompt command does not reproduce the Ghost row.",
+    "ghost_chat_user_text": "Write a detailed story about a fisherman who finds a mysterious map to a distant island."
+  },
+  "configs": {
+    "config_1": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512"
+      },
+      "threads": 8
+    },
+    "config_2": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_CUDA_GRAPHS": "1",
+        "CAMELID_CUDA_Q8_MULTIROW": "1"
+      },
+      "threads": 8
+    },
+    "config_3": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1"
+      },
+      "threads": 8
+    },
+    "config_4": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_GRAPHS": "1"
+      },
+      "threads": 8
+    },
+    "config_5": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_CUDA_CPU_PREFIX_LAYERS": "14",
+        "CAMELID_Q8_ROW_DISPATCH": "1",
+        "CAMELID_CUDA_RESIDENT_HEADROOM_MB": "128",
+        "CAMELID_MIN_VRAM_HEADROOM_MIB": "128"
+      },
+      "threads": 6
+    },
+    "config_6": {
+      "entrypoint": "gemma4-cuda-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_GEMMA4_GHOST_CUDA": "1",
+        "CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS": "1000",
+        "CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB": "160"
+      },
+      "threads": 8
+    },
+    "config_7": {
+      "entrypoint": "gemma4-cuda-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_GEMMA4_GHOST_CUDA": "1",
+        "CAMELID_GEMMA4_GHOST_CUDA_CACHE": "1",
+        "CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS": "1600",
+        "CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB": "160",
+        "CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS": "1",
+        "CAMELID_GEMMA4_CUDA_PINNED_EXPERTS": "1"
+      },
+      "threads": 8,
+      "expert_cache_mib": 1024
+    },
+    "config_8": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_CUDA_GRAPHS": "1",
+        "CAMELID_PRISM_CUDA_Q1T128": "1"
+      },
+      "threads": 8
+    },
+    "config_9": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_CUDA_GRAPHS": "1",
+        "CAMELID_PRISM_CUDA_Q2_DP4A": "1"
+      },
+      "threads": 8
+    },
+    "config_10": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_PRISM_CUDA_STRICT": "0"
+      },
+      "threads": 8
+    },
+    "config_11": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_PRISM_CUDA_Q2_DP4A": "1"
+      },
+      "threads": 8
+    },
+    "config_12": {
+      "entrypoint": "bench-generate",
+      "env": {
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_CUDA_RESIDENT_MAX_CONTEXT": "512",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "512",
+        "CAMELID_CUDA_GRAPHS": "1"
+      },
+      "threads": 8
+    }
+  },
+  "rows": [
+    {"model_id":"Ornith 1.0 9B","model":"Ornith 1.0 9B Q8_0","gguf_sha256":"d0e4bebaa8b3450c62090df1408f2ee5ccb2094f9c610ffde564a654483d4f37","before":{"status":"valid_saved_workload","median_tok_s":2.0962558704572767,"samples_tok_s":[2.0962558704572767,2.1004324418273863,2.0834843346807586],"binary":"before","config":"config_1","placement":{"mode":"GPU + host weight streaming","streamed_layers":22}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":5.149651090864377,"samples_tok_s":[5.113044172836675,5.253677108591231,5.149651090864377],"placement":{"gpu_layers_including_head":13,"total_layers_including_head":33,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"gemma_3_1b_it_q8_0","model":"Gemma 3 1B-It Q8_0","gguf_sha256":"b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5","before":{"status":"valid_saved_workload","median_tok_s":99.57409728044324,"samples_tok_s":[99.54984656781916,99.85115887490859,99.57409728044324],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":26,"streamed_layers":0}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":129.81225264121937,"samples_tok_s":[129.81225264121937,129.66063625597255,133.43195390608912],"placement":{"gpu_layers_including_head":27,"total_layers_including_head":27,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"tinyllama_1_1b_chat_q8_0","model":"TinyLlama 1.1B Chat Q8_0","gguf_sha256":"a4c9bb1dbaa372f6381a035fa5c02ef087aaa1ff1f843a56a22328114f03fc59","before":{"status":"valid_saved_workload","median_tok_s":124.20488093886372,"samples_tok_s":[124.20488093886372,122.99141461819785,124.93142297776113],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":22,"streamed_layers":0}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":172.05011941903956,"samples_tok_s":[172.4880243058715,170.51626147795977,172.05011941903956],"placement":{"gpu_layers_including_head":23,"total_layers_including_head":23,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama32_1b_instruct_q8_0","model":"Llama 3.2 1B Instruct Q8_0","gguf_sha256":"3f87a880027e7b9ea8e0da9e4009584336f352af444a0e6e5c20721ac4c7ffd1","before":{"status":"valid_saved_workload","median_tok_s":121.85945632259634,"samples_tok_s":[128.82401928911457,121.85945632259634,119.41521148574996],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":16,"streamed_layers":0}},"after":{"experiment":"llama1-wave2-multirow-graphs","median_tok_s":140.3170103770506,"samples_tok_s":[140.3170103770506,140.487580400102,139.52408663632804],"binary":"wave2","config":"config_2","placement":{"mode":"GPU resident","gpu_layers":16,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":162.56436973025833,"samples_tok_s":[162.38021262857762,162.56436973025833,163.80143139235088],"placement":{"mode":"GPU evidence recorded; exact layer receipt unavailable in saved summary"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama32_3b_instruct_q8_0","model":"Llama 3.2 3B Instruct Q8_0","gguf_sha256":"f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2","before":{"status":"valid_saved_workload","median_tok_s":52.77323560893603,"samples_tok_s":[51.447422597555246,52.865459860609185,52.77323560893603],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0}},"after":{"experiment":"llama3-wave2-multirow-graphs","median_tok_s":57.5766313227755,"samples_tok_s":[57.63799409432943,57.55263709808546,57.5766313227755],"binary":"wave2","config":"config_2","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":67.31633110094005,"samples_tok_s":[67.24102147053466,67.31633110094005,67.5709468339021],"placement":{"mode":"GPU evidence recorded; exact layer receipt unavailable in saved summary"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama_3_2_3b_instruct_q4_k_m","model":"Llama 3.2 3B Instruct Q4_K_M","gguf_sha256":"6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff","before":{"status":"valid_saved_workload","median_tok_s":43.71724949792288,"samples_tok_s":[43.71724949792288,43.602142602421004,43.91175755979805],"binary":"before","config":"config_3","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0}},"after":{"experiment":"llama3-q4-wave3-graphs","median_tok_s":56.41965991472902,"samples_tok_s":[56.53309587652495,56.41965991472902,56.38164281190436],"binary":"wave3","config":"config_4","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":91.06194721992178,"samples_tok_s":[91.67940793871485,90.86161132693725,91.06194721992178],"placement":{"gpu_layers_including_head":29,"total_layers_including_head":29,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama_3_2_3b_instruct_q5_k_m","model":"Llama 3.2 3B Instruct Q5_K_M","gguf_sha256":"0b94ccd04d908304cec5246a3d942b64417a423bc5c6d47c73bc557e590b5194","before":{"status":"valid_saved_workload","median_tok_s":27.262775481491204,"samples_tok_s":[27.89528269024566,27.262775481491204,26.816297383024988],"binary":"before","config":"config_3","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0}},"after":{"experiment":"q5-wave3-graphs","median_tok_s":49.2028861250728,"samples_tok_s":[49.323102556750406,49.2028861250728,49.08214836660021],"binary":"wave3","config":"config_4","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":82.14019844295817,"samples_tok_s":[82.14019844295817,82.40070228756028,82.11236980825144],"placement":{"gpu_layers_including_head":29,"total_layers_including_head":29,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama3_8b_instruct_q8_0","model":"Llama 3 8B Instruct Q8_0","gguf_sha256":"d7efa06c16dc522fe7e6a48e36d17cc42dcadfe581ae1cdf7be9f51734eaf85d","before":{"status":"valid_saved_workload","median_tok_s":1.9389234946529286,"samples_tok_s":[1.9565443338348996,1.883755405888535,1.9389234946529286],"binary":"before","config":"config_1","placement":{"mode":"GPU + host weight streaming","gpu_layers":15,"streamed_layers":17}},"after":{"experiment":"llama8-wave3-prefix14-h128-t6","median_tok_s":3.5623079011439476,"samples_tok_s":[3.538022751636965,3.6110764749482382,3.5623079011439476],"binary":"wave3","config":"config_5","placement":{"mode":"CPU prefix + GPU suffix","cpu_layers":14,"gpu_layers":18,"gpu_output_head":true},"repeat_tokens_identical":true,"output_match_to_original":false,"quality":"Experimental placement change. Coherent repeated raw output; only first20 generated IDs match original. Teacher-forced logits/KV and served/continuation qualification remain pending.","experimental":true},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":8.494505426149606,"samples_tok_s":[8.472605398210451,8.494505426149606,8.614757214774377],"placement":{"gpu_layers_including_head":20,"total_layers_including_head":33,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","fit_target_mib":"128","threads":"6","context":"512","kv_k":"f16","kv_v":"f16"}}},
+    {"model_id":"gemma4_e4b_it_q8_0","model":"Gemma 4 E4B-It Q8_0","gguf_sha256":"f8854aa4480df62585a279e7ca0a881554fc18a41c59c4f62642d16a2ae47012","before":{"status":"valid_saved_workload","median_tok_s":25.603508979049796,"samples_tok_s":[25.500154918460858,25.629707276655303,25.603508979049796],"binary":"before","config":"config_6","placement":{"mode":"GPU resident"}},"after":null,"prompt":"raw_continuation","notes":["Historical baseline/reference repeats were variable; offload/cache conclusions require controlled repetition.","Camelid was GPU resident; the historical reference used CPU/GPU offload. Different placement prevents a kernel-speed conclusion."],"reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":15.254033100290945,"samples_tok_s":[15.254033100290945,16.465799044387257,14.795641320568073],"placement":{"gpu_layers_including_head":33,"total_layers_including_head":43,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"gemma4_e2b_it_q8_0","model":"Gemma 4 E2B-It Q8_0","gguf_sha256":"605d3c2647d7c58c1e4b5375ccb5702acf94c2611b4c8d4877812f8fdd32d053","before":{"status":"valid_saved_workload","median_tok_s":46.75204350605279,"samples_tok_s":[46.75204350605279,46.71678482579972,46.78186276757892],"binary":"before","config":"config_6","placement":{"mode":"GPU resident"}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":74.95026430295958,"samples_tok_s":[74.51223819509065,75.074054347704,74.95026430295958],"placement":{"gpu_layers_including_head":36,"total_layers_including_head":36,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"gemma4_26b_a4b_it_q4_0","model":"Gemma 4 26B-A4B QAT Q4_0 \u00b7 CUDA Ghost-MoE","gguf_sha256":"3e8d5a52ccf99c18506c95c3d646e0f8e4da26f9858ac0f1c594c03c321b03b3","before":{"status":"valid_saved_workload","median_tok_s":15.109137104331252,"samples_tok_s":[14.897274378257562,15.389218914256428,15.109137104331252],"binary":"before","config":"config_7","placement":{"mode":"GPU expert cache + host/storage offload"}},"after":null,"logical_weights_sha256":"3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d","prompt":"ghost_rendered_chat","notes":["Ghost uses rendered chat because the plain continuation degenerated in both engines. The GGUF is an offload stub; logical_weights_sha256 identifies the source weights. Single-run optimization cache probes used a different RAM budget and are excluded from after."],"reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":21.92922627128214,"samples_tok_s":[21.93568422839849,21.92922627128214,21.701044025266853],"placement":{"gpu_layers_including_head":31,"total_layers_including_head":31,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"bonsai_4b_q1_0","model":"Bonsai 4B Q1_0","gguf_sha256":"4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168","before":{"status":"invalid_output","median_tok_s":null,"samples_tok_s":null,"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"reason":"Non-finite or degenerate output; no valid before rate or percentage improvement is claimed."},"after":{"experiment":"bonsai4-wave2-tiled-graphs","median_tok_s":100.54147521894093,"samples_tok_s":[100.66371470983803,100.54147521894093,100.52761960728688],"binary":"wave2","config":"config_8","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":null,"output_match_to_strict_fallback":true,"quality":"Original output invalid. Repaired fast path matches strict-fallback 128 IDs; repeated served smoke passed. Broader qualification remains pending."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":135.9188596514698,"samples_tok_s":[135.9188596514698,135.6479646930778,139.36089313872554],"placement":{"mode":"GPU evidence recorded; exact layer receipt unavailable in saved summary"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"ternary_bonsai_4b_q2_0","model":"Ternary Bonsai 4B Q2_0","gguf_sha256":"4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b","before":{"status":"valid_saved_workload","median_tok_s":35.09572649563202,"samples_tok_s":[35.15606747218906,35.09572649563202,32.06111221613956],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0}},"after":{"experiment":"ternary4-wave2-dp4a-graphs","median_tok_s":65.68800844199527,"samples_tok_s":[65.68800844199527,65.7066732007728,65.66138907650927],"binary":"wave2","config":"config_9","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":false,"quality":"Experimental Q8 activations replace strict f32 contractions; opt-in, saved raw smoke only. Diverges after116 tokens from strict.","experimental":true},"prompt":"raw_continuation","notes":["Reference is the pinned legacy Prism fork, not current upstream llama.cpp."],"reference":{"runtime":"prism_legacy","version":"b9596","commit":"9fcaed7","selection":"historical_reference","median_tok_s":101.31194986414626,"samples_tok_s":[102.76910129634724,99.33632385205928,101.31194986414626],"placement":{"gpu_layers_including_head":37,"total_layers_including_head":37,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"ternary_bonsai_4b_pq2_0","model":"Ternary Bonsai 4B PQ2_0","gguf_sha256":"829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb","before":{"status":"valid_saved_workload","median_tok_s":35.13158257627309,"samples_tok_s":[35.232173643681996,35.13158257627309,35.00256428234711],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0}},"after":{"experiment":"ternary4-pq2-wave2-dp4a-graphs","median_tok_s":65.63094828916913,"samples_tok_s":[65.63328523326535,65.63094828916913,65.48191155002439],"binary":"wave2","config":"config_9","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":false,"quality":"Experimental Q8 activations replace strict f32 contractions; opt-in, saved raw smoke only. Diverges after116 tokens from strict.","experimental":true},"prompt":"raw_continuation","reference":{"runtime":"prism","version":"b10754","commit":"2459f68b5","selection":"historical_reference","median_tok_s":129.87982536788206,"samples_tok_s":[130.56091849092138,129.87982536788206,126.35520936660224],"placement":{"gpu_layers_including_head":37,"total_layers_including_head":37,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"bonsai_8b_q1_0","model":"Bonsai 8B Q1_0","gguf_sha256":"284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54","before":{"status":"invalid_output","median_tok_s":null,"samples_tok_s":null,"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"reason":"Non-finite or degenerate output; no valid before rate or percentage improvement is claimed."},"after":{"experiment":"bonsai8-wave2-tiled-graphs","median_tok_s":66.92321972774263,"samples_tok_s":[66.94039490194602,66.90394211196991,66.92321972774263],"binary":"wave2","config":"config_8","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":null,"output_match_to_strict_fallback":true,"quality":"Original output invalid. Repaired fast path matches strict-fallback 128 IDs; repeated served smoke passed. Broader qualification remains pending."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":82.97318398160216,"samples_tok_s":[82.67507912721156,83.39790651554354,82.97318398160216],"placement":{"gpu_layers_including_head":37,"total_layers_including_head":37,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"ternary_bonsai_8b_q2_0","model":"Ternary Bonsai 8B Q2_0","gguf_sha256":"3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b","before":{"status":"valid_saved_workload","median_tok_s":19.144144874085114,"samples_tok_s":[19.145153807567837,19.144144874085114,19.138912882019483],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0}},"after":{"experiment":"ternary8-wave2-dp4a-graphs","median_tok_s":47.51199509526566,"samples_tok_s":[47.425329285824205,47.51199509526566,47.56883191249852],"binary":"wave2","config":"config_9","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"Experimental Q8 activations replace strict f32 contractions; opt-in, saved raw smoke only. Matches strict tokens on this single workload.","experimental":true},"prompt":"raw_continuation","notes":["Reference is the pinned legacy Prism fork, not current upstream llama.cpp."],"reference":{"runtime":"prism_legacy","version":"b9596","commit":"9fcaed7","selection":"historical_reference","median_tok_s":64.02271344391282,"samples_tok_s":[64.42543922170012,64.02271344391282,63.92275312781078],"placement":{"gpu_layers_including_head":37,"total_layers_including_head":37,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"bonsai_27b_q1_0","model":"Bonsai 27B Q1_0","gguf_sha256":"17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0","before":{"status":"valid_saved_workload","median_tok_s":8.769866258918066,"samples_tok_s":[8.805131275528858,8.769866258918066,8.759022819413163],"binary":"before","config":"config_1","placement":{"mode":"GPU resident"}},"after":{"experiment":"bonsai27-wave2-fast","median_tok_s":35.10538595400338,"samples_tok_s":[35.15913522923202,35.10538595400338,34.85344961468687],"binary":"wave2","config":"config_10","placement":{"mode":"GPU resident"},"repeat_tokens_identical":true,"output_match_to_original":false,"quality":"Experimental Q8 activations with strict default retained. First55 raw tokens match strict; raw tail has an anomalous thinking phrase. Repeated served chat after text/image warmups passed, but broad quality/parity is unqualified.","experimental":true},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":26.140158590489715,"samples_tok_s":[26.140158590489715,26.199790525454333,26.095395313390288],"placement":{"gpu_layers_including_head":65,"total_layers_including_head":65,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"ternary_bonsai_27b_q2_0","model":"Ternary Bonsai 27B Q2_0","gguf_sha256":"868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757","before":{"status":"valid_saved_workload","median_tok_s":3.069441789431005,"samples_tok_s":[3.069441789431005,3.0705654033719085,3.0002929774280287],"binary":"before","config":"config_1","placement":{"mode":"GPU + host weight streaming","streamed_layers":29}},"after":{"experiment":"ternary27-wave2-dp4a","median_tok_s":3.906321273061614,"samples_tok_s":[3.919315405339518,3.7518131634149174,3.906321273061614],"binary":"wave2","config":"config_11","placement":{"mode":"GPU + host weight streaming","gpu_layers":35,"streamed_layers":29},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"Experimental Q8 activations replace strict f32 contractions; opt-in, saved raw smoke only. Matches strict tokens on this single workload.","experimental":true},"prompt":"raw_continuation","notes":["Historical baseline/reference repeats were variable; offload/cache conclusions require controlled repetition.","Reference is the pinned legacy Prism fork, not current upstream llama.cpp."],"reference":{"runtime":"prism_legacy","version":"b9596","commit":"9fcaed7","selection":"historical_reference","median_tok_s":0.7547244039155458,"samples_tok_s":[0.7950590299089124,0.7000395704257337,0.7547244039155458],"placement":{"gpu_layers_including_head":35,"total_layers_including_head":65,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"llama3_2_1b_instruct_iq4_xs","model":"Llama 3.2 1B Instruct IQ4_XS","gguf_sha256":"69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba","before":{"status":"valid_saved_workload","median_tok_s":46.82068903759189,"samples_tok_s":[46.7345003833517,46.83507897260948,46.82068903759189],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":16,"streamed_layers":0}},"after":{"experiment":"iq4-wave3-graphs","median_tok_s":168.27131696155,"samples_tok_s":[168.35693047932543,168.20793255365203,168.27131696155],"binary":"wave3","config":"config_12","placement":{"mode":"GPU resident","gpu_layers":16,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":215.91846102841794,"samples_tok_s":[218.45929432487475,215.91846102841794,215.7790558392021],"placement":{"gpu_layers_including_head":17,"total_layers_including_head":17,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"mistral_7b_instruct_v0_3_q8_0","model":"Mistral 7B Instruct v0.3 Q8_0","gguf_sha256":"404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f","before":{"status":"valid_saved_workload","median_tok_s":1.9709231721887408,"samples_tok_s":[1.9712810153458187,1.9709231721887408,1.959306031391153],"binary":"before","config":"config_1","placement":{"mode":"GPU + host weight streaming","gpu_layers":16,"streamed_layers":16}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":5.89538915115634,"samples_tok_s":[5.89538915115634,5.67470981567068,6.091923869371308],"placement":{"gpu_layers_including_head":17,"total_layers_including_head":33,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"qwen3_0_6b_instruct_q8_0","model":"Qwen3 0.6B Q8_0","gguf_sha256":"9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031","before":{"status":"valid_saved_workload","median_tok_s":145.60346329875537,"samples_tok_s":[145.60346329875537,147.13053177492367,142.8135277021697],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":226.00197173373763,"samples_tok_s":[226.00197173373763,224.74137046225937,227.36305404079647],"placement":{"gpu_layers_including_head":29,"total_layers_including_head":29,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"qwen3_1_7b_instruct_q8_0","model":"Qwen3 1.7B Q8_0","gguf_sha256":"061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a","before":{"status":"valid_saved_workload","median_tok_s":81.15900166759381,"samples_tok_s":[81.57820292083369,81.15900166759381,81.01012352257787],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":28,"streamed_layers":0}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":107.90355291564745,"samples_tok_s":[107.14433354115397,107.90355291564745,107.93454916928643],"placement":{"gpu_layers_including_head":29,"total_layers_including_head":29,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"qwen3_4b_instruct_q8_0","model":"Qwen3 4B Q8_0","gguf_sha256":"8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300","before":{"status":"valid_saved_workload","median_tok_s":41.34711505388229,"samples_tok_s":[41.34711505388229,41.000674735513364,41.44069928928548],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0}},"after":null,"prompt":"raw_continuation","notes":["Camelid was GPU resident; the historical reference used CPU/GPU offload. Different placement prevents a kernel-speed conclusion."],"reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":39.68354404670284,"samples_tok_s":[39.68354404670284,39.68993100827426,39.6463545177021],"placement":{"gpu_layers_including_head":35,"total_layers_including_head":37,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"qwen3_4b_q4_k_m","model":"Qwen3 4B Q4_K_M","gguf_sha256":"7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5","before":{"status":"valid_saved_workload","median_tok_s":33.27095945352004,"samples_tok_s":[33.33884955663005,33.27095945352004,33.1912616659771],"binary":"before","config":"config_1","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0}},"after":{"experiment":"qwen4-q4-wave3-graphs","median_tok_s":43.519075833017645,"samples_tok_s":[43.565207837085886,43.519075833017645,43.378198459015124],"binary":"wave3","config":"config_12","placement":{"mode":"GPU resident","gpu_layers":36,"streamed_layers":0},"repeat_tokens_identical":true,"output_match_to_original":true,"quality":"All128 original Camelid token IDs retained in all3 saved repetitions; no broad model-quality claim."},"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"fresh_saved_reference","median_tok_s":70.61530394884116,"samples_tok_s":[70.49406906198483,70.61530394884116,70.84942321875066],"placement":{"gpu_layers_including_head":37,"total_layers_including_head":37,"mode":"GPU resident"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}},
+    {"model_id":"qwen3_8b_instruct_q8_0","model":"Qwen3 8B Q8_0","gguf_sha256":"408b955510e196121c1c375201744783b5c9a43c7956d73fc78df54c66e883d6","before":{"status":"valid_saved_workload","median_tok_s":1.807050806899622,"samples_tok_s":[1.7879336312391165,1.8147141864522776,1.807050806899622],"binary":"before","config":"config_1","placement":{"mode":"GPU + host weight streaming","gpu_layers":16,"streamed_layers":20}},"after":null,"prompt":"raw_continuation","reference":{"runtime":"upstream","version":"b11429","commit":"d81235049","selection":"historical_reference","median_tok_s":5.635282476964896,"samples_tok_s":[5.667297759690421,5.571185826903256,5.635282476964896],"placement":{"gpu_layers_including_head":17,"total_layers_including_head":37,"mode":"CPU/GPU offload"},"configuration":{"gpu_layers_requested":"auto","fit":"on","threads":"8","context":"512"}}}
+  ]
+}

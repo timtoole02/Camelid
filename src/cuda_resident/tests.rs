@@ -45,6 +45,232 @@ fn fill_q1_wire(wire: &mut [u8], seed: u8) {
     }
 }
 
+#[test]
+#[ignore = "requires a CUDA device; exhaustive Q1 sign expansion regression"]
+fn prism_q1_dp4a_matches_all_sign_patterns() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, cols) = (65_536usize, 128usize);
+    let activation: Vec<i8> = (0..cols).map(|i| (1 + i % 16) as i8).collect();
+    let mut wire = vec![0u8; rows * 18];
+    let mut expected = Vec::with_capacity(rows);
+    for (pattern, block) in wire.chunks_exact_mut(18).enumerate() {
+        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // weight scale = 1
+        for pair in block[2..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&(pattern as u16).to_le_bytes());
+        }
+        // Independent packed-format oracle. Integer activations and unit scales
+        // make every product and reduction exact in f32. Exhaust all 16-bit
+        // patterns consumed by the DP4A sign decoder, including selector high
+        // bits that raw PTX PRMT would mistakenly treat as sign replication.
+        let dot: i32 = activation
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let sign = if pattern & (1 << (i % 16)) == 0 {
+                    -1
+                } else {
+                    1
+                };
+                sign * i32::from(value)
+            })
+            .sum();
+        expected.push(dot as f32);
+    }
+    let d_quants = k.stream.clone_htod(&activation).unwrap();
+    let d_scales = k.stream.clone_htod(&vec![1.0f32; cols / 32]).unwrap();
+    for tiled in [false, true] {
+        let bytes = if tiled {
+            super::repack_q1_t128(&wire, rows, cols).unwrap()
+        } else {
+            wire.clone()
+        };
+        let d_weight = k.stream.clone_htod(&bytes).unwrap();
+        let mut d_output = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        let function = if tiled {
+            &k.prism_q1t128_q8_gemv
+        } else {
+            &k.prism_q1_q8_gemv
+        };
+        super::launch_prism_q1_q8_gemv(
+            &k.stream,
+            function,
+            &d_quants,
+            &d_scales,
+            &d_weight.as_view(),
+            rows,
+            cols,
+            &mut d_output,
+            0,
+        )
+        .unwrap();
+        let mut output = vec![0.0f32; rows];
+        k.stream.memcpy_dtoh(&d_output, &mut output).unwrap();
+        k.ctx.synchronize().unwrap();
+        for (pattern, (&actual, &expected)) in output.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual, expected,
+                "Q1 sign pattern {pattern:#06x}, tiled={tiled}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prism_q2_dp4a_activation_policy_preserves_strict_default() {
+    for lane in [ProjQuant::Q2_0G64, ProjQuant::Q2_0G128] {
+        for fast_q1 in [false, true] {
+            assert!(!lane.needs_q8_0(fast_q1, false));
+            assert!(lane.is_prism_low_bit(fast_q1, false));
+            assert!(lane.needs_q8_0(fast_q1, true));
+            assert!(!lane.is_prism_low_bit(fast_q1, true));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device; Q2/PQ2 DP4A integer oracle and residual"]
+fn prism_q2_dp4a_matches_packed_integer_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, cols) = (259usize, 384usize);
+    let quants: Vec<i8> = (0..cols)
+        .map(|i| ((i * 71 % 255) as i32 - 127) as i8)
+        .collect();
+    let scales: Vec<f32> = (0..cols / 32).map(|i| (1 + i % 4) as f32 * 0.25).collect();
+    let d_quants = k.stream.clone_htod(&quants).unwrap();
+    let d_scales = k.stream.clone_htod(&scales).unwrap();
+    for block_elements in [64usize, 128usize] {
+        let block_bytes = 2 + block_elements / 4;
+        let blocks = cols / block_elements;
+        let mut wire = vec![0u8; rows * blocks * block_bytes];
+        for row in 0..rows {
+            for wb in 0..blocks {
+                let block = &mut wire[(row * blocks + wb) * block_bytes..][..block_bytes];
+                let scale = (1 + wb % 4) as f32 * 0.25;
+                block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+                for (j, byte) in block[2..].iter_mut().enumerate() {
+                    *byte = (row + wb * 17 + j * 37) as u8;
+                }
+            }
+        }
+        let mut expected = vec![0.0f32; rows];
+        for (row, result) in expected.iter_mut().enumerate() {
+            for col in 0..cols {
+                let wb = col / block_elements;
+                let local = col % block_elements;
+                let block = &wire[(row * blocks + wb) * block_bytes..][..block_bytes];
+                let dw = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let weight = i32::from((block[2 + local / 4] >> (2 * (local % 4))) & 3) - 1;
+                *result += (weight * i32::from(quants[col])) as f32 * dw * scales[col / 32];
+            }
+        }
+        let d_weight = k.stream.clone_htod(&wire).unwrap();
+        for residual in [0, 1] {
+            let initial: Vec<f32> = (0..rows).map(|row| row as f32 * 0.125).collect();
+            let mut output = initial.clone();
+            let mut d_output = k.stream.clone_htod(&initial).unwrap();
+            super::launch_prism_q2_q8_gemv(
+                &k.stream,
+                &k.prism_q2_q8_gemv,
+                &d_quants,
+                &d_scales,
+                &d_weight.as_view(),
+                rows,
+                cols,
+                block_elements,
+                &mut d_output,
+                residual,
+            )
+            .unwrap();
+            k.stream.memcpy_dtoh(&d_output, &mut output).unwrap();
+            k.ctx.synchronize().unwrap();
+            for row in 0..rows {
+                let expected = expected[row] + if residual == 1 { initial[row] } else { 0.0 };
+                assert_eq!(
+                    output[row], expected,
+                    "Q2 G{block_elements} row {row}, residual={residual}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device; bounds Q8 activation error against strict Q2 f32"]
+fn prism_q2_dp4a_tracks_strict_f32_contractions() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, cols) = (79usize, 1_024usize);
+    let mut rng = Lcg(0x51_32_d4_a0);
+    let activation: Vec<f32> = (0..cols).map(|_| rng.next_f32() * 1.75).collect();
+    let d_input = k.stream.clone_htod(&activation).unwrap();
+    let mut d_quants = k.stream.alloc_zeros::<i8>(cols).unwrap();
+    let mut d_scales = k.stream.alloc_zeros::<f32>(cols / 32).unwrap();
+    super::launch_quantize(
+        &k.stream,
+        &k.quantize,
+        &d_input,
+        &mut d_quants,
+        &mut d_scales,
+        cols / 32,
+    )
+    .unwrap();
+    for block_elements in [64usize, 128usize] {
+        let block_bytes = 2 + block_elements / 4;
+        let mut wire = vec![0u8; rows * (cols / block_elements) * block_bytes];
+        for block in wire.chunks_exact_mut(block_bytes) {
+            let scale = 0.001 + rng.next_f32().abs() * 0.04;
+            block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = rng.next_u8();
+            }
+        }
+        let d_weight = k.stream.clone_htod(&wire).unwrap();
+        let mut d_strict = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        let mut d_fast = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_prism_low_bit_f32_gemv(
+            &k.stream,
+            &k.prism_low_bit_f32_gemv,
+            &d_input,
+            &d_weight.as_view(),
+            rows,
+            cols,
+            2,
+            block_elements,
+            false,
+            &mut d_strict,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q2_q8_gemv(
+            &k.stream,
+            &k.prism_q2_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_weight.as_view(),
+            rows,
+            cols,
+            block_elements,
+            &mut d_fast,
+            0,
+        )
+        .unwrap();
+        let mut strict = vec![0.0f32; rows];
+        let mut fast = vec![0.0f32; rows];
+        k.stream.memcpy_dtoh(&d_strict, &mut strict).unwrap();
+        k.stream.memcpy_dtoh(&d_fast, &mut fast).unwrap();
+        k.ctx.synchronize().unwrap();
+        let (cosine, relative_l2, max_abs) = vector_error(&fast, &strict);
+        assert!(fast.iter().all(|value| value.is_finite()));
+        assert!(cosine > 0.9999 && relative_l2 < 0.015,
+            "Q2 G{block_elements} activation error: cosine={cosine}, relative_l2={relative_l2}, max_abs={max_abs}");
+    }
+}
+
 // Pure predicate (no GPU): the device-decode embed-gather allowlist must stay in
 // lockstep with the `embed_gather_*` dispatch in `forward_token_device`. Families
 // without a kernel (Q5_K/Q2_K/IQ4_XS) must be refused at `set_device_decode_tables`
@@ -3181,6 +3407,172 @@ fn prefill_then_decode_matches_sequential() {
     }
 }
 
+#[test]
+#[ignore = "requires a CUDA device; Q1 prefill score-capacity regression"]
+fn q1_prefill_beyond_verify_capacity_preserves_kv_and_logits() {
+    let Some(_k) = kernels() else {
+        return;
+    };
+    let (layers, hidden, ffn, heads, kv_heads, head_dim, max_pos, vocab) = (
+        2usize, 256usize, 384usize, 4usize, 2usize, 64usize, 160usize, 128usize,
+    );
+    let mut rng = Lcg(0x7131_70726566696c);
+    let mut weight = |rows: usize, cols: usize| {
+        let mut wire = vec![0u8; rows * (cols / 128) * 18];
+        for block in wire.chunks_exact_mut(18) {
+            let scale = 0.003 + rng.next_f32().abs() * 0.009;
+            block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = rng.next_u8();
+            }
+        }
+        wire
+    };
+    let weights: Vec<[Vec<u8>; 7]> = (0..layers)
+        .map(|_| {
+            [
+                weight(hidden, hidden),
+                weight(kv_heads * head_dim, hidden),
+                weight(kv_heads * head_dim, hidden),
+                weight(hidden, hidden),
+                weight(ffn, hidden),
+                weight(ffn, hidden),
+                weight(hidden, ffn),
+            ]
+        })
+        .collect();
+    let output = weight(vocab, hidden);
+    let norm = vec![1.0f32; hidden];
+    let head_norm = vec![1.0f32; head_dim];
+    let build = || {
+        let mut engine = CudaResidentDecode::new(
+            layers, heads, kv_heads, head_dim, hidden, ffn, head_dim, max_pos, vocab, 1e-5, true,
+        )
+        .unwrap();
+        // Exercise the quantized Q1 lane on every CUDA generation and avoid
+        // environment-dependent tensor-core dispatch in this capacity receipt.
+        engine.k.fast_q1 = true;
+        engine.k.q1_tiled = false;
+        engine.k.prism_q1_q8_wmma_gemm_batched = None;
+        engine.k.prism_q8_b128_bitpack = None;
+        engine.k.prism_q1_q8_b128_bmma_gemm_batched = None;
+        for w in &weights {
+            engine
+                .set_layer_located(
+                    &w[0],
+                    &w[1],
+                    &w[2],
+                    &w[3],
+                    &w[4],
+                    &w[5],
+                    &w[6],
+                    &norm,
+                    &norm,
+                    Some(&head_norm),
+                    Some(&head_norm),
+                    true,
+                    [ProjQuant::Q1_0; 7],
+                )
+                .unwrap();
+        }
+        engine.set_output(&norm, &output, ProjQuant::Q1_0).unwrap();
+        engine
+    };
+    let mut serial = build();
+    let mut batched = build();
+    assert_eq!(
+        batched.d_verify_scores.len(),
+        super::MAX_VERIFY_K * heads * max_pos
+    );
+    let half = head_dim / 2;
+    let embeddings: Vec<f32> = (0..129 * hidden).map(|_| rng.next_f32()).collect();
+    let mut cos = Vec::with_capacity(129 * half);
+    let mut sin = Vec::with_capacity(129 * half);
+    for position in 0..129 {
+        for pair in 0..half {
+            let angle = position as f32 * 10000f32.powf(-((2 * pair) as f32) / head_dim as f32);
+            cos.push(angle.cos());
+            sin.push(angle.sin());
+        }
+    }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let check = |label: &str, got: &[f32], expected: &[f32]| {
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "{label}: non-finite output"
+        );
+        assert!(
+            got.iter().any(|v| *v != 0.0),
+            "{label}: trivial zero output"
+        );
+        let (cosine, relative_l2, max_abs) = vector_error(got, expected);
+        assert!(
+            cosine > 0.99999 && relative_l2 < 0.005,
+            "{label}: cosine={cosine} relative_l2={relative_l2} max_abs={max_abs}"
+        );
+    };
+    for tokens in [39usize, super::MAX_PRISM_PREFILL_K] {
+        serial
+            .prefill(
+                &embeddings[..tokens * hidden],
+                &cos[..tokens * half],
+                &sin[..tokens * half],
+                tokens,
+                scale,
+            )
+            .unwrap();
+        // Drive one complete prompt chunk directly so an external batch-size
+        // setting cannot hide the >16-row regression by splitting it up.
+        let mut scratch = batched.alloc_scratch(tokens, false).unwrap();
+        let stream = batched.k.stream.clone();
+        stream
+            .memcpy_htod(&embeddings[..tokens * hidden], &mut scratch.vh)
+            .unwrap();
+        stream
+            .memcpy_htod(&cos[..tokens * half], &mut scratch.vcos)
+            .unwrap();
+        stream
+            .memcpy_htod(&sin[..tokens * half], &mut scratch.vsin)
+            .unwrap();
+        batched
+            .run_batched_layer_stack(&mut scratch, &stream, 0, tokens, scale, false)
+            .unwrap();
+        batched.k.ctx.synchronize().unwrap();
+        assert!(batched.d_verify_scores.len() >= tokens * heads * max_pos);
+        for layer in 0..layers {
+            let (expected_k, expected_v) = serial.read_kv_layer(layer, tokens).unwrap();
+            let (got_k, got_v) = batched.read_kv_layer(layer, tokens).unwrap();
+            check(
+                &format!("K tokens={tokens} layer={layer}"),
+                &got_k,
+                &expected_k,
+            );
+            check(
+                &format!("V tokens={tokens} layer={layer}"),
+                &got_v,
+                &expected_v,
+            );
+        }
+        let input = &embeddings[tokens * hidden..(tokens + 1) * hidden];
+        let cos_row = &cos[tokens * half..(tokens + 1) * half];
+        let sin_row = &sin[tokens * half..(tokens + 1) * half];
+        let expected = serial
+            .forward_token_logits(input, cos_row, sin_row, tokens, scale)
+            .unwrap();
+        let got = batched
+            .forward_token_logits(input, cos_row, sin_row, tokens, scale)
+            .unwrap();
+        check(&format!("logits tokens={tokens}"), &got, &expected);
+    }
+    let capacity = batched.d_verify_scores.len();
+    batched.ensure_batched_attention_scores(1).unwrap();
+    assert_eq!(
+        batched.d_verify_scores.len(),
+        capacity,
+        "smaller batches retain capacity"
+    );
+}
+
 // The bookkeeping half of prefix continuation, which is where a bug would be
 // silent: an over-claimed prefix does not fail, it skips prefilling rows that do
 // not hold the prompt's tokens and answers from the wrong KV. No GPU needed, so
@@ -3402,6 +3794,74 @@ fn rms_norm_matches_cpu() {
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
     assert!(close(&got, &expected, 1e-4), "rms_norm diverged");
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q8_multirow_gemv_preserves_chunk_tails_residual_and_fp_order() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut rng = Lcg(0x6d75_6c74_6972_6f77);
+    // Exercise partial row groups/CTAs and both sides of each 32/64-block
+    // chunk boundary. The 257-block case ensures the accumulator survives
+    // several scratch reuses and a one-block final chunk.
+    for (rows, bpr) in [
+        (1usize, 1usize),
+        (3, 31),
+        (17, 32),
+        (17, 33),
+        (65, 63),
+        (65, 64),
+        (65, 65),
+        (65, 257),
+    ] {
+        let cols = bpr * 32;
+        let weights: Vec<f32> = (0..rows * cols).map(|_| rng.next_f32()).collect();
+        let wire = quantize_blocks(&weights, cols);
+        let soa = super::repack_q8_soa(&wire);
+        let activation: Vec<f32> = (0..cols).map(|_| rng.next_f32()).collect();
+        let (scales, quants) = quantize_row(&activation);
+        let expected = cpu_q8_dot(&scales, &quants, &wire, rows, bpr);
+        let d_scales = k.stream.clone_htod(&scales).unwrap();
+        let d_quants = k.stream.clone_htod(&quants).unwrap();
+        let d_weights = k.stream.clone_htod(&soa).unwrap();
+        for variant in 0..k.gemv_rows.len() {
+            for residual in [0, 1] {
+                let initial: Vec<f32> = (0..rows).map(|r| r as f32 * 0.03125 - 1.0).collect();
+                let mut d_output = k.stream.clone_htod(&initial).unwrap();
+                super::launch_gemv_rows(
+                    &k.stream,
+                    &k.gemv_rows[variant],
+                    variant,
+                    &d_scales,
+                    &d_quants,
+                    &d_weights.slice(..),
+                    rows,
+                    bpr,
+                    &mut d_output,
+                    residual,
+                )
+                .unwrap();
+                let mut got = vec![0.0f32; rows];
+                k.stream.memcpy_dtoh(&d_output, &mut got).unwrap();
+                k.ctx.synchronize().unwrap();
+                for (row, (&got, &dot)) in got.iter().zip(&expected).enumerate() {
+                    let expected = if residual == 0 {
+                        dot
+                    } else {
+                        initial[row] + dot
+                    };
+                    assert!(got.is_finite());
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "Q8 variant={variant} rows={rows} bpr={bpr} residual={residual} row={row}: {got} != {expected}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -4327,6 +4787,106 @@ fn attention_decode_matches_cpu() {
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
     assert!(close(&got, &expected, 1e-4), "attention diverged");
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn greedy_cuda_graph_preserves_live_attention_geometry() {
+    let Some(_) = kernels() else {
+        return;
+    };
+    let (hidden, ffn, vocab, capacity) = (64usize, 128usize, 64usize, 513usize);
+    let mut rng = Lcg(0x0006_a4f6_5129);
+    let mut weights = |rows: usize, cols: usize| {
+        let values: Vec<f32> = (0..rows * cols).map(|_| rng.next_f32() * 0.1).collect();
+        quantize_blocks(&values, cols)
+    };
+    let q = weights(hidden, hidden);
+    let k = weights(hidden, hidden);
+    let v = weights(hidden, hidden);
+    let o = weights(hidden, hidden);
+    let gate = weights(ffn, hidden);
+    let up = weights(ffn, hidden);
+    let down = weights(hidden, ffn);
+    let output = weights(vocab, hidden);
+    let norm = vec![1.0f32; hidden];
+    let mut engine = CudaResidentDecode::new(
+        1, 1, 1, hidden, hidden, ffn, hidden, capacity, vocab, 1e-5, false,
+    )
+    .unwrap();
+    engine
+        .set_layer(&q, &k, &v, &o, &gate, &up, &down, &norm, &norm)
+        .unwrap();
+    engine.set_output(&norm, &output, ProjQuant::Q8_0).unwrap();
+    // Populate a nontrivial history without hundreds of full model forwards.
+    // Both paths overwrite the current row with the same projection before attention.
+    let history: Vec<u8> = (0..capacity * hidden)
+        .flat_map(|_| crate::inference::f32_to_f16_bits(rng.next_f32()).to_le_bytes())
+        .collect();
+    engine
+        .k
+        .stream
+        .memcpy_htod(&history, &mut engine.cache_k[0])
+        .unwrap();
+    engine
+        .k
+        .stream
+        .memcpy_htod(&history, &mut engine.cache_v[0])
+        .unwrap();
+    let embedding: Vec<f32> = (0..hidden).map(|_| rng.next_f32()).collect();
+    let cos = vec![1.0f32; hidden / 2];
+    let sin = vec![0.0f32; hidden / 2];
+    let scale = 1.0 / (hidden as f32).sqrt();
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (index, &value)| {
+                if value > best.1 {
+                    (index, value)
+                } else {
+                    best
+                }
+            })
+            .0
+    };
+    // Revisit a smaller group count to prove cache selection, not only capture.
+    for position in [0usize, 1, 63, 64, 65, 127, 128, 129, 511, 64] {
+        let live = engine
+            .forward_token_logits(&embedding, &cos, &sin, position, scale)
+            .unwrap();
+        let token = engine
+            .forward_token_greedy_graphed(&embedding, &cos, &sin, position, scale)
+            .unwrap();
+        let mut graphed = vec![0.0f32; vocab];
+        engine
+            .k
+            .stream
+            .memcpy_dtoh(&engine.d_logits, &mut graphed)
+            .unwrap();
+        engine.k.ctx.synchronize().unwrap();
+        assert_eq!(token, argmax(&live) as u32, "position {position}");
+        assert_eq!(
+            live.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            graphed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "graph changed logits at position {position}"
+        );
+    }
+    assert_eq!(
+        engine.decode_graphs.len(),
+        4,
+        "one graph per visited group count"
+    );
+    // 513 keys require the live split-K path, including with the graph env enabled.
+    let live = engine
+        .forward_token_logits(&embedding, &cos, &sin, 512, scale)
+        .unwrap();
+    let token = engine
+        .forward_token(&embedding, &cos, &sin, 512, scale, true)
+        .unwrap();
+    assert_eq!(token, Some(argmax(&live) as u32));
+    assert_eq!(engine.decode_graphs.len(), 4);
+    assert!(super::splitk_verify_active(false));
 }
 
 // GATE OF RECORD for the split-K spec-verify parity fix: the spec-verify kernels
@@ -6882,6 +7442,75 @@ fn q4k_gemv_matches_oracle() {
     );
 }
 
+#[test]
+#[ignore = "requires a CUDA device"]
+fn parallel_q4k_gemv_preserves_dispatch_tails_residual_and_fp_order() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut rng = Lcg(0x4b_706172616c6c65);
+    // The small shapes cover partial row CTAs, partial groups of four
+    // superblocks, and several iterations of the ordered FP accumulation.
+    // The 2049-row shapes exercise 512-thread dispatch and its 46 KiB shared
+    // memory fallback, with an incomplete final CTA in both cases.
+    for (rows, n_sb) in [
+        (1usize, 1usize),
+        (9, 3),
+        (9, 8),
+        (9, 32),
+        (17, 33),
+        (2049, 12),
+        (2049, 56),
+        (2049, 57),
+    ] {
+        let activation: Vec<f32> = (0..n_sb * 256).map(|_| rng.next_f32()).collect();
+        let input = crate::inference::quantize_q8_k_blocks(&activation);
+        let scales: Vec<f32> = input.iter().map(|b| b.d).collect();
+        let quants: Vec<i8> = input.iter().flat_map(|b| b.qs).collect();
+        let wire = synth_q4k_wire(rows, n_sb, &mut rng);
+        let expected: Vec<f32> = wire
+            .chunks_exact(n_sb * 144)
+            .map(|row| crate::inference::q4_k_wire_row_dot(row, &input))
+            .collect();
+        let weights = super::swz_q4k_blocks(&wire);
+        let d_scales = k.stream.clone_htod(&scales).unwrap();
+        let d_quants = k.stream.clone_htod(&quants).unwrap();
+        let d_weight = k.stream.clone_htod(&weights).unwrap();
+        for residual in [0, 1] {
+            let initial: Vec<f32> = (0..rows).map(|r| r as f32 * 0.03125 - 1.0).collect();
+            let mut d_output = k.stream.clone_htod(&initial).unwrap();
+            super::launch_q4k_gemv(
+                &k.stream,
+                &k.q4k_gemv,
+                &d_scales,
+                &d_quants,
+                &d_weight.slice(..),
+                rows,
+                n_sb,
+                &mut d_output,
+                residual,
+            )
+            .unwrap();
+            let mut got = vec![0.0f32; rows];
+            k.stream.memcpy_dtoh(&d_output, &mut got).unwrap();
+            k.ctx.synchronize().unwrap();
+            for (row, (&got, &dot)) in got.iter().zip(&expected).enumerate() {
+                let expected = if residual == 0 {
+                    dot
+                } else {
+                    initial[row] + dot
+                };
+                assert!(got.is_finite());
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "Q4K rows={rows} n_sb={n_sb} residual={residual} row={row}: {got} != {expected}"
+                );
+            }
+        }
+    }
+}
+
 /// Batched Q4_K receipt: every token-major output must match the same CPU
 /// oracle used to validate the single-token GEMV. This specifically exercises
 /// the upload-swizzled weights against natural-order batched Q8_K activations.
@@ -9357,6 +9986,112 @@ fn q6k_gemv_matches_oracle() {
     );
 }
 
+/// The decode DP4A lane must retain the scalar wire oracle's eight independent
+/// FP accumulators, including tails and the fused residual. The oracle decodes
+/// the raw 210-byte wire independently; the GPU reads the padded 224-byte form.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn parallel_q6k_gemv_preserves_tails_residual_and_fp_order() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut rng = Lcg(0x6b_706172616c6c65);
+    // Four superblocks per warp iteration; eight rows per CTA. The last case
+    // also approaches the launcher's 48 KiB dynamic shared-memory boundary.
+    for (rows, n_sb) in [
+        (1usize, 1usize),
+        (9, 3),
+        (17, 4),
+        (9, 5),
+        (33, 12),
+        (9, 32),
+        (17, 33),
+        (9, 56),
+        (9, 65),
+        (9, 95),
+    ] {
+        for extreme in [false, true] {
+            let activation: Vec<f32> = (0..n_sb * 256).map(|_| rng.next_f32()).collect();
+            let mut input = crate::inference::quantize_q8_k_blocks(&activation);
+            let mut wire = synth_q6k_wire(rows, n_sb, &mut rng);
+            if extreme {
+                // Exercise signed DP4A's -128 input, both six-bit endpoints,
+                // and -128/+127 group scales. Alternating signs and unrelated
+                // block scales also expose accidental changes to the FP fold.
+                const QUANTS: [i8; 8] = [-128, 127, -1, 0, 1, -127, 63, -64];
+                for (sb, block) in input.iter_mut().enumerate() {
+                    block.d = (sb as f32 + 1.0) * if sb % 2 == 0 { 0.003 } else { -0.007 };
+                    for (i, quant) in block.qs.iter_mut().enumerate() {
+                        *quant = QUANTS[(i + i / 8 + sb) % QUANTS.len()];
+                    }
+                }
+                for (sb, block) in wire.chunks_exact_mut(210).enumerate() {
+                    match sb % 4 {
+                        0 => block[..192].fill(0),
+                        1 => block[..192].fill(255),
+                        _ => {}
+                    }
+                    for (g, scale) in block[192..208].iter_mut().enumerate() {
+                        *scale = QUANTS[(g + sb) % QUANTS.len()] as u8;
+                    }
+                }
+            }
+            let scales: Vec<f32> = input.iter().map(|block| block.d).collect();
+            let quants: Vec<i8> = input.iter().flat_map(|block| block.qs).collect();
+            let expected: Vec<f32> = wire
+                .chunks_exact(n_sb * 210)
+                .map(|row| crate::inference::q6_k_wire_row_dot(row, &input))
+                .collect();
+            let mut weights = super::pad_q6k_blocks(&wire);
+            // The padding is not part of the quant format and must not affect
+            // any packed load or dot product.
+            for block in weights.chunks_exact_mut(224) {
+                block[210..].fill(0xa5);
+            }
+            let d_scales = k.stream.clone_htod(&scales).unwrap();
+            let d_quants = k.stream.clone_htod(&quants).unwrap();
+            let d_weights = k.stream.clone_htod(&weights).unwrap();
+            for residual in [0, 1] {
+                let initial: Vec<f32> = (0..rows + 7).map(|r| r as f32 * 0.03125 - 1.0).collect();
+                let mut d_output = k.stream.clone_htod(&initial).unwrap();
+                super::launch_q6k_gemv(
+                    &k.stream,
+                    &k.q6k_gemv,
+                    &d_scales,
+                    &d_quants,
+                    &d_weights.slice(..),
+                    rows,
+                    n_sb,
+                    &mut d_output,
+                    residual,
+                )
+                .unwrap();
+                let mut got = vec![0.0f32; initial.len()];
+                k.stream.memcpy_dtoh(&d_output, &mut got).unwrap();
+                k.ctx.synchronize().unwrap();
+                for (row, (&got, &dot)) in got.iter().zip(&expected).enumerate() {
+                    let expected = if residual == 0 {
+                        dot
+                    } else {
+                        initial[row] + dot
+                    };
+                    assert!(got.is_finite());
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "Q6K rows={rows} n_sb={n_sb} extreme={extreme} residual={residual} row={row}: {got} != {expected}"
+                    );
+                }
+                assert_eq!(
+                    &got[rows..],
+                    &initial[rows..],
+                    "Q6K partial CTA wrote beyond the requested rows"
+                );
+            }
+        }
+    }
+}
+
 /// Batched Q6_K receipt over several independent Q8_K activation rows.
 #[test]
 #[ignore = "requires a CUDA device"]
@@ -9609,6 +10344,120 @@ fn iq4xs_gemv_matches_oracle() {
         close(&got, &expected, 1e-4),
         "iq4xs_gemv diverged from iq4_xs_wire_row_dot oracle (worst rel {worst:.3e})"
     );
+}
+
+// Preserve the shipped IQ4 kernel's floating-point topology, not only its
+// tolerance against the serial CPU oracle. Integer work can be partitioned
+// freely, but each original lane must still accumulate b=lane+32*k, ib=0..7.
+fn iq4xs_original_cuda_row_dot(wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    use crate::tensor::{IQ4XSBlock, IQ4_XS_BLOCK_BYTES, KVALUES_IQ4NL_I8};
+    let mut lanes = [0.0f32; 32];
+    for (lane, acc) in lanes.iter_mut().enumerate() {
+        for b in (lane..input.len()).step_by(32) {
+            let bytes = wire[b * IQ4_XS_BLOCK_BYTES..(b + 1) * IQ4_XS_BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            let block = IQ4XSBlock::from_bytes(bytes);
+            let y = &input[b];
+            let d4d8 = block.scale_f32() * y.d;
+            for ib in 0..8 {
+                let mut dot = 0i32;
+                for j in 0..16 {
+                    let code = block.qs()[ib * 16 + j];
+                    dot += KVALUES_IQ4NL_I8[(code & 15) as usize] as i32 * y.qs[ib * 32 + j] as i32;
+                    dot += KVALUES_IQ4NL_I8[(code >> 4) as usize] as i32
+                        * y.qs[ib * 32 + j + 16] as i32;
+                }
+                *acc += d4d8 * block.sub_block_scale_int(ib) as f32 * dot as f32;
+            }
+        }
+    }
+    for offset in [16, 8, 4, 2, 1] {
+        let previous = lanes;
+        for lane in 0..32 - offset {
+            lanes[lane] += previous[lane + offset];
+        }
+    }
+    lanes[0]
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn parallel_q5k_iq4xs_gemv_preserves_tails_residual_and_fp_order() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut rng = Lcg(0xd07_5eed);
+    // Include incomplete row CTAs, incomplete integer-work warps, production
+    // hidden/FFN widths, and the original IQ4 lane's second b+=32 iteration.
+    for rows in [1usize, 9] {
+        for n_sb in [1usize, 3, 8, 12, 32, 33, 56] {
+            let activation: Vec<f32> = (0..n_sb * 256).map(|_| rng.next_f32()).collect();
+            let input = crate::inference::quantize_q8_k_blocks(&activation);
+            let scales: Vec<f32> = input.iter().map(|b| b.d).collect();
+            let quants: Vec<i8> = input.iter().flat_map(|b| b.qs).collect();
+            let d_scales = k.stream.clone_htod(&scales).unwrap();
+            let d_quants = k.stream.clone_htod(&quants).unwrap();
+            for quant in [ProjQuant::Q5K, ProjQuant::IQ4XS] {
+                let (wire, block_bytes) = match quant {
+                    ProjQuant::Q5K => (synth_q5k_wire(rows, n_sb, &mut rng), 176),
+                    ProjQuant::IQ4XS => (synth_iq4xs_wire(rows, n_sb, &mut rng), 136),
+                    _ => unreachable!(),
+                };
+                let row_bytes = n_sb * block_bytes;
+                let expected: Vec<f32> = wire
+                    .chunks_exact(row_bytes)
+                    .map(|row| match quant {
+                        ProjQuant::Q5K => crate::inference::q5_k_wire_row_dot(row, &input),
+                        ProjQuant::IQ4XS => iq4xs_original_cuda_row_dot(row, &input),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let d_weight = k.stream.clone_htod(&wire).unwrap();
+                for residual in [0, 1] {
+                    let initial: Vec<f32> = (0..rows).map(|r| r as f32 * 0.03125 - 1.0).collect();
+                    let mut d_output = k.stream.clone_htod(&initial).unwrap();
+                    let kernel = match quant {
+                        ProjQuant::Q5K => &k.q5k_gemv,
+                        ProjQuant::IQ4XS => &k.iq4xs_gemv,
+                        _ => unreachable!(),
+                    };
+                    let launch = match quant {
+                        ProjQuant::Q5K => super::launch_q5k_gemv,
+                        ProjQuant::IQ4XS => super::launch_iq4xs_gemv,
+                        _ => unreachable!(),
+                    };
+                    launch(
+                        &k.stream,
+                        kernel,
+                        &d_scales,
+                        &d_quants,
+                        &d_weight.slice(..),
+                        rows,
+                        n_sb,
+                        &mut d_output,
+                        residual,
+                    )
+                    .unwrap();
+                    let mut got = vec![0.0f32; rows];
+                    k.stream.memcpy_dtoh(&d_output, &mut got).unwrap();
+                    k.ctx.synchronize().unwrap();
+                    for (row, (&got, &dot)) in got.iter().zip(&expected).enumerate() {
+                        let expected = if residual == 0 {
+                            dot
+                        } else {
+                            initial[row] + dot
+                        };
+                        assert_eq!(
+                            got.to_bits(),
+                            expected.to_bits(),
+                            "{quant:?} rows={rows} n_sb={n_sb} residual={residual} row={row}: {got} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---- qwen35 (Ornith) gated-delta-net SSM kernels ---------------------------

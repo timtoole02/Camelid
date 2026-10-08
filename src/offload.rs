@@ -56,6 +56,12 @@ impl OffloadRunStatus {
     /// One-line, human-facing summary for the load banner. Offloaded runs lead with a
     /// clear capacity-mode warning and the measured PCIe rate; resident runs are terse.
     pub fn describe(&self) -> String {
+        if self.source == "cpu-prefix" {
+            return format!(
+                "[gpu] EXPERIMENTAL CPU+GPU: {} prefix layers compute on CPU, {} suffix layers and output head resident on GPU; activations and new KV rows cross PCIe (no weight streaming)",
+                self.layers_offloaded, self.layers_resident,
+            );
+        }
         if self.layers_offloaded == 0 {
             return format!(
                 "[gpu] all {} layers resident in VRAM ({} MiB free) — full GPU speed",

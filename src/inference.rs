@@ -28,6 +28,8 @@ pub(crate) mod batch;
 #[cfg(target_arch = "aarch64")]
 mod cpu_neon;
 #[cfg(feature = "cuda")]
+mod cuda_cpu_prefix;
+#[cfg(feature = "cuda")]
 #[allow(dead_code)] // Phase 6 metadata contract; serving ownership is wired next.
 pub(crate) mod cuda_paged_kv;
 #[cfg(feature = "cuda")]
@@ -2746,6 +2748,10 @@ pub struct LlamaInferenceSession {
     cuda_sequence_lease: Option<cuda_sequence::CudaSequenceLease>,
     #[cfg(feature = "cuda")]
     cuda_resident_pin: Option<ResidentCudaIdentity>,
+    /// Explicit experimental CPU-prefix/GPU-suffix lane. Its GPU engine belongs
+    /// to this session; every appended GPU KV row is mirrored before commit.
+    #[cfg(feature = "cuda")]
+    cuda_cpu_prefix: Option<Box<std::sync::Mutex<cuda_cpu_prefix::State>>>,
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
@@ -3029,6 +3035,8 @@ impl LlamaInferenceSession {
             cuda_sequence_lease: self.cuda_sequence_lease.take(),
             #[cfg(feature = "cuda")]
             cuda_resident_pin: self.cuda_resident_pin.take(),
+            #[cfg(feature = "cuda")]
+            cuda_cpu_prefix: self.cuda_cpu_prefix.take(),
             is_drafter: self.is_drafter,
         }
     }
@@ -3128,6 +3136,8 @@ impl Clone for LlamaInferenceSession {
             cuda_sequence_lease: None,
             #[cfg(feature = "cuda")]
             cuda_resident_pin: None,
+            #[cfg(feature = "cuda")]
+            cuda_cpu_prefix: None,
             is_drafter: self.is_drafter,
         }
     }
@@ -3177,6 +3187,8 @@ impl LlamaInferenceSession {
             cuda_sequence_lease: None,
             #[cfg(feature = "cuda")]
             cuda_resident_pin: None,
+            #[cfg(feature = "cuda")]
+            cuda_cpu_prefix: None,
             is_drafter: false,
         })
     }
@@ -3283,7 +3295,10 @@ impl LlamaInferenceSession {
         // The engine is gone, so nothing vouches for those rows any more. Leaving the
         // record behind would let a later turn claim a prefix no engine holds.
         self.resident_tokens.clear();
-        self.kv_cache.rollback_to_position(position)
+        self.kv_cache.rollback_to_position(position)?;
+        #[cfg(feature = "cuda")]
+        self.invalidate_cuda_cpu_prefix_kv()?;
+        Ok(())
     }
 
     /// Roll back a GPU-resident drafter session to `position`. Unlike
@@ -3297,6 +3312,7 @@ impl LlamaInferenceSession {
         self.kv_cache.rollback_to_position(position)?;
         #[cfg(feature = "cuda")]
         {
+            self.invalidate_cuda_cpu_prefix_kv()?;
             if let Some(cache) = self.existing_resident_cache() {
                 let mut guard = cache
                     .lock()
@@ -3694,6 +3710,12 @@ impl LlamaInferenceSession {
             )));
         }
         let continuing = base_position > 0;
+        if self.cuda_cpu_prefix_layers()?.is_some() {
+            return cuda_prefill_chunk_unsupported(
+                continuing,
+                "experimental CPU-prefix mode uses CPU prefill",
+            );
+        }
         if !resident_decode_cuda_enabled() {
             return cuda_prefill_chunk_unsupported(continuing, "resident CUDA was disabled");
         }
@@ -4525,6 +4547,12 @@ impl LlamaInferenceSession {
         if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
             return Ok(None);
         }
+        // The split owns a suffix engine, not the full-model arena used by
+        // this verifier. Decline before resident_cache() pins that other
+        // engine; the CPU chunk verifier can use the authoritative host KV.
+        if self.cuda_cpu_prefix.is_some() || self.cuda_cpu_prefix_layers()?.is_some() {
+            return Ok(None);
+        }
         let position = self.kv_cache.position;
         let k = drafts.len() + 1;
         if k > crate::cuda_resident::MAX_VERIFY_K
@@ -4636,6 +4664,11 @@ impl LlamaInferenceSession {
     ) -> Result<Option<Vec<u32>>> {
         use crate::inference::spec_tree::TREE_MAX_NODES;
         if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
+            return Ok(None);
+        }
+        // As for the linear verifier, do not acquire the unrelated full-model
+        // arena for a session whose engine only contains the GPU suffix.
+        if self.cuda_cpu_prefix.is_some() || self.cuda_cpu_prefix_layers()?.is_some() {
             return Ok(None);
         }
         let n = tree.nodes();
@@ -4821,6 +4854,16 @@ impl LlamaInferenceSession {
         sample: Option<(f32, u64)>,
         input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
+        if let Some(prefix_layers) = self.cuda_cpu_prefix_layers()? {
+            if !compute_logits {
+                // CPU prefill keeps both halves' history authoritative. The
+                // suffix is seeded once before the first hybrid decode.
+                return Ok(None);
+            }
+            return self
+                .forward_cuda_cpu_prefix(embedding, prefix_layers, gpu_sample_token, sample)
+                .map(Some);
+        }
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
         }

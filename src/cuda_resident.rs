@@ -37,7 +37,11 @@ static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
 
 static __device__ __forceinline__ unsigned int __byte_perm(unsigned int a, unsigned int b, unsigned int s) {
     unsigned int d;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
+    // CUDA's intrinsic ignores the high bit of each selector nibble. Raw PTX
+    // PRMT instead interprets it as sign replication; Q1 sign expansion passes
+    // arbitrary weight bits here, so preserve the intrinsic's three-bit indices.
+    unsigned int selector = s & 0x7777u;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(selector));
     return d;
 }
 
@@ -403,6 +407,75 @@ extern "C" __global__ void q8_gemv(
     }
 }
 
+// Experimental Q8 decode: each warp evaluates several independent rows, then
+// one lane per row folds a bounded chunk of terms in the original block order.
+// The chunk boundary never resets an accumulator. Thus both each block's two
+// scale multiplies and the final left-to-right FP sum match q8_gemv exactly.
+template<int R, int C>
+__device__ __forceinline__ void q8_gemv_rows_impl(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem_rows[];
+    signed char* s_iq = (signed char*)smem_rows;
+    float* s_is = (float*)(smem_rows + (long)blocks_per_row * 32);
+    float* terms = (float*)(smem_rows + (long)blocks_per_row * 36);
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+    int row0 = (blockIdx.x * (blockDim.x >> 5) + warp) * R;
+    int myrow = row0 + lane;
+    bool folder = lane < R && myrow < rows;
+    float acc = 0.0f;
+    const unsigned short* scales =
+        (const unsigned short*)(weight_bytes + (long)rows * blocks_per_row * 32);
+    float* myterms = terms + (long)warp * R * C;
+    for (int c0 = 0; c0 < blocks_per_row; c0 += C) {
+        int cn = blocks_per_row - c0;
+        if (cn > C) cn = C;
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            int row = row0 + r;
+            if (row >= rows) break; // uniform across the warp
+            for (int cb = lane; cb < cn; cb += 32) {
+                int b = c0 + cb;
+                long wb = (long)row * blocks_per_row + b;
+                const int4* wq = (const int4*)(weight_bytes + wb * 32);
+                const int4* iq = (const int4*)(s_iq + (long)b * 32);
+                int4 a = wq[0], z = wq[1], x = iq[0], y = iq[1];
+                int dot = __dp4a(a.x, x.x, 0);
+                dot = __dp4a(a.y, x.y, dot); dot = __dp4a(a.z, x.z, dot);
+                dot = __dp4a(a.w, x.w, dot); dot = __dp4a(z.x, y.x, dot);
+                dot = __dp4a(z.y, y.y, dot); dot = __dp4a(z.z, y.z, dot);
+                dot = __dp4a(z.w, y.w, dot);
+                myterms[r * C + cb] = (float)dot * f16_bits_to_f32(scales[wb]) * s_is[b];
+            }
+        }
+        __syncwarp();
+        if (folder)
+            for (int cb = 0; cb < cn; cb++) acc += myterms[lane * C + cb];
+        __syncwarp(); // every row's reader finishes before the next chunk writes
+    }
+    if (folder) output[myrow] = residual ? output[myrow] + acc : acc;
+}
+
+#define Q8_ROWS_KERNEL(R, C) \
+extern "C" __global__ void q8_gemv_rows##R##_chunk##C( \
+    const float* input_scales, const signed char* input_quants, \
+    const unsigned char* weight_bytes, int rows, int blocks_per_row, \
+    float* output, int residual) { \
+    q8_gemv_rows_impl<R, C>(input_scales, input_quants, weight_bytes, rows, \
+        blocks_per_row, output, residual); \
+}
+Q8_ROWS_KERNEL(2, 32)
+Q8_ROWS_KERNEL(2, 64)
+Q8_ROWS_KERNEL(4, 64)
+Q8_ROWS_KERNEL(8, 32)
+#undef Q8_ROWS_KERNEL
+
 // Resolve one logical Q1 row/K-block in either stock row-major wire or the
 // same-size Q1T128 upload layout. Q1T128 groups every <=128-row tile/K-block as
 // [nr*16 signs][nr*2 scales]; only the final row tile may have nr < 128.
@@ -667,6 +740,68 @@ extern "C" __global__ void prism_q1_q8_gemv(
         total += __shfl_down_sync(mask, total, 4);
         total += __shfl_down_sync(mask, total, 2);
         total += __shfl_down_sync(mask, total, 1);
+        int row = first_row + ro;
+        if (lane == 0 && row < rows)
+            output[row] = residual ? output[row] + total : total;
+    }
+}
+
+// Experimental Prism Q2/PQ2 decode with Q8_0 activations. The packed 64- and
+// 128-value GGUF blocks both encode consecutive two-bit values as q-1. Keep
+// weights packed and reuse each activation chunk across eight output rows.
+extern "C" __global__ void prism_q2_q8_gemv(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int weight_block_elements,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * 8;
+    if (first_row >= rows) return;
+    int blocks_per_row = cols / weight_block_elements;
+    int block_bytes = 2 + weight_block_elements / 4;
+    int chunks_per_block = weight_block_elements / 32;
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f, 0.0f };
+    for (int chunk = lane; chunk < cols / 32; chunk += 32) {
+        const int* aq = (const int*)(input_quants + (long)chunk * 32);
+        int a[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) a[j] = aq[j];
+        float da = input_scales[chunk];
+        int wb = chunk / chunks_per_block;
+        int offset = 2 + (chunk % chunks_per_block) * 8;
+        #pragma unroll
+        for (int ro = 0; ro < 8; ro++) {
+            int row = first_row + ro;
+            if (row < rows) {
+                const unsigned char* block = weight_bytes
+                    + ((long)row * blocks_per_row + wb) * block_bytes;
+                float dw = f16_bits_to_f32((unsigned short)block[0]
+                    | ((unsigned short)block[1] << 8));
+                int dot = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    unsigned int q = block[offset + j];
+                    unsigned int selectors = (q & 3u) | ((q & 12u) << 2)
+                        | ((q & 48u) << 4) | ((q & 192u) << 6);
+                    int w = (int)__byte_perm(0x020100ffu, 0x020100ffu, selectors);
+                    dot = __dp4a(w, a[j], dot);
+                }
+                sums[ro] += ((float)dot * dw) * da;
+            }
+        }
+    }
+    #pragma unroll
+    for (int ro = 0; ro < 8; ro++) {
+        float total = sums[ro];
+        total += __shfl_down_sync(0xffffffffu, total, 16);
+        total += __shfl_down_sync(0xffffffffu, total, 8);
+        total += __shfl_down_sync(0xffffffffu, total, 4);
+        total += __shfl_down_sync(0xffffffffu, total, 2);
+        total += __shfl_down_sync(0xffffffffu, total, 1);
         int row = first_row + ro;
         if (lane == 0 && row < rows)
             output[row] = residual ? output[row] + total : total;
@@ -3279,25 +3414,18 @@ extern "C" __global__ void nvfp4_gemv(
 
 // ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
 // Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
-// (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
-// WITH per-16 bsums), NOT Q8_0. Weights are the repacked SoA layout (see
-// repack_q4k_soa): first all expanded 4-bit quants (rows*n_sb*256 i8, the oracle's
-// `a[256]` — nibbles already expanded low-then-high in 64-value groups), then
-// per-superblock metadata: d & dmin (f32 each, the f16 super-scales already
-// widened) and the 8 unpacked 6-bit scales + 8 unpacked mins (u8 each, the kmask
-// `utmp` unpack already done on the host). The per-superblock integer dot is kept
-// scalar (correctness-first, matching the oracle's "no SIMD" doc) because the
-// oracle's 8-lane f32 split (below) cannot be reproduced by a 4-wide __dp4a, which
-// would collapse four distinct lanes into one accumulator.
+// (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks).
+// Weights retain the 144-byte wire header, with each 32-byte quant group swizzled
+// at upload so an aligned word holds positions l, l+8, l+16, l+24. The matching
+// activation permutation happens in shared memory. Eight lanes cooperate on each
+// superblock: each dp4a combines only terms within one oracle integer aux lane.
 //
 // PARITY ANCHOR: the oracle keeps 8 f32 main-lane accumulators sums[0..8] plus a
-// scalar mins accumulator sumf, both summed over superblocks IN ORDER, with final
-// `sumf + sums[0] + ... + sums[7]` (left-to-right). The per-superblock integer
-// work (aux32[l] for l in 0..8, and the mins integer sumi) is exact regardless of
-// order, so the lanes compute those integers per superblock and stash them in
-// shared (the analog of q8_gemv's myterms[b]); lane 0 then replays the EXACT f32
-// accumulation order. The 8-lane split is load-bearing: dd*aux32[l] is rounded to
-// f32 per lane before summing, so collapsing the lanes would change the f32 result.
+// scalar mins accumulator sumf, all summed over superblocks IN ORDER. After the
+// integer work reaches shared memory, lanes 0..8 independently replay those nine
+// original accumulators. Lane 0 adds sums[0]..sums[7] left-to-right starting at
+// zero, then returns sumf + smain. No floating-point association changes: each
+// dd*aux32[l] still rounds separately before its ordered per-anchor accumulation.
 //
 // aux32[l] = Σ_{j=0..8} scale[j] * Σ_{k=0..4} q8[j*32+k*8+l] * a[j*32+k*8+l]
 //   (lane l owns the 8th element of every 8-stride within each 32-group; folding
@@ -3308,7 +3436,7 @@ extern "C" __global__ void nvfp4_gemv(
 extern "C" __global__ void q4k_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
-    const unsigned char* __restrict__ weight_bytes, // SWIZZLED 144-byte Q4_K blocks, row-major
+    const unsigned char* __restrict__ weight_bytes, // SWIZZLED 144-byte Q4_K wire, row-major
     int rows, int n_sb, float* __restrict__ output, int residual
 ) {
     extern __shared__ unsigned char smem4[];
@@ -3317,17 +3445,12 @@ extern "C" __global__ void q4k_gemv(
     // per-warp scratch: 8 aux32 lanes + 1 sumi = 9 ints, per superblock.
     int* aux = (int*)(smem4 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*9 int
     int tid = threadIdx.x;
-    // Stage the input vector SWIZZLED to match the upload-time weight swizzle
-    // (swz_q4k_blocks): within each 32-wide scale group jg, byte l+k*8 lands at
-    // l*4+k, so an aux lane's four stride-8 activations sit in ONE aligned i32
-    // and pair with the weight word for __dp4a. A pure byte permutation —
-    // group sums (bsums) and per-lane products are the same integers.
+    // Put each oracle aux lane's four stride-8 activations in one dp4a word.
+    // Match the upload-time weight swizzle without changing activation storage.
     for (int i = tid; i < n_sb * 256; i += blockDim.x) {
-        int jg = i >> 5;      // 32-wide group index
-        int p = i & 31;       // linear position within the group
-        int l = p & 7;
-        int kk = p >> 3;
-        s_iq[(long)jg * 32 + l * 4 + kk] = input_quants[i];
+        int group = i >> 5;
+        int p = i & 31;
+        s_iq[(long)group * 32 + (p & 7) * 4 + (p >> 3)] = input_quants[i];
     }
     for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
     __syncthreads();
@@ -3339,129 +3462,83 @@ extern "C" __global__ void q4k_gemv(
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     int* myaux = aux + (long)warp * n_sb * 9;
-    // Phase 1 — integer partials with ALL 32 lanes cooperating. Work unit
-    // u = (super-block b = u>>2, byte-group g = u&3): 32 quant bytes = two
-    // consecutive uint4 loads, so the four units of one super-block read
-    // consecutive 32 B chunks and the warp's loads coalesce (the old layout
-    // gave each lane a whole 144 B-strided super-block, leaving half the warp
-    // idle whenever n_sb <= 16 — every 4096-col projection — and defeating
-    // coalescing; measured ~60 GB/s achieved vs ~20-25% of that fixed here).
-    // NEGATIVE RESULT (measured 2026-07-03, do not retry): a warp-sequential
-    // remap (whole warp walks SBs in order, lane n reads quant word n — one
-    // perfectly coalesced 128 B transaction per SB) REGRESSED ~8% end-to-end
-    // (Q4_K_M 18.7 -> 17.1 tok/s, parity intact). The per-SB combine needs ~7
-    // dependent shuffles + a shared store, serializing the loop, while THIS
-    // unit-spread shape keeps 8 independent dp4a chains in flight and L1
-    // already absorbs the scattered-sector cost. ~135 GB/s is the plateau of
-    // this shape; the llama.cpp mmvq gap (~190 GB/s) is not reachable by
-    // load-coalescing alone.
-    // Each unit computes its two scale-groups' contributions to the 8 aux
-    // lanes plus the mins-side sumi over ITS activation quarter (per-16
-    // groups 4g..4g+4, mins index gg>>1 = 2g/2g+1 — an exact partition of the
-    // oracle's loops). Integer addition is associative, so this split is
-    // BIT-EXACT; partials combine across the 4 lanes of a super-block with
-    // two shuffle steps and the g==0 lane stores the 9 totals. The ordered
-    // f32 tail below is byte-for-byte the oracle's — parity is unchanged.
+    // Eight lanes cooperate on one superblock, one lane per integer aux32.
+    // This fills the warp even for narrow projections and replaces scalar
+    // products with exact dp4a dots. The ordered floating-point tail is unchanged.
     long row_sb0 = (long)row * n_sb;
-    int units = n_sb * 4;
-    for (int u0 = 0; u0 < units; u0 += 32) {
+    for (int u0 = 0; u0 < n_sb * 8; u0 += 32) {
         int u = u0 + lane;
-        bool active = (u < units) && (row < rows);
-        int b = u >> 2;
-        int g = u & 3;
-        int aux32[8];
-        #pragma unroll
-        for (int l = 0; l < 8; l++) aux32[l] = 0;
+        int b = u >> 3;
+        int l = u & 7;
+        int ax_l = 0;
         int sumi = 0;
+        bool active = row < rows && b < n_sb;
         if (active) {
             const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
             const signed char* y256 = s_iq + (long)b * 256;  // staged activation
-            // Unpack the packed 6-bit (scale, min) pairs via the kmask scheme
-            // (oracle order). The 12 scale/min bytes are header bytes 4..16.
+            // Packed 6-bit (scale, min) unpack via the kmask scheme (bytes 4..16).
             uint4 hdr = *reinterpret_cast<const uint4*>(blk);  // bytes 0..16
-            unsigned int u0w = hdr.y;
+            unsigned int u0 = hdr.y;
             unsigned int u1 = hdr.z;
             unsigned int u2 = hdr.w;
             unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
             unsigned int uaux = u1 & KMASK1;
-            u1 = (u2 & KMASK2) | (((u0w >> 6) & KMASK3) << 4);
+            u1 = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
             u2 = uaux;
-            u0w &= KMASK1;
+            u0 &= KMASK1;
             unsigned char sc[8], mn[8];
-            sc[0] = u0w & 0xff; sc[1] = (u0w >> 8) & 0xff; sc[2] = (u0w >> 16) & 0xff; sc[3] = (u0w >> 24) & 0xff;
+            sc[0] = u0 & 0xff; sc[1] = (u0 >> 8) & 0xff; sc[2] = (u0 >> 16) & 0xff; sc[3] = (u0 >> 24) & 0xff;
             sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff; sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
             mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff; mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
             mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff; mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
-            int slo = (int)sc[2 * g];
-            int shi = (int)sc[2 * g + 1];
-            // dp4a form over the SWIZZLED layouts: weight word l holds the four
-            // stride-8 quant bytes of aux lane l (swz_q4k_blocks); the staged
-            // activation words are permuted identically, and the low/high
-            // nibble halves of the SAME weight word serve scale groups 2g and
-            // 2g+1. aux32[l] = slo*Σ(y_lo·q_lo) + shi*Σ(y_hi·q_hi) — the
-            // distributed form of the oracle's per-element products: identical
-            // integers. The mins side collapses because the two per-16 bsums of
-            // a 32-group share one min: sumi += mn[j]*(whole-group activation
-            // sum), computed as packed dp4a against 0x01010101.
-            const int* qw = reinterpret_cast<const int*>(blk + 16 + g * 32);
-            const int* ylo = reinterpret_cast<const int*>(y256 + (2 * g) * 32);
-            const int* yhi = reinterpret_cast<const int*>(y256 + (2 * g + 1) * 32);
-            int sum_lo = 0, sum_hi = 0;
             #pragma unroll
-            for (int l = 0; l < 8; l++) {
-                int q = qw[l];
-                int yl = ylo[l];
-                int yh = yhi[l];
-                int qlo = q & 0x0F0F0F0F;
-                int qhi = (q >> 4) & 0x0F0F0F0F;
-                aux32[l] += slo * __dp4a(qlo, yl, 0) + shi * __dp4a(qhi, yh, 0);
-                sum_lo = __dp4a(yl, 0x01010101, sum_lo);
-                sum_hi = __dp4a(yh, 0x01010101, sum_hi);
+            for (int g = 0; g < 4; g++) {
+                int slo = (int)sc[2 * g];
+                int shi = (int)sc[2 * g + 1];
+                // Q4 weights were swizzled at upload: this aligned word holds
+                // exactly the four stride-8 quants for the lane's aux sum.
+                unsigned int word = reinterpret_cast<const unsigned int*>(blk + 16 + g * 32)[l];
+                int qlo = (int)(word & 0x0f0f0f0fu);
+                int qhi = (int)((word >> 4) & 0x0f0f0f0fu);
+                int yl = reinterpret_cast<const int*>(y256 + g * 64)[l];
+                int yh = reinterpret_cast<const int*>(y256 + g * 64 + 32)[l];
+                ax_l += slo * __dp4a(qlo, yl, 0) + shi * __dp4a(qhi, yh, 0);
+                sumi += (int)mn[2 * g] * __dp4a(yl, 0x01010101, 0)
+                    + (int)mn[2 * g + 1] * __dp4a(yh, 0x01010101, 0);
             }
-            sumi += (int)mn[2 * g] * sum_lo + (int)mn[2 * g + 1] * sum_hi;
+            myaux[(long)b * 9 + l] = ax_l;
         }
-        // Combine the 4 same-super-block lanes (g==0 collects g=1..3). Lanes
-        // whose shuffle source crosses a group boundary read garbage, but only
-        // g==0 lanes store, so it is discarded. Integer sums — order-free.
-        #pragma unroll
-        for (int off = 2; off >= 1; off >>= 1) {
-            #pragma unroll
-            for (int l = 0; l < 8; l++)
-                aux32[l] += __shfl_down_sync(0xffffffffu, aux32[l], off);
-            sumi += __shfl_down_sync(0xffffffffu, sumi, off);
-        }
-        if (active && g == 0) {
-            int* ax = myaux + (long)b * 9;
-            #pragma unroll
-            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
-            ax[8] = sumi;
-        }
+        // Every superblock has all eight lanes, including the final partial
+        // warp iteration. Each group reduces only its exact integer mins sum.
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 4, 8);
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 2, 8);
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 1, 8);
+        if (active && l == 0) myaux[(long)b * 9 + 8] = sumi;
     }
     __syncwarp();
-    if (row < rows && lane == 0) {
-        long row_sb0 = (long)row * n_sb;
-        float sums[8];
-        #pragma unroll
-        for (int l = 0; l < 8; l++) sums[l] = 0.0f;
-        float sumf = 0.0f;
+    float partial = 0.0f;
+    if (row < rows && lane < 9) {
         for (int b = 0; b < n_sb; b++) {
             const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
-            int* ax = myaux + (long)b * 9;
-            float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
-            float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
             float dact = s_is[b];
-            float dd = d * dact;
-            #pragma unroll
-            for (int l = 0; l < 8; l++) sums[l] += dd * (float)ax[l];
-            sumf -= dmin * dact * (float)ax[8];
+            if (lane < 8) {
+                float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                float dd = d * dact;
+                partial += dd * (float)myaux[(long)b * 9 + lane];
+            } else {
+                float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+                partial -= dmin * dact * (float)myaux[(long)b * 9 + 8];
+            }
         }
-        // Final reduction in the oracle's EXACT order: it returns
-        // `sumf + sums.iter().sum()`, i.e. the 8 main lanes are summed FIRST
-        // (left-to-right from 0.0) and only then added to the mins accumulator sumf.
-        // `(((sumf+s0)+s1)+...)` would be a different f32 association — keep this split.
-        float smain = 0.0f;
-        #pragma unroll
-        for (int l = 0; l < 8; l++) smain += sums[l];
+    }
+    float smain = 0.0f;
+    #pragma unroll
+    for (int l = 0; l < 8; l++) {
+        float term = __shfl_sync(0xffffffffu, partial, l);
+        if (lane == 0) smain += term;
+    }
+    float sumf = __shfl_sync(0xffffffffu, partial, 8);
+    if (row < rows && lane == 0) {
         float acc = sumf + smain;
         output[row] = residual ? (output[row] + acc) : acc;
     }
@@ -3495,8 +3572,13 @@ extern "C" __global__ void q5k_gemv(
     // per-warp scratch: 8 aux32 lanes + 1 sumi = 9 ints, per superblock.
     int* aux = (int*)(smem5 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*9 int
     int tid = threadIdx.x;
-    for (int i = tid; i < n_sb * 64; i += blockDim.x)
-        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    // Put each oracle aux lane's four stride-8 activations in one dp4a word.
+    // Only shared input is permuted; the model retains its original wire bytes.
+    for (int i = tid; i < n_sb * 256; i += blockDim.x) {
+        int group = i >> 5;
+        int p = i & 31;
+        s_iq[(long)group * 32 + (p & 7) * 4 + (p >> 3)] = input_quants[i];
+    }
     for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
     __syncthreads();
 
@@ -3507,12 +3589,20 @@ extern "C" __global__ void q5k_gemv(
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     int* myaux = aux + (long)warp * n_sb * 9;
-    if (row < rows) {
-        long row_sb0 = (long)row * n_sb;
-        for (int b = lane; b < n_sb; b += 32) {
+    // Eight lanes cooperate on one superblock, one lane per integer aux32.
+    // This fills the warp even for narrow projections and replaces scalar
+    // products with exact dp4a dots. The ordered floating-point tail is unchanged.
+    long row_sb0 = (long)row * n_sb;
+    for (int u0 = 0; u0 < n_sb * 8; u0 += 32) {
+        int u = u0 + lane;
+        int b = u >> 3;
+        int l = u & 7;
+        int ax_l = 0;
+        int sumi = 0;
+        bool active = row < rows && b < n_sb;
+        if (active) {
             const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
             const signed char* y256 = s_iq + (long)b * 256;  // staged activation
-            int* ax = myaux + (long)b * 9;
             // Packed 6-bit (scale, min) unpack via the kmask scheme (bytes 4..16).
             uint4 hdr = *reinterpret_cast<const uint4*>(blk);  // bytes 0..16
             unsigned int u0 = hdr.y;
@@ -3528,82 +3618,67 @@ extern "C" __global__ void q5k_gemv(
             sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff; sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
             mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff; mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
             mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff; mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
-            // qh: 32 high bits, bytes 16..48. Loaded as 2 uint4 (8 uint32 words); the
-            // SAME 32 bytes serve every byte-group (only the selected bit varies).
-            const uint4* qhv = reinterpret_cast<const uint4*>(blk + 16);
-            uint4 qh_a = qhv[0];
-            uint4 qh_b = qhv[1];
-            const unsigned int* qhd = reinterpret_cast<const unsigned int*>(&qh_a);
-            const unsigned int* qhd2 = reinterpret_cast<const unsigned int*>(&qh_b);
-            const uint4* q5v = reinterpret_cast<const uint4*>(blk + 48);  // 128 low-nibble bytes
-            int aux32[8];
-            #pragma unroll
-            for (int l = 0; l < 8; l++) aux32[l] = 0;
+            // The qh plane is reused by all four 64-element groups. Gather
+            // this lane's stride-8 positions once, in activation-word order.
+            const unsigned char* qh = blk + 16;
+            unsigned int high = (unsigned int)qh[l]
+                | ((unsigned int)qh[l + 8] << 8)
+                | ((unsigned int)qh[l + 16] << 16)
+                | ((unsigned int)qh[l + 24] << 24);
             #pragma unroll
             for (int g = 0; g < 4; g++) {
                 int slo = (int)sc[2 * g];
                 int shi = (int)sc[2 * g + 1];
-                int lobase = g * 64;          // a-index of low-nibble scale-group 2g
-                int hibase = g * 64 + 32;     // a-index of high-nibble scale-group 2g+1
-                unsigned int mlo = 1u << (2 * g);      // qh bit for the low nibble
-                unsigned int mhi = 1u << (2 * g + 1);  // qh bit for the high nibble
-                uint4 wlo = q5v[g * 2];
-                uint4 whi = q5v[g * 2 + 1];
-                const unsigned int* wd = reinterpret_cast<const unsigned int*>(&wlo);
-                const unsigned int* wd2 = reinterpret_cast<const unsigned int*>(&whi);
-                #pragma unroll
-                for (int w = 0; w < 8; w++) {
-                    unsigned int word = (w < 4) ? wd[w] : wd2[w - 4];       // 4 low-nibble bytes
-                    unsigned int qhword = (w < 4) ? qhd[w] : qhd2[w - 4];   // 4 matching qh bytes
-                    #pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        int p = w * 4 + t;             // 0..32 position in the group
-                        unsigned int byte = (word >> (t * 8)) & 0xff;
-                        unsigned int qhb = (qhword >> (t * 8)) & 0xff;
-                        int lo = (int)(byte & 0xF) + ((qhb & mlo) ? 16 : 0);
-                        int hi = (int)(byte >> 4) + ((qhb & mhi) ? 16 : 0);
-                        int l = p & 7;
-                        aux32[l] += slo * (int)y256[lobase + p] * lo;
-                        aux32[l] += shi * (int)y256[hibase + p] * hi;
-                    }
-                }
+                const unsigned char* qs = blk + 48 + g * 32;
+                unsigned int word = (unsigned int)qs[l]
+                    | ((unsigned int)qs[l + 8] << 8)
+                    | ((unsigned int)qs[l + 16] << 16)
+                    | ((unsigned int)qs[l + 24] << 24);
+                int qlo = (int)((word & 0x0f0f0f0fu)
+                    | (((high >> (2 * g)) & 0x01010101u) << 4));
+                int qhi = (int)(((word >> 4) & 0x0f0f0f0fu)
+                    | (((high >> (2 * g + 1)) & 0x01010101u) << 4));
+                int yl = reinterpret_cast<const int*>(y256 + g * 64)[l];
+                int yh = reinterpret_cast<const int*>(y256 + g * 64 + 32)[l];
+                ax_l += slo * __dp4a(qlo, yl, 0) + shi * __dp4a(qhi, yh, 0);
+                sumi += (int)mn[2 * g] * __dp4a(yl, 0x01010101, 0)
+                    + (int)mn[2 * g + 1] * __dp4a(yh, 0x01010101, 0);
             }
-            #pragma unroll
-            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
-            // Mins side: identical to q4k — per-16 activation sums times mins[g/2].
-            int sumi = 0;
-            #pragma unroll
-            for (int g = 0; g < 16; g++) {
-                int bsum = 0;
-                #pragma unroll
-                for (int l = 0; l < 16; l++) bsum += (int)y256[g * 16 + l];
-                sumi += bsum * (int)mn[g >> 1];
-            }
-            ax[8] = sumi;
+            myaux[(long)b * 9 + l] = ax_l;
         }
+        // Every superblock has all eight lanes, including the final partial
+        // warp iteration. Each group reduces only its exact integer mins sum.
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 4, 8);
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 2, 8);
+        sumi += __shfl_down_sync(0xffffffffu, sumi, 1, 8);
+        if (active && l == 0) myaux[(long)b * 9 + 8] = sumi;
     }
     __syncwarp();
-    if (row < rows && lane == 0) {
-        long row_sb0 = (long)row * n_sb;
-        float sums[8];
-        #pragma unroll
-        for (int l = 0; l < 8; l++) sums[l] = 0.0f;
-        float sumf = 0.0f;
+    // Each lane replays one original FP accumulator in superblock order.
+    // Only these independent anchors run in parallel; the final sum is serial.
+    float partial = 0.0f;
+    if (row < rows && lane < 9) {
         for (int b = 0; b < n_sb; b++) {
             const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
-            int* ax = myaux + (long)b * 9;
-            float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
-            float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
             float dact = s_is[b];
-            float dd = d * dact;
-            #pragma unroll
-            for (int l = 0; l < 8; l++) sums[l] += dd * (float)ax[l];
-            sumf -= dmin * dact * (float)ax[8];
+            if (lane < 8) {
+                float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                float dd = d * dact;
+                partial += dd * (float)myaux[(long)b * 9 + lane];
+            } else {
+                float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+                partial -= dmin * dact * (float)myaux[(long)b * 9 + 8];
+            }
         }
-        // Same ordered reduction as q4k: 8 main lanes summed first, then + sumf.
-        float smain = 0.0f;
-        #pragma unroll
-        for (int l = 0; l < 8; l++) smain += sums[l];
+    }
+    float smain = 0.0f;
+    #pragma unroll
+    for (int l = 0; l < 8; l++) {
+        float term = __shfl_sync(0xffffffffu, partial, l);
+        if (lane == 0) smain += term;
+    }
+    float sumf = __shfl_sync(0xffffffffu, partial, 8);
+    if (row < rows && lane == 0) {
         float acc = sumf + smain;
         output[row] = residual ? (output[row] + acc) : acc;
     }
@@ -3611,9 +3686,9 @@ extern "C" __global__ void q5k_gemv(
 
 // ---- Q6_K GEMV: one warp per output row, fused dequant + integer dot ---------
 // Bit-identical reproduction of the validated CPU oracle `q6_k_wire_row_dot`.
-// The activation is Q8_K (256-wide blocks). Weights are read STRAIGHT from the
-// 210-byte GGUF wire super-block (ql[128] + qh[64] + scales(i8)[16] + d(f16)) —
-// no SoA repack is needed: the oracle reads the same byte layout, and each warp
+// The activation is Q8_K (256-wide blocks). Weights retain the GGUF field layout
+// (ql[128] + qh[64] + scales(i8)[16] + d(f16)), with each 210-byte super-block
+// padded to 224 bytes at upload. No SoA repack is needed, and each CTA
 // stages the shared Q8_K activation once, so the per-row weight read is already
 // the dominant DRAM stream. The 8-lane main-side split is the SAME parity anchor
 // as q4k_gemv: the oracle keeps 8 f32 accumulators sums[0..8] summed over
@@ -3627,8 +3702,9 @@ extern "C" __global__ void q5k_gemv(
 //   aux32[l] += scale[j] * y.qs[off+l] * a[off+l]   for j in 0..16, off=j*16,
 //                                                    l in 0..8 then l in 8..16
 // where a[256] are the rebuilt signed-6-bit weights (recombination order from
-// q6_k_wire_block_dequant). Lane l (0..8) owns its own aux32 lane; lane 0 then
-// replays sums[l] += (d_w * d_act) * aux32[l] per superblock, in order.
+// q6_k_wire_block_dequant). Lane l (0..8) owns its own aux32 lane and replays
+// sums[l] += (d_w * d_act) * aux32[l] per superblock, in order. Lane 0 keeps the
+// oracle's final left-to-right sum of those eight independent FP accumulators.
 // Draft-chain helper: dequantize ONE row of the 224-byte PADDED Q6_K tied head
 // (the exact layout q6k_gemv reads below — its unit (h, s, l) element map is
 // mirrored here per element) for the token id sitting in a device buffer, and
@@ -3678,8 +3754,12 @@ extern "C" __global__ void q6k_gemv(
     // per-warp scratch: 8 aux32 lanes per superblock (the main-side integers).
     int* aux = (int*)(smem6 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*8 int
     int tid = threadIdx.x;
-    for (int i = tid; i < n_sb * 64; i += blockDim.x)
-        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    // Within each group of 32, a word now holds positions l+{0,8,16,24}.
+    // Its low/high byte pairs belong to the two distinct 16-value scales.
+    for (int i = tid; i < n_sb * 256; i += blockDim.x) {
+        int p = i & 31;
+        s_iq[(i & ~31) + (p & 7) * 4 + (p >> 3)] = input_quants[i];
+    }
     for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
     __syncthreads();
 
@@ -3688,100 +3768,72 @@ extern "C" __global__ void q6k_gemv(
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     int* myaux = aux + (long)warp * n_sb * 8;
-    // Blocks are PADDED 210->224 at upload (pad_q6k_blocks) so ql(+0)/qh(+128)/
-    // scales(+192)/d(+208) are all 16-aligned for uint4 loads.
+    // Blocks retain the existing lossless 210->224 upload padding.
     const int WIRE = 224;
-    // Phase 1 — integer partials with ALL 32 lanes cooperating. Work unit
-    // u = (super-block b = u>>2, quarter = u&3 with h = quarter>>1, s =
-    // quarter&1): each unit covers l in [s*16, s*16+16) of half h, i.e. the 64
-    // weights at indices h*128 + s*16 + l' + {0,32,64,96} — exactly four whole
-    // 16-element scale groups (j = 8h+s+{0,2,4,6}), an exact partition of the
-    // oracle's loops. Three uint4 loads per unit (ql lo/hi 16 B chunks + qh
-    // 16 B chunk) replace the old per-lane a[256] local-memory rebuild with
-    // scalar byte loads off the unaligned 210 B wire (half the warp also sat
-    // idle whenever n_sb <= 16). Integer sums are order-free, so this split is
-    // BIT-EXACT; the ordered f32 tail below is unchanged.
+    // Eight lanes cooperate on each super-block. Lane l owns the oracle's
+    // integer anchor l: two elements from each of sixteen scale groups.
+    // Contract each pair with signed DP4A and two zero bytes. All 32 products
+    // fit exactly in i32 even at the extreme signed weight/input/scale values;
+    // only their integer association changes, never the floating-point order.
     long row_sb0 = (long)row * n_sb;
-    int units = n_sb * 4;
+    int units = n_sb * 8;
     for (int u0 = 0; u0 < units; u0 += 32) {
         int u = u0 + lane;
         bool active = (u < units) && (row < rows);
-        int b = u >> 2;
-        int quarter = u & 3;
-        int aux32[8];
-        #pragma unroll
-        for (int l = 0; l < 8; l++) aux32[l] = 0;
+        int b = u >> 3;
+        int l = u & 7;
         if (active) {
             const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
             const signed char* y256 = s_iq + (long)b * 256;
-            int h = quarter >> 1;
-            int s = quarter & 1;
-            int qlb = h * 64;
-            int qhb = 128 + h * 32;
-            int wbase = h * 128;
-            // All 16 scales in one uint4 (block+192 is 16-aligned).
-            uint4 scv = *reinterpret_cast<const uint4*>(block + 192);
-            const signed char* sc = (const signed char*)&scv;
-            uint4 qlo = *reinterpret_cast<const uint4*>(block + qlb + s * 16);
-            uint4 qhiv = *reinterpret_cast<const uint4*>(block + qlb + 32 + s * 16);
-            uint4 qhv = *reinterpret_cast<const uint4*>(block + qhb + s * 16);
-            const unsigned char* ql_lo = (const unsigned char*)&qlo;
-            const unsigned char* ql_hi = (const unsigned char*)&qhiv;
-            const unsigned char* qh = (const unsigned char*)&qhv;
-            int base = wbase + s * 16;
-            int j0 = 8 * h + s; // scale group of the {+0} sub-range
-            int s0 = (int)sc[j0];
-            int s1 = (int)sc[j0 + 2];
-            int s2 = (int)sc[j0 + 4];
-            int s3 = (int)sc[j0 + 6];
+            const signed char* sc = (const signed char*)(block + 192);
+            int ax = 0;
             #pragma unroll
-            for (int l = 0; l < 16; l++) {
-                int albyte = (int)ql_lo[l];
-                int ahbyte = (int)ql_hi[l];
-                int hbyte = (int)qh[l];
-                int a0 = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
-                int a1 = ((ahbyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
-                int a2 = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
-                int a3 = ((ahbyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
-                int al = l & 7;
-                aux32[al] += s0 * (int)y256[base + l] * a0;
-                aux32[al] += s1 * (int)y256[base + l + 32] * a1;
-                aux32[al] += s2 * (int)y256[base + l + 64] * a2;
-                aux32[al] += s3 * (int)y256[base + l + 96] * a3;
+            for (int h = 0; h < 2; h++) {
+                const unsigned char* ql = block + h * 64 + l;
+                const unsigned char* qh = block + 128 + h * 32 + l;
+                unsigned int lo = (unsigned int)ql[0] | ((unsigned int)ql[8] << 8)
+                    | ((unsigned int)ql[16] << 16) | ((unsigned int)ql[24] << 24);
+                unsigned int hi = (unsigned int)ql[32] | ((unsigned int)ql[40] << 8)
+                    | ((unsigned int)ql[48] << 16) | ((unsigned int)ql[56] << 24);
+                unsigned int high = (unsigned int)qh[0] | ((unsigned int)qh[8] << 8)
+                    | ((unsigned int)qh[16] << 16) | ((unsigned int)qh[24] << 24);
+                #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    unsigned int low = ((g & 1) ? hi : lo) >> ((g >> 1) * 4);
+                    unsigned int codes = (low & 0x0f0f0f0fu)
+                        | (((high >> (g * 2)) & 0x03030303u) << 4);
+                    // Subtract 32 independently in each byte, then clear the
+                    // temporary high-bit bias. No cross-byte borrow is possible.
+                    unsigned int weights = ((codes | 0x80808080u) - 0x20202020u)
+                        ^ 0x80808080u;
+                    unsigned int y = ((const unsigned int*)(y256 + h * 128 + g * 32))[l];
+                    int dot0 = __dp4a((int)(weights & 0xffffu), (int)(y & 0xffffu), 0);
+                    int dot1 = __dp4a((int)(weights >> 16), (int)(y >> 16), 0);
+                    ax += (int)sc[h * 8 + g * 2] * dot0;
+                    ax += (int)sc[h * 8 + g * 2 + 1] * dot1;
+                }
             }
-        }
-        // Combine the 4 same-super-block lanes (quarter==0 collects 1..3);
-        // cross-group shuffle reads are discarded. Integer sums — order-free.
-        #pragma unroll
-        for (int off = 2; off >= 1; off >>= 1) {
-            #pragma unroll
-            for (int l = 0; l < 8; l++)
-                aux32[l] += __shfl_down_sync(0xffffffffu, aux32[l], off);
-        }
-        if (active && quarter == 0) {
-            int* ax = myaux + (long)b * 8;
-            #pragma unroll
-            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
+            myaux[(long)b * 8 + l] = ax;
         }
     }
     __syncwarp();
-    if (row < rows && lane == 0) {
-        long row_sb0 = (long)row * n_sb;
-        float sums[8];
-        #pragma unroll
-        for (int l = 0; l < 8; l++) sums[l] = 0.0f;
+    float partial = 0.0f;
+    if (row < rows && lane < 8) {
         for (int b = 0; b < n_sb; b++) {
             const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
             unsigned short d_bits = (unsigned short)block[208]
                 | ((unsigned short)block[209] << 8);
             float d = f16_bits_to_f32(d_bits) * s_is[b];
-            int* ax = myaux + (long)b * 8;
-            #pragma unroll
-            for (int l = 0; l < 8; l++) sums[l] += d * (float)ax[l];
+            partial += d * (float)myaux[(long)b * 8 + lane];
         }
-        float acc = 0.0f;
-        #pragma unroll
-        for (int l = 0; l < 8; l++) acc += sums[l];
+    }
+    float acc = 0.0f;
+    #pragma unroll
+    for (int l = 0; l < 8; l++) {
+        float term = __shfl_sync(0xffffffffu, partial, l);
+        if (lane == 0) acc += term;
+    }
+    if (row < rows && lane == 0) {
         output[row] = residual ? (output[row] + acc) : acc;
     }
 }
@@ -3798,6 +3850,18 @@ extern "C" __global__ void q6k_gemv(
 // `d4d8 * ls * sumi` (matching the oracle's per-ib association). Each lane owns a
 // strided set of super-blocks; the final warp-reduce over f32 partials is what the
 // 1e-4 tolerance absorbs (integer sumi/ls are exact).
+__device__ __forceinline__ int iq4xs_lookup_packed(unsigned int indices) {
+    // Four independent signed-byte lookups in the 16-value IQ4_NL codebook.
+    // The selector only contains 0..7: the upper half is selected with a byte
+    // mask, so prmt's sign-extension selector bit is never involved.
+    unsigned int selector = (indices & 7u) | ((indices >> 4) & 0x70u)
+        | ((indices >> 8) & 0x700u) | ((indices >> 12) & 0x7000u);
+    unsigned int lo = __byte_perm(0xbfad9881u, 0xf6eaddcfu, selector);
+    unsigned int hi = __byte_perm(0x26190d01u, 0x71594535u, selector);
+    unsigned int mask = ((indices & 0x08080808u) >> 3) * 0xffu;
+    return (int)((lo & ~mask) | (hi & mask));
+}
+
 extern "C" __global__ void iq4xs_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
@@ -3807,15 +3871,13 @@ extern "C" __global__ void iq4xs_gemv(
     extern __shared__ unsigned char smem_iq4[];
     signed char* s_iq = (signed char*)smem_iq4;              // n_sb*256 i8 staged input
     float* s_is = (float*)(smem_iq4 + (long)n_sb * 256);     // n_sb f32 staged scales
+    float* partials = (float*)(smem_iq4 + (long)n_sb * 260); // warps*32 FP lane sums
     int tid = threadIdx.x;
     for (int i = tid; i < n_sb * 64; i += blockDim.x)
         ((int*)s_iq)[i] = ((const int*)input_quants)[i];     // n_sb*256 bytes as ints
     for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
     __syncthreads();
 
-    const int KV[16] = {
-        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
-    };
     const int WIRE = 136;
     int warp = tid >> 5;
     int lane = tid & 31;
@@ -3823,32 +3885,58 @@ extern "C" __global__ void iq4xs_gemv(
     int row = blockIdx.x * warps_per_block + warp;
     if (row >= rows) return;
     long row_sb0 = (long)row * n_sb;
-    float acc = 0.0f;
-    for (int b = lane; b < n_sb; b += 32) {
-        const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
-        unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        float d4d8 = f16_bits_to_f32(d_bits) * s_is[b];
-        unsigned short sh = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
-        const unsigned char* sl = block + 4;
-        const unsigned char* qs = block + 8;
-        const signed char* y256 = s_iq + (long)b * 256;
-        #pragma unroll
-        for (int ib = 0; ib < 8; ib++) {
-            int low = (sl[ib >> 1] >> (4 * (ib & 1))) & 0xF;
-            int high = (sh >> (2 * ib)) & 0x3;
-            int ls = (low | (high << 4)) - 32;
-            const unsigned char* q = qs + ib * 16;
-            const signed char* yy = y256 + ib * 32;
-            int sumi = 0;
+    float* mypartials = partials + warp * 32;
+    mypartials[lane] = 0.0f;
+    __syncwarp();
+    // Spread a superblock's eight integer dots across eight lanes. Previously
+    // one lane decoded all 256 weights, leaving most lanes idle for small K.
+    // The ib==0 lane replays all eight FP terms in order into the original
+    // lane's accumulator (b % 32). This uses bounded scratch even at large K.
+    for (int u0 = 0; u0 < n_sb * 8; u0 += 32) {
+        int u = u0 + lane;
+        int b = u >> 3;
+        int ib = u & 7;
+        int sumi = 0;
+        unsigned short sh = 0;
+        unsigned int sl = 0;
+        float d4d8 = 0.0f;
+        float acc = 0.0f;
+        bool active = b < n_sb;
+        if (active) {
+            const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const unsigned int* qs = reinterpret_cast<const unsigned int*>(block + 8 + ib * 16);
+            const int* ylo = reinterpret_cast<const int*>(s_iq + (long)b * 256 + ib * 32);
+            const int* yhi = ylo + 4;
             #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                int byte = q[j];
-                sumi += KV[byte & 0xF] * (int)yy[j];
-                sumi += KV[byte >> 4] * (int)yy[j + 16];
+            for (int j = 0; j < 4; j++) {
+                unsigned int codes = qs[j];
+                sumi = __dp4a(iq4xs_lookup_packed(codes & 0x0f0f0f0fu), ylo[j], sumi);
+                sumi = __dp4a(iq4xs_lookup_packed((codes >> 4) & 0x0f0f0f0fu), yhi[j], sumi);
             }
-            acc += d4d8 * (float)ls * (float)sumi;
+            if (ib == 0) {
+                unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
+                d4d8 = f16_bits_to_f32(d_bits) * s_is[b];
+                sh = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
+                sl = *reinterpret_cast<const unsigned int*>(block + 4);
+                acc = mypartials[b & 31];
+            }
         }
+        // All lanes participate, including inactive groups in the final warp.
+        // Integer dots may be reassociated; these eight FP additions may not.
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int dot = __shfl_sync(0xffffffffu, sumi, (lane & ~7) + j);
+            if (active && ib == 0) {
+                int low = (sl >> (4 * j)) & 0xF;
+                int high = (sh >> (2 * j)) & 0x3;
+                int ls = (low | (high << 4)) - 32;
+                acc += d4d8 * (float)ls * (float)dot;
+            }
+        }
+        if (active && ib == 0) mypartials[b & 31] = acc;
     }
+    __syncwarp();
+    float acc = mypartials[lane];
     #pragma unroll
     for (int off = 16; off >= 1; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -4816,6 +4904,25 @@ extern "C" __global__ void kv_scatter(
     // f16_bits_to_f32 and feed the same f32 into the dot product.
     cache[((long)kv_head * max_pos + (position % max_pos)) * head_dim + d] =
         f32_to_f16_bits(src[(long)kv_head * head_dim + d]);
+}
+
+// Gather one position from every contiguous F16 KV layer. The pointer table and
+// output both order K layers first, then V layers; each row is [head][head_dim].
+// Copy bits without arithmetic so the host uses the same F16 conversion as the
+// checked per-layer span reader, including subnormals and signed zero.
+extern "C" __global__ void kv_gather_row_f16(
+    const unsigned short* const* __restrict__ caches,
+    unsigned short* __restrict__ output,
+    int total, int row_width, int head_dim, int max_pos, int position
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (unsigned int)total) return;
+    int cache = idx / row_width;
+    int offset = idx % row_width;
+    int head = offset / head_dim;
+    int dim = offset % head_dim;
+    long long source = ((long long)head * max_pos + position) * head_dim + dim;
+    output[idx] = caches[cache][source];
 }
 
 // ---- Attention decode: per query head, GQA, scale, softmax, weighted V -----
@@ -8784,6 +8891,10 @@ pub struct CudaResidentKernels {
     /// Immutable fast/strict arithmetic contract for this kernel/engine instance.
     /// Read once at construction so a later model reload can choose independently.
     pub(crate) fast_q1: bool,
+    /// Explicit experimental Q2/PQ2 activation-quantized decode opt-in.
+    pub(crate) fast_q2: bool,
+    /// Experimental ordered Q8 multirow GEMV, limited to benchmarked SM86 shapes.
+    pub(crate) q8_multirow: bool,
     /// Immutable Q1 projection layout contract for this kernel/engine instance.
     /// Standalone kernel users default to raw GGUF; resident model construction
     /// selects this before any weight upload.
@@ -8794,8 +8905,10 @@ pub struct CudaResidentKernels {
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) rms_inv_norm_quantize_q8_0: CudaFunction,
     pub(crate) gemv: CudaFunction,
+    pub(crate) gemv_rows: [CudaFunction; 4],
     pub(crate) prism_low_bit_f32_gemv: CudaFunction,
     pub(crate) prism_q1_q8_gemv: CudaFunction,
+    pub(crate) prism_q2_q8_gemv: CudaFunction,
     pub(crate) prism_q1t128_q8_gemv: CudaFunction,
     pub(crate) prism_q8_32_bitplanes_qsum: CudaFunction,
     pub(crate) prism_q1t128_q8_popc_gemv_m16: CudaFunction,
@@ -8845,6 +8958,7 @@ pub struct CudaResidentKernels {
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
+    kv_gather_row_f16: CudaFunction,
     pub(crate) attention: CudaFunction,
     pub(crate) kv_scatter_paged: CudaFunction,
     pub(crate) attention_paged: CudaFunction,
@@ -9087,6 +9201,8 @@ impl CudaResidentKernels {
         Ok(Self {
             sm86,
             fast_q1,
+            fast_q2: std::env::var("CAMELID_PRISM_CUDA_Q2_DP4A").as_deref() == Ok("1"),
+            q8_multirow: std::env::var("CAMELID_CUDA_Q8_MULTIROW").as_deref() == Ok("1"),
             q1_tiled,
             rms_norm: f("rms_norm_f32")?,
             rms_norm_per_head: f("rms_norm_per_head_f32")?,
@@ -9094,8 +9210,15 @@ impl CudaResidentKernels {
             rms_norm_quantize: f("rms_norm_quantize")?,
             rms_inv_norm_quantize_q8_0: f("rms_inv_norm_quantize_q8_0")?,
             gemv: f("q8_gemv")?,
+            gemv_rows: [
+                f("q8_gemv_rows2_chunk32")?,
+                f("q8_gemv_rows2_chunk64")?,
+                f("q8_gemv_rows4_chunk64")?,
+                f("q8_gemv_rows8_chunk32")?,
+            ],
             prism_low_bit_f32_gemv: f("prism_low_bit_f32_gemv")?,
             prism_q1_q8_gemv: f("prism_q1_q8_gemv")?,
+            prism_q2_q8_gemv: f("prism_q2_q8_gemv")?,
             prism_q1t128_q8_gemv: f("prism_q1t128_q8_gemv")?,
             prism_q8_32_bitplanes_qsum: f("prism_q8_32_bitplanes_qsum")?,
             prism_q1t128_q8_popc_gemv_m16: f("prism_q1t128_q8_popc_gemv_m16")?,
@@ -9150,6 +9273,7 @@ impl CudaResidentKernels {
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
+            kv_gather_row_f16: f("kv_gather_row_f16")?,
             attention: f("attention_decode")?,
             kv_scatter_paged: f("kv_scatter_paged")?,
             attention_paged: f("attention_decode_paged")?,
@@ -10051,6 +10175,53 @@ pub(crate) fn launch_gemv(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+// Indices also select CudaResidentKernels::gemv_rows. All measured candidates use
+// 256 threads; keep this opt-in restricted to the shapes with a measured win.
+const Q8_MULTIROW_GEOMETRIES: [(u32, u32); 4] = [(2, 32), (2, 64), (4, 64), (8, 32)];
+
+fn q8_multirow_variant(rows: usize, cols: usize) -> Option<usize> {
+    match (rows, cols) {
+        (2048, 2048) => Some(0),
+        (512, 2048) => Some(1),
+        (8192, 3072) => Some(2),
+        (3072, 8192) => Some(3),
+        // In particular, the 128256x2048 output head was slower than q8_gemv.
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_rows(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    variant: usize,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let (rows_per_warp, chunk) = Q8_MULTIROW_GEOMETRIES[variant];
+    let warps = 8u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps * rows_per_warp), 1, 1),
+        block_dim: (warps * 32, 1, 1),
+        shared_mem_bytes: blocks_per_row as u32 * 36 + warps * rows_per_warp * chunk * 4,
+    };
+    let (rows, blocks_per_row) = (rows as i32, blocks_per_row as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&blocks_per_row)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 /// Q8 GEMV that fuses the post-projection residual add: writes `out[row] += acc` instead of
 /// `= acc`, so `out` must be the residual (hidden) buffer. Saves a separate residual_add launch
 /// and the projection's f32 round-trip. Bit-identical to gemv-then-residual_add (F2).
@@ -10161,6 +10332,39 @@ pub(crate) fn launch_prism_q1_q8_gemv(
         .arg(&rows)
         .arg(&cols)
         .arg(&blocks_per_row)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q2_q8_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    weight_block_elements: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(matches!(weight_block_elements, 64 | 128));
+    debug_assert!(cols.is_multiple_of(weight_block_elements));
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(64), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (rows, cols, block_elements) = (rows as i32, cols as i32, weight_block_elements as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&block_elements)
         .arg(out)
         .arg(&residual);
     unsafe { b.launch(cfg) }.map(|_| ())
@@ -10690,11 +10894,9 @@ pub(crate) fn launch_prism_q1_q8_b128_bmma_gemm_batched(
 
 /// Q4_K_M GEMV launch: same warp-per-row geometry as `launch_gemv`, but the input
 /// is Q8_K (256-wide super-blocks: `n_sb` f32 scales + `n_sb*256` i8 quants) and the
-/// weight is `repack_q4k_soa` bytes. Shared holds the staged Q8_K input vector
+/// weight is the upload-swizzled Q4_K wire. Shared holds the staged Q8_K input vector
 /// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
-/// 9-int scratch (8 main lanes + 1 mins) for lane 0's ordered f32 reduction.
-// As repack_q4k_soa: exercised by the bit-parity test; the production per-tensor
-// dispatch into this launcher is the deferred end-to-end follow-up.
+/// 9-int scratch (8 main lanes + 1 mins) for the ordered per-anchor f32 reductions.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn launch_q4k_gemv(
     s: &Arc<CudaStream>,
@@ -10707,7 +10909,14 @@ pub(crate) fn launch_q4k_gemv(
     out: &mut CudaSlice<f32>,
     residual: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
-    let block = 256u32;
+    // Larger row grids benefit from sixteen warps after parallelizing the
+    // integer anchors and their independent FP sums. Stay inside the 46 KiB
+    // shared-memory budget for wider contractions.
+    let block = if rows >= 2048 && n_sb * (260 + 16 * 36) <= 46 * 1024 {
+        512u32
+    } else {
+        256u32
+    };
     let warps_per_block = block / 32;
     let n_sb_u = n_sb as u32;
     let cfg = LaunchConfig {
@@ -10729,8 +10938,8 @@ pub(crate) fn launch_q4k_gemv(
 }
 
 /// IQ4_XS GEMV launch: same warp-per-row geometry as `launch_q6k_gemv`, but the
-/// kernel accumulates f32 partials in registers (no per-warp integer scratch), so
-/// shared memory is just the staged Q8_K activation. Weight is the RAW 136-byte
+/// kernel stages its original 32 f32 lane partials in bounded per-warp scratch.
+/// Weight is the RAW 136-byte
 /// IQ4_XS wire (raw passthrough upload; the kernel unpacks the codebook on the fly).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_iq4xs_gemv(
@@ -10750,8 +10959,8 @@ pub(crate) fn launch_iq4xs_gemv(
     let cfg = LaunchConfig {
         grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
-        // staged input only: n_sb*256 i8 + n_sb*4 f32 (partials live in registers).
-        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4,
+        // Staged input plus 32 original FP lane sums per warp, independent of K.
+        shared_mem_bytes: n_sb_u * 260 + warps_per_block * 32 * 4,
     };
     let (r, nb) = (rows as i32, n_sb as i32);
     let mut b = s.launch_builder(f);
@@ -10804,10 +11013,10 @@ pub(crate) fn launch_q5k_gemv(
 }
 
 /// Q6_K GEMV launch: same warp-per-row geometry as `launch_q4k_gemv`. Input is
-/// Q8_K (`n_sb` f32 scales + `n_sb*256` i8 quants); weight is the RAW 210-byte
-/// Q6_K wire bytes (no SoA repack). Shared holds the staged Q8_K input vector
+/// Q8_K (`n_sb` f32 scales + `n_sb*256` i8 quants); weights use the 224-byte
+/// padded Q6_K wire layout. Shared holds the staged Q8_K input vector
 /// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
-/// 8-int main-lane scratch for lane 0's ordered f32 reduction.
+/// 8-int main-lane scratch for the eight independent ordered f32 accumulators.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_q6k_gemv(
     s: &Arc<CudaStream>,
@@ -11164,6 +11373,22 @@ fn dispatch_gemv(
 ) -> Result<(), cudarc::driver::DriverError> {
     match lane {
         ProjQuant::Q8_0 => {
+            if kern.q8_multirow && kern.sm86 {
+                if let Some(variant) = q8_multirow_variant(rows, cols) {
+                    return launch_gemv_rows(
+                        s,
+                        &kern.gemv_rows[variant],
+                        variant,
+                        q8_0_scales,
+                        q8_0_quants,
+                        weight,
+                        rows,
+                        cols / 32,
+                        out,
+                        residual,
+                    );
+                }
+            }
             if residual != 0 {
                 launch_gemv_residual(
                     s,
@@ -11272,6 +11497,18 @@ fn dispatch_gemv(
                 residual,
             )
         }
+        ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 if kern.fast_q2 => launch_prism_q2_q8_gemv(
+            s,
+            &kern.prism_q2_q8_gemv,
+            q8_0_quants,
+            q8_0_scales,
+            weight,
+            rows,
+            cols,
+            lane.prism_layout().expect("Q2 block layout").1,
+            out,
+            residual,
+        ),
         ProjQuant::Q1_0 | ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 => {
             let (bits, block_elements) = lane
                 .prism_layout()
@@ -11465,7 +11702,7 @@ fn quantize_batched_for_lanes(
     // still prepare it once for any Q8_0 projection sharing this activation.
     if lanes
         .iter()
-        .any(|q| q.needs_q8_0(kern.fast_q1) && !(*q == ProjQuant::Q1_0 && bmma_ready))
+        .any(|q| q.needs_q8_0(kern.fast_q1, kern.fast_q2) && !(*q == ProjQuant::Q1_0 && bmma_ready))
     {
         launch_quantize(
             s,
@@ -12572,6 +12809,10 @@ pub(crate) fn launch_attention_batched(
 ) -> Result<(), cudarc::driver::DriverError> {
     // Scores live in the per-engine global scratch buffer. Shared memory only holds the query
     // and weighted-V partials (max_groups * head_dim, the decode-parity G-group reduction).
+    assert!(
+        global_scores.len() >= k * n_heads * max_pos,
+        "batched attention requires one max_pos score row per token and head"
+    );
     let max_groups = (1024 / head_dim).max(1);
     let shared = ((head_dim + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
@@ -12873,6 +13114,10 @@ pub(crate) fn launch_attention_tree_batched(
 ) -> Result<(), cudarc::driver::DriverError> {
     // Scores live in the per-engine global scratch buffer. Shared memory holds the query,
     // slot indices (<= base + k), and weighted-V partials (max_groups * head_dim).
+    assert!(
+        global_scores.len() >= k * n_heads * max_pos,
+        "tree attention requires one max_pos score row per token and head"
+    );
     let max_groups = (1024 / head_dim).max(1);
     let shared = ((head_dim + base_position + k + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
@@ -13710,16 +13955,17 @@ pub(crate) const SPLITK_THRESHOLD: usize = 512;
 /// plain greedy decode. Mirrors the plain-decode dispatch (`!graph_capture && attn_shared >
 /// SPLITK_THRESHOLD`): on the LIVE (non-graph-captured) decode path, `position_count >
 /// SPLITK_THRESHOLD` runs split-K, so the verify kernels must reproduce its exact chunked reduction
-/// above the threshold. A graph-captured greedy decode skips split-K (uses the G-group
-/// attention_decode), so when CUDA graphs drive greedy decode the verify must STAY G-group. Passed
+/// above the threshold. Generic greedy graphs return to the live path above the
+/// threshold, so their verify always keeps split-K enabled. Preserve the separate
+/// Qwen3.5 device-loop policy here; its graph and prefill behavior is unchanged. Passed
 /// to the verify kernels as `splitk_active`; the per-token `pc > SPLITK_THRESHOLD` test is done
 /// in-kernel so a verify batch straddling the boundary picks the right path per token.
 ///
 /// SCOPE: `CAMELID_ATTN_COALESCED` additionally re-associates split-K's per-position dot (Pass 1
 /// warp-shuffle), which this emulation does NOT reproduce — so the > SPLITK_THRESHOLD lossless
 /// guarantee holds only on the default non-coalesced path. The kernel-parity test asserts that.
-fn splitk_verify_active() -> bool {
-    !cuda_graphs_enabled()
+fn splitk_verify_active(qwen35: bool) -> bool {
+    !qwen35 || !cuda_graphs_enabled()
 }
 
 /// Split-K decode attention: grid = n_heads x n_splits (vs one block per head), so the
@@ -13943,8 +14189,8 @@ pub(crate) fn launch_attention(
     n_kv_heads: usize,
     head_dim: usize,
     position: &CudaSlice<i32>,
-    // Positions used to choose the weighted-V group count. The non-graph path passes the exact
-    // current count; the graph-capture path passes `max_pos` so launch geometry is replay-stable.
+    // Positions used to choose the weighted-V group count. Generic graphs cache
+    // this exact live geometry; the separately scoped device-loop graph uses capacity.
     shared_positions: usize,
     max_pos: usize,
     scale: f32,
@@ -13959,10 +14205,7 @@ pub(crate) fn launch_attention(
     // contiguous key ranges. The strided score/exp loops and the tid==0 softmax
     // reductions stay bit-identical; the weighted-V is FP-reassociated for parallelism
     // (token-parity, not bit-identical to CPU — see the kernel body). Verified token-id.
-    let max_groups = (1024 / head_dim as u32).max(1);
-    let groups = (shared_positions.max(1) as u32)
-        .div_ceil(head_dim as u32)
-        .clamp(1, max_groups);
+    let groups = attention_decode_groups(head_dim, shared_positions);
     let block = groups * head_dim as u32;
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
@@ -13989,6 +14232,13 @@ pub(crate) fn launch_attention(
         .arg(&scale)
         .arg(global_scores);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn attention_decode_groups(head_dim: usize, position_count: usize) -> u32 {
+    let max_groups = (1024 / head_dim as u32).max(1);
+    (position_count.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14490,15 +14740,17 @@ pub enum ProjQuant {
 
 impl ProjQuant {
     /// Whether this projection consumes the compact Q8_0 activation buffers.
-    fn needs_q8_0(self, fast_q1: bool) -> bool {
-        self == ProjQuant::Q8_0 || (self == ProjQuant::Q1_0 && fast_q1)
+    fn needs_q8_0(self, fast_q1: bool, fast_q2: bool) -> bool {
+        self == ProjQuant::Q8_0
+            || (self == ProjQuant::Q1_0 && fast_q1)
+            || (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && fast_q2)
     }
 
     /// Whether this is one of Prism's packed low-bit rows. These projections
     /// consume the original f32 activation to preserve the Metal oracle's
     /// reduction association.
-    fn is_prism_low_bit(self, fast_q1: bool) -> bool {
-        matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128)
+    fn is_prism_low_bit(self, fast_q1: bool, fast_q2: bool) -> bool {
+        (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && !fast_q2)
             || (self == ProjQuant::Q1_0 && !fast_q1)
     }
 
@@ -14692,6 +14944,16 @@ struct InactiveKvBank {
     filled: usize,
 }
 
+/// Lazy readback scratch for the CPU-prefix lane. Host pointer-table and transfer
+/// storage remain alive until the stream has completed, including error paths.
+struct KvRowReadback {
+    pointers: Vec<u64>,
+    d_pointers: CudaSlice<u64>,
+    pointers_uploaded: bool,
+    d_bits: CudaSlice<u16>,
+    bits: Vec<u16>,
+}
+
 /// GPU-resident Llama decode engine. Weights and KV cache live on the GPU; one
 /// `forward_token` call runs the whole per-token forward with a single sync.
 pub struct CudaResidentDecode {
@@ -14723,6 +14985,7 @@ pub struct CudaResidentDecode {
     cache_k: Vec<CudaSlice<u8>>,
     cache_v: Vec<CudaSlice<u8>>,
     pub kv_quant: crate::model::KvCacheQuantization,
+    kv_row_readback: Option<KvRowReadback>,
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
@@ -14749,9 +15012,9 @@ pub struct CudaResidentDecode {
     d_sk_chunkmax: CudaSlice<f32>, // n_heads * SPLITK_MAX
     d_sk_lsum: CudaSlice<f32>,     // n_heads * SPLITK_MAX
     d_sk_acc: CudaSlice<f32>,      // n_heads * SPLITK_MAX * head_dim
-    // Batched speculative-verification attention scores, k_tokens-major
-    // (flat (token * n_heads + head)).
-    d_verify_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
+    // Batched attention scores, k_tokens-major (flat (token * n_heads + head)).
+    // Starts at MAX_VERIFY_K rows and grows for wider prompt batches.
+    d_verify_scores: CudaSlice<f32>,
     d_proj: CudaSlice<f32>,
     /// Holds a projection's output AFTER a gemma3 sandwich post-norm and before
     /// its residual add. A top-level field rather than one inside `Gemma3Gpu` so
@@ -14795,12 +15058,12 @@ pub struct CudaResidentDecode {
     /// graph's kernel args are frozen, so the only thing that varies per token
     /// (position, embedding, RoPE) must arrive through device buffers it reads.
     d_position: CudaSlice<i32>,
-    /// Captured CUDA graph of the greedy decode forward (layer stack + output proj +
-    /// argmax). Recorded once, then replayed per token with one `launch()` instead of
+    /// Captured CUDA graphs of the greedy decode forward (layer stack + output proj +
+    /// argmax), keyed by live attention group count and scale bits. Replayed with one `launch()` instead of
     /// ~600 individual kernel launches. The per-token inputs (embedding / RoPE /
     /// position) are written to device buffers BEFORE replay, so the frozen graph
     /// reads fresh values each step. Captured at the engine's `eps`/`scale`/`max_pos`.
-    decode_graph: Option<SendCudaGraph>,
+    decode_graphs: Vec<(u32, u32, SendCudaGraph)>,
     /// Qwen3.5 device-loop graph containing the resident layer stack, final norm,
     /// and lm_head. Token gather, RoPE row selection, and ring argmax stay outside
     /// because their source/destination views change per step. This still collapses
@@ -15624,6 +15887,7 @@ impl CudaResidentDecode {
             cache_k,
             cache_v,
             kv_quant,
+            kv_row_readback: None,
             filled: 0,
             resident_tokens: Vec::new(),
             active_kv_slot: 0,
@@ -15664,7 +15928,7 @@ impl CudaResidentDecode {
             d_cos: alloc_f(rope_dim / 2)?,
             d_sin: alloc_f(rope_dim / 2)?,
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
-            decode_graph: None,
+            decode_graphs: Vec::new(),
             device_forward_graph: None,
             overlap,
             verify_scratch: None,
@@ -16637,7 +16901,7 @@ impl CudaResidentDecode {
         if self.paged_kv_pages.is_some() {
             return Err("paged CUDA KV does not use contiguous KV slots".into());
         }
-        if self.decode_graph.is_some() || self.device_forward_graph.is_some() {
+        if !self.decode_graphs.is_empty() || self.device_forward_graph.is_some() {
             return Err("cannot add a CUDA KV slot after graph capture".into());
         }
         let stream = self.k.stream.clone();
@@ -17019,15 +17283,171 @@ impl CudaResidentDecode {
         layer: usize,
         n_positions: usize,
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        self.read_kv_layer_range(layer, 0, n_positions)
+    }
+
+    /// Read one position from every layer with one gather, one DtoH, and one
+    /// stream sync. Each returned side is [layer][kv_head][head_dim]. The
+    /// CPU-prefix lane admits this contiguous F16 layout; other callers retain
+    /// `read_kv_layer_range` for the layouts it supports.
+    pub(crate) fn read_kv_row_all_layers(
+        &mut self,
+        position: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if self.kv_quant != crate::model::KvCacheQuantization::F16
+            || self.is_windowed()
+            || self.paged_kv_pages.is_some()
+        {
+            return Err("read_kv_row_all_layers requires contiguous nonwindowed F16 KV".into());
+        }
+        if position >= self.max_pos {
+            return Err(format!(
+                "read_kv_row_all_layers: position {position} exceeds resident capacity {}",
+                self.max_pos
+            ));
+        }
+        let row_width = self
+            .n_kv_heads
+            .checked_mul(self.head_dim)
+            .filter(|&width| width > 0)
+            .ok_or("read_kv_row_all_layers: invalid row width")?;
+        let side_width = self
+            .n_layers
+            .checked_mul(row_width)
+            .filter(|&width| width > 0)
+            .ok_or("read_kv_row_all_layers: invalid layer count")?;
+        let total = side_width
+            .checked_mul(2)
+            .filter(|&width| width <= i32::MAX as usize)
+            .ok_or("read_kv_row_all_layers: gather is too large")?;
+        let cache_bytes = row_width
+            .checked_mul(self.max_pos)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or("read_kv_row_all_layers: cache size overflow")?;
+        if self.max_pos > i32::MAX as usize
+            || self.cache_k.len() != self.n_layers
+            || self.cache_v.len() != self.n_layers
+            || self
+                .cache_k
+                .iter()
+                .chain(&self.cache_v)
+                .any(|cache| cache.len() != cache_bytes)
+        {
+            // This also rejects sparse SSM placeholders and per-layer rings.
+            return Err("read_kv_row_all_layers: incompatible contiguous KV buffers".into());
+        }
+        let stream = self.k.stream.clone();
+        let (pointers, read_guards): (Vec<_>, Vec<_>) = self
+            .cache_k
+            .iter()
+            .chain(&self.cache_v)
+            .map(|cache| cache.device_ptr(&stream))
+            .unzip();
+        // Banks can be switched and sparse caches replaced elsewhere in the
+        // engine. Check their current addresses instead of caching stale raw
+        // pointers. The common single-slot path uploads this table only once.
+        if self
+            .kv_row_readback
+            .as_ref()
+            .is_none_or(|scratch| scratch.pointers != pointers)
+        {
+            let d_pointers = stream
+                .alloc_zeros::<u64>(pointers.len())
+                .map_err(|error| format!("KV gather pointer allocation: {error}"))?;
+            let d_bits = stream
+                .alloc_zeros::<u16>(total)
+                .map_err(|error| format!("KV gather output allocation: {error}"))?;
+            self.kv_row_readback = Some(KvRowReadback {
+                pointers,
+                d_pointers,
+                pointers_uploaded: false,
+                d_bits,
+                bits: vec![0; total],
+            });
+        }
+        let scratch = self.kv_row_readback.as_mut().expect("initialized above");
+        let transfer = (|| {
+            if !scratch.pointers_uploaded {
+                stream
+                    .memcpy_htod(&scratch.pointers, &mut scratch.d_pointers)
+                    .map_err(|error| format!("KV gather pointer upload: {error}"))?;
+            }
+            let (total, width, hd, capacity, position) = (
+                total as i32,
+                row_width as i32,
+                self.head_dim as i32,
+                self.max_pos as i32,
+                position as i32,
+            );
+            let mut launch = stream.launch_builder(&self.k.kv_gather_row_f16);
+            launch
+                .arg(&scratch.d_pointers)
+                .arg(&mut scratch.d_bits)
+                .arg(&total)
+                .arg(&width)
+                .arg(&hd)
+                .arg(&capacity)
+                .arg(&position);
+            // The checked table points to this engine's live buffers. Exclusive
+            // engine access prevents replacement until the stream sync below.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: ((total as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| format!("KV gather launch: {error}"))?;
+            drop(launch);
+            // Record cache reads after their launch when cudarc's optional
+            // stream-event tracking is enabled.
+            drop(read_guards);
+            stream
+                .memcpy_dtoh(&scratch.d_bits, &mut scratch.bits)
+                .map_err(|error| format!("KV gather readback: {error}"))?;
+            stream
+                .synchronize()
+                .map_err(|error| format!("KV gather sync: {error}"))?;
+            scratch.pointers_uploaded = true;
+            Ok::<(), String>(())
+        })();
+        if transfer.is_err() {
+            // Drain any successful upload/launch before returning an error.
+            // The caller poisons partially advanced sessions as before.
+            let _ = stream.synchronize();
+        }
+        transfer?;
+        let convert = |bits: &[u16]| {
+            bits.iter()
+                .map(|&bits| crate::inference::f16_bits_to_f32(bits))
+                .collect()
+        };
+        Ok((
+            convert(&scratch.bits[..side_width]),
+            convert(&scratch.bits[side_width..]),
+        ))
+    }
+
+    /// Read a bounded span without transferring the preceding history. Retained
+    /// for individual-layer inspection and supported quantized KV layouts.
+    pub(crate) fn read_kv_layer_range(
+        &self,
+        layer: usize,
+        start_position: usize,
+        n_positions: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         // Bounds first, as `seed_layer` does: the slices below would otherwise panic on an
         // out-of-range layer or an over-long read. Callers are seams that already fall back on
         // Err, so refusing is strictly better than aborting the process.
         if layer >= self.n_layers {
             return Err("read_kv_layer: layer out of range".into());
         }
-        if n_positions > self.max_pos {
+        if start_position
+            .checked_add(n_positions)
+            .is_none_or(|end| end > self.max_pos)
+        {
             return Err(format!(
-                "read_kv_layer: {n_positions} positions exceeds resident capacity {}",
+                "read_kv_layer: span {start_position}+{n_positions} exceeds resident capacity {}",
                 self.max_pos
             ));
         }
@@ -17040,7 +17460,7 @@ impl CudaResidentDecode {
             let mut k_bytes = vec![0u8; n_kv * span];
             let mut v_bytes = vec![0u8; n_kv * span];
             for h in 0..n_kv {
-                let gsrc = h * max_pos * bytes_per_head;
+                let gsrc = (h * max_pos + start_position) * bytes_per_head;
                 s.memcpy_dtoh(
                     &self.cache_k[layer].slice(gsrc..gsrc + span),
                     &mut k_bytes[h * span..(h + 1) * span],
@@ -17092,7 +17512,7 @@ impl CudaResidentDecode {
             let mut k_bits = vec![0u16; n_kv * span];
             let mut v_bits = vec![0u16; n_kv * span];
             for h in 0..n_kv {
-                let gsrc = h * max_pos * hd * 2;
+                let gsrc = (h * max_pos + start_position) * hd * 2;
                 let k_bytes_mut: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
                         k_bits[h * span..].as_mut_ptr() as *mut u8,
@@ -17217,8 +17637,8 @@ impl CudaResidentDecode {
         compute_logits: bool,
         // When true the kernel chain is being recorded into a CUDA graph: the
         // per-token inputs are NOT uploaded here (the replay does that just before
-        // launch) and attention's shared `scores[]` is sized to `max_pos` so the
-        // captured launch config holds for every replayed position.
+        // launch). Generic graphs retain live attention geometry and are cached
+        // by group count; the separate device-loop graph retains capacity geometry.
         graph_capture: bool,
         // When true the per-token inputs (hidden/cos/sin/position) are ALREADY in
         // the device buffers — written by embed_gather/rope_select plus a 4-byte
@@ -17303,7 +17723,7 @@ impl CudaResidentDecode {
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
-        let attn_shared = if graph_capture {
+        let attn_shared = if graph_capture && device_inputs {
             self.max_pos
         } else {
             position + 1
@@ -17405,11 +17825,11 @@ impl CudaResidentDecode {
             };
             let attn_need_q8_0 = lq[..n_attn_consumers]
                 .iter()
-                .any(|q| q.needs_q8_0(self.k.fast_q1));
+                .any(|q| q.needs_q8_0(self.k.fast_q1, self.k.fast_q2));
             let attn_need_q8k = lq[..n_attn_consumers].iter().any(|q| q.needs_q8k());
             let attn_need_f32 = lq[..n_attn_consumers]
                 .iter()
-                .any(|q| q.is_prism_low_bit(self.k.fast_q1));
+                .any(|q| q.is_prism_low_bit(self.k.fast_q1, self.k.fast_q2));
             let attn_q1 = self.k.fast_q1
                 && lq[..n_attn_consumers]
                     .iter()
@@ -18026,10 +18446,10 @@ impl CudaResidentDecode {
                             self.hidden,
                         )
                         .map_err(map)?;
-                    } else if lq[3].needs_q8_0(self.k.fast_q1)
-                        || lq[3].is_prism_low_bit(self.k.fast_q1)
+                    } else if lq[3].needs_q8_0(self.k.fast_q1, self.k.fast_q2)
+                        || lq[3].is_prism_low_bit(self.k.fast_q1, self.k.fast_q2)
                     {
-                        if lq[3].needs_q8_0(self.k.fast_q1) {
+                        if lq[3].needs_q8_0(self.k.fast_q1, self.k.fast_q2) {
                             launch_quantize(
                                 &s,
                                 &self.k.quantize,
@@ -18367,7 +18787,7 @@ impl CudaResidentDecode {
                             value_dim / 256,
                         )
                         .map_err(map)?;
-                    } else if !bonsai_ssm_q8 && sq[4].needs_q8_0(self.k.fast_q1) {
+                    } else if !bonsai_ssm_q8 && sq[4].needs_q8_0(self.k.fast_q1, self.k.fast_q2) {
                         launch_quantize(
                             &s,
                             &self.k.quantize,
@@ -18399,11 +18819,11 @@ impl CudaResidentDecode {
             // ffn norm + gate/up + silu + down + residual. gate/up consume the ffn-norm
             // activation; down consumes the silu(gate)*up activation. Each is produced in
             // the format its consumers read (Q8_0 path byte-identical for an all-Q8_0 layer).
-            let ffn_need_q8_0 =
-                lq[4].needs_q8_0(self.k.fast_q1) || lq[5].needs_q8_0(self.k.fast_q1);
+            let ffn_need_q8_0 = lq[4].needs_q8_0(self.k.fast_q1, self.k.fast_q2)
+                || lq[5].needs_q8_0(self.k.fast_q1, self.k.fast_q2);
             let ffn_need_q8k = lq[4].needs_q8k() || lq[5].needs_q8k();
-            let ffn_need_f32 =
-                lq[4].is_prism_low_bit(self.k.fast_q1) || lq[5].is_prism_low_bit(self.k.fast_q1);
+            let ffn_need_f32 = lq[4].is_prism_low_bit(self.k.fast_q1, self.k.fast_q2)
+                || lq[5].is_prism_low_bit(self.k.fast_q1, self.k.fast_q2);
             let ffn_q1 = self.k.fast_q1 && lq[4..6].iter().all(|lane| *lane == ProjQuant::Q1_0);
             if ffn_q1 {
                 launch_prism_rms_norm_q8_batched(
@@ -18660,7 +19080,9 @@ impl CudaResidentDecode {
                     self.hidden,
                 )
                 .map_err(map)?;
-            } else if lq[6].needs_q8_0(self.k.fast_q1) || lq[6].is_prism_low_bit(self.k.fast_q1) {
+            } else if lq[6].needs_q8_0(self.k.fast_q1, self.k.fast_q2)
+                || lq[6].is_prism_low_bit(self.k.fast_q1, self.k.fast_q2)
+            {
                 if self.k.fast_q1 && lq[6] == ProjQuant::Q1_0 {
                     launch_prism_silu_mul_q8_batched(
                         &s,
@@ -18672,7 +19094,7 @@ impl CudaResidentDecode {
                         fb,
                     )
                     .map_err(map)?;
-                } else if lq[6].is_prism_low_bit(self.k.fast_q1) {
+                } else if lq[6].is_prism_low_bit(self.k.fast_q1, self.k.fast_q2) {
                     launch_silu_mul(
                         &s,
                         &self.k.silu_mul,
@@ -18847,7 +19269,10 @@ impl CudaResidentDecode {
                 1,
             )
             .map_err(map)?;
-        } else if self.output_quant.is_prism_low_bit(self.k.fast_q1) {
+        } else if self
+            .output_quant
+            .is_prism_low_bit(self.k.fast_q1, self.k.fast_q2)
+        {
             launch_rmsnorm(
                 &s,
                 &self.k.rms_norm,
@@ -18858,7 +19283,7 @@ impl CudaResidentDecode {
                 self.eps,
             )
             .map_err(map)?;
-        } else if self.output_quant.needs_q8_0(self.k.fast_q1) {
+        } else if self.output_quant.needs_q8_0(self.k.fast_q1, self.k.fast_q2) {
             if fused {
                 launch_rmsnorm_quantize(
                     &s,
@@ -18969,20 +19394,10 @@ impl CudaResidentDecode {
             self.k.ctx.synchronize().map_err(map)?;
             return Ok(None);
         }
-        // Greedy decode: replay the captured CUDA graph when enabled (one launch for
-        // the whole ~600-kernel token), else the per-launch path. STATUS 2026-07-03:
-        // capture is broken on this Windows/WDDM driver (576.83, CUDA 12.9) for BOTH
-        // the llama and qwen35 arches — begin_capture on the default stream returns
-        // CAPTURE_UNSUPPORTED (fixed by the dedicated engine stream), and recording
-        // then dies with CAPTURE_ISOLATION ("dependency created on uncaptured work in
-        // another stream") inside the common layer loop even after a pre-capture
-        // stream drain, in release builds deterministically (llama probe:
-        // full_forward_token_matches_cpu fails identically). The qwen35 guard below is
-        // kept so an env opt-in cannot silently fall back to the CPU lane on serve;
-        // the real launch-overhead fix is the device-side decode loop (resident
-        // embedding gather + resident rope tables reading d_sampled/d_position), which
-        // needs no capture at all. qwen35's SSM state itself is graph-compatible
-        // (stable engine-level buffers, no position launch scalars).
+        // Generic greedy graphs preserve the live weighted-V group count. At
+        // >512 keys, use the live split-K path; a capacity-shaped graph changes
+        // FP association and can change greedy output even on short prompts.
+        // Qwen3.5 retains its separately gated device-loop graph.
         // gemma3 is excluded from graph capture alongside qwen35. The captured
         // graph freezes each layer's kernel identity and args, and a windowed
         // schedule alternates between `attention_decode_sw` and the full-causal
@@ -18990,6 +19405,10 @@ impl CudaResidentDecode {
         // safe outcome of getting it wrong is not a crash but a wrong token.
         if self.kv_slot_count() == 1
             && cuda_graphs_enabled()
+            && position < SPLITK_THRESHOLD
+            // Streamed weights use an uncaptured copy stream and external
+            // events; retain the ordinary forward for those sessions.
+            && self.offload.is_none()
             && self.qwen35.is_none()
             && self.gemma3.is_none()
         {
@@ -19265,7 +19684,11 @@ impl CudaResidentDecode {
             s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .map_err(map("begin"))?;
             let recorded = self.forward_pass(&[], &[], &[], position, scale, true, true, true);
-            let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0) };
+            // cudarc models flags as an enum without a zero variant. These
+            // graphs contain no allocation nodes, so AUTO_FREE_ON_LAUNCH has
+            // no allocations to free and supplies a valid Rust enum value.
+            let flags =
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
             let captured = s.end_capture(flags);
             recorded?;
             match captured.map_err(map("end"))? {
@@ -19305,12 +19728,13 @@ impl CudaResidentDecode {
     }
 
     /// Greedy decode via CUDA graph: upload this token's inputs to device buffers,
-    /// then replay the captured forward (lazily recorded on the first call). One
+    /// then replay the forward for this attention geometry (captured lazily). One
     /// `graph.launch()` replaces the ~600 individual kernel launches, cutting the
     /// host-side launch overhead the profiler flagged. Byte-identical to the
     /// per-launch path: the same kernels read the same buffers; only `position`,
     /// the embedding, and the RoPE tables change, and those arrive through the
-    /// device buffers the graph reads.
+    /// device buffers the graph reads. Attention group count and scale are graph
+    /// cache keys because they change floating-point reduction order or kernel args.
     fn forward_token_greedy_graphed(
         &mut self,
         embedding: &[f32],
@@ -19334,7 +19758,15 @@ impl CudaResidentDecode {
         s.memcpy_htod(&[position as i32], &mut self.d_position)
             .map_err(map("htod-pos"))?;
 
-        if self.decode_graph.is_none() {
+        let groups = attention_decode_groups(self.head_dim, position + 1);
+        let scale_bits = scale.to_bits();
+        let graph_index = self
+            .decode_graphs
+            .iter()
+            .position(|(g, s, _)| *g == groups && *s == scale_bits);
+        let graph_index = if let Some(index) = graph_index {
+            index
+        } else {
             // Record the greedy forward (layer stack + output projection + argmax)
             // once. Stream capture records without executing, so this does not write
             // KV; the first real execution is the `launch()` below.
@@ -19361,24 +19793,27 @@ impl CudaResidentDecode {
                 Ok(())
             })();
             // Always end capture to leave the stream clean, then surface a record error.
-            // flags = 0 (no special instantiation flags); the repr(u32) enum has no
-            // zero variant, and cudarc consumes it via `as u32`, so the 0 bits pass.
-            let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0) };
+            // This capture contains no allocation nodes. AUTO_FREE_ON_LAUNCH
+            // therefore has no effect, and avoids constructing the invalid zero
+            // discriminant of cudarc's graph-instantiation flag enum.
+            let flags =
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
             let captured = s.end_capture(flags);
             recorded?;
             match captured.map_err(map("end"))? {
                 Some(graph) => {
                     graph.upload().map_err(map("upload"))?;
-                    self.decode_graph = Some(SendCudaGraph(graph));
+                    self.decode_graphs
+                        .push((groups, scale_bits, SendCudaGraph(graph)));
                 }
                 None => return Err("decode graph capture produced no graph".into()),
             }
-        }
+            self.decode_graphs.len() - 1
+        };
 
-        self.decode_graph
-            .as_ref()
-            .expect("decode graph present")
-            .0
+        self.decode_graphs[graph_index]
+            .2
+             .0
             .launch()
             .map_err(map("replay"))?;
         let mut out = [0u32; 1];
@@ -20599,7 +21034,7 @@ impl CudaResidentDecode {
                     max_pos,
                     scale,
                     q_width,
-                    i32::from(splitk_verify_active()),
+                    i32::from(splitk_verify_active(self.qwen35.is_some())),
                     &mut scores,
                 )
                 .map_err(map)?;
@@ -20627,7 +21062,7 @@ impl CudaResidentDecode {
                         max_pos,
                         scale,
                         q_width,
-                        i32::from(splitk_verify_active()),
+                        i32::from(splitk_verify_active(self.qwen35.is_some())),
                         &mut scores,
                     )
                     .map_err(map)?;
@@ -20756,6 +21191,25 @@ impl CudaResidentDecode {
         Ok(())
     }
 
+    fn ensure_batched_attention_scores(&mut self, tokens: usize) -> Result<(), String> {
+        let required = tokens * self.n_heads * self.max_pos;
+        if self.d_verify_scores.len() < required {
+            // Q1 prompt batches can contain 128 tokens, whereas speculative
+            // verification starts with only MAX_VERIFY_K (16) score rows.
+            // Every attention CTA addresses a full max_pos stride, including
+            // early prompt tokens whose causal prefix is much shorter.
+            // These batched stacks are not graph-captured. Greedy/device-loop
+            // graphs use d_sk_scores, so replacing this allocation cannot leave
+            // a captured kernel referring to its old address.
+            self.d_verify_scores = self
+                .k
+                .stream
+                .alloc_zeros::<f32>(required)
+                .map_err(|e| format!("batched attention score alloc: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Allocate a `VerifyScratch` sized to `cap` rows (`cap * dim`). Used by the
     /// linear verify (`cap = MAX_VERIFY_K`), tree verify (`cap = TREE_MAX_NODES`),
     /// and prompt prefill (`cap = batch_cap`).
@@ -20870,6 +21324,7 @@ impl CudaResidentDecode {
         flash_ok: bool, // SIROCCO Phase P M1: prefill passes true (opt-in flash); verify passes false.
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda batched layers: {e}");
+        self.ensure_batched_attention_scores(k)?;
         // Own the Arc locally so each per-launch `&s` is `&Arc<CudaStream>` (what the
         // launch helpers take), not `&&Arc` — the launch calls below are copied verbatim
         // from the original inline loop. Arc::clone is a cheap refcount bump.
@@ -21185,7 +21640,11 @@ impl CudaResidentDecode {
                             scale,
                             q_width,
                             k,
-                            if splitk_verify_active() { 1 } else { 0 },
+                            if splitk_verify_active(self.qwen35.is_some()) {
+                                1
+                            } else {
+                                0
+                            },
                             &mut self.d_verify_scores,
                         )
                         .map_err(map)?;
@@ -21777,6 +22236,7 @@ impl CudaResidentDecode {
         scale: f32,
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda tree layers: {e}");
+        self.ensure_batched_attention_scores(k)?;
         let s = s.clone();
         let (hidden, q_width, kv_width, ffn_dim) =
             (self.hidden, self.q_width, self.kv_width, self.ffn_dim);
@@ -21979,7 +22439,11 @@ impl CudaResidentDecode {
                 scale,
                 q_width,
                 k,
-                if splitk_verify_active() { 1 } else { 0 },
+                if splitk_verify_active(self.qwen35.is_some()) {
+                    1
+                } else {
+                    0
+                },
                 &mut self.d_verify_scores,
             )
             .map_err(map)?;
