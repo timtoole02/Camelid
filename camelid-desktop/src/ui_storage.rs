@@ -8,6 +8,7 @@ use tauri::{Manager, State};
 
 const UI_STORAGE_FILE: &str = "ui-storage-v1.json";
 const UI_STORAGE_TEMP_FILE: &str = "ui-storage-v1.json.tmp";
+const UI_STORAGE_LOCK_FILE: &str = "ui-storage-v1.lock";
 const UI_STORAGE_VERSION: u32 = 1;
 const MAX_KEY_BYTES: usize = 256;
 const MAX_VALUE_BYTES: usize = 32 * 1024 * 1024;
@@ -15,7 +16,6 @@ const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct UiStorageInner {
-    loaded: bool,
     initialized: bool,
     values: BTreeMap<String, String>,
 }
@@ -159,7 +159,7 @@ fn write_document(app_data_dir: &Path, values: &BTreeMap<String, String>) -> Res
 }
 
 impl UiStorageState {
-    fn with_loaded<T>(
+    fn with_document<T>(
         &self,
         app_data_dir: &Path,
         operation: impl FnOnce(&mut UiStorageInner) -> Result<T, String>,
@@ -168,17 +168,30 @@ impl UiStorageState {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !inner.loaded {
-            let (initialized, values) = load_document(app_data_dir)?;
-            inner.loaded = true;
-            inner.initialized = initialized;
-            inner.values = values;
-        }
+        fs::create_dir_all(app_data_dir)
+            .map_err(|err| format!("could not create {}: {err}", app_data_dir.display()))?;
+        // Lock a separate file: replacing the JSON must not replace the inode
+        // whose lock protects the transaction. Dropping the file unlocks it.
+        let lock_path = app_data_dir.join(UI_STORAGE_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| format!("could not open {}: {err}", lock_path.display()))?;
+        lock.lock()
+            .map_err(|err| format!("could not lock {}: {err}", lock_path.display()))?;
+        // Every transaction starts from the durable document, including reads.
+        // A stale state must never overwrite keys saved by another state.
+        let (initialized, values) = load_document(app_data_dir)?;
+        inner.initialized = initialized;
+        inner.values = values;
         operation(&mut inner)
     }
 
     fn snapshot(&self, app_data_dir: &Path) -> Result<UiStorageSnapshot, String> {
-        self.with_loaded(app_data_dir, |inner| {
+        self.with_document(app_data_dir, |inner| {
             Ok(UiStorageSnapshot {
                 version: UI_STORAGE_VERSION,
                 initialized: inner.initialized,
@@ -199,7 +212,7 @@ impl UiStorageState {
             return Err("desktop UI storage only accepts Camelid-owned keys".to_string());
         }
 
-        self.with_loaded(app_data_dir, |inner| {
+        self.with_document(app_data_dir, |inner| {
             let mut next = inner.values.clone();
             if let Some(value) = value {
                 next.insert(key, value);
@@ -219,7 +232,7 @@ impl UiStorageState {
         values: BTreeMap<String, String>,
     ) -> Result<(), String> {
         validate_values(&values)?;
-        self.with_loaded(app_data_dir, |inner| {
+        self.with_document(app_data_dir, |inner| {
             write_document(app_data_dir, &values)?;
             inner.initialized = true;
             inner.values = values;
@@ -325,5 +338,58 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("Camelid-owned"));
         assert!(!storage_path(root.path()).exists());
+    }
+
+    #[test]
+    fn unrelated_write_from_a_stale_state_preserves_saved_chats() {
+        let root = tempfile::tempdir().unwrap();
+        let first = UiStorageState::default();
+        let second = UiStorageState::default();
+        first.snapshot(root.path()).unwrap();
+        second.snapshot(root.path()).unwrap();
+        first
+            .set_value(
+                root.path(),
+                "camelid.conversations".into(),
+                Some("saved chat".into()),
+            )
+            .unwrap();
+        second
+            .set_value(root.path(), "camelid-theme".into(), Some("light".into()))
+            .unwrap();
+        let snapshot = first.snapshot(root.path()).unwrap();
+        assert_eq!(snapshot.values["camelid.conversations"], "saved chat");
+        assert_eq!(snapshot.values["camelid-theme"], "light");
+
+        first
+            .set_value(root.path(), "camelid-theme".into(), None)
+            .unwrap();
+        assert_eq!(second.snapshot(root.path()).unwrap().values.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_storage_transactions_preserve_every_independent_key() {
+        let root = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let path = root.path();
+                scope.spawn(move || {
+                    UiStorageState::default()
+                        .set_value(
+                            path,
+                            format!("camelid.test-{index}"),
+                            Some(index.to_string()),
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        let snapshot = UiStorageState::default().snapshot(root.path()).unwrap();
+        for index in 0..16 {
+            assert_eq!(
+                snapshot.values[&format!("camelid.test-{index}")],
+                index.to_string()
+            );
+        }
     }
 }

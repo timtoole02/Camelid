@@ -336,7 +336,13 @@ impl ServerPolicy {
 
     pub(crate) fn cors_layer(&self) -> CorsLayer {
         let layer = CorsLayer::new()
-            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers([AUTHORIZATION, CONTENT_TYPE, X_API_KEY.clone()]);
         if self.cors_origins.is_empty() {
             layer
@@ -1032,6 +1038,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn configured_browser_origin_can_preflight_collection_rename() {
+        let policy = ServerPolicy::resolve(
+            SocketAddr::from(([127, 0, 0, 1], 8181)),
+            ServeOptions {
+                cors_origins: vec!["https://chat.example".into()],
+                ..ServeOptions::default()
+            },
+        )
+        .unwrap();
+        let state = super::super::AppState::default().with_server_policy(&policy);
+        let app = super::super::router_with_state_and_policy(state, policy);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/collections/collection")
+                    .header(ORIGIN, "https://chat.example")
+                    .header("access-control-request-method", "PATCH")
+                    .header("access-control-request-headers", "content-type,x-api-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://chat.example"
+        );
+        assert!(response.headers()["access-control-allow-methods"]
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|method| method.trim() == "PATCH"));
     }
 
     #[tokio::test]

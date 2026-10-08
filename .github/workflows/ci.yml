@@ -541,7 +541,7 @@ jobs:
       # searches them, and a deleted one is shown and left out of the search.
       - name: Frontend knowledge collections browser smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: npm run smoke:knowledge-collections-browser
+        run: node scripts/knowledge-routing-smoke.mjs && npm run smoke:knowledge-collections-browser
 
       # Whole-library search: a per-chat switch, what the message says it
       # searched, and a clear fallback when search by meaning is unavailable.

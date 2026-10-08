@@ -24,6 +24,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
+# 2.3.4 preserves the desktop crate's Rust 1.89 floor.
+tauri-plugin-single-instance = "=2.3.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

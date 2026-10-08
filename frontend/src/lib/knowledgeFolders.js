@@ -3,11 +3,13 @@
    only this web UI on the computer running Camelid. */
 
 import { browseWorkspaceFolders } from './workspaceAgent.js'
+import { apiFetch } from './apiRequest.js'
+import { getApiBase } from './apiBase.js'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
-async function request(path, options = {}) {
-  const response = await fetch(path, options)
+async function request(path, options = {}, apiBase = getApiBase()) {
+  const response = await apiFetch(path, options, apiBase)
   if (response.status === 204) return null
   const body = await response.json().catch(() => null)
   if (!response.ok) throw new Error(body?.error?.message || `The folder request failed (${response.status}).`)
@@ -53,17 +55,17 @@ export function normalizeFolder(value) {
   }
 }
 
-export const listFolders = async () => (await request('/api/folders') || []).map(normalizeFolder).filter(Boolean)
+export const listFolders = async (apiBase = getApiBase()) => (await request('/api/folders', {}, apiBase) || []).map(normalizeFolder).filter(Boolean)
 
-export const watchFolder = async (path, collectionId) => normalizeFolder(await request('/api/folders', {
+export const watchFolder = async (path, collectionId, apiBase = getApiBase()) => normalizeFolder(await request('/api/folders', {
   method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ path, collection_id: collectionId }),
-}))
+}, apiBase))
 
-export const scanFolder = async id => normalizeFolder(await request(`/api/folders/${encodeURIComponent(id)}/scan`, { method: 'POST' }))
+export const scanFolder = async (id, apiBase = getApiBase()) => normalizeFolder(await request(`/api/folders/${encodeURIComponent(id)}/scan`, { method: 'POST' }, apiBase))
 
-export const unwatchFolder = id => request(`/api/folders/${encodeURIComponent(id)}`, { method: 'DELETE' })
+export const unwatchFolder = (id, apiBase = getApiBase()) => request(`/api/folders/${encodeURIComponent(id)}`, { method: 'DELETE' }, apiBase)
 
-export const browseFolders = path => browseWorkspaceFolders('', path)
+export const browseFolders = (path, apiBase = getApiBase()) => browseWorkspaceFolders(apiBase, path)
 
 export const SKIP_REASONS = {
   too_large: 'larger than 64 MB',
