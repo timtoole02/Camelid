@@ -89,7 +89,7 @@ Camelid and restart after changing them; they do not expand the support ledger.
 | `CAMELID_CUDA_Q8_MULTIROW=1` | Use the measured multirow Q8 kernels for selected shapes on SM86. Other shapes retain their original dispatch. |
 | `CAMELID_PRISM_CUDA_Q1T128=1` | Enable the tiled Q1 decode representation where supported. |
 | `CAMELID_PRISM_CUDA_Q2_DP4A=1` | Quantize activations to Q8 for experimental Q2/PQ2 integer dots. This changes arithmetic and needs workload-specific quality validation. |
-| `CAMELID_PRISM_CUDA_STRICT=0` | Explicitly request fast Prism arithmetic. The Windows Bonsai 27B Q1 strict default remains in place; a fast-path throughput measurement does not establish broad output quality. |
+| `CAMELID_PRISM_CUDA_STRICT=0` | Explicitly request fast Q1 arithmetic. The Windows Bonsai 27B Q1 strict default remains in place; a fast-path throughput measurement does not establish broad output quality. |
 | `CAMELID_CUDA_CPU_PREFIX_LAYERS=N` | Compute the first `N` dense Q8 layers on CPU and retain the remaining layers and output head on CUDA. Zero or unset disables this experiment. |
 
 The CPU-prefix experiment admits a single unsharded dense Llama/Mistral/Qwen3
