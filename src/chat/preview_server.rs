@@ -377,7 +377,7 @@ use std::future::IntoFuture;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
     use std::net::SocketAddr;
     fn request(address: SocketAddr, method: &str, path: &str, host: &str) -> String {
         let mut socket = std::net::TcpStream::connect(address).unwrap();
@@ -445,8 +445,39 @@ mod tests {
         )
         .starts_with("HTTP/1.1 403"));
         assert!(request(addr, "POST", "/index.html", &host).starts_with("HTTP/1.1 405"));
+
+        // Hold an identified connection to this server across shutdown. Once
+        // its listener closes, another parallel test can reuse the same port.
+        let mut connection = std::net::TcpStream::connect(addr).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            connection,
+            "HEAD /index.html HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .unwrap();
+        let mut connection = BufReader::new(connection);
+        let mut line = String::new();
+        connection.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"));
+        loop {
+            line.clear();
+            assert_ne!(connection.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
         drop(server);
-        assert!(std::net::TcpStream::connect(addr).is_err());
+        match connection.read(&mut [0]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("preview connection remained open after shutdown: {other:?}"),
+        }
     }
     #[test]
     fn managed_preview_rejects_missing_entry_and_invalid_paths() {
