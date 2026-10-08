@@ -1,0 +1,4 @@
+Ornith 1.0 9B Q8_0, release build, 4 vCPU CPU, harness/cancel-test.mjs:
+tiny chat, idle engine: 12107 ms
+suggestion request cancelled after 10004 ms: AbortError
+tiny chat right after the cancel: 144836 ms

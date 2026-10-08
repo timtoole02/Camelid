@@ -258,7 +258,7 @@ function UserTurn({ message, messageContent, onEditResend, onOpenDocument }) {
     copiedResetRef.current = window.setTimeout(() => setCopied(false), 1600)
   }
   return (
-    <article className="cxturn cxturn--user">
+    <article className="cxturn cxturn--user" data-message-id={message.id}>
       <div className="cxturn__user-wrapper">
         {library && (
           <ul className="cxturn__user-docs" aria-label="Whole library searched for this message">
@@ -426,6 +426,7 @@ export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = fa
   return (
     <article
       className={`cxturn cxturn--assistant ${assistantStreaming ? 'is-streaming' : ''}`}
+      data-message-id={message.id}
       aria-busy={assistantStreaming ? 'true' : undefined}
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}

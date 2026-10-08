@@ -99,7 +99,7 @@ function App() {
   const dash = useDashboardData({ showNotice, clearNotice })
   const {
     dashboard, authRequired, tab, setTab, selectedConversationId, setSelectedConversationId,
-    selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
+    selectedModelId, setSelectedModelId, search, setSearch, noteSearch, setNoteSearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
     inspectMode, setInspectMode, tokenInspections, inspectionSupported,
     structuredMode, setStructuredMode, structuredSchema, setStructuredSchema,
@@ -109,11 +109,13 @@ function App() {
     thinkingMode, setThinkingMode,
     webResearchEnabled, setWebResearchEnabled, webResearchStatus,
     loadingModelId, registerForm, setRegisterForm,
-    conversations, memories, filteredConversations, models, runtime, selectedConversation,
+    conversations, notes, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
     createConversation, showNewChatLanding, sendMessage, resendFromMessage, continueFromMessage,
-    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveToMemory,
-    createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
+    regenerateAsVariant, selectMessageVariant, discardMessageVariant, stopGeneration, saveReplyAsNote,
+    createNote, updateNote, deleteNote, renameConversation, deleteConversation, deleteAllConversations,
+    userMemories, memoryEnabled, setMemoryEnabled, acceptMemorySuggestion, dismissMemorySuggestion, undoMemorySuggestion, lookForMemories, memoryLookup,
+    addMemory, editMemory, setMemoryInUse, forgetMemory, forgetAllMemories, focusMessage, focusConversationMessage,
     conversationTags, archivedConversationCount, conversationTagFilter, toggleConversationTagFilter,
     clearConversationTagFilter, showArchivedConversations, setShowArchivedConversations,
     setConversationPinned, setConversationArchived, addConversationTag, removeConversationTag,
@@ -286,6 +288,14 @@ function App() {
     setSelectedConversationId(id)
     navigateTab('chat')
     closeMobileNav()
+  }
+
+  /* Where a memory came from: its conversation, scrolled to the message. */
+  const openMemorySource = (conversationId, messageId) => {
+    if (!conversations.some((conversation) => conversation.id === conversationId)) return false
+    selectConversation(conversationId)
+    focusConversationMessage(conversationId, messageId)
+    return true
   }
 
   const startNewChat = (projectId = '') => {
@@ -485,7 +495,16 @@ function App() {
               pendingConversation={pendingConversation}
               composer={composer}
               setComposer={setComposer}
-              saveToMemory={saveToMemory}
+              saveReplyAsNote={saveReplyAsNote}
+              userMemories={userMemories}
+              memoryEnabled={memoryEnabled}
+              acceptMemorySuggestion={acceptMemorySuggestion}
+              dismissMemorySuggestion={dismissMemorySuggestion}
+              undoMemorySuggestion={undoMemorySuggestion}
+              lookForMemories={lookForMemories}
+              memoryLookup={memoryLookup}
+              focusMessage={focusMessage}
+              onOpenMemory={() => navigateTab('memory')}
               sendMessage={sendMessage}
               resendFromMessage={resendFromMessage}
               continueFromMessage={continueFromMessage}
@@ -572,15 +591,25 @@ function App() {
 
           {tab === 'memory' && (
             <MemoryView
-              memories={memories}
-              memorySearch={memorySearch}
-              setMemorySearch={setMemorySearch}
+              memories={userMemories}
+              memoryEnabled={memoryEnabled}
+              setMemoryEnabled={setMemoryEnabled}
+              addMemory={addMemory}
+              editMemory={editMemory}
+              setMemoryInUse={setMemoryInUse}
+              forgetMemory={forgetMemory}
+              forgetAllMemories={forgetAllMemories}
+              conversations={conversations}
+              openMemorySource={openMemorySource}
+              notes={notes}
+              noteSearch={noteSearch}
+              setNoteSearch={setNoteSearch}
               selectedConversation={selectedConversation}
               latestAssistantMessage={latestAssistantMessage}
-              saveToMemory={saveToMemory}
-              createMemory={createMemory}
-              updateMemory={updateMemory}
-              deleteMemory={deleteMemory}
+              saveReplyAsNote={saveReplyAsNote}
+              createNote={createNote}
+              updateNote={updateNote}
+              deleteNote={deleteNote}
               setTab={navigateTab}
             />
           )}
@@ -642,6 +671,10 @@ function App() {
               onOpenCluster={() => navigateTab('cluster')}
               conversationCount={conversations.length}
               deleteAllConversations={deleteAllConversations}
+              memoryEnabled={memoryEnabled}
+              setMemoryEnabled={setMemoryEnabled}
+              memoryCount={userMemories.length}
+              onOpenMemory={() => navigateTab('memory')}
               selectedModel={selectedModel}
               capabilities={dashboard?.capabilities}
             />

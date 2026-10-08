@@ -18,7 +18,9 @@ reference messages, in order. Global instructions come from Generation controls;
 Camelid's existing automatic code instructions are shown when the draft triggers
 them. Project instructions follow, then conversation instructions, with a stated
 preference for the conversation's instructions when preferences conflict. Turn off
-inheritance to omit global or project instructions entirely.
+inheritance to omit global or project instructions entirely. When memory is on,
+the facts you chose to keep follow as one **Memory** source; **Use memory in this
+chat** turns that off for one conversation. See [Memory](MEMORY.md).
 
 Selected reference files follow as labelled user-role data messages, with their
 names and contents quoted as JSON strings. They are not executed or rendered as

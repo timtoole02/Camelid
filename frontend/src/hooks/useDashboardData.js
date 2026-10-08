@@ -15,6 +15,25 @@ import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/n
 import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
+import {
+  AUTO_SUGGEST_MAX_SUGGESTION_MS,
+  MAX_MEMORIES,
+  MEMORIES_STORAGE_KEY as USER_MEMORIES_STORAGE_KEY,
+  MEMORY_ENABLED_STORAGE_KEY,
+  SUGGESTION_COST_STORAGE_KEY,
+  cleanMemoryText,
+  freshSuggestions,
+  memoryKey,
+  newMemory,
+  normalizeMemories,
+  normalizeSuggestionCosts,
+  normalizeSuggestions,
+  parseSuggestionReply,
+  suggestionMode,
+  suggestionRequest,
+  toSuggestions,
+  userTurnNumber,
+} from '../lib/memory.js'
 import { allTags, archivedCount, organizeConversations, withArchived, withPinned, withTagAdded, withTagRemoved } from '../lib/conversationOrganization.js'
 import { parseImportedConversations } from '../lib/conversationImport.js'
 import { appStorage } from '../lib/appStorage.js'
@@ -70,7 +89,8 @@ const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
 const SELECTED_MODEL_STORAGE_KEY = 'camelid.selectedModelId'
 const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
-const MEMORIES_STORAGE_KEY = 'camelid.memories'
+/* Saved notes predate memory and keep their original storage key. */
+const NOTES_STORAGE_KEY = 'camelid.memories'
 const VALID_TABS = new Set(['projects', 'changes', 'connections', 'chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'divergence', 'compatibility', 'telemetry', 'arena', 'observatory'])
 
 function getInitialTab() {
@@ -662,7 +682,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
      are the durable part. */
   const [conversationTagFilter, setConversationTagFilter] = useState([])
   const [showArchivedConversations, setShowArchivedConversations] = useState(false)
-  const [memorySearch, setMemorySearch] = useState('')
+  const [noteSearch, setNoteSearch] = useState('')
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
   const [sending, setSending] = useState(false)
@@ -726,11 +746,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [externalForm, setExternalForm] = useState({ id: '', name: '', source: 'Hosted API', api_base: 'https://api.example/v1', api_key: '', model_name: '' })
   const [localModels, setLocalModels] = useState(() => readJsonStorage(LOCAL_MODELS_STORAGE_KEY, []).map(normalizeLocalModelRecord).filter(Boolean))
   const [localConversations, setLocalConversations] = useState(() => normalizeStoredConversations(readJsonStorage(CONVERSATIONS_STORAGE_KEY, []), { clearStaleStreaming: true }))
-  const [localMemories, setLocalMemories] = useState(() => readJsonStorage(MEMORIES_STORAGE_KEY, []))
+  const [localNotes, setLocalNotes] = useState(() => readJsonStorage(NOTES_STORAGE_KEY, []))
+  const [userMemories, setUserMemories] = useState(() => normalizeMemories(readJsonStorage(USER_MEMORIES_STORAGE_KEY, [])))
+  // Off unless the user turned it on.
+  const [memoryEnabled, setMemoryEnabledState] = useState(() => readJsonStorage(MEMORY_ENABLED_STORAGE_KEY, false) === true)
+  /* The message the chat scrolls to and marks, such as where a memory came from. */
+  const [focusMessage, setFocusMessage] = useState(null)
+  /* The user message a suggestion request is reading, while it runs. */
+  const [memoryLookup, setMemoryLookup] = useState(null)
 
   const localModelsRef = useRef(localModels)
   const localConversationsRef = useRef(localConversations)
-  const localMemoriesRef = useRef(localMemories)
+  const localNotesRef = useRef(localNotes)
+  const userMemoriesRef = useRef(userMemories)
+  const memoryEnabledRef = useRef(memoryEnabled)
+  /* The side request that looks for things to remember. Sending a message
+     cancels it, so it never holds up the next reply. */
+  const memorySuggestionRef = useRef(null)
   const selectedConversationIdRef = useRef(selectedConversationId)
   const activeChatRequestRef = useRef(null)
 
@@ -743,8 +775,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }, [localConversations])
 
   useEffect(() => {
-    localMemoriesRef.current = localMemories
-  }, [localMemories])
+    localNotesRef.current = localNotes
+  }, [localNotes])
 
   useEffect(() => {
     selectedConversationIdRef.current = selectedConversationId
@@ -784,13 +816,30 @@ export function useDashboardData({ showNotice, clearNotice }) {
     })
   }
 
-  const persistMemories = (updater) => {
-    setLocalMemories((current) => {
+  const persistNotes = (updater) => {
+    setLocalNotes((current) => {
       const next = typeof updater === 'function' ? updater(current) : updater
-      localMemoriesRef.current = next
-      writeJsonStorage(MEMORIES_STORAGE_KEY, next)
+      localNotesRef.current = next
+      writeJsonStorage(NOTES_STORAGE_KEY, next)
       return next
     })
+  }
+
+  const persistUserMemories = (updater) => {
+    const next = normalizeMemories(typeof updater === 'function' ? updater(userMemoriesRef.current) : updater)
+    userMemoriesRef.current = next
+    setUserMemories(next)
+    writeJsonStorage(USER_MEMORIES_STORAGE_KEY, next)
+    return next
+  }
+
+  const setMemoryEnabled = (enabled) => {
+    const next = enabled === true
+    memoryEnabledRef.current = next
+    setMemoryEnabledState(next)
+    writeJsonStorage(MEMORY_ENABLED_STORAGE_KEY, next)
+    if (!next) memorySuggestionRef.current?.abort()
+    return next
   }
 
   const persistLocalModels = (updater) => {
@@ -809,7 +858,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     try {
       const currentLocalModels = localModelsOverride || localModelsRef.current
       const currentLocalConversations = localConversationsRef.current
-      const currentLocalMemories = localMemoriesRef.current
+      const currentLocalNotes = localNotesRef.current
       const healthStartedAt = performance.now()
       const health = await fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
         recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
@@ -956,7 +1005,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         currentModel,
         capabilities,
         conversations: currentLocalConversations,
-        memories: currentLocalMemories,
+        memories: currentLocalNotes,
         apiBase: normalizedApiBase,
       })
       setAuthRequired(false)
@@ -1002,7 +1051,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         currentModel: null,
         capabilities: null,
         conversations: localConversationsRef.current,
-        memories: localMemoriesRef.current,
+        memories: localNotesRef.current,
         apiBase: normalizedApiBase,
       })
       setDashboard(fallbackDashboard)
@@ -1055,7 +1104,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }, [selectedModelId])
 
   const conversations = localConversations.length ? localConversations : dashboard?.conversations || []
-  const memories = localMemories.length ? localMemories : dashboard?.memories || []
+  const notes = localNotes.length ? localNotes : dashboard?.memories || []
   const models = dashboard?.models || []
   const runtime = dashboard?.runtime
 
@@ -1116,15 +1165,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const conversationTags = useMemo(() => allTags(conversations), [conversations])
   const archivedConversationCount = useMemo(() => archivedCount(conversations), [conversations])
 
-  const filteredMemories = useMemo(() => {
-    if (!memorySearch.trim()) return memories
-    const q = memorySearch.toLowerCase()
-    return memories.filter((memory) =>
-      memory.title.toLowerCase().includes(q)
-      || memory.body.toLowerCase().includes(q)
-      || memory.scope.toLowerCase().includes(q),
+  const filteredNotes = useMemo(() => {
+    if (!noteSearch.trim()) return notes
+    const q = noteSearch.toLowerCase()
+    return notes.filter((note) =>
+      note.title.toLowerCase().includes(q)
+      || note.body.toLowerCase().includes(q)
+      || note.scope.toLowerCase().includes(q),
     )
-  }, [memories, memorySearch])
+  }, [notes, noteSearch])
 
   const latestAssistantMessage = useMemo(
     () => [...(selectedConversation?.messages || [])].reverse().find((message) => message.role === 'assistant'),
@@ -1133,7 +1182,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const chatContext = normalizeChatContext(selectedConversation ? selectedConversation.context : draftContext)
   const contextSourcesFor = (context, messages) => buildContextSources({ context, projects,
-    globalPrompt, codePrompt: codePolicyForMessages(messages) })
+    globalPrompt, codePrompt: codePolicyForMessages(messages), memories: memoryEnabled ? userMemories : null })
   const contextSources = contextSourcesFor(chatContext, [{ role: 'user', content: composer }])
   const updateGlobalPrompt = value => {
     setGlobalPrompt(value)
@@ -1361,6 +1410,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const messageContent = draftContent.trim()
     const requestMessageContent = String(requestContent ?? messageContent).trim()
     if (!requestMessageContent) return
+    memorySuggestionRef.current?.abort()
     setSending(true)
     let activeConversationId = null
     let assistantId = null
@@ -2311,6 +2361,23 @@ export function useDashboardData({ showNotice, clearNotice }) {
         outcome: streamed.finishReason === 'error' ? 'error' : 'ok',
         promptText: messageContent,
       })
+      /* Only a new message from the user can hold something new about them:
+         a continuation or a re-rolled reply re-sends the same words, and a
+         connected-tools turn is still running. */
+      if (memoryEnabledRef.current
+        && normalizeChatContext(conversation.context).use_memory
+        && !continuedMessage && !variantMessage && !mcpConversationId && !connectedTools?.length
+        && streamed.finishReason !== 'error') {
+        const mode = suggestionMode({
+          firstTokenMs: assistantMessage.first_content_ms,
+          lastSuggestionMs: normalizeSuggestionCosts(readJsonStorage(SUGGESTION_COST_STORAGE_KEY, {}))[requestModelId],
+        })
+        if (mode === 'auto') {
+          void suggestMemories({ conversationId: conversation.id, messageId: userMessage.id, userText: messageContent, model: requestModelId })
+        } else {
+          patchUserMessage(conversation.id, userMessage.id, { memory_suggestion_offer: true })
+        }
+      }
       return { conversationId: conversation.id, message: assistantMessage, history: [...history, assistantMessage] }
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
@@ -2497,33 +2564,216 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setPendingChat(null)
   }
 
-  const createMemory = async ({ title, body, scope = 'General' }) => {
-    const memory = { id: makeId('memory'), title, body, scope, created_at: nowIso(), updated_at: nowIso() }
-    persistMemories((current) => [memory, ...current])
+  const createNote = async ({ title, body, scope = 'General' }) => {
+    const note = { id: makeId('memory'), title, body, scope, created_at: nowIso(), updated_at: nowIso() }
+    persistNotes((current) => [note, ...current])
     setTab('memory')
-    showNotice('Memory saved in browser storage for this Camelid UI session.', 'success')
+    showNotice('Note saved on this device.', 'success')
     return true
   }
 
-  const updateMemory = async (id, changes, { successMessage = 'Memory updated.' } = {}) => {
-    persistMemories((current) => current.map((memory) => memory.id === id ? { ...memory, ...changes, updated_at: nowIso() } : memory))
+  const updateNote = async (id, changes, { successMessage = 'Note updated.' } = {}) => {
+    persistNotes((current) => current.map((note) => note.id === id ? { ...note, ...changes, updated_at: nowIso() } : note))
     if (successMessage) showNotice(successMessage, 'success')
     return true
   }
 
-  const deleteMemory = async (id, { successMessage = 'Memory deleted.' } = {}) => {
-    persistMemories((current) => current.filter((memory) => memory.id !== id))
+  const deleteNote = async (id, { successMessage = 'Note deleted.' } = {}) => {
+    persistNotes((current) => current.filter((note) => note.id !== id))
     if (successMessage) showNotice(successMessage, 'success')
     return true
   }
 
-  const saveToMemory = async () => {
+  const saveReplyAsNote = async () => {
     const latestAssistant = [...(selectedConversation?.messages || [])].reverse().find((message) => message.role === 'assistant')
     if (!latestAssistant) {
       showNotice('There is no assistant reply to save yet.', 'error')
       return
     }
-    await createMemory({ title: `Saved from ${selectedConversation?.title?.trim() || 'Current chat'}`, body: latestAssistant.content, scope: 'Conversation' })
+    await createNote({ title: `Saved from ${selectedConversation?.title?.trim() || 'Current chat'}`, body: latestAssistant.content, scope: 'Conversation' })
+  }
+
+  /* ---- Memory ---------------------------------------------------------- */
+
+  const patchUserMessage = (conversationId, messageId, patch) => {
+    persistConversations((current) => current.map((conversation) => (
+      conversation.id === conversationId
+        ? {
+            ...conversation,
+            messages: (conversation.messages || []).map((message) => (
+              message.id === messageId ? { ...message, ...(typeof patch === 'function' ? patch(message) : patch) } : message
+            )),
+          }
+        : conversation
+    )))
+  }
+
+  const patchSuggestions = (conversationId, messageId, update) => {
+    patchUserMessage(conversationId, messageId, (message) => ({
+      memory_suggestions: update(normalizeSuggestions(message.memory_suggestions)),
+    }))
+  }
+
+  const recordSuggestionCost = (model, ms) => {
+    if (!model || !Number.isFinite(ms)) return
+    const costs = normalizeSuggestionCosts(readJsonStorage(SUGGESTION_COST_STORAGE_KEY, {}))
+    delete costs[model]
+    writeJsonStorage(SUGGESTION_COST_STORAGE_KEY, normalizeSuggestionCosts({ ...costs, [model]: Math.round(ms) }))
+  }
+
+  /* Asks the model, in a side request, what the user's message says about
+     them that is worth keeping. Whatever it finds is shown under the reply as
+     suggestions; nothing is saved until the user accepts one. How long it took
+     decides whether this model is asked automatically next time. */
+  const suggestMemories = async ({ conversationId, messageId, userText, model, manual = false }) => {
+    memorySuggestionRef.current?.abort()
+    const controller = new AbortController()
+    memorySuggestionRef.current = controller
+    setMemoryLookup({ conversationId, messageId, manual })
+    const started = performance.now()
+    const ask = async (constrained) => {
+      const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify(suggestionRequest({
+          model, userText, constrained, knownFacts: userMemoriesRef.current.map((memory) => memory.text),
+        })),
+      })
+      return { response, payload: await response.json().catch(() => null) }
+    }
+    try {
+      let { response, payload } = await ask(true)
+      // Some serve lanes cannot constrain output to a schema; ask them plainly.
+      if (!response.ok && payload?.error?.code === 'unsupported_parameter') ({ response, payload } = await ask(false))
+      if (response.ok) recordSuggestionCost(model, performance.now() - started)
+      if (!response.ok || controller.signal.aborted || !memoryEnabledRef.current) return
+      const facts = freshSuggestions(parseSuggestionReply(payload?.choices?.[0]?.message?.content), {
+        memories: userMemoriesRef.current,
+      })
+      if (facts.length) patchSuggestions(conversationId, messageId, () => toSuggestions(facts))
+      if (manual) {
+        patchUserMessage(conversationId, messageId, { memory_suggestion_offer: false })
+        if (!facts.length) showNotice('Nothing new to remember in that message.', 'info')
+      }
+    } catch {
+      // Cancelled by the next message, or the engine was unreachable: no
+      // suggestions this turn. A request already this slow still counts.
+      const elapsed = performance.now() - started
+      if (elapsed > AUTO_SUGGEST_MAX_SUGGESTION_MS) recordSuggestionCost(model, elapsed)
+    } finally {
+      if (memorySuggestionRef.current === controller) {
+        memorySuggestionRef.current = null
+        setMemoryLookup(null)
+      }
+    }
+  }
+
+  /** The button offered under a reply when the model is too slow to ask on its own. */
+  const lookForMemories = (conversationId, messageId) => {
+    const conversation = localConversationsRef.current.find((item) => item.id === conversationId)
+    const message = conversation?.messages?.find((item) => item.id === messageId && item.role === 'user')
+    if (!message || !memoryEnabledRef.current) return
+    const model = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+    void suggestMemories({ conversationId, messageId, userText: String(message.content || ''), model, manual: true })
+  }
+
+  const memoryLimitReached = () => {
+    if (userMemoriesRef.current.length < MAX_MEMORIES) return false
+    showNotice(`Memory holds up to ${MAX_MEMORIES} facts. Forget some on the Memory page to add more.`, 'error')
+    return true
+  }
+
+  /** Saves a suggestion, as the user may have edited it, with where it came from. */
+  const acceptMemorySuggestion = (conversationId, messageId, suggestionId, editedText) => {
+    const conversation = localConversationsRef.current.find((item) => item.id === conversationId)
+    const message = conversation?.messages?.find((item) => item.id === messageId)
+    const suggestion = normalizeSuggestions(message?.memory_suggestions).find((item) => item.id === suggestionId)
+    const factText = cleanMemoryText(editedText ?? suggestion?.text)
+    if (!suggestion || suggestion.status !== 'pending' || !factText) return null
+    const existing = userMemoriesRef.current.find((memory) => memoryKey(memory.text) === memoryKey(factText))
+    if (!existing && memoryLimitReached()) return null
+    const memory = existing || newMemory(factText, {
+      kind: 'chat',
+      conversation_id: conversationId,
+      message_id: messageId,
+      turn: userTurnNumber(conversation.messages, messageId),
+      conversation_title: conversation.title || '',
+    })
+    if (!existing) persistUserMemories((current) => [memory, ...current])
+    patchSuggestions(conversationId, messageId, (items) => items.map((item) => (
+      item.id === suggestionId ? { ...item, text: factText, status: 'saved', memory_id: memory.id } : item
+    )))
+    return memory
+  }
+
+  const dismissMemorySuggestion = (conversationId, messageId, suggestionId) => {
+    patchSuggestions(conversationId, messageId, (items) => items.map((item) => (
+      item.id === suggestionId && item.status === 'pending' ? { ...item, status: 'dismissed' } : item
+    )))
+  }
+
+  /** Takes back a suggestion just saved: the memory is forgotten and the
+      suggestion is offered again. */
+  const undoMemorySuggestion = (conversationId, messageId, suggestionId) => {
+    const conversation = localConversationsRef.current.find((item) => item.id === conversationId)
+    const message = conversation?.messages?.find((item) => item.id === messageId)
+    const suggestion = normalizeSuggestions(message?.memory_suggestions).find((item) => item.id === suggestionId)
+    if (!suggestion || suggestion.status !== 'saved') return
+    if (suggestion.memory_id) persistUserMemories((current) => current.filter((memory) => memory.id !== suggestion.memory_id))
+    patchSuggestions(conversationId, messageId, (items) => items.map((item) => {
+      if (item.id !== suggestionId) return item
+      const { memory_id: _memoryId, ...rest } = item
+      return { ...rest, status: 'pending' }
+    }))
+  }
+
+  /** A memory the user wrote, or made from a saved note. */
+  const addMemory = (factText, source = { kind: 'manual' }) => {
+    const cleaned = cleanMemoryText(factText)
+    if (!cleaned) return null
+    const existing = userMemoriesRef.current.find((memory) => memoryKey(memory.text) === memoryKey(cleaned))
+    if (existing) {
+      showNotice('That is already in memory.', 'info')
+      return existing
+    }
+    if (memoryLimitReached()) return null
+    const memory = newMemory(cleaned, source)
+    persistUserMemories((current) => [memory, ...current])
+    showNotice('Added to memory.', 'success')
+    return memory
+  }
+
+  const editMemory = (id, factText) => {
+    const cleaned = cleanMemoryText(factText)
+    if (!cleaned) return false
+    persistUserMemories((current) => current.map((memory) => (
+      memory.id === id && memory.text !== cleaned ? { ...memory, text: cleaned, edited: true, updated_at: nowIso() } : memory
+    )))
+    return true
+  }
+
+  /** A memory not in use is kept, but never given to the model. */
+  const setMemoryInUse = (id, enabled) => {
+    persistUserMemories((current) => current.map((memory) => (
+      memory.id === id ? { ...memory, enabled: enabled === true, updated_at: nowIso() } : memory
+    )))
+  }
+
+  const forgetMemory = (id) => {
+    persistUserMemories((current) => current.filter((memory) => memory.id !== id))
+    showNotice('Forgotten.', 'success')
+  }
+
+  const forgetAllMemories = () => {
+    persistUserMemories([])
+    showNotice('Memory cleared.', 'success')
+  }
+
+  /** Marks one message for the chat to scroll to once its conversation is
+      open, such as where a memory came from. */
+  const focusConversationMessage = (conversationId, messageId) => {
+    setFocusMessage({ conversationId, messageId, at: Date.now() })
   }
 
   const installModel = async (id) => {
@@ -2864,8 +3114,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setSelectedModelId,
     search,
     setSearch,
-    memorySearch,
-    setMemorySearch,
+    noteSearch,
+    setNoteSearch,
     composer,
     setComposer,
     newChatTitle,
@@ -2907,7 +3157,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     externalForm,
     setExternalForm,
     conversations,
-    memories,
+    notes,
     models,
     runtime,
     selectedConversation,
@@ -2915,7 +3165,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     selectedModelRunnable,
     selectedModelExperimental,
     filteredConversations,
-    filteredMemories,
+    filteredNotes,
     latestAssistantMessage,
     pendingConversation,
     createConversation,
@@ -2939,10 +3189,25 @@ export function useDashboardData({ showNotice, clearNotice }) {
     removeConversationTag,
     importConversationsFromText,
     stopGeneration,
-    saveToMemory,
-    createMemory,
-    updateMemory,
-    deleteMemory,
+    saveReplyAsNote,
+    createNote,
+    updateNote,
+    deleteNote,
+    userMemories,
+    memoryEnabled,
+    setMemoryEnabled,
+    acceptMemorySuggestion,
+    dismissMemorySuggestion,
+    undoMemorySuggestion,
+    lookForMemories,
+    memoryLookup,
+    addMemory,
+    editMemory,
+    setMemoryInUse,
+    forgetMemory,
+    forgetAllMemories,
+    focusMessage,
+    focusConversationMessage,
     renameConversation,
     deleteConversation,
     deleteAllConversations,

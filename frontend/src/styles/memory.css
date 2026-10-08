@@ -1,0 +1,85 @@
+/* Memory: the switch, the Memory page, the suggestions under a reply, and the
+   mark on a message opened from a memory. */
+
+.memory-switch { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); cursor: pointer; }
+.memory-switch__copy { display: grid; gap: var(--space-2); }
+.memory-switch__copy small { color: var(--color-text-muted); line-height: 1.5; }
+.memory-switch input { flex: none; width: 20px; height: 20px; accent-color: var(--color-accent); cursor: pointer; }
+
+/* ---- Memory page ---- */
+/* The page stacks with its own gap; the tabs sit at their natural width and
+   the open section keeps the rhythm of the page. */
+.memory-view [role="tabpanel"] { display: flex; flex-direction: column; gap: var(--space-4); }
+.memory-tabs { display: inline-flex; align-self: flex-start; gap: var(--space-1); padding: var(--space-1); margin-bottom: calc(-1 * var(--space-2)); border-radius: var(--radius-md); background: var(--color-surface); border: 1px solid var(--color-border-soft); }
+.memory-tabs button { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--color-text-muted); font-size: var(--text-sm); font-weight: 600; cursor: pointer; }
+.memory-tabs button span { font-size: var(--text-xs); font-weight: 500; color: var(--color-text-faint); }
+.memory-tabs button:hover { color: var(--color-text); }
+.memory-tabs button.is-active { background: var(--color-bg-elevated); color: var(--color-text); box-shadow: var(--shadow-1); }
+.memory-tabs button:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+
+.memory-status.is-on { border-color: var(--color-selected-row-border); background: var(--color-accent-soft); }
+
+.memory-add__row { display: flex; gap: var(--space-2); align-items: center; }
+.memory-add__row input { flex: 1; min-width: 0; }
+
+.memory-note { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); line-height: 1.5; }
+
+.memory-list { display: grid; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
+.memory-item { display: grid; gap: var(--space-2); }
+.memory-item.is-off .memory-item__text { color: var(--color-text-muted); }
+.memory-item__text { margin: 0; font-size: var(--text-md); line-height: 1.5; word-break: break-word; }
+.memory-item__edit { display: flex; gap: var(--space-2); align-items: center; }
+.memory-item__edit input { flex: 1; min-width: 0; }
+.memory-item__meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); color: var(--color-text-faint); font-size: var(--text-xs); }
+.memory-item__source { display: inline-flex; align-items: center; gap: var(--space-1); padding: 0; border: none; background: none; color: var(--color-accent-text); font: inherit; cursor: pointer; text-align: left; }
+.memory-item__source:hover { text-decoration: underline; }
+.memory-item__source:focus-visible { outline: none; box-shadow: var(--shadow-focus); border-radius: var(--radius-sm); }
+.memory-item__source.is-static { color: var(--color-text-muted); cursor: default; }
+.memory-item__source.is-static:hover { text-decoration: none; }
+.memory-item__actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-1); }
+.memory-item__use { display: inline-flex; align-items: center; gap: var(--space-2); margin-right: auto; color: var(--color-text-muted); font-size: var(--text-sm); cursor: pointer; }
+.memory-item__use input { width: 16px; height: 16px; accent-color: var(--color-accent); cursor: pointer; }
+
+/* ---- Suggestions under a reply ---- */
+.memsug {
+  /* Lines up with the reply text, past the avatar column. */
+  margin: calc(-1 * var(--space-1)) 0 var(--space-2) calc(30px + var(--space-3));
+  padding: var(--space-3);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-subtle);
+  animation: camelidFadeInUp var(--dur-base) var(--ease-standard);
+}
+.memsug__head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); color: var(--color-text-muted); font-size: var(--text-xs); }
+.memsug__head strong { color: var(--color-text); font-size: var(--text-sm); }
+.memsug__link { margin-left: auto; padding: 0; border: none; background: none; color: var(--color-accent-text); font-size: var(--text-xs); font-weight: 600; cursor: pointer; }
+.memsug__link:hover { text-decoration: underline; }
+.memsug__list { display: grid; gap: var(--space-2); margin: var(--space-2) 0 0; padding: 0; list-style: none; }
+.memsug__item { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); padding: var(--space-2) var(--space-3); border-radius: var(--radius-md); background: var(--color-bg-elevated); border: 1px solid var(--color-border-soft); }
+.memsug__item p { flex: 1 1 220px; margin: 0; font-size: var(--text-sm); line-height: 1.45; word-break: break-word; }
+.memsug__item.is-saved p { color: var(--color-text-muted); }
+.memsug__check { flex: none; color: var(--color-ready); }
+.memsug__actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1); }
+.memsug__primary { padding: var(--space-1) var(--space-3); border: none; border-radius: var(--radius-sm); background: var(--color-accent); color: var(--color-accent-ink); font-size: var(--text-xs); font-weight: 600; cursor: pointer; }
+.memsug__primary:hover:not(:disabled) { background: var(--color-accent-hover); }
+.memsug__primary:disabled { opacity: 0.5; cursor: default; }
+.memsug__primary:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.memsug__input { flex: 1 1 260px; min-width: 0; }
+
+.memsug--offer { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--text-xs); }
+.memsug__offer { padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); background: var(--color-bg-elevated); color: var(--color-text); font-size: var(--text-xs); font-weight: 600; cursor: pointer; }
+.memsug__offer:hover:not(:disabled) { background: var(--color-surface-hover); }
+.memsug__offer:disabled { opacity: 0.5; cursor: default; }
+.memsug__offer:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+
+@media (max-width: 640px) {
+  .memsug { margin-left: 0; }
+  .memory-add__row { flex-wrap: wrap; }
+}
+
+/* ---- A message opened from a memory ---- */
+.cxturn.is-focused { border-radius: var(--radius-lg); box-shadow: 0 0 0 2px var(--color-accent-soft); background: var(--color-accent-soft); transition: background 0.6s ease, box-shadow 0.6s ease; }
+@media (prefers-reduced-motion: reduce) {
+  .memsug { animation: none; }
+  .cxturn.is-focused { transition: none; }
+}

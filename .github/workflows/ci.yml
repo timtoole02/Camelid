@@ -664,6 +664,16 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:project-context-browser
 
+      # Memory: off until turned on, suggested facts kept only on Remember, each
+      # with its conversation and turn, and only memories in use sent.
+      - name: Frontend memory smoke
+        if: ${{ !cancelled() }}
+        run: npm run smoke:memory
+
+      - name: Frontend memory browser smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run smoke:memory-browser
+
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
       # which model a fresh install is offered (supported_* rows only, fit-filtered,
       # smallest first) and the inspect -> load -> readiness protocol behind the one
