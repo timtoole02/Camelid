@@ -27,7 +27,14 @@ const priorTarget = process.env.VITE_CAMELID_PROXY_TARGET
 process.env.VITE_CAMELID_PROXY_TARGET = `${backendOrigin}/gateway`
 let vite
 try {
-  vite = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } })
+  vite = await createServer({
+    root: fileURLToPath(new URL('..', import.meta.url)),
+    logLevel: 'silent',
+    // This test exercises HTTP middleware only. Do not start a native dependency
+    // scan that would still be running when this short-lived server closes.
+    optimizeDeps: { noDiscovery: true, include: [] },
+    server: { host: '127.0.0.1', port: 0 },
+  })
   await vite.listen()
   const uiOrigin = `http://127.0.0.1:${vite.httpServer.address().port}`
   const post = async (path, headers = {}, body) => fetch(`${uiOrigin}${path}`, { method: 'POST', headers, body })
@@ -43,11 +50,12 @@ try {
   for (const path of ['/__camelid/backend/launch', '/__camelid/backend/stop']) {
     const response = await post(path, { origin: 'https://untrusted.example', 'content-type': 'text/plain' }, JSON.stringify({ command: 'exit 0' }))
     assert.equal(response.status, 403, 'development management rejects untrusted browser mutations')
+    await response.text()
   }
-  console.log('development origin smoke passed')
 } finally {
   await vite?.close()
   await new Promise(done => backend.close(done))
   if (priorTarget === undefined) delete process.env.VITE_CAMELID_PROXY_TARGET
   else process.env.VITE_CAMELID_PROXY_TARGET = priorTarget
 }
+console.log('development origin smoke passed')
