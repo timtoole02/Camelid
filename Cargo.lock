@@ -707,6 +707,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "hound",
+ "html5ever",
  "image",
  "libc",
  "llguidance",

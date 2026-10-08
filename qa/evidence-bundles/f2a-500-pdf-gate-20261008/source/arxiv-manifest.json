@@ -1,0 +1,4102 @@
+{
+ "2610.10536v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Decoupling Exploration from Optimization in RLVR",
+  "file": "2610.10536v1.pdf",
+  "bytes": 1208404,
+  "sha256": "111b0ff06b759c78016c3acc9a6edb88b069bfd23227c0945a9edc38a60b3f6b"
+ },
+ "2610.10533v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "EngramEdit: Decoupled Knowledge Updates in LLMs through Conditional Memory",
+  "file": "2610.10533v1.pdf",
+  "bytes": 1217849,
+  "sha256": "c0e2f2d5829f13608087a09e3eeb0109dc8a5c6fbf6c58301952c0cec660634f"
+ },
+ "2610.10526v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Rephrase Before You Act: Characterizing and Mitigating Language Sensitivity in Vision-Language-Action Models",
+  "file": "2610.10526v1.pdf",
+  "bytes": 2264055,
+  "sha256": "3558ddd8b3a6616699361e57eaa879221668cbfbf2be1ae6e3847e18858fd910"
+ },
+ "2610.10508v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Your Prompt Should Do More: Effects of Retrieval Instructions in Embedding Models",
+  "file": "2610.10508v1.pdf",
+  "bytes": 1843504,
+  "sha256": "b917d5507439246e2191f304584032ede883fa130908e6d36d560941d773950f"
+ },
+ "2610.10506v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Validity Without Ground Truth: What Stated-Preference Economics Offers the Evaluation of Language Models",
+  "file": "2610.10506v1.pdf",
+  "bytes": 402075,
+  "sha256": "6c7679f3ae58c66cdc09b50c908dc2830eae2dad2694c1adae9d8ea020bcab6e"
+ },
+ "2610.10455v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "PHRBench: A Behavioral Evaluation of Post-Hallucination Reasoning in LLMs",
+  "file": "2610.10455v1.pdf",
+  "bytes": 7480999,
+  "sha256": "403aa4a786bffaf37c904dd98d5fb6e7ca610ebb3567f94a97a307d9e4adb5a7"
+ },
+ "2610.10444v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "RunningTab: Direct Workspace Interaction with Environment-Side Tabs",
+  "file": "2610.10444v1.pdf",
+  "bytes": 1742544,
+  "sha256": "db5c210d03ba3c3af61675c552c742ae6598e0c4fd560a1cddbd1dfa97dc5754"
+ },
+ "2610.10426v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "CoTrace: Data Recipes for Training Terminal Agents with Harness-Model Co-Evolution",
+  "file": "2610.10426v1.pdf",
+  "bytes": 2036179,
+  "sha256": "04895cb4eece7e1cafdc004c5130e2e238b625f6560a9a06dcdfb2fd8636a4f4"
+ },
+ "2610.10422v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Which Rollout Taught It That? BehaviorTrace and the Limits of Training-Data Attribution in Online RL",
+  "file": "2610.10422v1.pdf",
+  "bytes": 384331,
+  "sha256": "a59c3ccafdf3277e082961ffc330cb790aeb56f40a3c4966a046a5fcc560ff3a"
+ },
+ "2610.10411v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Training Parallel Speculative Draft Models by Directly Minimizing Expected Decoding Rounds",
+  "file": "2610.10411v1.pdf",
+  "bytes": 739952,
+  "sha256": "70c43ad8686b03df6313ae8cffcd4acf0e4029a13518aa479242eb3d949cc8aa"
+ },
+ "2610.10405v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Reasoning-Token Spikes Under Prompted Untruthful Responding in Large Language Models",
+  "file": "2610.10405v1.pdf",
+  "bytes": 1352619,
+  "sha256": "9d27f2527a6ca023dbf76038f60846720a572307faa562010918515d7e2b2f9e"
+ },
+ "2610.10378v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Document-Level Text Simplification in Estonian Using Large Language Models",
+  "file": "2610.10378v1.pdf",
+  "bytes": 194438,
+  "sha256": "527e6d6ad8e76f073529b6551d37bc944a85f1e7405e9ff1b9a041539097dc04"
+ },
+ "2610.10368v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Input-Blind Controls Produce Substantial Oracle Headroom for Layer Programs in Multiple-Choice Evaluation",
+  "file": "2610.10368v1.pdf",
+  "bytes": 1231665,
+  "sha256": "dbe5acfe6dd76f539075ca513ba834c7f7c2cd264b342820f4b031c0d6c8e392"
+ },
+ "2610.10332v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Learning to Act with Task Progress: Distilling Small Agents from Compact Teacher Supervision",
+  "file": "2610.10332v1.pdf",
+  "bytes": 2004191,
+  "sha256": "339c94c549b02243229ed387f912142a8fdd7ce686bf5857e901c23d44478ad6"
+ },
+ "2610.10318v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Nobody Truly Agrees on Sentiment: Humans, Bespoke Tools, and LLMs Struggle with Social Media Texts",
+  "file": "2610.10318v1.pdf",
+  "bytes": 428087,
+  "sha256": "76f3d79ed5ce2432bbd54484770192ccefaf2de14ecd8d05671c56aa95057d8b"
+ },
+ "2610.10304v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "SemanticFold: Latent Sequence Compression SeparatesLanguage Modeling, Decodability, and Reasoning",
+  "file": "2610.10304v1.pdf",
+  "bytes": 383598,
+  "sha256": "0da7ed07e40492812cc5d85626d91a49388dc43162261bf813cf8dea5f0b1724"
+ },
+ "2610.10276v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "PatchBench: Measuring Collateral Damage in Activation Patching",
+  "file": "2610.10276v1.pdf",
+  "bytes": 408492,
+  "sha256": "f04515b50ebfe085fd919ded7740a708aae1a2e44be7ed9e0d95b063b2336fd1"
+ },
+ "2610.10232v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "LLM Persuasion Is in the Eye of the Evaluation",
+  "file": "2610.10232v1.pdf",
+  "bytes": 429591,
+  "sha256": "c407180cc9a3406028f63bb573b167f6a5810b2cab028c43f60fc524d571d108"
+ },
+ "2610.10227v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "From Prompts to Trees: Effective LLM-Guided Tree Generation for Few-Shot Tabular Classification",
+  "file": "2610.10227v1.pdf",
+  "bytes": 5072236,
+  "sha256": "365f7cd1344744ce883e5368fa71e96983a3401c63ea49c82c1844db01dde701"
+ },
+ "2610.10201v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "GAGR-Lab: Evaluating Joint Spatial-Geometric and Analytic Function Reasoning",
+  "file": "2610.10201v1.pdf",
+  "bytes": 267086,
+  "sha256": "b656fb843df03441f7a45af7d6858270f4b9681eb0c01c235d326f9eec33429a"
+ },
+ "2610.10179v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Beyond Outcome Rewards: Constructing and Assigning Retrieval Credit for Search Agents",
+  "file": "2610.10179v1.pdf",
+  "bytes": 428087,
+  "sha256": "87b42da2731b65be023da90aaa689560756d3656ecfe0f825f18f6e4f0f170dd"
+ },
+ "2610.10154v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "HySPE: Positional Encoding via Symplectic Dual Shears",
+  "file": "2610.10154v1.pdf",
+  "bytes": 306552,
+  "sha256": "4c7af9cf4fbae8377378bb5e9b56bbcf561040c4e83d002fbe3f1592a1471e40"
+ },
+ "2610.10145v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "InterView-C: A Synchronized Multimodal Corpus of VR Avatar-Mediated Survey Interviews",
+  "file": "2610.10145v1.pdf",
+  "bytes": 2616129,
+  "sha256": "b17f9ee4d0dd561305e30edba145dd42ab5fa13b5ed7b48562e82af4d48089ea"
+ },
+ "2610.10138v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "LLM4Impact: Integrating Heterogeneous Information for Scientific Impact Prediction",
+  "file": "2610.10138v1.pdf",
+  "bytes": 3057471,
+  "sha256": "0648fcec9d54e7e41c8825b0347eca5c73f0733c8aef1d7efae033993a71a547"
+ },
+ "2610.10118v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "YANchor-4B: Effective Long-Horizon Reasoning in O(N) Time with O(1) Memory",
+  "file": "2610.10118v1.pdf",
+  "bytes": 1911675,
+  "sha256": "69e6a2e60aee0cd989abae0895b25b91ef3b579c7c92d0dfb2de83cf436d40e7"
+ },
+ "2610.10114v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Mechanics of Long-Context Hybrid Models Part 1.1: From Hybrid Attention to Hybrid Position",
+  "file": "2610.10114v1.pdf",
+  "bytes": 6298755,
+  "sha256": "f3d4b314eb55cb6ab773fc96cafa77e161efe901c53d99b5039ff8887a478681"
+ },
+ "2610.10092v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "I would rather quit NLP than read another paper like this: The rise of antithesis in NLP papers",
+  "file": "2610.10092v1.pdf",
+  "bytes": 463168,
+  "sha256": "a233ec09ce1cd9c36ca7329b2feb26332dd46926bc94b098ec6338f7ca7728a9"
+ },
+ "2610.10091v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "ExperienceIndex: Artifact-Grounded Memory",
+  "file": "2610.10091v1.pdf",
+  "bytes": 1454836,
+  "sha256": "0f2fd384df577d142461bd06147fd649b5b9bf4d4c8b07d4e0b458fdf1880b7b"
+ },
+ "2610.10088v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "SkillSandbox: Skill Verification via Dynamic Scenario Synthesis",
+  "file": "2610.10088v1.pdf",
+  "bytes": 4353158,
+  "sha256": "d221e8d36de51c54073fcdc2f196d3a27b0b34962b91924df76cc50d01540e41"
+ },
+ "2610.10058v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Cache the Encoder Within:Compact, Reusable Memory across LLM Queries",
+  "file": "2610.10058v1.pdf",
+  "bytes": 338234,
+  "sha256": "6d35381a8ebf8705685cd4b296958e0c5e31cc47326c5de3b0302b1cc53709d6"
+ },
+ "2610.10049v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "The Long Road to the Same Answer: Cognitive Bias Under Escalating Reasoning Budgets in Large Language Models",
+  "file": "2610.10049v1.pdf",
+  "bytes": 288540,
+  "sha256": "9ad341a35ff8254197aba51e29745013b56657a7563a14a2e93d3d55c76b5d45"
+ },
+ "2610.09981v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Sensitive-Topic Leakage Through LLM Routing Metadata: Measurement and Mitigation",
+  "file": "2610.09981v1.pdf",
+  "bytes": 796572,
+  "sha256": "4b1762272217835d9d137d62915aa721eec054489c2125b3f6a6080f29438936"
+ },
+ "2610.09976v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "EASE: Entropy-Adaptive Distribution Shaping for Evading AI-generated Text Detectors",
+  "file": "2610.09976v1.pdf",
+  "bytes": 430427,
+  "sha256": "4deca0213e99feeecadafd4a26cf5771cefb281318a2a75d60f12b320f8eb57f"
+ },
+ "2610.09934v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Itgan at NADI 2026 shared task: Parameter-Efficient Whisper Adaptation for Robust, Mixed-Dialect and Code-Switched Arabic ASR",
+  "file": "2610.09934v1.pdf",
+  "bytes": 264735,
+  "sha256": "6e88e184a17546caf971cba2c3f5cf3349ebce01441c3a90bac83992e1bcee5c"
+ },
+ "2610.09920v1": {
+  "status": "too_large",
+  "bytes": 17797657,
+  "category": "cs.CL"
+ },
+ "2610.09906v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Constrained-Action AI Remediation for SIEM/XDR via a NeMo-Guardrails Proxy",
+  "file": "2610.09906v1.pdf",
+  "bytes": 238146,
+  "sha256": "28ac5208016760bc1a1951dcfc6d3d7edee6041f9ae83f8dedf80bf62d2826b0"
+ },
+ "2610.09872v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "LiveMACE: Process-Aware Evaluation of LLM Agent Capabilities in Evolving Markets",
+  "file": "2610.09872v1.pdf",
+  "bytes": 6830738,
+  "sha256": "4deab047f5d3ada89e377853196e1f7872402147469945da7672c0e0754d7a03"
+ },
+ "2610.09858v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Training Advisors for LLM Agents from Task Outcomes",
+  "file": "2610.09858v1.pdf",
+  "bytes": 5223898,
+  "sha256": "6c78783bd1aff072bd89e2131d9f2265fb02b1dae2d4b8c7a18592fc93541ba2"
+ },
+ "2610.09835v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "A Deafening Silence: Catastrophic Forgetting Lives in the Output Embeddings of Tokens the Data Never Speaks",
+  "file": "2610.09835v1.pdf",
+  "bytes": 1040211,
+  "sha256": "6d51b8e75971db733e8c4bfb8884d14c8e7dc3af8f50400b221961cd88c57dd7"
+ },
+ "2610.09795v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "MIRROR: From Imitation to Internalization in LLM Personalization",
+  "file": "2610.09795v1.pdf",
+  "bytes": 1195969,
+  "sha256": "671f1bbd3d2883e800201aa30ba78d674d5b792ac01416e3f5156e0b1ed2b013"
+ },
+ "2610.09788v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Judging in Latent Space: Efficient Generative Reward Modeling via Semantics-Preserving Compression",
+  "file": "2610.09788v1.pdf",
+  "bytes": 730053,
+  "sha256": "f9484b2243524a87f18e18b9190a3edc4d0ea7dcaf5bf4711c737033f0fa8e5a"
+ },
+ "2610.09772v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Decoupling Logic from Persona: Structural Immunity of Edge LLM Agents to Context Pollution",
+  "file": "2610.09772v1.pdf",
+  "bytes": 270106,
+  "sha256": "7bb94c945873c836134e8371a9b5123fd489da1e0aeb775995089a3e31e42eac"
+ },
+ "2610.09769v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "From Expert-Guided Proof Search to Automated Open-Problem Solving",
+  "file": "2610.09769v1.pdf",
+  "bytes": 183098,
+  "sha256": "0c2961d9f302121ceb246c617edde324b542f2494bb9ef69e8b54d0e7b53deba"
+ },
+ "2610.09761v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "PARC-Loc: Text-to-Point-Cloud Localization with Partial Assignment and Relational Consistency",
+  "file": "2610.09761v1.pdf",
+  "bytes": 2431360,
+  "sha256": "26838642818bb547f09b8712eb3a8805f36e3a2334b43122c3d77a9f54596d55"
+ },
+ "2610.09756v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Shaer: Controlled Arabic Poetry Generation with Meter Subform and Semantic Conditioning",
+  "file": "2610.09756v1.pdf",
+  "bytes": 4129404,
+  "sha256": "b486aea3839d8a524c8280a82cd10c676ff8b6851e3e628707c1f31ce46300b3"
+ },
+ "2610.09733v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Bridge Routing Heads: Where Multilingual Multi-hop Reasoning Lives in LLMs",
+  "file": "2610.09733v1.pdf",
+  "bytes": 548115,
+  "sha256": "aadf55f9411aba8620621782945817ff8b3a08798672d7b531e6a571d3f505bb"
+ },
+ "2610.09724v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Towards Explaining Query Expansion Performance in Information Retrieval",
+  "file": "2610.09724v1.pdf",
+  "bytes": 2917869,
+  "sha256": "353b57b058b095daf4e21aa6714b966582173352cdfc130294e6912855862a08"
+ },
+ "2610.09710v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "SpikingVLA: Asynchronous Spiking Vision-Language-Action Models",
+  "file": "2610.09710v1.pdf",
+  "bytes": 13817139,
+  "sha256": "3d263ec25d62e50e1513fef54a28a2d3db3e5d42683333014039fcc2695fddf5"
+ },
+ "2610.09684v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "From Pareto to Preference: Personalized Test-Time Scaling via Amortized Agentic Policy Discovery",
+  "file": "2610.09684v1.pdf",
+  "bytes": 839724,
+  "sha256": "fead97347be1fd2af65a15c6557d94d86de4f207a18980bdfe4222ace59a83b8"
+ },
+ "2610.09671v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "InsClaimBench: Benchmarking Insurance Claim Adjudication Across the Decision Chain",
+  "file": "2610.09671v1.pdf",
+  "bytes": 687226,
+  "sha256": "46d9e909792b5b9e77c91acd033b4e68857c10373b655d8b324afefaeb6a0c99"
+ },
+ "2610.09665v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "SAPD: Step-Aligned Privileged Distillation",
+  "file": "2610.09665v1.pdf",
+  "bytes": 373787,
+  "sha256": "e3604746762a50e082aa47f2c25a1a2e013bcff5746e22a6baea15146e444068"
+ },
+ "2610.09661v1": {
+  "status": "ok",
+  "category": "cs.CL",
+  "title": "Alice: A Large-Scale German Benchmark for Rubric-Based Multi-Dimensional Automatic Short Answer Scoring",
+  "file": "2610.09661v1.pdf",
+  "bytes": 897377,
+  "sha256": "69423279a629eff3005511bd24e09fdd9d2d81288e8e721925a98837edfba9df"
+ },
+ "2610.10527v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Decentralized SGD under Heavy-Tailed Noise: Optimal Convergence Rates and the Role of Gradient Clipping",
+  "file": "2610.10527v1.pdf",
+  "bytes": 1839184,
+  "sha256": "0433bb134633e1a5effdf51620f5b3f0ce441eae60cd87d93bd4b5ba892b5478"
+ },
+ "2610.10520v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Distilling Graph Geometry: Knowledge Gap from GNNs to MLPs",
+  "file": "2610.10520v1.pdf",
+  "bytes": 2262229,
+  "sha256": "929594e2d6790599363e8a5dbb3f8f9445d83e68a5ba05674ed88d1110b3e6f7"
+ },
+ "2610.10519v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Why Forget-Only Unlearning Needs Memorization",
+  "file": "2610.10519v1.pdf",
+  "bytes": 627690,
+  "sha256": "d1de2e44fdbc031ab8021016caad037d1f50b9bdf7768a0f93df35161971c2d0"
+ },
+ "2610.10513v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "SciExam for ENSO: Can AI Agents Build Climate Models?",
+  "file": "2610.10513v1.pdf",
+  "bytes": 5483455,
+  "sha256": "cd8f98dda5ce91daeaa39139159dccffeec49d71b675738e853b709fa06dd8fc"
+ },
+ "2610.10499v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Oracle-Efficient and Parameter-Free Agnostic Smoothed Online Learning",
+  "file": "2610.10499v1.pdf",
+  "bytes": 524189,
+  "sha256": "87bb914d99a7318fd766c8f624be99cf0e11d23545c6663acc68ce2cafd9579e"
+ },
+ "2610.10496v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Evolutionary Architecture Search for Chlorophyll-$a$ Prediction in Lakes using Sentinel-2",
+  "file": "2610.10496v1.pdf",
+  "bytes": 308478,
+  "sha256": "75ce42ffcdf19afe3bc24f2956e0ba6292a470b1aeeef63ee40fdde14a1c63fe"
+ },
+ "2610.10488v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Best Arm Identification for Bandits with Shifting Means",
+  "file": "2610.10488v1.pdf",
+  "bytes": 713960,
+  "sha256": "aeaa1d57647d72e437c9bebf74dc5efa2a94402533c8c98730398a663dd5f591"
+ },
+ "2610.10483v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Two-Level Softmax Sampling Done Right: Correcting Bias from Size Imbalance and Dispersion",
+  "file": "2610.10483v1.pdf",
+  "bytes": 1610998,
+  "sha256": "87eaf8c32ce2334d5e8a9a52f90accbf5d5f3df3dee8bd67448a23b4e073dda8"
+ },
+ "2610.10460v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Composing What Each Teacher Learned: Multi-Teacher On-Policy Distillation through Teacher-Relative Shifts",
+  "file": "2610.10460v1.pdf",
+  "bytes": 404672,
+  "sha256": "9057669c3510dc98000fc632d4d307b32a73a94da274e9091e591f9df90c40f7"
+ },
+ "2610.10459v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "NeuralBES: A Differentiable, Control-Aware Emulator for Scalable Building Energy Modeling",
+  "file": "2610.10459v1.pdf",
+  "bytes": 1766090,
+  "sha256": "36ff21af8e0ebe128a4c3eb942f2c5e46b2d35b74d4767a9979319e18ddd9092"
+ },
+ "2610.10447v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "A Good Self-Teacher Meets the Student Where They Are: Joint On-Policy Learning and Teaching",
+  "file": "2610.10447v1.pdf",
+  "bytes": 1010690,
+  "sha256": "8cf02f60be4e3e62973edb0e92176efe463307657c38d34b468fd0d429b3fdb0"
+ },
+ "2610.10440v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Seq-Flow: Efficient Probabilistic Forecasting with Self-Rollout Error Control",
+  "file": "2610.10440v1.pdf",
+  "bytes": 478826,
+  "sha256": "37e1fef9047e48d0d70c78009e8f2208ccf04a9c71773485fef0e945a43f0e64"
+ },
+ "2610.10437v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Q-Learning with Scalar Adjoint Matching",
+  "file": "2610.10437v1.pdf",
+  "bytes": 8885722,
+  "sha256": "d8a96d22d81d43eb616661f29278627d553de444fe7c8faa0b3baa2445fdeac6"
+ },
+ "2610.10430v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Conditional Flow Matching for Generation of 3D Multi-variable Instantaneous Urban Microclimate Fields",
+  "file": "2610.10430v1.pdf",
+  "bytes": 4030117,
+  "sha256": "da252e5001e591c25083189ab1efa7dbf6007d3be467cc585d24a7043681853a"
+ },
+ "2610.10428v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Derivative Gaussian Processes on a Two-Direction Budget",
+  "file": "2610.10428v1.pdf",
+  "bytes": 2092909,
+  "sha256": "08a95916415c2b1f99a6030a707a1d1b1f23162e6f72712f3e4c3ce99218eaa7"
+ },
+ "2610.10415v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Steerspeech: Activation Steering For Emotion Control In Generated Speech",
+  "file": "2610.10415v1.pdf",
+  "bytes": 432886,
+  "sha256": "4857be31cb02f7faeed20679bfe5bbb130c2df32ea6578c8c48a6200fab385c9"
+ },
+ "2610.10409v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "RobotWorld: Benchmarking Multimodal Agents for Robot Use Across Diverse Tasks and Embodiments",
+  "file": "2610.10409v1.pdf",
+  "bytes": 12704097,
+  "sha256": "7a6a53e4d7f62bcfaa4b57342fd6b3919134e648bd8e5a7dd1b563edb8bb42c6"
+ },
+ "2610.10408v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Rubix: Global Correspondence-Free Point Set Alignment through Assignment Geometry",
+  "file": "2610.10408v1.pdf",
+  "bytes": 6138858,
+  "sha256": "93a911eb214838ae74ba502bc2eb7d87e9a421fd4bec7ccb9bbc5e6890f583ca"
+ },
+ "2610.10407v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "SOTA: Stock Options Trading Agents Guided by Option-Implied Return Distributions",
+  "file": "2610.10407v1.pdf",
+  "bytes": 419609,
+  "sha256": "19f4f3879cec38f2ef8c190819cf763198af3054f3ffaa24247a0e07aece173f"
+ },
+ "2610.10398v1": {
+  "status": "too_large",
+  "bytes": 45487957,
+  "category": "cs.LG"
+ },
+ "2610.10395v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Executing Causal Structure Learning with Linear-Attention Transformers",
+  "file": "2610.10395v1.pdf",
+  "bytes": 925568,
+  "sha256": "61d6da1887bd6d2009d2aa96bba606baaae517148022746b957d3e3060b875c2"
+ },
+ "2610.10394v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Kernel Autoresearch for Open-Ended Model Discovery",
+  "file": "2610.10394v1.pdf",
+  "bytes": 1835731,
+  "sha256": "53115eeec9e2e2da648d07d3518c95b5e6e60efa9b4068e76919c24e494b3bba"
+ },
+ "2610.10393v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Safe Meta-Policy Design with Risk Control",
+  "file": "2610.10393v1.pdf",
+  "bytes": 1151388,
+  "sha256": "e376c9c39e532445943aacd996084f20f244ed6048db23395a93c5135961e8a7"
+ },
+ "2610.10385v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "OrBIT: Structure-Guided Embedding Compression",
+  "file": "2610.10385v1.pdf",
+  "bytes": 445372,
+  "sha256": "750d8ce082cebac6a524cb6bf8bd93f65e1e90d903e881460b7b7f23df5a7ad5"
+ },
+ "2610.10383v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Boosting and the Expressive Power of Simple Weak Learners via the $\u03b3$-VC Dimension",
+  "file": "2610.10383v1.pdf",
+  "bytes": 830063,
+  "sha256": "87d26c58c079b376a757043eb909f6108f8b4c1bbd2ab8450f1a8559198496ed"
+ },
+ "2610.10381v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "ResidualQuant: KV Cache Quantization for Looped Transformers with 2-Bit Residuals",
+  "file": "2610.10381v1.pdf",
+  "bytes": 1597700,
+  "sha256": "6c60f2235a510f41ea911c419f85600660fd48c56ff9fa4b8cf1eceedecfc754"
+ },
+ "2610.10379v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Continual Learning without Continual Training",
+  "file": "2610.10379v1.pdf",
+  "bytes": 764984,
+  "sha256": "22d2bd4dff68227d3b57d5058630e5fb52423587f67723a84fb431885327e772"
+ },
+ "2610.10367v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Temporally Interpretable Differentiable Decision Trees",
+  "file": "2610.10367v1.pdf",
+  "bytes": 598911,
+  "sha256": "cc2e56f0e0b453377d1b335faff388f9c617b8c90560142f326f2728b1a09885"
+ },
+ "2610.10366v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Koopman Observers for Diffusion Acceleration: Correcting Feature Forecasts with Shallow Measurements",
+  "file": "2610.10366v1.pdf",
+  "bytes": 805717,
+  "sha256": "12a0e539e49cd2fd56177e357b7eb0d745c2148ff686dcba9aaab851e689616d"
+ },
+ "2610.10362v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Pathwise Information Certificates for Decentralized Adaptive Sensing",
+  "file": "2610.10362v1.pdf",
+  "bytes": 1213530,
+  "sha256": "af23ff33ec7191b6e5e26bbe3b7edeea865787a0f2f1839c7df8a17b9b9ec90c"
+ },
+ "2610.10361v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "ORDERS: An Empirical Study of Norm-Rank Aggregation for Personalized Federated Learning",
+  "file": "2610.10361v1.pdf",
+  "bytes": 698061,
+  "sha256": "d53ddbe93b0eb3b718efc5110f46f6bb9ea3d8b7bbba3aa8cd6064c150504c79"
+ },
+ "2610.10351v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Measurement-Efficient Differentiable Quantum Architecture Search for Combinatorial Optimization",
+  "file": "2610.10351v1.pdf",
+  "bytes": 295299,
+  "sha256": "6e4b30842f75f0bcbac36fa3692c6a313b61855d3fbb9d8e29eb3d43aee7b584"
+ },
+ "2610.10349v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "AutoAdapt: Automatic Domain Discovery Enables Low-Cost Extensibility",
+  "file": "2610.10349v1.pdf",
+  "bytes": 260881,
+  "sha256": "7758ded5951211230cfa05d447731f4659530f65cb31e1cabe5b65c755f21b4a"
+ },
+ "2610.10347v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Dataset Pruning from First Principles: A Label-Free Linear Programming Approach",
+  "file": "2610.10347v1.pdf",
+  "bytes": 3777507,
+  "sha256": "729109731d6125956cd97df334de7384642790159013c134ef1e919ec6a0708b"
+ },
+ "2610.10340v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Data Reuse in Non-Stationary Learning",
+  "file": "2610.10340v1.pdf",
+  "bytes": 1353432,
+  "sha256": "db962e25246400bf48f364cf87c3ea36703874582c39e10c6bd7957bdf7f080c"
+ },
+ "2610.10326v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Average-Reward Reinforcement Learning for Multichain MDPs: A Hierarchical Decomposition Approach",
+  "file": "2610.10326v1.pdf",
+  "bytes": 1607137,
+  "sha256": "b24556b835b1898b38560246d9a1db0344a48ca25c2a630851b6113bdfcca648"
+ },
+ "2610.10323v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "HAN-Mamba: Hierarchical Selective State Space Networks for Multi-Scale Financial Volatility Forecasting",
+  "file": "2610.10323v1.pdf",
+  "bytes": 440816,
+  "sha256": "2858c85e959fa581de6d1c8a9c260176fde17546bc8c614d5731b6b39950acfc"
+ },
+ "2610.10321v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Estimating Uncoded Crash Factors with Tabular Foundation and System One Models: Kumo Tabular and Jev",
+  "file": "2610.10321v1.pdf",
+  "bytes": 784662,
+  "sha256": "10313cac3d0dc041a22ffad1efb86b99244fef537b3a3769dd8ea3e7fb440480"
+ },
+ "2610.10317v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Thinking in Depth: Retrospective Inference for Tabular Foundation Models",
+  "file": "2610.10317v1.pdf",
+  "bytes": 9829971,
+  "sha256": "55e2ccc19ee8c3f457480e12068249d00aff4e653c7d856904a9862e86ba7bb1"
+ },
+ "2610.10314v1": {
+  "status": "too_large",
+  "bytes": 45999594,
+  "category": "cs.LG"
+ },
+ "2610.10311v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Fault-tolerant foundation models",
+  "file": "2610.10311v1.pdf",
+  "bytes": 6988851,
+  "sha256": "aec138d2138bad46c27cdab28031940244d1e2a73d0d21f422c98e6a379836cb"
+ },
+ "2610.10310v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "RSIGym: A Flexible Environment for Recursive Self-Improvement",
+  "file": "2610.10310v1.pdf",
+  "bytes": 795835,
+  "sha256": "98bab004313d37140a4df322ef6d90260a2a0a0d80b0709ccf98561a69b26ce2"
+ },
+ "2610.10305v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "How Do Transformers Learn to Represent Symmetries?",
+  "file": "2610.10305v1.pdf",
+  "bytes": 5462190,
+  "sha256": "54c0a5e278ae718a7634efbdc62cd8ef67a9d7154215b8914e49b55b143bce4c"
+ },
+ "2610.10302v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Continual Graph Multi-Agent Reinforcement Learning",
+  "file": "2610.10302v1.pdf",
+  "bytes": 788145,
+  "sha256": "10a74d8ad855aad9b144d7e958323722536e1d2f2c8f56be55488174cc5b4122"
+ },
+ "2610.10301v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Revisiting Explainable AI through Model-Independent Concept Dictionaries",
+  "file": "2610.10301v1.pdf",
+  "bytes": 2794601,
+  "sha256": "1f49bf787d99167518fa8c8fa221c4788b7567e11ce757de8e44c9b5049c2e37"
+ },
+ "2610.10299v1": {
+  "status": "ok",
+  "category": "cs.LG",
+  "title": "Shared Gaussianization: What Gaussian Regularizers Certify About Contrastive Learning, and What They Miss",
+  "file": "2610.10299v1.pdf",
+  "bytes": 717288,
+  "sha256": "7dcde3509ce79f11a5f9972c7fa28b192d840f06da8d6b1842072be34f1214ae"
+ },
+ "2610.10360v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Receiver-Domain Behavioral Probing for Backdoor-Resilient Federated GPS Spoofing Detection in UAV Networks",
+  "file": "2610.10360v1.pdf",
+  "bytes": 1175309,
+  "sha256": "8a2c2b287e67742d70b41b4f4e6d71f893c2fe586efe6abaf1e0137447477f6e"
+ },
+ "2610.10345v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "SLDR: Defending Against Malicious Fine-tuning via Selective Layers Recovery and Dynamic Routing",
+  "file": "2610.10345v1.pdf",
+  "bytes": 3036421,
+  "sha256": "b1fcb8579fa42e768291d78ecd08b3288546614e7efdfdf71e24c4f94126a815"
+ },
+ "2610.10333v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "The Economic Security of Exponential EIP-1559",
+  "file": "2610.10333v1.pdf",
+  "bytes": 576234,
+  "sha256": "88ac6d58d6c14b12422a9c6042f47a2fcd76120dc7fe00531557b1b4ed72f02e"
+ },
+ "2610.10260v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "PairAudit: Guiding Human Review with Graph Tokens under Distribution Shift",
+  "file": "2610.10260v1.pdf",
+  "bytes": 469458,
+  "sha256": "7948f0a760efbcb8432ff0bab5eb06ebd21a4f2b362f3dcbbb8bda81abc65cec"
+ },
+ "2610.10176v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Collusion-Secure Semi-Quantum Secret Sharing Scheme using a Quantum Third Party",
+  "file": "2610.10176v1.pdf",
+  "bytes": 349233,
+  "sha256": "e2859d060af3b7ca0c05cca5f80f6745dc3aa3d57b8176a58e4c4a068ae9f2ce"
+ },
+ "2610.10150v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "On the Reliability of LLM-Based Vulnerability Patching Benchmarks",
+  "file": "2610.10150v1.pdf",
+  "bytes": 257012,
+  "sha256": "0ee3e9dc485769edb8fa5ad82f8ad239129a9b19112a1a10fed43257a3887d72"
+ },
+ "2610.10149v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Pump-and-Dump meets Honeypot Tokens: Detection and Analysis of Telegram Bait-and-Trap Schemes",
+  "file": "2610.10149v1.pdf",
+  "bytes": 1629419,
+  "sha256": "9c633075ba000c32d1a1d4e7784d3d2644e4a4b8561f9f41278b06373c7cd6ae"
+ },
+ "2610.10075v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "BetweenCut: Private Heavy-Node Classification with Doubly Logarithmic Error in Tree Height",
+  "file": "2610.10075v1.pdf",
+  "bytes": 658432,
+  "sha256": "336aada866c6e59c325e5aa952232e78de121acf528384fbdd3a987c989e0dbb"
+ },
+ "2610.10068v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Efficient Provably Private Classification with a Tabular Foundation Model",
+  "file": "2610.10068v1.pdf",
+  "bytes": 2682333,
+  "sha256": "946db42aec3b2f9d9e2b909c42534b7ef27e971d01879635ccd4ccfba58a5e6f"
+ },
+ "2610.10010v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Defining Purpose-Limited Secrets",
+  "file": "2610.10010v1.pdf",
+  "bytes": 413640,
+  "sha256": "6c71692c16cd8bd03111c72e20217f0a3e07c0e204b5904da82800d73b207a26"
+ },
+ "2610.10002v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "The Price of Privacy: Randomness Complexity of Graph-Based Multi-Secret Sharing",
+  "file": "2610.10002v1.pdf",
+  "bytes": 378665,
+  "sha256": "5f5769a5707861f16411c3711ecca202ced2ec060e2fb19e541628174725099e"
+ },
+ "2610.09918v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "CYBERFORT: A Compliance-Chain Platform Operationalising the Cyber Resilience Act for SMEs",
+  "file": "2610.09918v1.pdf",
+  "bytes": 756692,
+  "sha256": "3400f19831dbf4098ad780c307289f38445984261e9066ab79236040395b9edb"
+ },
+ "2610.09892v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Defensive Sufficiency in a Stackelberg Model of AI Security",
+  "file": "2610.09892v1.pdf",
+  "bytes": 632856,
+  "sha256": "4acfc599fa2c9b1482a1195a95d6482cb9e959e06ea53aa50ec457eddbbb1dc3"
+ },
+ "2610.09825v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Hybrid Hierarchical Runtime Verification for Edge-IoT Security: Combining MonPoly and RTLola",
+  "file": "2610.09825v1.pdf",
+  "bytes": 451631,
+  "sha256": "a2d4b630b793d40cef236b9c46bc05ac53426848f9426f7e22578b96c0437c6a"
+ },
+ "2610.09817v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Hierarchical Security Monitoring for Edge-IoT: A Formal Methods Approach",
+  "file": "2610.09817v1.pdf",
+  "bytes": 364553,
+  "sha256": "4e41fda3737e327de41952d76f4e7f73dbde8ebe06cc48df57306a8f1fef0d11"
+ },
+ "2610.09793v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Formal Runtime Verification for Tool-Using LLM Agents: An Offline Same-Benchmark Study on AgentDojo and STAC",
+  "file": "2610.09793v1.pdf",
+  "bytes": 708367,
+  "sha256": "d046c3cb499c940a7f4c6b87349d32bab1f3b654d8188b1aa8afad59b30d03ad"
+ },
+ "2610.09767v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Faster PMNS Multi-precision Multiplications Using Truncated Montgomery Technique",
+  "file": "2610.09767v1.pdf",
+  "bytes": 610507,
+  "sha256": "0fed34c9455da9b4ba57955e26958eedcf722252bf3d8cc999da005e4f90bdfa"
+ },
+ "2610.09730v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Trust a Few: The Weakest Assumptions a Protocol Needs",
+  "file": "2610.09730v1.pdf",
+  "bytes": 898510,
+  "sha256": "79c416accd3e7327ebeec8d0318d858f7aa2ccd289471cfd87050b9535311b7a"
+ },
+ "2610.09717v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Pareto-optimal quantum kernel selection for unsupervised anomaly detection on real malware beaconing data",
+  "file": "2610.09717v1.pdf",
+  "bytes": 1494960,
+  "sha256": "2a957b434ba62ae4e12848399213b0248f1cf3156ca96c36b9d8e13fd6197c17"
+ },
+ "2610.09708v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Black-Box Adversarial Patch Attacks on VLAs via Ancestor VLM Exploitation",
+  "file": "2610.09708v1.pdf",
+  "bytes": 1801989,
+  "sha256": "4bbe4a4d30e339041997121daf1579b67de966e8956db8715c9488708ccbe862"
+ },
+ "2610.09703v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Understanding and Mitigating Token-Pruning-Induced Vulnerabilities in VLMs",
+  "file": "2610.09703v1.pdf",
+  "bytes": 11168367,
+  "sha256": "ca8da62b46e659093a5de6a78007395470961f4e6d6a1d47a63f544af5ef48b2"
+ },
+ "2610.09697v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Automotive Hardware Attacks: An Architect's Guide to TARA",
+  "file": "2610.09697v1.pdf",
+  "bytes": 311544,
+  "sha256": "596871a9f4fa4c4f6a5f7e133ca5cd61a2e5574b639a317d1587af9ac75ae966"
+ },
+ "2610.09651v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Closed-Form Noise Calibration Against Membership Inference for Random-Allocation DP-SGD",
+  "file": "2610.09651v1.pdf",
+  "bytes": 852405,
+  "sha256": "a711c3f147fc4e0358681939b25a9a374f1b9a54f028e73137c80e0f31c4b5a2"
+ },
+ "2610.09581v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Correct Answers, Unsupported Findings: Evidence Binding in Forensic Reconstruction of LLM Agent Logs",
+  "file": "2610.09581v1.pdf",
+  "bytes": 524003,
+  "sha256": "af3d1aed8cda594320512bc43dbe43fc22d131879852841046cb7ecc470abf8d"
+ },
+ "2610.09580v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Beyond FAIR: A Fitness Function Framework for Sustainable Research Software",
+  "file": "2610.09580v1.pdf",
+  "bytes": 252417,
+  "sha256": "382527b2ccc5046bee69898b65e7586c3158fe53f389b30022aa1ec4494d2c76"
+ },
+ "2610.09553v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "MARS: Malware Analysis with Rule-Based Scoring of LLM Claims",
+  "file": "2610.09553v1.pdf",
+  "bytes": 558104,
+  "sha256": "d60ef51c800504ade36320da55e7a0e5a8c9742373b8125125c82b5fe66441db"
+ },
+ "2610.09552v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Constitution-Guided Watermarking",
+  "file": "2610.09552v1.pdf",
+  "bytes": 1361538,
+  "sha256": "f48e866d50a032f84f7e48c33c4114c2e75b41267ca7a64d90eecd6bb35cb0a7"
+ },
+ "2610.09469v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Secure-CUA: Controlling Untrusted Influence in Computer-Use Agents",
+  "file": "2610.09469v1.pdf",
+  "bytes": 1388926,
+  "sha256": "ba8cba12d2a6d31cafd26aa6343e8b628b6989973210c9a9d1bf4bc551bc5e2c"
+ },
+ "2610.09337v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Ask the Expert: LLM-Guided Reinforcement Learning for Autonomous Cyber Defense",
+  "file": "2610.09337v1.pdf",
+  "bytes": 683369,
+  "sha256": "f44effcf9aa74e7fcf0af117f6bbebc3420235eef544f4b3611560d2ce378280"
+ },
+ "2610.09264v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Package Hallucination Attacks on Coding Agents through Prompt Injection in Rule Files",
+  "file": "2610.09264v1.pdf",
+  "bytes": 740833,
+  "sha256": "d224596e86c872f108ba9f276b2e09625155d48d81acf46b884a84ccc6feb5da"
+ },
+ "2610.09240v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Adversarial Images Hijack Web Agents from Visual Grounding to Browser Execution",
+  "file": "2610.09240v1.pdf",
+  "bytes": 3606339,
+  "sha256": "dd1d07a93018d4560dc399afcd47f870e112c8a649321b40aaa54d1de807c224"
+ },
+ "2610.09138v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "SwarmReconGuard: Black-Box Detection of Distributed Collective Reconnaissance by Individually Benign-Looking Agent Populations",
+  "file": "2610.09138v1.pdf",
+  "bytes": 509761,
+  "sha256": "8f59eb72704f6ad6ee3d4938ea40b718330c9ad91f8069addf2d7670111528bd"
+ },
+ "2610.09033v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Quad-State Safety Evaluation of Open-Weight Large Language Models on Non-Canonical Inputs",
+  "file": "2610.09033v1.pdf",
+  "bytes": 292168,
+  "sha256": "c6a8358481c3ccecfa1756ec1f8c7b93f03fd5ad2be5576acb7312cde1177c74"
+ },
+ "2610.09029v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Cost of Delay for Post-Quantum Migration: Putting Classical and Harvest-Now-Decrypt-Later Risk on One Ordered List",
+  "file": "2610.09029v1.pdf",
+  "bytes": 867311,
+  "sha256": "52cd7084fd71f44c674d89b86485ef415bd290641232ef6f8670859c60ac4414"
+ },
+ "2610.09027v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Visual Memory Attacks Can Persist Through The KV Cache",
+  "file": "2610.09027v1.pdf",
+  "bytes": 2173976,
+  "sha256": "4d86bd1a0f210d230512851565366f982690d115bac00da675c4d351a79e1fba"
+ },
+ "2610.09012v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "TwinGuard-Lite: A Rule-Based State-Admission Gateway for Generative Patient Digital Twins",
+  "file": "2610.09012v1.pdf",
+  "bytes": 287624,
+  "sha256": "cf968d16523c20034b02406c29e0210d27b436066becc96d9dc9af8dbf35e2bf"
+ },
+ "2610.09007v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Sigma-Hunter: A Domain-Specific Language Model for Threat Hunting and Detection Engineering",
+  "file": "2610.09007v1.pdf",
+  "bytes": 250432,
+  "sha256": "e5caef4685168324bbabeeb0e657ec89d798def5dbdd4810c16f6e9829466c06"
+ },
+ "2610.09004v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Removing Information Content Does Not Certify Tamper Resistance in Open-Weight Models",
+  "file": "2610.09004v1.pdf",
+  "bytes": 611058,
+  "sha256": "76813e75b580122e2b458d60201335d5fdf8c446cb06ead0f37b790405ef138d"
+ },
+ "2610.09000v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "How Fragile Is On-Device Language Model Safety? Localizing Safety-Critical Parameters for Sparse Fault Analysis",
+  "file": "2610.09000v1.pdf",
+  "bytes": 226186,
+  "sha256": "d6c34bed6f1a3911ca4efce577991af5ad90cf98342c67e8ae3c45dc748a83d0"
+ },
+ "2610.08951v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "ASPIRE: Agentic Safety & Prompt Injection Red-teaming Engine",
+  "file": "2610.08951v1.pdf",
+  "bytes": 1676662,
+  "sha256": "9312bf5fb5210d7fb58d3cbdd317fb26b12a32ed3cd015ec2eff93ebfd71e010"
+ },
+ "2610.08928v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Multi-Aspect Runtime Verification for Simulation-Based V&V of LLM-Enabled Autonomous Agents",
+  "file": "2610.08928v1.pdf",
+  "bytes": 694763,
+  "sha256": "b97a26936282ecd92135d3abc80e2f956b7c8844d27927a8c239bb278f084351"
+ },
+ "2610.08771v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Mission-Aware Attestation Envelopes for Time-Critical Autonomous Action: A Hardware-in-the-Loop V2I Study",
+  "file": "2610.08771v1.pdf",
+  "bytes": 3272155,
+  "sha256": "87464edf13490781f1b6c89732e51005185a3007eb136730ecebae29efe70b69"
+ },
+ "2610.08739v2": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "BARE-AI: Bit-Flip Attack Resilience in AI Hardware through Built-in Performance Monitors",
+  "file": "2610.08739v2.pdf",
+  "bytes": 3148418,
+  "sha256": "8f16ac32e31683b485cef34ff730868b3773cdb4cc926917bea7d941bfb548f2"
+ },
+ "2610.08678v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Secure Speculative Decoding for Large Language Models",
+  "file": "2610.08678v1.pdf",
+  "bytes": 533779,
+  "sha256": "3d1ca0ac3e00a20606ab79fc22848678c52c18139d8b31d54d27d471fc53b675"
+ },
+ "2610.08668v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Semantic Behavioral Watermarking: Paraphrase-Robust and Forgery-Resistant Provenance for LLM Agents",
+  "file": "2610.08668v1.pdf",
+  "bytes": 534440,
+  "sha256": "2d3ad1449665bf694832f218bec6f05db588e3af0b9cbad5e1e0561431d99635"
+ },
+ "2610.08895v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Contextualization of Third-Party Cloud Security Findings",
+  "file": "2610.08895v1.pdf",
+  "bytes": 309347,
+  "sha256": "769a15c7749caf1579441eacc07b2e9b9b78950bfaf57d3dd2da64d2d70e3d03"
+ },
+ "2610.08590v1": {
+  "status": "too_large",
+  "bytes": 15757004,
+  "category": "cs.CR"
+ },
+ "2610.08571v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "RAG-PIBench: A Leakage-Aware Benchmark for Prompt-Injection Detection in Trustworthy RAG Systems",
+  "file": "2610.08571v1.pdf",
+  "bytes": 385319,
+  "sha256": "7bea9d946ee5700a65fe39cbea3232939395c8420f4ee8f716994454f47685de"
+ },
+ "2610.08464v1": {
+  "status": "ok",
+  "category": "cs.CR",
+  "title": "Federated Bayesian Surveillance of Mechanical Thrombectomy Adverse Events: A Population Risk Layer for Surgical Digital Twins",
+  "file": "2610.08464v1.pdf",
+  "bytes": 236150,
+  "sha256": "a145cf1fb91830394d5d9021e33ce0e377807181834aa1533c956746f0419a73"
+ },
+ "2610.10500v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Taxonomic Classification with Complete Tag Arrays",
+  "file": "2610.10500v1.pdf",
+  "bytes": 557104,
+  "sha256": "e157a98f79a4408cc7461621b8542b334c8d6ec6f8ee31a64ec85ea3f4d9625e"
+ },
+ "2610.10482v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Truecell reproduces R Seurat's single-cell analysis outputs natively in the Python ecosystem",
+  "file": "2610.10482v1.pdf",
+  "bytes": 1433530,
+  "sha256": "c67acb110ea8ef7d35ed960e35698c5ab995ed8043c75507df3df6e45dd4a038"
+ },
+ "2610.09054v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Beyond the Transcriptome: Chromatin-Informed Prediction of Cell-State-Dependent Perturbation Responses",
+  "file": "2610.09054v1.pdf",
+  "bytes": 3539733,
+  "sha256": "480b40e3a785d3297bbfbfef5516020271e4b4283bac218466d8c4d53ae2da3e"
+ },
+ "2610.08376v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "HRPv2: an automated and enhanced method for full-length homology-based R-gene prediction",
+  "file": "2610.08376v1.pdf",
+  "bytes": 65026,
+  "sha256": "93fe1d92d640212bf610b5c670104390188ae185114f821582fda4211466e70d"
+ },
+ "2610.06088v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Random Genetic Variation Links Personality to Earnings and Wealth",
+  "file": "2610.06088v1.pdf",
+  "bytes": 6592285,
+  "sha256": "8a5de26161b58b2d7c7a6039fc59e0564569f51643d36828bb3201056762967d"
+ },
+ "2610.04945v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "TempoBridge: Source-Conditioned Flow Matching with Optimal Transport Couplings for Single-Cell Population Transitions",
+  "file": "2610.04945v1.pdf",
+  "bytes": 3518775,
+  "sha256": "7b3a63bc4a7450290f052dd66466023a72cd4f1756c6fb0d2d0c24829643bd9b"
+ },
+ "2610.04763v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Tracing model-generated DNA with position-independent watermarking",
+  "file": "2610.04763v1.pdf",
+  "bytes": 1397398,
+  "sha256": "7a6955aa79caa9b052dce1695b2fa744522139c6ef595f264edc47a16aea33cb"
+ },
+ "2610.04633v1": {
+  "status": "too_large",
+  "bytes": 38568511,
+  "category": "q-bio.GN"
+ },
+ "2610.03987v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "On the sensitivity to hyperparameters of a Bayesian method to infer selection signatures",
+  "file": "2610.03987v1.pdf",
+  "bytes": 1018709,
+  "sha256": "5feb9b2fc6eddff609026ebf3bf73fb2f63e087192f762d29fb66161bab66bc2"
+ },
+ "2610.03075v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Generating eukaryotic reference genome assemblies: Earth BioGenome Project quality standards and recommendations",
+  "file": "2610.03075v1.pdf",
+  "bytes": 2114919,
+  "sha256": "9a2493f618811f82c20f4a12c708ad609aeca83e30d8157d66bdd6c30e84e791"
+ },
+ "2610.03815v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "GCTAg: scalable mixed-model analysis for biobank-scale agricultural cohorts",
+  "file": "2610.03815v1.pdf",
+  "bytes": 3636902,
+  "sha256": "d95841e1de7a51f36cdc5ee3dfa22100e5b68cff9f789184631deed3d289ed5c"
+ },
+ "2609.40143v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "From DNA Design to DNA Slimming: Auditable Agentic Discovery of a Deletion-Only Designer",
+  "file": "2609.40143v1.pdf",
+  "bytes": 222112,
+  "sha256": "1163332761c19ad8c25eff42d85f193331d9d41689da39972fae93346f7faeb5"
+ },
+ "2609.39830v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "MerKurio: sequence extraction and annotation based on matching k-mers",
+  "file": "2609.39830v1.pdf",
+  "bytes": 82049,
+  "sha256": "3827c819ee20ec1e5f4dd9a7618a280969d5ac6a421b20fe3dbc4d864badba79"
+ },
+ "2609.38908v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "CellMSA: Context Modeling for Single-Cell Representation Learning",
+  "file": "2609.38908v1.pdf",
+  "bytes": 8183991,
+  "sha256": "7fb17da8903293f830597adac5ce2b0fbb6e2577d81cc33381573eccb6fb5279"
+ },
+ "2609.38651v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Fragment Path Complex Networks for Viral Genome Classification",
+  "file": "2609.38651v1.pdf",
+  "bytes": 3265791,
+  "sha256": "8c3441b64b6dd7f6945637c9363b83838964f172921e60d353d3feda7aa88747"
+ },
+ "2609.37735v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "CancerZigZag: Iterative Seed-Anchored Diffusion for Generative Modeling of Single-Cell State Transitions",
+  "file": "2609.37735v1.pdf",
+  "bytes": 1241004,
+  "sha256": "dfe60e535c9b308ce0059813acd7b6f9aeffe4b682a355882cd8b8a3c1678697"
+ },
+ "2609.34079v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "GenoMorph: Pathway-Grounded Genomic Disease Reasoning via Adaptive Latent Computation",
+  "file": "2609.34079v1.pdf",
+  "bytes": 3011865,
+  "sha256": "b14e86315e4803a4a6890db25c3a0038f8ffbbf3016d14a63484136b7e650575"
+ },
+ "2610.02232v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Generalizable single-cell perturbation response prediction using energy-guided flow matching",
+  "file": "2610.02232v1.pdf",
+  "bytes": 6325852,
+  "sha256": "de20189c063c1a505631cd881f9574122fde6c5aa38b1a66beb9e21d65e92cbb"
+ },
+ "2609.35883v2": {
+  "status": "error",
+  "error": "HTTP Error 404: Not Found",
+  "category": "q-bio.GN"
+ },
+ "2609.35882v2": {
+  "status": "error",
+  "error": "HTTP Error 404: Not Found",
+  "category": "q-bio.GN"
+ },
+ "2609.35881v2": {
+  "status": "error",
+  "error": "HTTP Error 404: Not Found",
+  "category": "q-bio.GN"
+ },
+ "2609.35877v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "BarcodeMAE+: Rethinking Masked Pretraining and Global Representations for DNA Barcode Foundation Models",
+  "file": "2609.35877v1.pdf",
+  "bytes": 14208788,
+  "sha256": "a7177a3fe24d2dc3a750e1c74ccd4d340daed47d4d1a6339741a1a7fb1075898"
+ },
+ "2609.32527v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "AmbiModBench: Benchmarking Gene Perturbation Prediction Beyond Shared Responses",
+  "file": "2609.32527v1.pdf",
+  "bytes": 1300676,
+  "sha256": "e7ff5e5d7697e0849ba9724cc04f25223eff64d3a738ff4d04ed43d493a7407c"
+ },
+ "2610.00283v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "CANN: Commutative Algebra Neural Networks for Virus Classification",
+  "file": "2610.00283v1.pdf",
+  "bytes": 1206385,
+  "sha256": "6f61ce9c3d31401004e39855327a3ea9feede443fd2b4925e7f63bda3be9119d"
+ },
+ "2609.30013v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "EMMA: an R/Bioconductor package to automate tracking of metadata in functional enrichment analyses",
+  "file": "2609.30013v1.pdf",
+  "bytes": 300506,
+  "sha256": "802ff19c598ea2a789eb0482515038dcedd899e7f8c67713061a089ef7eb2eb9"
+ },
+ "2609.28386v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Motif-Vocab: StatisticallyCalibrated Transcription-Factor-Identity Tokenization forGenomic Language Models",
+  "file": "2609.28386v1.pdf",
+  "bytes": 674252,
+  "sha256": "34d29d4cd5572b0fee81a40892c0bf8e4f8ab50b87a43623d1ba4a29139bb3f8"
+ },
+ "2609.28557v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "BaseCamp --- An Agentic AI Framework for Automating DNA Sequencing Data Pipelines",
+  "file": "2609.28557v1.pdf",
+  "bytes": 427709,
+  "sha256": "cc31f8ba23b7a8e62ed42b393f6aa05e52dd920e98163261933c0ca2e140045e"
+ },
+ "2609.27207v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "BreCol: Benchmarking Classical and Deep-Learning Methods for Microbiome-Based Cancer Detection",
+  "file": "2609.27207v1.pdf",
+  "bytes": 237436,
+  "sha256": "ce7eaf4546af1b9f19cf2bfc6951f91a183c7aa0cf577d76554ed56a859401c8"
+ },
+ "2609.21115v2": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Hybrid quantum-classical attention for histopathology-based molecular profiling in data-limited cancers",
+  "file": "2609.21115v2.pdf",
+  "bytes": 5897168,
+  "sha256": "5bbec4ecb055e45bffaf6f3cc9b98ae5cc4f412e6b713392cc1f82d54768e162"
+ },
+ "2609.19569v2": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Large Language Model Agents for Evidence Based Genetic Disease Severity Classification",
+  "file": "2609.19569v2.pdf",
+  "bytes": 1520374,
+  "sha256": "6e17a7d0caf11c88f93e660aaeba74079308bbd99e5777efa2b261660cd3737a"
+ },
+ "2609.19139v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "STUART: Sequence Triage and qUAntification of Read Transcripts for Rapid Ionizing Radiation Exposure Assessment",
+  "file": "2609.19139v1.pdf",
+  "bytes": 561372,
+  "sha256": "2080f79a6b0b93dc49870674a3956c117808a94798b9f2757f72c96ba69af721"
+ },
+ "2609.18431v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "HPOQuest: A Rare-Disease Diagnostic Agent Using Active Phenotype Acquisition",
+  "file": "2609.18431v1.pdf",
+  "bytes": 495988,
+  "sha256": "14eaaa7b8171baf5ebfb558bf9971f8e942eb7b0363162514d0ccd263362691d"
+ },
+ "2609.18372v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "PlainMap: a lightweight, restartable mapping pipeline for ancient and modern DNA",
+  "file": "2609.18372v1.pdf",
+  "bytes": 331303,
+  "sha256": "30555818f10a3818108f2dd8076e6ac4b503445c7e53989751db2c9221525451"
+ },
+ "2609.17801v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "GIA: Germline-Informed Aging with AlphaGenome Finds Genetically Regulated CpGs",
+  "file": "2609.17801v1.pdf",
+  "bytes": 3992927,
+  "sha256": "cdf3f38ded1730036e51d42de1bb19eb7e28c6828aa1906b94b07aa9285d77ad"
+ },
+ "2609.16925v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "HyCoSeq: Contextual Hyperbolic Representation Learning for Genomic Sequences",
+  "file": "2609.16925v1.pdf",
+  "bytes": 1717417,
+  "sha256": "bbd3e774b2ab73db7a2d13e092c62bdde665fb8bb72def7e36b91437321e84e3"
+ },
+ "2609.17620v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Democratizing Clinical Tumor Whole Genome Sequencing: 18-hour End-to-end Analysis via Trillion-parameter Large Language Models Locally Deployed on Consumer-grade Hardware",
+  "file": "2609.17620v1.pdf",
+  "bytes": 114441,
+  "sha256": "eb0a0f08737773ccb11bb5039db8d7ff06eb8e167053c6a8ef2d265d9aff6742"
+ },
+ "2609.14970v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Towards a knowledge-enhanced single-cell foundation model",
+  "file": "2609.14970v1.pdf",
+  "bytes": 5999525,
+  "sha256": "fba3370a88e408b649f7d1e6f01bfdc88c7a9847bc253aa0b5365d2264d12868"
+ },
+ "2609.17599v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Structure is not mechanism: high-gain gated-FFN rows across text and genomic foundation models",
+  "file": "2609.17599v1.pdf",
+  "bytes": 2284190,
+  "sha256": "1c23be681ca2a25a8d8e1c25190fb7b72efa0b17028df6a6393ebd05399e623e"
+ },
+ "2609.14147v1": {
+  "status": "too_large",
+  "bytes": 42111305,
+  "category": "q-bio.GN"
+ },
+ "2609.11877v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Biology-in-the-loop: Amortized Adaptive Hit Discovery in CRISPR Screens",
+  "file": "2609.11877v1.pdf",
+  "bytes": 3931943,
+  "sha256": "adcaaa5b7f9bd0e3bc1f91d94d26c8d4924c5c0b3064b6625c01ba92c6eaef28"
+ },
+ "2609.08165v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "A Transformer-Based Delta Expression Encoder for Psilocybin Transcriptional Response: Architecture, Representations, and Biological Validation",
+  "file": "2609.08165v1.pdf",
+  "bytes": 3042957,
+  "sha256": "fd562a4ee0ffd690f9bdc12c3b9ffcdb2f72421365f701a3b0e98930163c21b2"
+ },
+ "2609.07500v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Human mutation field reveals an equilibrium-like structure with irreversible circulation",
+  "file": "2609.07500v1.pdf",
+  "bytes": 5502671,
+  "sha256": "a6b731c2de8a6b36aaa0201bb5c1592c8a5a1c85539e4f5353edea6f284abd9d"
+ },
+ "2609.05784v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "A Network-Structured Bayesian Hierarchical Model for Sparse Mutation-Drug Response Associations: Application to Cancer Pharmacogenomics",
+  "file": "2609.05784v1.pdf",
+  "bytes": 2562965,
+  "sha256": "7cbfbf47cc9418623e8214343ded53ac18262d862754e234a70ef96b6a877412"
+ },
+ "2609.04658v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "VizIt: A multi-view framework for exploring single-cell, spatial, and genetic data online",
+  "file": "2609.04658v1.pdf",
+  "bytes": 645541,
+  "sha256": "e9e6b217f401d3c44a24d70694ca40521c886bf19f68f31b9378b950787b9c8c"
+ },
+ "2609.04509v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "A Semantic Model of Genetic Evidence: A Step Toward Bridging the Basic-Science-Clinic Gap",
+  "file": "2609.04509v1.pdf",
+  "bytes": 1250575,
+  "sha256": "42f38ee3d347eebff9605dfcd326e844a57f6ff2b06f83a6b274b41b0d34e3ca"
+ },
+ "2609.03058v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Enhancer-promoter proximity predicts transcriptional competence but not transcriptional output in the Drosophila brain",
+  "file": "2609.03058v1.pdf",
+  "bytes": 4616086,
+  "sha256": "9802f6b11d2c93188bfdde25318c690c5373ce5a0eb87d1d7f84e644b40cacf5"
+ },
+ "2609.02344v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Subcellularly Resolved Single-Cell Embedding Learning with Transcriptomic data, Protein Structure and Localization Information",
+  "file": "2609.02344v1.pdf",
+  "bytes": 12131528,
+  "sha256": "44405759cddc76169c72da8fd3791b9134c481304323e7335c56b53da295800e"
+ },
+ "2609.01357v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "PopPert: Population-level Joint-Distribution Modeling for Single-Cell Perturbation Prediction",
+  "file": "2609.01357v1.pdf",
+  "bytes": 2343756,
+  "sha256": "b4d4800b7fabf05d5a283e678031b567a8ca1c3d698e784a14c54bc38077c8e1"
+ },
+ "2608.31004v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Storage-Centric System Designs for Enabling Fast, Efficient, and Low-Cost Genomic and Metagenomic Analyses",
+  "file": "2608.31004v1.pdf",
+  "bytes": 4655972,
+  "sha256": "29e825943846543e18843d22534589aad91deac6a4881371ddbb52b54f74af90"
+ },
+ "2608.28849v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Confounder-Aware Feature Correction for Single-Cell Batch Integration",
+  "file": "2608.28849v1.pdf",
+  "bytes": 403925,
+  "sha256": "94ce154821db996604686487eb58a6c607475f887eacfff1cd0d2a77597eec23"
+ },
+ "2609.22187v1": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Correlation-Guided Flow Matching with Annealed Masking for Spatial Transcriptomics Generation",
+  "file": "2609.22187v1.pdf",
+  "bytes": 9446307,
+  "sha256": "9afbee905e579156b0b700f2ad6ce0fb0a517d232899133b64d05f10b2573154"
+ },
+ "2608.26208v2": {
+  "status": "ok",
+  "category": "q-bio.GN",
+  "title": "Learning Interpretable Tumor Microenvironment Representations by Fitting Pan-Cancer Cell State-Niche Correlation",
+  "file": "2608.26208v2.pdf",
+  "bytes": 1398256,
+  "sha256": "6a17de845613a15bf79e030b0f1a055d3c4b59c8776651e7e34a9aac6838ee8b"
+ },
+ "2610.10420v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Lattice tuning of optical and mechanical interactions in gold nanodisk metasurfaces",
+  "file": "2610.10420v1.pdf",
+  "bytes": 1081011,
+  "sha256": "a4e9895d9fb08373900308fe9416503cded3b11b9cfba616ff8a4d78ef984b61"
+ },
+ "2610.10404v1": {
+  "status": "too_large",
+  "bytes": 16017891,
+  "category": "physics.optics"
+ },
+ "2610.10313v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Visibility function and Stokes parameter analysis for non-ideal quarter-wave plates in a polarization contrast scheme",
+  "file": "2610.10313v1.pdf",
+  "bytes": 3340086,
+  "sha256": "28dff1ae562ac5fedf20636f1c01b093271be26d109a22a075625d800ff96f7c"
+ },
+ "2610.10294v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Sub-shot-noise mid-infrared photothermal measurements using twin beams",
+  "file": "2610.10294v1.pdf",
+  "bytes": 12731122,
+  "sha256": "3758623acd22038bf3ead7d716a162f6c7d087ddb75619090bd70c5767a0f3a3"
+ },
+ "2610.10287v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Thermal Holography with Nonlocal Metasurfaces",
+  "file": "2610.10287v1.pdf",
+  "bytes": 1394113,
+  "sha256": "9c0d63d0abccdf5c8be5170544290fe3d944ef1a7907d09fa658ea30e135c278"
+ },
+ "2610.10193v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Start-to-end simulations of non-relativistic electron acceleration along reflective grating structure by front-tilted laser pulse",
+  "file": "2610.10193v1.pdf",
+  "bytes": 3083294,
+  "sha256": "131820b7dca1e5b3e1f015726efde2175e9a82591cc4300f680edd43d828cd3c"
+ },
+ "2610.09921v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Beyond Spectroscopic Strong Coupling: Operational Benchmarks for Cavity-to-Magnon Quantum Transfer",
+  "file": "2610.09921v1.pdf",
+  "bytes": 3802535,
+  "sha256": "52a237a31c36ba04ef458de9616a31159eaa7f86c3472374ff8ec7ca50d06003"
+ },
+ "2610.09917v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Enhanced Magneto-Optical Kerr Effect in Nano-Magnetic Metamaterials with Near-Perfect Coherent Absorption",
+  "file": "2610.09917v1.pdf",
+  "bytes": 5040656,
+  "sha256": "e01836ddc47767813ebbaab36640824cd33b4f24053203f8b5c75edaa3590d68"
+ },
+ "2610.09814v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Bogoliubov-de Gennes spectrum, Cherenkov radiation and recoil of solitons with third-order dispersion underlying optical analogue horizons",
+  "file": "2610.09814v1.pdf",
+  "bytes": 575788,
+  "sha256": "7d645c5620fc3fdf268f4431a5d5e6ec077d952f4024b68ee5232aef9d322a9c"
+ },
+ "2610.09745v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Efficient detection of spectral cluster states",
+  "file": "2610.09745v1.pdf",
+  "bytes": 6017939,
+  "sha256": "5cc5691227e9ca9e2229b7bf10cbe58238ff33914991a00516cc502700bdc805"
+ },
+ "2610.09716v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Phonon-Enabled Collective Strong Coupling of Color Centers in a Plasmonic Cavity",
+  "file": "2610.09716v1.pdf",
+  "bytes": 4000259,
+  "sha256": "82d47ca6d67b2784a91b614a350e05d9e72fc42df806cb4aa8bda6fb9cbf00ab"
+ },
+ "2610.09527v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Angular resolution limit of augmented reality waveguides from guided mode theory",
+  "file": "2610.09527v1.pdf",
+  "bytes": 384376,
+  "sha256": "91ca3f833d4f3b466351990904bf07fb2485ff894452775bd52ea2271ee00482"
+ },
+ "2610.09481v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Vector beams for real-time monitoring of crystalline symmetry on \u03bcm length scale",
+  "file": "2610.09481v1.pdf",
+  "bytes": 10573115,
+  "sha256": "8f8e8b549c234c4b47475ef64244ae669a392691f74bf070bce19f1109ea07fe"
+ },
+ "2610.09445v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Electromagnetic Field of an Oscillating Point Charge Measured by a Transversely Comoving Observer",
+  "file": "2610.09445v1.pdf",
+  "bytes": 437329,
+  "sha256": "cbd3a300641b568a67df603c845b98182471b6a4bb805496a14c591ac326db80"
+ },
+ "2610.09435v1": {
+  "status": "too_large",
+  "bytes": 17180830,
+  "category": "physics.optics"
+ },
+ "2610.09359v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Electromagnetically Transmissive and Thermally Opaque Engineered Microwave Interconnect",
+  "file": "2610.09359v1.pdf",
+  "bytes": 7628846,
+  "sha256": "7e04a61c015e28b4263d73a4f85bd295723399bc071ea8a855e7f4db94198570"
+ },
+ "2610.09182v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Shadow-Free Scattering with Complex Frequency Excitations",
+  "file": "2610.09182v1.pdf",
+  "bytes": 1077949,
+  "sha256": "a70db2e88da42863601cab21e8bc04c7ef098aa4650bdd292e935ba809ca9b18"
+ },
+ "2610.09180v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Low-Cost Spectrophotometers: A Comparative Evaluation of Open-Source Architectures",
+  "file": "2610.09180v1.pdf",
+  "bytes": 3347726,
+  "sha256": "49d2c3cffde06e7ffb67d0f86ce535954da1c8788f4681ec47a2e24730d23ddf"
+ },
+ "2610.09081v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Nonlinear Spectral Computing",
+  "file": "2610.09081v1.pdf",
+  "bytes": 1616627,
+  "sha256": "d13742c78d30f3e4e8c0bfdb6c945603c2fa46504aa335789f57d067d547a245"
+ },
+ "2610.08786v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Energy-constrained two-way capacity bounds for noisy Gaussian channels",
+  "file": "2610.08786v1.pdf",
+  "bytes": 512144,
+  "sha256": "4c8631e9c3aad812435e097dcb3d36b8d9a5f286742a4e97bf5406b34e3ac4df"
+ },
+ "2610.08453v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Parametric amplifier mediated nonreciprocal phonon laser in non-Markovian optomechanical resonators",
+  "file": "2610.08453v1.pdf",
+  "bytes": 1070675,
+  "sha256": "0dd6056bda8919a1a151e8ab53e7cc3c22041a1e8829193283130226480ab23b"
+ },
+ "2610.08346v1": {
+  "status": "too_large",
+  "bytes": 23072218,
+  "category": "physics.optics"
+ },
+ "2610.08343v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Perfect Bound States and non-Markovian Dynamics for Imperfect Giant Atoms in a Semi-Infinite Waveguide",
+  "file": "2610.08343v1.pdf",
+  "bytes": 3366723,
+  "sha256": "dcf7375a83ebd26ae59a0527c81701181a6cd56beaa678c30f02520332505d32"
+ },
+ "2610.08325v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Synthesizing free-electron wave functions by stimulated near-field interactions",
+  "file": "2610.08325v1.pdf",
+  "bytes": 7779998,
+  "sha256": "77f6c4cb0b2fc082b44aa3378c6dbeb01d57fd31d9a1d89950202c149710e76e"
+ },
+ "2610.08269v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Boosting the photon bunching of classical light via a modified Fabry-P\u00e9rot cavity",
+  "file": "2610.08269v1.pdf",
+  "bytes": 1121671,
+  "sha256": "3a3aaaa40f663aa1d345077178a9b591e09bcfee8acf574f93302fc153289402"
+ },
+ "2610.08223v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "In-line Dispersion Control of Femtosecond Laser Pulses by Multilayer Huygens' Metasurfaces",
+  "file": "2610.08223v1.pdf",
+  "bytes": 13694353,
+  "sha256": "689c012c9a300980a18db9edaacbb4aba1f57d2d17ccc670349d914bc61d1580"
+ },
+ "2610.08213v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "RACE-FPP: A Robust AI-assisted Characterisation Enhancement for Fringe Projection Profilometry",
+  "file": "2610.08213v1.pdf",
+  "bytes": 2505427,
+  "sha256": "18b2316ba246dec4b550836e5caa2b97bfee8ca88f2edc200647660503af3d0f"
+ },
+ "2610.08047v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Beyond Group Delay: Fundamental Limits of Achromatic Metasurfaces",
+  "file": "2610.08047v1.pdf",
+  "bytes": 2283413,
+  "sha256": "be387fa38f7613a58f2cb177ab6fe50dbb4fba7ec1058bbb83f6e4723f61ad94"
+ },
+ "2610.08005v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Squeezed light from a semiconductor amplifier",
+  "file": "2610.08005v1.pdf",
+  "bytes": 631419,
+  "sha256": "f75e6e3685544f0ef698db1955363fd50799b2e9f77110cdc4d84e10b295bfa7"
+ },
+ "2610.07988v1": {
+  "status": "too_large",
+  "bytes": 19268584,
+  "category": "physics.optics"
+ },
+ "2610.07965v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Optimizing Laguerre-Gaussian Mode Interferometry in Gravitational-Wave Detectors through Modal Degeneracy Breaking",
+  "file": "2610.07965v1.pdf",
+  "bytes": 1642325,
+  "sha256": "0db11fdca84a469b7d14ca0c695b7513d61b7fb7dc4d6c82e2f68164a5724ec2"
+ },
+ "2610.07951v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "A Multimodal Hyperspectral and Laser Speckle Imaging Platform for Simultaneous Monitoring of Spinal Cord Oxygenation, Perfusion and Metabolism",
+  "file": "2610.07951v1.pdf",
+  "bytes": 1621098,
+  "sha256": "12d6e3777357a95975c1518745f99de0c10cdd76fcce79dc9454a2a1c61ba32d"
+ },
+ "2610.07813v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Microfabrication of Paul wheel trap chip in fused silica by selective laser etching",
+  "file": "2610.07813v1.pdf",
+  "bytes": 1664816,
+  "sha256": "750f99985d0abfe5ff0318b1dc58e951d7039b8f4ef3b8f3426167a00c283999"
+ },
+ "2610.07633v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Direct visualization of non-equilibrium heat extraction by a metasurface absorber",
+  "file": "2610.07633v1.pdf",
+  "bytes": 962999,
+  "sha256": "e8ad5568fbbfdd9a73427cb0f153dc79582e1e200d66d1bac1958880d0e6fecd"
+ },
+ "2610.07595v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Crossover of magnetodipole and electrodipole contributions in the broadband magneto-optics of bismuth-substituted iron garnets",
+  "file": "2610.07595v1.pdf",
+  "bytes": 733876,
+  "sha256": "e836f0cba3734323dfe723dbf00d53df7c4e7e10dcdd284f631c84331839bb7d"
+ },
+ "2610.07529v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Targeted search shows that random-device testing underestimates worst-case error in a simulated wave-based neural operator",
+  "file": "2610.07529v1.pdf",
+  "bytes": 2641648,
+  "sha256": "faf0abd7dae5613992d0a6f924faeb83f8ad02f6292dd1150f35220583ee3f1b"
+ },
+ "2610.07408v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Compact Circuit Models for Nanoantenna-Based Lightwave Electronics",
+  "file": "2610.07408v1.pdf",
+  "bytes": 3633396,
+  "sha256": "5cd003364f5d5fd74aafb9b6d60ecae3e2539d4767e100ead5c9ad8fd81d9054"
+ },
+ "2610.07316v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Theory of resonance Raman profiles in transition metal dichalcogenide monolayers: Interference effects due to inter-valley phonon scattering",
+  "file": "2610.07316v1.pdf",
+  "bytes": 2924686,
+  "sha256": "dd309bec3698185a51734f86761a2983d5c6852748cd2c580ff62b70651b7fe6"
+ },
+ "2610.07235v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Recoil-heating modulation in levitated optomechanics through optical wavefront shaping",
+  "file": "2610.07235v1.pdf",
+  "bytes": 6845527,
+  "sha256": "755098b54eda9926ca80d9efe7592c03cc5459bda2d59fcdecd83c484344e324"
+ },
+ "2610.07213v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Many-body Interactions in Ultrafast Spectroscopy",
+  "file": "2610.07213v1.pdf",
+  "bytes": 1339334,
+  "sha256": "f37d89d0324c5fa7f599f7e978a5e694211527ae20a6d0b357550a7ad54b77f0"
+ },
+ "2610.07188v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Dual-channel metasurfaces for refractometric and spatial heterogeneity sensing",
+  "file": "2610.07188v1.pdf",
+  "bytes": 4090464,
+  "sha256": "9fbd5d65e415e394b3bea79a050c3c3746c9e0fc195d6e68fa6721a6df2fc7cf"
+ },
+ "2610.06832v2": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Energy-constrained two-way capacities of pure-loss and quantum-limited amplifier channels",
+  "file": "2610.06832v2.pdf",
+  "bytes": 719738,
+  "sha256": "f2cca927bb61d6261c7b56dbe0ea694121e36a4f821ef6f7c8b7d7423c380f24"
+ },
+ "2610.06711v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Novel functionalities enabled by asymmetric reconfiguration in VO2-dielectric metasurfaces",
+  "file": "2610.06711v1.pdf",
+  "bytes": 13512444,
+  "sha256": "aa2ba8e8aa869a2ac55854a8a2d2065d85d59f2ff379add03cb2f65b18f68c82"
+ },
+ "2610.06618v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Heterodyne-Enhanced Sensing of Cavity Mode Spacing",
+  "file": "2610.06618v1.pdf",
+  "bytes": 473985,
+  "sha256": "76b7fe1090eed78a664e5a6a7fbdf0757d56839361287cfcc000ccc07c390ca7"
+ },
+ "2610.06599v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Experimental Demonstration of Autonomous Class Aware Optimization via Digital Twin Aided Optical Network Agent",
+  "file": "2610.06599v1.pdf",
+  "bytes": 716135,
+  "sha256": "20946fe7811bf24701c0a99f119bd6a4b51a59534b3351f37fa9758836b326e9"
+ },
+ "2610.06566v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Digital confocal imaging in holographic optical coherence tomography at high space-bandwidth product",
+  "file": "2610.06566v1.pdf",
+  "bytes": 12809176,
+  "sha256": "0ec842bb625fa12ec0d84ccd0ebd05e4db55312ec33a559ce1144ad9b84ad9f7"
+ },
+ "2610.06528v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Cherenkov Bursts are Memory Steps",
+  "file": "2610.06528v1.pdf",
+  "bytes": 1821488,
+  "sha256": "4a6736e4c2bc5fd04d7521a4e57b81e0a56493c32f58d65d2bca2993a0df6e94"
+ },
+ "2610.06477v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Continuous-wave 148.4-nm generation in top-seeded solution-grown strontium tetraborate",
+  "file": "2610.06477v1.pdf",
+  "bytes": 1735675,
+  "sha256": "e19e8ad0382f66cc72c9f5b6535f4f9b935ea6db7b6b52e0429618e14d071449"
+ },
+ "2610.06391v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Symmetry Control in Coupled Quantum Cascade Ring Lasers",
+  "file": "2610.06391v1.pdf",
+  "bytes": 8044899,
+  "sha256": "314e7f4f07de2d4be894f39d208ce53358d1db9b66b4418f7ba33947d753a08c"
+ },
+ "2610.06311v1": {
+  "status": "too_large",
+  "bytes": 38301675,
+  "category": "physics.optics"
+ },
+ "2610.06279v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Electro-Optical Metalens for Near-Surface Cooling of a Levitated Particle",
+  "file": "2610.06279v1.pdf",
+  "bytes": 2556624,
+  "sha256": "c234bcdbf483071a606c7dd7af16105346ea13f0161b60eee6d264933462dafb"
+ },
+ "2610.06209v1": {
+  "status": "ok",
+  "category": "physics.optics",
+  "title": "Cooling and delocalizing thermal oscillators in hollow-core fibers using optical fringes",
+  "file": "2610.06209v1.pdf",
+  "bytes": 14555354,
+  "sha256": "a961be7c61b6eeb35eff3923bb19e27c8fa14003aa4af46070d8ed8cbba6c183"
+ },
+ "2610.10525v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "A Hawkes Microfoundation for Multitype Inverse Gaussian Subordinators",
+  "file": "2610.10525v1.pdf",
+  "bytes": 554570,
+  "sha256": "359eac5b7b5df3f1e12e72e0b6609ec408eb836f53fef513e6b181bf714edd87"
+ },
+ "2610.10511v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "The Exact Overlaps Conjecture for Self-Similar Measures on the Real Line",
+  "file": "2610.10511v1.pdf",
+  "bytes": 420407,
+  "sha256": "5011a9e9f6194d038df14f6f9bb452e1f66d71bb511af8b6cdd921d761add0fa"
+ },
+ "2610.10505v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "The circle packing and Riemann uniformization embedding of the tree-weighted planar maps converges to Liouville quantum gravity",
+  "file": "2610.10505v1.pdf",
+  "bytes": 1278172,
+  "sha256": "01cbd8f1099d097b56b653bac901bfecc3e34bb22fec0ab02594118c1dfe74df"
+ },
+ "2610.10502v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Notes on Kozma and Nitzan's proof of $\u03b8(p_c)=0$",
+  "file": "2610.10502v1.pdf",
+  "bytes": 260825,
+  "sha256": "f87eae523b388d02bc5b65fae3dce370e022af0f27299b08a4f2fb2b2e3c04ba"
+ },
+ "2610.10501v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "The Tutte embedding of tree-weighted planar maps converges to Liouville quantum gravity",
+  "file": "2610.10501v1.pdf",
+  "bytes": 2002007,
+  "sha256": "0aff10928bb639c6c5648510607025d05a3e7f5f8e5c05f3cb9aae91065c6f65"
+ },
+ "2610.10481v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Random permutations using GEPP",
+  "file": "2610.10481v1.pdf",
+  "bytes": 2402427,
+  "sha256": "cf424c5609dd42bd6e6c690a94ae6b35253d1e4d7f40c7041a33cda567554eaa"
+ },
+ "2610.10480v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "The circle packing and Riemann uniformization embedding of the mated-CRT map converges to Liouville quantum gravity",
+  "file": "2610.10480v1.pdf",
+  "bytes": 1031942,
+  "sha256": "0216bad3928a007ec332d9389f069f4eff0b26a5fea272c98efcbc6024fd7cc2"
+ },
+ "2610.10474v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Fast Almost-Uniform Sampling of Random $k$-SAT Solutions",
+  "file": "2610.10474v1.pdf",
+  "bytes": 766207,
+  "sha256": "53ed3430203fab292a67b855dcd973dfbc8d85766d978e8a311529ada8fc4e63"
+ },
+ "2610.10469v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Iterated Graph Systems (II): Bernoulli percolation and critical-exponent universality classes on hierarchical lattices",
+  "file": "2610.10469v1.pdf",
+  "bytes": 407788,
+  "sha256": "67fa7d88d2d4b921c95a110a857d90abbb3103e7b085afbc4325db50ef8bcbee"
+ },
+ "2610.10456v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Risk-minimizing GUE-implementations of truthful reporting in a Dynamic Social Choice Problem",
+  "file": "2610.10456v1.pdf",
+  "bytes": 681039,
+  "sha256": "d38fa3d36a68fb32555908102a41274d842df76c9bccd70f4ad916ab498ae6c3"
+ },
+ "2610.10380v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Perfect matchings in hypergraphs and Feige's inequality",
+  "file": "2610.10380v1.pdf",
+  "bytes": 299294,
+  "sha256": "415e8c7b35a53dfebd79588a66738d79fde7db04ff13045213ec6a2d2ab061bb"
+ },
+ "2610.10289v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Exact bounds on the distribution function of isotropic log-concave distributions",
+  "file": "2610.10289v1.pdf",
+  "bytes": 892557,
+  "sha256": "fc2118624d3d3681578fd68c30465ce25764a1adfd08e27d60875ca342b5c208"
+ },
+ "2610.10278v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Neural Sampling with Reweighted Normalizing Flows via the Wasserstein--Fisher--Rao JKO Scheme",
+  "file": "2610.10278v1.pdf",
+  "bytes": 5593171,
+  "sha256": "a4730683a1640e6a8ee20863b0a423d9d0a46e1ccdcd34049ee92340598d4f76"
+ },
+ "2610.10257v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "First-order $\u0393$-expansion for entropic optimal transport with non-degenerate costs",
+  "file": "2610.10257v1.pdf",
+  "bytes": 745400,
+  "sha256": "a3a317e2df87c503ca46ae85648ebd85ff1b7814c779a1236b6d7824a6043e5c"
+ },
+ "2610.10252v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Limit theorems for one-dimensional diffusions: reflected, skew, sticky, skew-sticky, and snapping-out limits",
+  "file": "2610.10252v1.pdf",
+  "bytes": 564927,
+  "sha256": "395f4281561de1f1b4fa69420bcaf1275b7c1cfe2e5996b829c2e98929ee0ac5"
+ },
+ "2610.10247v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "On $L^p$ norms of maximal operators",
+  "file": "2610.10247v1.pdf",
+  "bytes": 318660,
+  "sha256": "f2b3d634de56600cb133a903eb9ac1e2a21962e6968ba3859d5494978a64f5af"
+ },
+ "2610.10237v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Monotone Multiple Stopping and Last-Success Problems",
+  "file": "2610.10237v1.pdf",
+  "bytes": 526817,
+  "sha256": "cdd9037557613ccb9b1ad3d6ee762c1ae7d089f686f058820762fbd8c39701e1"
+ },
+ "2610.10234v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Wasserstein de-initialization for Markov chains",
+  "file": "2610.10234v1.pdf",
+  "bytes": 549801,
+  "sha256": "7ff8f2dd1b9f328fa8824653610843d50c53d331d323c45fe5ee277baed7cb6e"
+ },
+ "2610.10228v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Expected mixed volumes of convex hulls of random walks and L\u00e9vy processes",
+  "file": "2610.10228v1.pdf",
+  "bytes": 547369,
+  "sha256": "87245fc8dfcad4b3bc8c9c1e3bfb4332b769669e7af058662e1c49405d5b7f88"
+ },
+ "2610.10162v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Kozma's centrally excited walk converges to a Euclidean ball",
+  "file": "2610.10162v1.pdf",
+  "bytes": 1487372,
+  "sha256": "5b175eb2b2206612d249939dec6c120bdd0c3f4ffd51e56dd366a345ebeb1dd5"
+ },
+ "2610.10083v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Two dimensional Villain model in the BKT phase",
+  "file": "2610.10083v1.pdf",
+  "bytes": 834215,
+  "sha256": "2a583a5f0ca6107ee4b6af3e72cb74c2dffa09cac492c2c6bc05ada4b0662823"
+ },
+ "2610.10080v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Sharp Asymptotic Theory of Maximum Likelihood Estimation for Gaussian Processes with an RBF Kernel",
+  "file": "2610.10080v1.pdf",
+  "bytes": 1988396,
+  "sha256": "534ed2bd30a44e82ef8a8ccf6ae12d20df2785d349eedb935e25c4317739f121"
+ },
+ "2610.10034v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "A second-moment proof of quenched equals annealed for the Potts model on random regular graphs",
+  "file": "2610.10034v1.pdf",
+  "bytes": 606150,
+  "sha256": "d88ccd8da0a91346bfc6220905ad37d4cb8a05ce0d9d0e1b6e52d912d3ccca12"
+ },
+ "2610.10033v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Gaussian Equivalence for Multi-Head Self-Attention",
+  "file": "2610.10033v1.pdf",
+  "bytes": 732438,
+  "sha256": "d65099ea9a8f19d37e2998d56154075e1b8b428502bff864715e2a4ff2967206"
+ },
+ "2610.10022v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Improved Berry-Esseen bounds for multivariate nonlinear statistics in convex distance",
+  "file": "2610.10022v1.pdf",
+  "bytes": 661419,
+  "sha256": "a3c0ccb2d5bb7fa81a5b3b3e48f1b1ea1158b38ccb8d8eb0dff82d471f7e7db9"
+ },
+ "2610.10017v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Moment Methods for Uniform Average Mixing on Strongly Regular Graphs",
+  "file": "2610.10017v1.pdf",
+  "bytes": 507666,
+  "sha256": "df7c80104a4f81a3359313965edf41e3e93bdad904cfb9ebd061adaa7f1714f4"
+ },
+ "2610.09882v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Simulated annealing and Weak Poincar\u00e9 inequalities with inverse-polynomial accuracy for the Sherrington-Kirkpatrick model",
+  "file": "2610.09882v1.pdf",
+  "bytes": 984961,
+  "sha256": "15b76af8dd189f2ee9a11cef894ec27cc517df45a96988e22256474db85c1046"
+ },
+ "2610.09869v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Smooth spectral statistics of random perturbations of Schr\u00f6dinger operators near Anosov energy levels",
+  "file": "2610.09869v1.pdf",
+  "bytes": 640515,
+  "sha256": "e8813eae80803f224772edb687518b23c83daa62369b13370ee334fac22b22f7"
+ },
+ "2610.09813v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Drift Estimation for a Multi-Dimensional L\u00e9vy-Driven Stochastic Differential Equation Using Deep Neural Networks",
+  "file": "2610.09813v1.pdf",
+  "bytes": 550375,
+  "sha256": "3b508c467d0523e5e68cec35056c37166c68f74efdc9efddc5bc79f0f2ec97ff"
+ },
+ "2610.09811v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Strong transport noise prevents self-intersection in 2D fluid-structure interaction",
+  "file": "2610.09811v1.pdf",
+  "bytes": 507740,
+  "sha256": "6411c5c0749df145872dc6b0b325fdd8c68fc5a4bbf31d6d1e3f32ac41edb546"
+ },
+ "2610.09790v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Maximal volume of convex bodies avoiding random points and lacunary dilates",
+  "file": "2610.09790v1.pdf",
+  "bytes": 579845,
+  "sha256": "86d992ff629cdd9185cdac08d805cf0c8beeca4b90649bb3adc30952392df2c9"
+ },
+ "2610.09779v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "On an infinitely divisible distribution involving modified Bessel functions",
+  "file": "2610.09779v1.pdf",
+  "bytes": 330642,
+  "sha256": "1c60904e1ad77a9ad83a9727de2337ee4127e2d0c38d98e691ace24e6d76a311"
+ },
+ "2610.09768v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Fluctuations of Nonlinear Observables in Mean Field Neural Network Training",
+  "file": "2610.09768v1.pdf",
+  "bytes": 666942,
+  "sha256": "3f9c9b9226f25d5abdc8366df3eef7d463f68569f3801df3c515ae2d10b3827d"
+ },
+ "2610.09738v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Curvature bounds for the cost of coherence in conditional optimal transport",
+  "file": "2610.09738v1.pdf",
+  "bytes": 537668,
+  "sha256": "c05c61eae7d4940c551f789fc92a74995b8c68bfa6bafc392ecc6b3f4a2c5a9f"
+ },
+ "2610.09725v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Tameness of transitive Boolean functions",
+  "file": "2610.09725v1.pdf",
+  "bytes": 358040,
+  "sha256": "b86be5c00d3afbfe68986e40c468d302dda512cd6c5a462e8ae0f7d38f1da748"
+ },
+ "2610.09669v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "A dual characterization and algorithm of general optimal stopping",
+  "file": "2610.09669v1.pdf",
+  "bytes": 779404,
+  "sha256": "490279d895f39ca0093d1b7fec90bbae65f513b2ba4efa2994ea6b2a0525caad"
+ },
+ "2610.09640v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Quantitative stability of optimal transport via regularization",
+  "file": "2610.09640v1.pdf",
+  "bytes": 185967,
+  "sha256": "809e18c929a7033d4187384435c319ed66fb07b662f16e383ea1427ff1d1ec7e"
+ },
+ "2610.09570v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "A fixed-time stable limit theorem for non-normalized functionals on irregular time grids",
+  "file": "2610.09570v1.pdf",
+  "bytes": 420507,
+  "sha256": "b5362dfd8dc89c8bfa00cd1510a127a78860e435d98888428e02b39b5f248d2c"
+ },
+ "2610.09522v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Reflected Anchored Langevin Algorithms",
+  "file": "2610.09522v1.pdf",
+  "bytes": 4125710,
+  "sha256": "e2b8ea50ff49a4adea0808cd997344bc5f3f4da3c044c3660640df30722d90d6"
+ },
+ "2610.09521v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Unique Ergodicity for Strongly Damped Stochastic Wave Equations under Finite-Rank Pure-Jump L\u00e9vy Forcing",
+  "file": "2610.09521v1.pdf",
+  "bytes": 713700,
+  "sha256": "b23a870d6bf16347fc2240df35ae237d7bf23fbc4394b5373e33b987dc3acead"
+ },
+ "2610.09506v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Mixing Times of Switch Chains via High-Dimensional Expansion",
+  "file": "2610.09506v1.pdf",
+  "bytes": 488582,
+  "sha256": "fb7f04cc8f548c82a60db6712489a04a1b0fd92ab8748cc80e15e2579086fdd7"
+ },
+ "2610.09404v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "$L^p$ maximal inequalities for Gaussian subordination with applications to Breuer--Major--Donsker principles",
+  "file": "2610.09404v1.pdf",
+  "bytes": 608585,
+  "sha256": "b94081a1818a0a48f4fcf078e1dd7de54d913b5958020eb0026206cf7c99ebf2"
+ },
+ "2610.09380v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "The singularity probability of dense random regular graphs",
+  "file": "2610.09380v1.pdf",
+  "bytes": 653145,
+  "sha256": "c2c301df5619c514cf589f8ad324f160a528c10ee64e90364fd83068afcbf75b"
+ },
+ "2610.09278v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Backward stochastic partial differential equations with unbounded random coefficients",
+  "file": "2610.09278v1.pdf",
+  "bytes": 540149,
+  "sha256": "58dac0bc34d8104c892d367b7a18a27c2cf68be0c7aca7d334e8c36a1714a888"
+ },
+ "2610.09258v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Vertex crossings in a symmetric Markov multinomial model",
+  "file": "2610.09258v1.pdf",
+  "bytes": 606719,
+  "sha256": "77cb80212c400a649408ad4fae62721ecdb2070e19540ae63010294574362817"
+ },
+ "2610.09135v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Random $3$-regular graphs are not globally synchronizing",
+  "file": "2610.09135v1.pdf",
+  "bytes": 706867,
+  "sha256": "0b0b3fe2cd0d812333a025bd616cfb1976c9a13bde324d1bbcaaec0ff801a592"
+ },
+ "2610.09121v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Limit of the octahedron recurrence with GUE boundary data",
+  "file": "2610.09121v1.pdf",
+  "bytes": 2919281,
+  "sha256": "cbe0f258475e9bf7c32fc1a46001a3f16d326f8df0788d0528bc7ff780598aa6"
+ },
+ "2610.09076v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Universality for the extreme eigenvalues of Laplacian random matrices",
+  "file": "2610.09076v1.pdf",
+  "bytes": 419485,
+  "sha256": "47e4c391d954c3f8f5a38b04ee6870ff15bd0c1d5d655e1c4367515a192f692e"
+ },
+ "2610.09044v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Quadratic Weak-to-Strong Generalization in Random Feature Networks via Random Matrix Theory",
+  "file": "2610.09044v1.pdf",
+  "bytes": 950163,
+  "sha256": "5d319885489e5898d65f29fbed1c08220edb4198945c7df45817c0f757b0e863"
+ },
+ "2610.09038v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Long-Time Large Deviation Asymptotics for Mean-Field Granular Media Equations",
+  "file": "2610.09038v1.pdf",
+  "bytes": 642099,
+  "sha256": "e4d2735c495e3ce258f5c557e8285d4520154d7b74d8d2db7fbe7fdd6e6d2472"
+ },
+ "2610.09019v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "When Lines Become Contagious: Analyzing the Spread of Infection in the M/M/1 Queue",
+  "file": "2610.09019v1.pdf",
+  "bytes": 1203009,
+  "sha256": "a846be887fb6f420dabab21cbf9823745df19381d43d074cd69aaf1af38b268e"
+ },
+ "2610.09018v1": {
+  "status": "ok",
+  "category": "math.PR",
+  "title": "Conditional Flat Exponential Directed Last Passage Percolation under a One-Point Upper Large Deviation Event",
+  "file": "2610.09018v1.pdf",
+  "bytes": 551077,
+  "sha256": "2af3dc6c2f9c3443ed2c2e9c74f09130f3cf181d1e26817951bb5fe6af2196b1"
+ },
+ "2610.10476v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "From a Hierarchy of Stochastic Differential Equations to a Hierarchy of Generalized Beta Distributions",
+  "file": "2610.10476v1.pdf",
+  "bytes": 461359,
+  "sha256": "7d1097a38700c224b5c86ea79d668f768ced4ffc2cb888875789056d881aec08"
+ },
+ "2610.10043v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Building Macroeconomically Relevant Climate Indices via the Assemblage VAR",
+  "file": "2610.10043v1.pdf",
+  "bytes": 5518083,
+  "sha256": "6d007f50b037fa63347eb13ce6428618144f6f10f9cd2ca26498a41a9111e0e7"
+ },
+ "2610.09601v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Cluster-Robust Prediction-Powered Inference",
+  "file": "2610.09601v1.pdf",
+  "bytes": 611092,
+  "sha256": "b02a6dfa0309f0d7ce29063a264d7235bdde459dd7868ed847c58aa8654e4540"
+ },
+ "2610.09351v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Detecting Copula Structural Changes: A Smooth Testing Approach",
+  "file": "2610.09351v1.pdf",
+  "bytes": 555357,
+  "sha256": "ed0bc57a389f93d707fec8f480cedb94b6adaa846a4cfc196865bcf108b29739"
+ },
+ "2610.08558v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Measuring Gift Card Program Incrementality via Causal Data Fusion",
+  "file": "2610.08558v1.pdf",
+  "bytes": 969768,
+  "sha256": "b735d575c8bdbb3e6bd285931bf7ebb674b005ed7246970750e8bd264c299353"
+ },
+ "2610.08409v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Bayesian Machine Learning Methods For Large Scale Demand Estimation",
+  "file": "2610.08409v1.pdf",
+  "bytes": 2303764,
+  "sha256": "425f50a95b13f8110514a75cbfe2f6d7130a7e66dff1f971da19e916608c7964"
+ },
+ "2610.08194v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "The Noise Is the Signal: Correlated Sampling Error Is Rank-Informative for Proxy Metric Selection",
+  "file": "2610.08194v1.pdf",
+  "bytes": 782413,
+  "sha256": "7e3db94cdd8eaa5254a3ee6a29fb1414e92ce7208186ccc6db67f9c980e99345"
+ },
+ "2610.07589v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Vine Copula VAR:From Recursive Margins to Joint Forecast Inference",
+  "file": "2610.07589v1.pdf",
+  "bytes": 810455,
+  "sha256": "873dcf19b3694e80f0c29967ce438e92a07823f5e37a1e09d6d3958d48f28f56"
+ },
+ "2610.07363v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Network Experiments with Edge Treatments and Node Outcomes",
+  "file": "2610.07363v1.pdf",
+  "bytes": 569593,
+  "sha256": "540a020e9f85e38fec8227b4b23a37d021c671873b879fdd779f23ce40cd4d0f"
+ },
+ "2610.06412v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Measuring Trade Direction in a Prediction Market: Settlement Ground Truth and Trading-Cost Measurement on Polymarket",
+  "file": "2610.06412v1.pdf",
+  "bytes": 1015440,
+  "sha256": "ba34d19d60c5c912cc54569823d791b8a56871315962735f5859d0917ba916fc"
+ },
+ "2610.06119v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Power enhancement via cross-fit variance estimation: Applications to specification, overidentification, and many-restriction testing",
+  "file": "2610.06119v1.pdf",
+  "bytes": 765673,
+  "sha256": "eb81db620d076c674adba043909728bfef83d82b9014bd6aef24b0b41b7a614f"
+ },
+ "2610.05705v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "An Averaging Alternative to Pre-Trend Testing",
+  "file": "2610.05705v1.pdf",
+  "bytes": 369082,
+  "sha256": "a1f4e1c15202a0468135d37f540a265b90f43710a8af14cc1cc6552e577279ec"
+ },
+ "2610.05618v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Causal Lag Structure Discovery in Confounded Time Series via Orthogonalized Adaptive Estimation",
+  "file": "2610.05618v1.pdf",
+  "bytes": 1626899,
+  "sha256": "ed4c97d58549508053398fb86e14dc900e012cd2aa8b6e8fce39a5678863dfa5"
+ },
+ "2610.05535v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Synthetic Control under Out-of-Span Common Shocks: Diagnosis, Exposure Balance and Correction",
+  "file": "2610.05535v1.pdf",
+  "bytes": 1106838,
+  "sha256": "2dcb3620ce139dffe0f4ca10b69cde37ec40aa4386a5fb9949db384bcb3160c6"
+ },
+ "2610.05486v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Surrogate-powered Causal Inference with Censored Outcomes",
+  "file": "2610.05486v1.pdf",
+  "bytes": 1651629,
+  "sha256": "fe5d25be8f01460b41a18ba3b001ef56abda5d9a8f1ea45206d912584e905ff9"
+ },
+ "2610.05405v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Impulse Response Inference for Matrix Autoregressions",
+  "file": "2610.05405v1.pdf",
+  "bytes": 687218,
+  "sha256": "2b483a03d31b27fde533437d01a3557457888de49e9de325d8831bfaa426c440"
+ },
+ "2610.04982v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Nonlinear fiscal multiplier controlling for policy and economic regimes",
+  "file": "2610.04982v1.pdf",
+  "bytes": 2128915,
+  "sha256": "8d2af4d1c333dc06c14025adf9bb21666d93026857ef601db4bfd0f8a8850ec5"
+ },
+ "2610.04223v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Matched Triple-Differences: A Framework for Covariate Adjustment",
+  "file": "2610.04223v1.pdf",
+  "bytes": 786505,
+  "sha256": "790eeb2a6c9b6eb5d5cfff378e4a4f6f001550f564b03af65f12f5c5805fe9e4"
+ },
+ "2610.04217v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Bootstrap Inference with a Randomly Assigned Regressor: Covariance Filtering and the Limits of Marginal Resampling",
+  "file": "2610.04217v1.pdf",
+  "bytes": 772002,
+  "sha256": "1abf67d1135a6149406167facf703e46a8f4d4b428a666aa774e4880857a3b50"
+ },
+ "2610.04146v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Partial Identification under Imperfect Measurement: A Distributionally Robust Approach",
+  "file": "2610.04146v1.pdf",
+  "bytes": 614285,
+  "sha256": "273b6b3769c5030fc5c8189aad21fb9bffabea62c01b76a2d685e60de49e9c89"
+ },
+ "2610.03895v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "A Path-Dependent Agent-Based Microsimulation of Crime and Violence Reduction Policy Portfolios in Bolivia: Survey Calibration, Adaptive Emulator Ensembles, Global Sensitivity, Tempered MCMC, and Multi-Objective Policy Analysis",
+  "file": "2610.03895v1.pdf",
+  "bytes": 760329,
+  "sha256": "ac960f4670420ee894adec90fdb236f477a22ca32f387244da78a6344a233601"
+ },
+ "2610.02944v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Cross-Fitting Under Nonregularity: Normality and Inference via Locality",
+  "file": "2610.02944v1.pdf",
+  "bytes": 552444,
+  "sha256": "5cf57679a1016f970d23c48b3de9f0ca33420daf53b861b4b08f0ff7c3b8f19f"
+ },
+ "2610.02938v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Evaluating Threshold Policies in Randomized Threshold Designs: A Cautionary Tale for Regression Discontinuity Designs",
+  "file": "2610.02938v1.pdf",
+  "bytes": 321320,
+  "sha256": "df2092bcd57fb79026ec8c6962bfa39a17bb0d538def7f1e71af573ce1b50f01"
+ },
+ "2610.02290v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Expected Utility Regret Rule: Minimax and Bayes Optimal Portfolio Choice",
+  "file": "2610.02290v1.pdf",
+  "bytes": 904034,
+  "sha256": "c81762e92b396636995776c6516feed3158c9fc6df1e4089c3e6f506ec14fe67"
+ },
+ "2610.01935v2": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Pragmatic DML with AI-Learned Representations",
+  "file": "2610.01935v2.pdf",
+  "bytes": 461937,
+  "sha256": "54307d01c5f5f6fef01db65d8c4a06d77ea9ce9d2510139668f1e14ab207b26d"
+ },
+ "2610.01654v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Identifying Panel Conditioning with Refreshment Samples: Sharp Bounds and Design Assumptions",
+  "file": "2610.01654v1.pdf",
+  "bytes": 511082,
+  "sha256": "b9ac4bf37b837fc158a83b66004d7fccb03321929330026c66436788186b4b80"
+ },
+ "2610.01465v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "A distributional modelling approach with application to electricity price forecasting",
+  "file": "2610.01465v1.pdf",
+  "bytes": 520059,
+  "sha256": "970dcd92ec0366e62a7a2494358f9cf1bbe5f4f4b4f3694ed8ff2f4baef05826"
+ },
+ "2610.01464v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Inference after data-driven control-unit selection in difference-in-differences with estimated covariance",
+  "file": "2610.01464v1.pdf",
+  "bytes": 657861,
+  "sha256": "3d53be6569495b5fb89b6ae5cc44693efb1292f99b1c777e71f197dffdf7960a"
+ },
+ "2610.00581v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "The Anatomy of Commodity Risk: Micro, Market, and Economy-Wide Sources",
+  "file": "2610.00581v1.pdf",
+  "bytes": 1353008,
+  "sha256": "84c5b9e0751beffe1f3ea8b41ea9e834903f55f8185a58eddb80c8df149e9455"
+ },
+ "2609.40156v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Partial identification with entropy regularized optimal transport",
+  "file": "2609.40156v1.pdf",
+  "bytes": 842911,
+  "sha256": "4d8ac1d0db76541f4286278970c8d3ed1ec4f824e87836449f86b5d3aaf41cef"
+ },
+ "2609.38875v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Optimal Allocation and Volume under Surface",
+  "file": "2609.38875v1.pdf",
+  "bytes": 869802,
+  "sha256": "38e65ea43518c751fc405e4ed0eb0a2aa8cf8052a68cb310b6b7f87157564dfe"
+ },
+ "2609.38692v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Imputation is all you need: double robustness, semiparametric efficiency, and automatic covariate balance for estimating the average treatment effect",
+  "file": "2609.38692v1.pdf",
+  "bytes": 486593,
+  "sha256": "40965b532a967910252341eb59452a275986a80c0bef8bfd2b0bf993ddd8be75"
+ },
+ "2609.37412v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Debiased Inference for Bounding Wage Inequality with Many Controls",
+  "file": "2609.37412v1.pdf",
+  "bytes": 694352,
+  "sha256": "740acc2a5ed1f10437b94dd58cc0fe824cc1555694a3875b570844b3631459fe"
+ },
+ "2609.37168v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Are there asymmetries in euro area monetary policy transmission?",
+  "file": "2609.37168v1.pdf",
+  "bytes": 1124273,
+  "sha256": "e89a884756b07d137fe396770bc59f944bdaa209a2da61d25500831c0a1faa8f"
+ },
+ "2609.36824v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Testing for Unobserved Heterogeneity in Censored Duration Models: EM Approach",
+  "file": "2609.36824v1.pdf",
+  "bytes": 457660,
+  "sha256": "ddb7c0d811dd707a5269dd5478d6777219994ef473a6c05fe7b41606d273ff38"
+ },
+ "2609.36445v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Continuously Updating GMM in Linear IV Models: A Polynomial Approach",
+  "file": "2609.36445v1.pdf",
+  "bytes": 636289,
+  "sha256": "104e2880d77f5fc8035579cb0b3a18dbf3d8d161dc86bb9a074cab1427d06542"
+ },
+ "2609.36280v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Probabilistic Seasonality",
+  "file": "2609.36280v1.pdf",
+  "bytes": 970531,
+  "sha256": "1b496f71d71f2ed0643f36868e83fcbedd0e837c3594f28a6205893ecebccf10"
+ },
+ "2609.35011v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Price Stability in the European Union: A Systemic Approach Using Random Matrix Theory",
+  "file": "2609.35011v1.pdf",
+  "bytes": 421623,
+  "sha256": "21a1693a6cee6419089ce99c842191531cc521b80a32b371a3de13df46796449"
+ },
+ "2609.33859v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "The Potential of Nighttime Light Imagery for Detailed Local Economic Analysis",
+  "file": "2609.33859v1.pdf",
+  "bytes": 4936292,
+  "sha256": "2f3f2c866397d5678ec38bb863768bb763c03fad02b25e95e774c818575983a6"
+ },
+ "2609.37477v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Calibrated Order-Randomized Rosenblatt Tests",
+  "file": "2609.37477v1.pdf",
+  "bytes": 1139997,
+  "sha256": "d72366f2180002d028e3da6710ac4e128faefe05c01fad1bc318928828a17d19"
+ },
+ "2609.33471v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "A One-Saddle 1/5 Approximation Algorithm for Common-Kernel Bimatrix Games: Recognition, Exact Segment Optimization, Sharp Selector Bounds, and Certified Robustness",
+  "file": "2609.33471v1.pdf",
+  "bytes": 9310853,
+  "sha256": "48d15be577ceb2ed74fe17a263686b757bfec70fc02d7b08bde004c3e244f0e4"
+ },
+ "2609.33418v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "An adaptive $L_2$-type test for high-dimensional white noise",
+  "file": "2609.33418v1.pdf",
+  "bytes": 857741,
+  "sha256": "c6c31061f74f6b25dbc3f405954946be9e0fc6d4c3d851a8df22a255526bdd8d"
+ },
+ "2609.33058v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Evolution of Market Microstructure in the Age of AI",
+  "file": "2609.33058v1.pdf",
+  "bytes": 562355,
+  "sha256": "ac338e395604c3d1bb83622fda36b76b335b18f796bf00b90df186a16b7c0d40"
+ },
+ "2609.32725v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Minimax Choice of Projection Geometry under Linear Inequality Constraints",
+  "file": "2609.32725v1.pdf",
+  "bytes": 1340305,
+  "sha256": "279c799ff9380631ab66396abab6c8b19c691c5d4888e1e701ce569ae026d890"
+ },
+ "2609.32369v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Two-Point Dependent Wild Bootstrap for Weakly Dependent Estimating Equations",
+  "file": "2609.32369v1.pdf",
+  "bytes": 578209,
+  "sha256": "7314776aa5e8ad298ede486e33b3e063c5cbb0eda4b64ce0a4bf86c92d43ca13"
+ },
+ "2609.32076v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "An Adversarial Approach to Identification, Computation, and Inference in Models with a Linear-in-Measures Representation",
+  "file": "2609.32076v1.pdf",
+  "bytes": 916440,
+  "sha256": "3b8b1df21cf0b9456285509348b951f1be2ba41fc189ce0fce50047ddf31eed8"
+ },
+ "2609.31958v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Multiple testing of a function's monotonicity",
+  "file": "2609.31958v1.pdf",
+  "bytes": 574719,
+  "sha256": "6c403d5ce56e8bfeb19ad9d4321c7e7cc2d9534030cd292c58bfc0b3d7dcfb1e"
+ },
+ "2609.31561v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Orthogonal Moments in Likelihood Models",
+  "file": "2609.31561v1.pdf",
+  "bytes": 914982,
+  "sha256": "f06dcb2971cc03cfe444827f2190fd2fa060b73b776b3b45453a7b830a0a6474"
+ },
+ "2609.31442v3": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Bootstrap Inference for Dynamic Panel Data Models with Common Correlated Effects",
+  "file": "2609.31442v3.pdf",
+  "bytes": 856528,
+  "sha256": "668225aacdffc681d3baef4ede867f04301710352e06f0c126009ec27b872e9d"
+ },
+ "2609.30617v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "Risk-Averse Welfare Maximization via Marginal Treatment Effects",
+  "file": "2609.30617v1.pdf",
+  "bytes": 897985,
+  "sha256": "f9a482cc0e753c244e1c7c1b40bac3137ef3f67f2330171174dc52a86da8405d"
+ },
+ "2609.30528v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "When Do Surrogate Metrics Work? A Finite-Sample Comparison Under Realistic Failure Modes",
+  "file": "2609.30528v1.pdf",
+  "bytes": 1066348,
+  "sha256": "b4a765bb3ab12463dcd07dc8595499c5ad1ac88aab8b39fccef09c0d281ddbdc"
+ },
+ "2609.30504v1": {
+  "status": "ok",
+  "category": "econ.EM",
+  "title": "A Characterization of the $M$-tests Under Nearly Integrated Nearly White Noise",
+  "file": "2609.30504v1.pdf",
+  "bytes": 533301,
+  "sha256": "f0170d60b448363d3b48635e2cb39f01fcba6bcbf0727a2a8d6006306e225351"
+ },
+ "2610.10308v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Two Low-Mass-Ratio Microlensing Planets from High-Magnification Events: KMT-2021-BLG-0247 and MOA-2023-BLG-169",
+  "file": "2610.10308v1.pdf",
+  "bytes": 3064093,
+  "sha256": "4bf896175e6be89bbd62194f3a469393a9568334a8d31166bf04b95ef53997c9"
+ },
+ "2610.10130v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "A Recurrent Infrared Modulation in the Warm Post-impact Debris Disk NGC 2547 ID8",
+  "file": "2610.10130v1.pdf",
+  "bytes": 799678,
+  "sha256": "87c14b3366fa7d56721a63d7a7125a0a199e9e84555d0f6d122f764c02d36bc1"
+ },
+ "2610.09965v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Astrometric planet search around southern ultracool dwarfs: V. Discovery of the exoplanet candidate PALTA-1 b",
+  "file": "2610.09965v1.pdf",
+  "bytes": 1193536,
+  "sha256": "835d0c78e70547dc35ab01f4929ec7eef2d87d40a65e7713e5f088ac639a2684"
+ },
+ "2610.09881v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "A faint dust ring beyond the compact disk of Sz 76",
+  "file": "2610.09881v1.pdf",
+  "bytes": 2358313,
+  "sha256": "0add9e5f946ab213a43bd320e3d11b4af1228aa19174eb11b898414809295aca"
+ },
+ "2610.09854v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "A Jupiter-like radio aurora in the L3.5 dwarf LSPM J0036+1821",
+  "file": "2610.09854v1.pdf",
+  "bytes": 2687665,
+  "sha256": "4d45dc8d2f00e117de3fc0a26f357d7f9385e26ec841533bcf6ad76003647b41"
+ },
+ "2610.09575v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "A comparison between particle and fluid approaches for streaming instability in global patch simulations",
+  "file": "2610.09575v1.pdf",
+  "bytes": 5822713,
+  "sha256": "b317ee132147687aa23f9097ef5581eca455ce7c6a0a217ade81558c453dd210"
+ },
+ "2610.09394v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "The Fast Transient Foreground Fog of LSST",
+  "file": "2610.09394v1.pdf",
+  "bytes": 6210414,
+  "sha256": "46001b7709ef44fe23d3afd7c9ebcf07731a6d8aa9dd9c7e7d85e272d5f0ab88"
+ },
+ "2610.09323v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Constrained Diffusion for Data-Scarce Orbital Monte Carlo in Constellation Tasking",
+  "file": "2610.09323v1.pdf",
+  "bytes": 7343059,
+  "sha256": "3b36c41b4502b8c35aacc949f0b5514b610b3d1ef8c1b530dc4595d3ab71b4d5"
+ },
+ "2610.09128v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Detection of escaping magnesium in the upper atmosphere of WASP-76b",
+  "file": "2610.09128v1.pdf",
+  "bytes": 6593352,
+  "sha256": "aac3e7c2ae9d264d4ba7bf5f875da4f4b95b88118d092d7cd9f02e64b218bc3b"
+ },
+ "2610.09110v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Polarimetric Behaviour of (3200) Phaethon: New Observations with Implications for Surface Heterogeneity",
+  "file": "2610.09110v1.pdf",
+  "bytes": 2780681,
+  "sha256": "9100ab87bb0a0f2c10c0ab446932e75fdb8ea49bf2e48439d49ee82d5534175a"
+ },
+ "2610.08922v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Searching for hot water world candidates with CHEOPS: II. A low-density super-Earth orbiting the K dwarf TOI-2211",
+  "file": "2610.08922v1.pdf",
+  "bytes": 4551690,
+  "sha256": "79b693a3fc73a0c510ee6966e9b265e81dbc29e6427c7b53a7afcf66a11dc620"
+ },
+ "2610.08758v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Coronal Mass Ejections from the Young Sun: Deceleration-Powered Solar Energetic Particles as a Self-Extinguishing Forcing of the Early Earth",
+  "file": "2610.08758v1.pdf",
+  "bytes": 789212,
+  "sha256": "300b7d018b20ecb26d9e10b07a547972c9a3a1c5d3cac1f29a583d2d69f9a381"
+ },
+ "2610.08584v1": {
+  "status": "too_large",
+  "bytes": 24619135,
+  "category": "astro-ph.EP"
+ },
+ "2610.08472v1": {
+  "status": "too_large",
+  "bytes": 26573409,
+  "category": "astro-ph.EP"
+ },
+ "2610.08471v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Reflex instabilities I: Boundaries makes grid-based disc simulations frame-dependent",
+  "file": "2610.08471v1.pdf",
+  "bytes": 3139674,
+  "sha256": "9aaf4fb1f7a82747bcecc9f2cd7230730b63813027a421a42e7ad3f18d8bf4de"
+ },
+ "2610.08410v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Decoy and disclosure radii of invariant shape descriptors",
+  "file": "2610.08410v1.pdf",
+  "bytes": 3926950,
+  "sha256": "79be4a4820bc43b137056330edbf539588d91dfaf93e3b9bd192ea0632838cf6"
+ },
+ "2610.08273v1": {
+  "status": "too_large",
+  "bytes": 22421922,
+  "category": "astro-ph.EP"
+ },
+ "2610.08128v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Ariel Tier 3 Observations: An Opportunity to Explore both Stellar and Planetary Variability through Broad Wavelength Time-domain Spectroscopy",
+  "file": "2610.08128v1.pdf",
+  "bytes": 12145421,
+  "sha256": "d0389e7c4dd407d18921564a124f97c3f563082396d50e29cfa91de8c00a35f9"
+ },
+ "2610.08065v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "HD 715 b, a Warm Jupiter Orbiting a Massive Subgiant Discovered from a Single TESS Transit",
+  "file": "2610.08065v1.pdf",
+  "bytes": 1311711,
+  "sha256": "9d8848f261d76264f17ef4838e21881fe557591a5e406307a2696449d306a56d"
+ },
+ "2610.07861v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "COSMOS-3D: Spectro-photometric Confirmation of Shabgard, a Cool, Metal-poor Brown Dwarf in the COSMOS Field",
+  "file": "2610.07861v1.pdf",
+  "bytes": 7621535,
+  "sha256": "c3b37f86be349e0b336ebaa587b947b35b352f46c4224a0e793665b1e86d22a7"
+ },
+ "2610.07636v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Hubble Space Telescope Observations of Active Asteroid (101955) Bennu",
+  "file": "2610.07636v1.pdf",
+  "bytes": 2795925,
+  "sha256": "b9d180f935c80778d1fbbc6f02f46e12288ee6eed2c3ea16661a5250be79e04b"
+ },
+ "2610.07584v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Discovery of 2 km ultra-fast rotating asteroid in Rubin DP2 catalog via varying Fourier order method",
+  "file": "2610.07584v1.pdf",
+  "bytes": 7173700,
+  "sha256": "5e14bca783092a637ea0a57830a1e60d05d65e0979a098d3d003d1fa28cbe798"
+ },
+ "2610.07395v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Tracing the main belt origins of S-complex near-Earth objects: From space mission targets to meteorite sources",
+  "file": "2610.07395v1.pdf",
+  "bytes": 1849708,
+  "sha256": "cc26e01dd62d45842d43938e4ed648ad63724c287a344395f9d430432c01d4b7"
+ },
+ "2610.07202v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Exploring the ultrahot Neptune LTT 9779 b with CRIRES+. Non-detection of helium transmission spectra and detection of H$_2$O on the dayside",
+  "file": "2610.07202v1.pdf",
+  "bytes": 8537992,
+  "sha256": "0e270baf8e637453098164b51e92f91062daf71c57b4a923d7fc8148f888d661"
+ },
+ "2610.07181v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Enhancing the Interpretability of Radial Velocity Analysis Using Leave-one-out Cross-validation",
+  "file": "2610.07181v1.pdf",
+  "bytes": 780785,
+  "sha256": "c68590622f3813ed934c5212eb6d34a5d2006e11066a7388406f9db41b1abcf6"
+ },
+ "2610.07178v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Molecular hydrogen formation on dust: The impact of gas-dust drift on formation efficiency",
+  "file": "2610.07178v1.pdf",
+  "bytes": 1854784,
+  "sha256": "b4286f9ed32e37a9068a98575b7d694d64267dd7fa1617d483391bab18018bc4"
+ },
+ "2610.07161v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Discovery of a second-generation planet candidate accreting onto a white dwarf",
+  "file": "2610.07161v1.pdf",
+  "bytes": 1054994,
+  "sha256": "cd2c75bdc0a5ea9252356bc48800a8824fecd65f4749259e531e8630ccdf5f6a"
+ },
+ "2610.07149v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Detecting multiple planets in Gaia data using Bayesian model selection",
+  "file": "2610.07149v1.pdf",
+  "bytes": 2643511,
+  "sha256": "de559399ac9e53dfc3d5f72f8ed1eea26283575a5d7529a5a01cd5ff7f98fed4"
+ },
+ "2610.07133v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "First Direct Identification of a Multi-Star Microlens System Hosting a Planet",
+  "file": "2610.07133v1.pdf",
+  "bytes": 9854789,
+  "sha256": "0844642f15e50a410b498134b0f7fa008bde6428cfb0ccc56fefceabdfa4707b"
+ },
+ "2610.06780v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Production of White Dwarf Debris Disks from Planetary Collisions and Poynting-Robertson Drag",
+  "file": "2610.06780v1.pdf",
+  "bytes": 712431,
+  "sha256": "e10488a9629e300671373161212e7e0d5450d30748e349d222bcfc8a7a9b83fd"
+ },
+ "2610.06416v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Dynamics around non-spherical symmetric bodies - III. The case of a spherical body with a crater",
+  "file": "2610.06416v1.pdf",
+  "bytes": 12706541,
+  "sha256": "e7311f98b0ab00806a8aa768af55b421b450eca4cff43f547dc473cc9c3077a9"
+ },
+ "2610.06332v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Shadows cast by precessing annuli as evidence for an inclined planet in HD 139614",
+  "file": "2610.06332v1.pdf",
+  "bytes": 9053240,
+  "sha256": "bc8e8436eb930c9c457935d0451a78763043f8f796bceb388fca9ac64bae49c7"
+ },
+ "2610.06254v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Fast and Stable Nonlinear Emulation of TIEGCM Using an Autoregressive SINDy Framework",
+  "file": "2610.06254v1.pdf",
+  "bytes": 5074869,
+  "sha256": "d7d3ad8feeedecbd3613609f0160b89646cc8383785d638b459077e192c03515"
+ },
+ "2610.06082v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Spins and shapes of asteroids reconstructed from photometry from surveys",
+  "file": "2610.06082v1.pdf",
+  "bytes": 3018628,
+  "sha256": "a448c260fc4f65d19f753e795e0e1d2e2baa2cede57bab9e9ab382adfaa3262a"
+ },
+ "2610.06077v1": {
+  "status": "too_large",
+  "bytes": 17621816,
+  "category": "astro-ph.EP"
+ },
+ "2610.05951v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "SPIRou near-infrared spectropolarimetry of the ultra-hot Jupiter KELT-9b: tentative detection of the planet magnetic field",
+  "file": "2610.05951v1.pdf",
+  "bytes": 2476844,
+  "sha256": "050706afabf1bbcb612c5cb31f63b78cef30e9954e184906acac0668791e4897"
+ },
+ "2610.05372v1": {
+  "status": "too_large",
+  "bytes": 21741988,
+  "category": "astro-ph.EP"
+ },
+ "2610.05358v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Astronomia Ova: Kepler's Laws, Ptolemy's Equant, and Legendre's Polynomials",
+  "file": "2610.05358v1.pdf",
+  "bytes": 1468824,
+  "sha256": "7b6c7ee28bca3c09a6474998435f56fa3e31addfacdcb6230c70fdc47410d71e"
+ },
+ "2610.05287v2": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Irradiated Atmospheres VII. Effect of Mixing Energy Flux on Atmosphere-Interior Coupling",
+  "file": "2610.05287v2.pdf",
+  "bytes": 2024527,
+  "sha256": "4a57967390749440c59f859d0e2887cd790942a3e0c29be9d0f5b5f786425ebf"
+ },
+ "2610.04986v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Candidate O I 7774 \u00c5 Absorption from an Escaping Rock-Vapor Outflow of BD+05 4868 Ab",
+  "file": "2610.04986v1.pdf",
+  "bytes": 1975629,
+  "sha256": "5ab539e7a8bfe19bff207f8421d77002844b5022aae44a40b1e67dab27013f6b"
+ },
+ "2610.04919v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Spectral Energy Distribution and Polarimetric Properties of Dust in the Interstellar Comet 3I/ATLAS",
+  "file": "2610.04919v1.pdf",
+  "bytes": 753241,
+  "sha256": "86b25c79699d30e5206fabdb3aa09332bdc87ddea53fd14777e82316e56b1731"
+ },
+ "2610.04655v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Xenia: A Table-Driven Code for Astrophysical Multi-Fluid Hydrodynamics",
+  "file": "2610.04655v1.pdf",
+  "bytes": 644431,
+  "sha256": "2c74508ca535d6c0392da52ed00555ca4672b8c66287c2ed106b9c11c9b35fc5"
+ },
+ "2610.04497v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Stellar magnetic activity and rocky planets in cool dwarf stars",
+  "file": "2610.04497v1.pdf",
+  "bytes": 14234335,
+  "sha256": "39bc444f5bed4479ee15162c96b4b84a987dddea19dd1124a6931b99654dbbdc"
+ },
+ "2610.04358v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "How dust particles orbiting white dwarfs can reveal undetected co-orbiting exoplanets II. Exoplanets on elliptic orbits",
+  "file": "2610.04358v1.pdf",
+  "bytes": 13579449,
+  "sha256": "7577039f2034852b668c864a4557aeb8ef04564afda6a2f35ea07a13407434fa"
+ },
+ "2610.04114v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Closing the Gap: A Test of the Streaming Instability Using Simulations and Observations of the Cold-Classical Kuiper Belt Size Distribution",
+  "file": "2610.04114v1.pdf",
+  "bytes": 1899853,
+  "sha256": "b3d44b28aef14c57b1ea1cf9dc937cc957a474f5218c3e69eb51ae8c29b4be9a"
+ },
+ "2610.04081v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "AEGIS: Differentiable Mars Climate Model with Neural Closures",
+  "file": "2610.04081v1.pdf",
+  "bytes": 1540146,
+  "sha256": "152a8551f8eaade11162de1a070cfaeaaf7cf076325407b6d43d964b14e16d74"
+ },
+ "2610.04050v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Measuring the Age and Initial Composition of Interstellar Objects",
+  "file": "2610.04050v1.pdf",
+  "bytes": 2127187,
+  "sha256": "34031b1af82ddf3ca5f542cb04cb40d237a50478f31828a5b23977ae295672fe"
+ },
+ "2610.03974v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "The Nearest, Brightest Debris Disk Host Stars: Updated Photosphere Models and Dust Properties for Stars with Saturated 2MASS Photometry",
+  "file": "2610.03974v1.pdf",
+  "bytes": 3268985,
+  "sha256": "a83fb689f80c23d9d7bad667be16a2133505efc5d122dee867fd269e8a5e8eb2"
+ },
+ "2610.03635v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Temporal Variability of Titan's Middle-Atmospheric Zonal Winds from Southern Fall to Late Winter (2016-2023)",
+  "file": "2610.03635v1.pdf",
+  "bytes": 1320320,
+  "sha256": "f34f431141629bbe6b5f6b2af3791ea8bb33156b503f6deeae5d138c689d9b40"
+ },
+ "2610.02956v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Plato benchmark stars I. The initial benchmark sample",
+  "file": "2610.02956v1.pdf",
+  "bytes": 2514976,
+  "sha256": "1089713509484129bba9e359c83f62e09cbd60cc18df6070d009e895b7e97a19"
+ },
+ "2610.02783v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Joint RV-Astrometric Analysis of two-planet system HD 65216: Prospects for Gaia DR4",
+  "file": "2610.02783v1.pdf",
+  "bytes": 6661356,
+  "sha256": "eff2d4dab936921b24daa2460667d257b79e8bbf92a37d6ca09a0a9863c4407d"
+ },
+ "2610.02629v1": {
+  "status": "ok",
+  "category": "astro-ph.EP",
+  "title": "Performance of AutoRegressive Planet Search methodology on simulated PLATO lightcurves",
+  "file": "2610.02629v1.pdf",
+  "bytes": 2706839,
+  "sha256": "57d3846ce34d8fa0312fa320b9876f5a3d6ff662955862a6dcd61dddd6960c25"
+ },
+ "2610.10293v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Adaptively Combining Randomized and External Control Data Using a Mixture Prior in the Presence of Heterogeneity",
+  "file": "2610.10293v1.pdf",
+  "bytes": 353225,
+  "sha256": "1b8d2a8f6a1252ed979901bebc6c461293cbb2600a40392021eea1d73d314266"
+ },
+ "2610.10271v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Interval Localization for Multiple Change-points with Error Rate Control",
+  "file": "2610.10271v1.pdf",
+  "bytes": 1734981,
+  "sha256": "d023a938050464d58ed8801b684bc58f3cb36ee414c1b241ade81f6ce4e8bb85"
+ },
+ "2610.10168v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Conformal Prediction for Spatially Dependent Data via Sequential Whitening",
+  "file": "2610.10168v1.pdf",
+  "bytes": 1430228,
+  "sha256": "e2ae4b8d1feaf3c074cec18fde98655278053afb0f571c690b3673f965e26bc1"
+ },
+ "2610.10167v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Policy Learning with Weak Signals",
+  "file": "2610.10167v1.pdf",
+  "bytes": 1382413,
+  "sha256": "b69ed0bcefbdbd62e59fd8b1eb2b462b5c77731f6bfda0e15639a16c0e3ce5ab"
+ },
+ "2610.10142v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "When Can You Ship on Evals Alone? Trial-Level Surrogacy for Offline Evaluation of LLM Systems",
+  "file": "2610.10142v1.pdf",
+  "bytes": 449365,
+  "sha256": "41f192731cceb13f46d3f63d1de36beac4bcd9be293a17621313ce85f5136322"
+ },
+ "2610.09984v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Extreme Binary Classification: Extreme Value Theory for Extreme Constraint on False Negative",
+  "file": "2610.09984v1.pdf",
+  "bytes": 948373,
+  "sha256": "00e11884b667d5f7b6895542b1f09278ce59771a7ce0bb11871a307de2b52059"
+ },
+ "2610.09930v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Anchored Reversible Jump Sequential Monte Carlo",
+  "file": "2610.09930v1.pdf",
+  "bytes": 2484382,
+  "sha256": "cad93a3d7262f2a075c5f1640689f3036982e77413dfbc20355d1712e41aaf99"
+ },
+ "2610.09883v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Adjusting for Social Groups in Spatial Point Process Models for Waiting Pedestrian Configurations",
+  "file": "2610.09883v1.pdf",
+  "bytes": 6571092,
+  "sha256": "ee639846c1351061236597da80d212179b0f3a2d4ecf461fee3d100b6a713484"
+ },
+ "2610.09801v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Statistical Inference for Continuous Action Bandits",
+  "file": "2610.09801v1.pdf",
+  "bytes": 778506,
+  "sha256": "f49b03bbe90142318ab630f59805263bfd5abf806073bdf23275edb2b4ceefc7"
+ },
+ "2610.09762v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "The generalized lower triangular process prior",
+  "file": "2610.09762v1.pdf",
+  "bytes": 493509,
+  "sha256": "b3aef9a7ad8d302c2870097e984bbe62ccfe45fe5399b6ae11672472584b3c97"
+ },
+ "2610.09722v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Beyond Source-Level Transfer: Sample-Level Learning for High-Dimensional Quantile Regression",
+  "file": "2610.09722v1.pdf",
+  "bytes": 589571,
+  "sha256": "3cff43eaee9b02247e1a0871092e4b8943a4f18327eb915b11f6894f8941ca7f"
+ },
+ "2610.09668v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Statistical Oceanography of Profiling Floats and Surface Drifters",
+  "file": "2610.09668v1.pdf",
+  "bytes": 3952208,
+  "sha256": "cad095073395827230847fbba10e8b11df4c14e50ead82d07729c158992bad13"
+ },
+ "2610.09658v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Sharp Partial Identification for Survival Model Comparison Without Target Outcomes",
+  "file": "2610.09658v1.pdf",
+  "bytes": 2157111,
+  "sha256": "28e6c5ec9fab8a56d38ffa31d6bd3214bae18c4fbaf40ee96cd79d6a2c37debd"
+ },
+ "2610.09627v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "The Lambert Penalty: Logarithmic Shrinkage for Sparse Regression",
+  "file": "2610.09627v1.pdf",
+  "bytes": 779029,
+  "sha256": "ca2981d80ee4290d69f7291eb82308697e1438aaa767add3a17989f6b17fa00a"
+ },
+ "2610.09452v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Finite-Rank Logistic Gaussian Processes with Exact Likelihood for Conditional Density Estimation",
+  "file": "2610.09452v1.pdf",
+  "bytes": 1495894,
+  "sha256": "f2c31796c5eb6870adb523072859b997171de7305a7560fbdeeaaf49e0f8a3b9"
+ },
+ "2610.09423v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Manifold Fitting by Successive Tangent-Space Projection",
+  "file": "2610.09423v1.pdf",
+  "bytes": 2925026,
+  "sha256": "0555da0b81906a8af4180169971186b3228179192d0a2cac07095ed253e4339e"
+ },
+ "2610.09391v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Reusing Statistical Guarantees Under Change: Selection Costs and Event Ownership",
+  "file": "2610.09391v1.pdf",
+  "bytes": 592237,
+  "sha256": "9705b15fdc6c34dd6794e05a1f7f14dad74fe520a4b4ffdd32710c034d4252e9"
+ },
+ "2610.09339v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Sequential resetting procedures and false discovery rate",
+  "file": "2610.09339v1.pdf",
+  "bytes": 2509103,
+  "sha256": "826afa949231b462ca0a3db45dab63be6d81ad8081720101b43ad19c6f7b5a25"
+ },
+ "2610.09259v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Distinguishable Category Groupings in Complex Surveys: Which Categories Can the Design Tell Apart?",
+  "file": "2610.09259v1.pdf",
+  "bytes": 269718,
+  "sha256": "2253398196512312019d18cf3b9138963b0f1bbec2d89ed6f2f1ac5e2acd7b7c"
+ },
+ "2610.09234v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Longitudinal causal inference under informative missingness using the self-censoring model",
+  "file": "2610.09234v1.pdf",
+  "bytes": 497331,
+  "sha256": "9ccca03229f242ccdf3d680182c9b945ed319f4f21c96144e95ccd6dc0a31b51"
+ },
+ "2610.09214v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Calibration-Free Robust Bayesian Inference for Discrete Unnormalized Models",
+  "file": "2610.09214v1.pdf",
+  "bytes": 794201,
+  "sha256": "183b61e730be9dbf8eb401e835c6768dc609fccbba263f982a657580760ea57a"
+ },
+ "2610.09208v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Sketched Calibration for Conformal Prediction under Covariate Shift",
+  "file": "2610.09208v1.pdf",
+  "bytes": 704562,
+  "sha256": "434c3d07224c070aad434f203043384d310438910b0a508b116b5245f022bf31"
+ },
+ "2610.09153v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Relative Wasserstein Spatial Depth for Cluster Number Selection in Distributional Data",
+  "file": "2610.09153v1.pdf",
+  "bytes": 1503777,
+  "sha256": "dc706def59f9c807f9e04a0651e09ef83becf2f9eb73701a59ec9d7cdec74571"
+ },
+ "2610.09123v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Sharp and Adaptive Cluster Recovery in Slowly Mixing Gaussian Hidden Markov Models",
+  "file": "2610.09123v1.pdf",
+  "bytes": 642229,
+  "sha256": "eedef3e372ee841151bfab34d0449a804db0f4c4ed875f117bff648a6b0ad160"
+ },
+ "2610.09100v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Score-Based Methods for Selecting Direct Causes in Reweighted Distributions",
+  "file": "2610.09100v1.pdf",
+  "bytes": 684836,
+  "sha256": "5a974a992daa7748b5f7e2a2283ad011ecff5fa53dbadf49208ecd58c517bbfe"
+ },
+ "2610.09094v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "A Formal Graphical Inference Framework for Combining Effect Size with Statistical Significance: Application to Multivariate and Functional Linear Models",
+  "file": "2610.09094v1.pdf",
+  "bytes": 1140105,
+  "sha256": "5ada8ab7cb4445a2ab2598109624535bba30f400136378d5438851747266d0b5"
+ },
+ "2610.09070v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Covariate-dependent Joint Modeling of Multivariate Ordinal Preferences and Its Connections with Comparison Models",
+  "file": "2610.09070v1.pdf",
+  "bytes": 488086,
+  "sha256": "ecbe7dc4fb904bc317e09a187715395f839831973cc9233a95c8a9f16aedd205"
+ },
+ "2610.08974v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Projected Normal Models on Recursively Curved Tori",
+  "file": "2610.08974v1.pdf",
+  "bytes": 823022,
+  "sha256": "1ba5ebad9992f774e3ed2aa76848ba31f08ea358a42bf854a3a7e8b3cb8b9a89"
+ },
+ "2610.08715v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Prediction-powered inference for time series across space",
+  "file": "2610.08715v1.pdf",
+  "bytes": 316897,
+  "sha256": "ad775ba95699f22aff30c19dfba03e16422a48ba57d0178fcd8a1cf3f7c021e2"
+ },
+ "2610.08711v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Asymptotic Null Distributions of Moran's $I$ and Assortativity in Large Networks",
+  "file": "2610.08711v1.pdf",
+  "bytes": 809908,
+  "sha256": "88a2cb08a139499e3cc364f75ea7a998e58605e5a65b5673135898ef95be8012"
+ },
+ "2610.08602v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "When does conformal calibration need censoring weights? Cause-of-failure prediction sets under competing risks",
+  "file": "2610.08602v1.pdf",
+  "bytes": 711356,
+  "sha256": "51662cd4bc5e781ca0941a12325c459a791f90ff9ef003ee67de0adfc93ebf9a"
+ },
+ "2610.08481v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Fridge: focused fine-tuning of ridge regression for personalize predictions",
+  "file": "2610.08481v1.pdf",
+  "bytes": 351677,
+  "sha256": "4f3816271b5f8f4bf49b8576f0b3e355cdd8463e84a260b27557bb42f5f56770"
+ },
+ "2610.08386v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Elastic kernel Ridge regression, with applications in phonetics",
+  "file": "2610.08386v1.pdf",
+  "bytes": 674747,
+  "sha256": "e91cd68adf62c8a4a3239a91d78aa3d49ec1ec0e88dd26db3a2a8ac3190cec42"
+ },
+ "2610.08345v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "High-Dimensional Statistical Inference for Sparse Support Vector Machines",
+  "file": "2610.08345v1.pdf",
+  "bytes": 494352,
+  "sha256": "b883e70e748f2cfe1a2156e7fb30ecda8bf16f5f1279099e1771c202d38eed05"
+ },
+ "2610.08321v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Covariate-dependent Nonparametric $g$-modeling for regression via infinite Mixture-of-Expertizing class",
+  "file": "2610.08321v1.pdf",
+  "bytes": 6357250,
+  "sha256": "e99242e184fb33d2065f25bb303dc0e2d9438c565be407da09b1ee4aaab9f070"
+ },
+ "2610.08317v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Bayesian heterogeneous copula mixtures with nonparametric margins: consistency, identifiability and tail asymmetry in physical fitness data",
+  "file": "2610.08317v1.pdf",
+  "bytes": 1254367,
+  "sha256": "0af3655f252729b50a667a93e63968b89e8b0d9fe63ce3bad9167e765526e721"
+ },
+ "2610.08292v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Where Do Two Populations of Persistence Diagrams Differ? Calibrated Local Inference at a Fixed Budget",
+  "file": "2610.08292v1.pdf",
+  "bytes": 760482,
+  "sha256": "e0d5b9daf6f5e23807d5a4ad45bd6fcd963e142f0a61be247f3b0017fcb592d2"
+ },
+ "2610.08210v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Anytime-valid simulation-based hypothesis testing",
+  "file": "2610.08210v1.pdf",
+  "bytes": 521717,
+  "sha256": "7c562c35b3e118f4a43d15c94b06c4345a5123ddaea7b6e6208f6612d1172755"
+ },
+ "2610.08197v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "The Missing Corner: When Sharp Causal Bounds Fail to Compose",
+  "file": "2610.08197v1.pdf",
+  "bytes": 479709,
+  "sha256": "afa269cffa5c4d5c49b33f7bbb59ec645c62d7a33f0d52bad7e458d392337f7e"
+ },
+ "2610.08157v1": {
+  "status": "too_large",
+  "bytes": 17815892,
+  "category": "stat.ME"
+ },
+ "2610.08132v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Beyond Marginal Monitoring: Distributed Joint-Distribution Testing for Data Concept Drift in Large Scale E-Commerce Operations",
+  "file": "2610.08132v1.pdf",
+  "bytes": 3883971,
+  "sha256": "412ca618768ff0d9cedb3ec044aa11ca55d554878dcbd76ff4bfced0b14989e1"
+ },
+ "2610.08100v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "The Geometry of Existence and Uniqueness of Maximum Likelihood Estimation in Categorical Response Models",
+  "file": "2610.08100v1.pdf",
+  "bytes": 344554,
+  "sha256": "fe387962ad8ef53daaf20f02b6640777d9c6d3d692fb217c8f682f7aaf070978"
+ },
+ "2610.08092v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "What Should We Measure Next? Finding Identification Strategies by Refining Mechanisms",
+  "file": "2610.08092v1.pdf",
+  "bytes": 543913,
+  "sha256": "6e1827ce561ca30457d37cda37b09e73ac357e0277b9bfac46d653428ed40834"
+ },
+ "2610.08073v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Collaborative representations for targeted causal inference under outcome selection",
+  "file": "2610.08073v1.pdf",
+  "bytes": 539368,
+  "sha256": "d173e043f76b45d3d8fec83bdacf279df3708c301b12439ab1edd47ef83250f7"
+ },
+ "2610.08059v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "The Topp-Leone XLindley Distribution: Properties, Estimation and Applications to Lifetime Data",
+  "file": "2610.08059v1.pdf",
+  "bytes": 966131,
+  "sha256": "1b977bb68a9f53f632156cc9c7c217a73c14e49a6e0c0ed44851740b88cb34bf"
+ },
+ "2610.08017v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "Scope-Restricted Backtracking Counterfactuals",
+  "file": "2610.08017v1.pdf",
+  "bytes": 440203,
+  "sha256": "69055722bdf07e4962eb8e249db361c51d384526e4892849fc7cf6b685d0418e"
+ },
+ "2610.07888v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "A Functional Representation of Credit Behavior for Probability of Default Modeling",
+  "file": "2610.07888v1.pdf",
+  "bytes": 717096,
+  "sha256": "45e1c130ab81bf61c9263c9d0bd556626fda8e7739b3d623e3d6658262b3eb37"
+ },
+ "2610.07877v1": {
+  "status": "ok",
+  "category": "stat.ME",
+  "title": "State-space representation of early-life child mortality dynamics: linking event history analysis and orbit-based models",
+  "file": "2610.07877v1.pdf",
+  "bytes": 1720640,
+  "sha256": "ffb51dea78fd908f6605311c2945b486afbfa68a3ae66d757837122792308cd1"
+ },
+ "2610.10327v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Fast Antenna Coding Based on Pixel Antennas for Enhancing Spectral Efficiency of MIMO Systems",
+  "file": "2610.10327v1.pdf",
+  "bytes": 652142,
+  "sha256": "e24b8eb5c0bdb9b0bb0f117fdf685298a3b9ff373d6b0b6411373015d247d8a5"
+ },
+ "2610.10309v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Antenna Coding by Pixel Antennas: Unlocking A New Dimension for Wireless Communications",
+  "file": "2610.10309v1.pdf",
+  "bytes": 2776773,
+  "sha256": "e7f5df7858e3bb92c050897a6fe805853289227c29795637b92902cd377b22a1"
+ },
+ "2610.10155v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Near-Field Beamforming Design for Multi-IRS Wireless Beam Routing",
+  "file": "2610.10155v1.pdf",
+  "bytes": 1147673,
+  "sha256": "1a30bfede62188531a48003bae17a654f4eb24fbd6086e9b4ce2947ca2db3f40"
+ },
+ "2610.10106v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Variational Bayesian Inference Based Progressive Multi-Target MIMO Sensing with Nuisance Parameters",
+  "file": "2610.10106v1.pdf",
+  "bytes": 3591839,
+  "sha256": "11d4dceada761b49c2d614455558f0ca019d38c50493b50391861938295b4f7f"
+ },
+ "2610.09851v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Effects of Residual Chirp Rate on DAFT-s-AFDM Uplink Performance",
+  "file": "2610.09851v1.pdf",
+  "bytes": 370052,
+  "sha256": "e790419ea78cb42326be907dcc81551f64dda1e3526f35d00fdac4768804268c"
+ },
+ "2610.09792v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "A Proof-of-Concept Study of Weakly Supervised Labeling of Fine-Grained EEG Components for Artifact Attenuation",
+  "file": "2610.09792v1.pdf",
+  "bytes": 2042396,
+  "sha256": "7722c760f769f5f0b24664749d429af06c9f2ece6e6922f563a4ded69f1a3742"
+ },
+ "2610.09787v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Sparsity in control problems: Recent trends and open challenges",
+  "file": "2610.09787v1.pdf",
+  "bytes": 860865,
+  "sha256": "c40b093bcfbde41488807b88075767bc6a1f73857eb9c02d2d0b39be05ce6360"
+ },
+ "2610.09682v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Self-Supervised Deconvolution of In-Air Sonar Images Using Sensor Ego-Motion",
+  "file": "2610.09682v1.pdf",
+  "bytes": 392151,
+  "sha256": "da5eab7f1c12e905a6c77eca01939db32d29aa729ae4491f55a719e14c35c95d"
+ },
+ "2610.09617v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Second-order optimization of variable projection SVM models and road abnormality detection",
+  "file": "2610.09617v1.pdf",
+  "bytes": 300547,
+  "sha256": "053fac42f3c0f3774b36ab69f5f632b75e9af5d70b74fa130b3a1b47be9ac05a"
+ },
+ "2610.09429v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Predictive Beamforming via Echo-Beam Modality Separation with Cross-Attention for ISAC Systems",
+  "file": "2610.09429v1.pdf",
+  "bytes": 929801,
+  "sha256": "d743e6d1321dc18b6f52065afe445d113b4ad74af4ce4013ec7fa6d373361d22"
+ },
+ "2610.09381v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Finite-Aperture Modeling of Pattern-Reconfigurable Antennas for Multiuser Beamforming",
+  "file": "2610.09381v1.pdf",
+  "bytes": 2376567,
+  "sha256": "718c2c334ff2d29c46154bf7ab12f0fa4ae32194ab1e4f3637082c699e8e23c6"
+ },
+ "2610.09334v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "VM-ARRAYDPS: Virtual Microphone Augmented Diffusion Posterior Sampling for Unsupervised Blind Speech Separation",
+  "file": "2610.09334v1.pdf",
+  "bytes": 304267,
+  "sha256": "c17c5ea0dc20206a97e14345ff5d5d4492bb58def7b9893c16f3086906dbd792"
+ },
+ "2610.09225v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Lyapunov-Inspired LyRIC Activation and GLARE Attention in Chaos-Guided State Space Modeling for EMG-To-Speech (ETS) Synthesis",
+  "file": "2610.09225v1.pdf",
+  "bytes": 7638287,
+  "sha256": "ee512ad2a9160355cbcf2d1cd2a05110a23bf732c893d6e36d827440dbd2b1ce"
+ },
+ "2610.09172v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Beyond the Doppler Dilemma: Improved Fast Weather Radar Unambiguous Doppler Velocity Spectrum Reconstruction from Sparse Aperiodic Sweeps",
+  "file": "2610.09172v1.pdf",
+  "bytes": 6206428,
+  "sha256": "0b4db3525712ab0c8d165eaa309cc54ed62aceb5c6cbfc7a1d8d9d78416258d7"
+ },
+ "2610.09161v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Fast Whittle Maximum-Likelihood Parametric Spectrum Estimation for Weather-Radar Doppler Moments",
+  "file": "2610.09161v1.pdf",
+  "bytes": 480268,
+  "sha256": "f4e7ac78da3338350224f609fe512dc447f402a3de1dcff2a478b29f96afb0bc"
+ },
+ "2610.09080v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "User-Target Pairing for NOMA-Enabled ISAC in Low-Altitude Wireless Networks",
+  "file": "2610.09080v1.pdf",
+  "bytes": 966986,
+  "sha256": "a95dbee8aa78456ac77fab38318b3d77239232acced3802147181d2fa170d1ba"
+ },
+ "2610.09052v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "BeatFlow-ECG: Rectified Flow for ECG Reconstruction from Indirect Wearable Signals",
+  "file": "2610.09052v1.pdf",
+  "bytes": 4194426,
+  "sha256": "ce487112f791b0d33677f328b9c780452f03eb0f083eeddcee8995cf9d2ff3e4"
+ },
+ "2610.09010v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Hierarchical RIS Association for FR3 Space-Air-Ground Integrated Networks",
+  "file": "2610.09010v1.pdf",
+  "bytes": 620015,
+  "sha256": "11b80802aa9db46319bb4d4dda26083174bac16099e639e806fc6c508ca42403"
+ },
+ "2610.08992v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Geometry-Informed Neural Network for Pilot-Limited Channel Estimation via Sensing from Uplink Traffic",
+  "file": "2610.08992v1.pdf",
+  "bytes": 448551,
+  "sha256": "cf9bd791d2b99b408871be245634c9ade3174f677d21687ef7f116aabf4e5658"
+ },
+ "2610.08982v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "FlightMagNav: An Open Dataset and Probabilistic Map Learning and Validation Framework for Outdoor Magnetic Field-Based Positioning",
+  "file": "2610.08982v1.pdf",
+  "bytes": 10024930,
+  "sha256": "2399fb281e9ef8cfc7b6aa6bb4906f8f39f2fa2b1dd9e6a4da926553cbcf2ace"
+ },
+ "2610.08977v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "SNR-Gated LSTM-Conditioned Diffusion Model for MIMO Channel Estimation",
+  "file": "2610.08977v1.pdf",
+  "bytes": 2543336,
+  "sha256": "671cff9916b018dfb5cd743156d50e2fb648532aef68c893a5acab37ddceb896"
+ },
+ "2610.08973v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Beamforming Design for RIS-Assisted Backscatter NOMA in Underlay Cognitive Radio",
+  "file": "2610.08973v1.pdf",
+  "bytes": 664919,
+  "sha256": "a70a7c192bc3ca682dc753bb1a0ee0dcd29d0b64ca8f898aed88e1f8743a9863"
+ },
+ "2610.08744v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "RIS-Assisted Reliability Maximization for URLLC in Upper Mid-Band 6G Networks",
+  "file": "2610.08744v1.pdf",
+  "bytes": 985493,
+  "sha256": "456b3ace3eeacd6f6ab65047e47f9583325f34506bcea97c347ec1af11c674be"
+ },
+ "2610.08730v2": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Sliding-scale Insulin Does Not Control Steroid-induced Hyperglycemia in a Non-diabetic Patient, No Matter How You Tune It",
+  "file": "2610.08730v2.pdf",
+  "bytes": 434036,
+  "sha256": "f3c688b24a8531219647eab4e57c1993bbc98899e169e5d13daac396a3bf6b0f"
+ },
+ "2610.08696v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Fundamental CRB-Rate Tradeoff of Rydberg Atomic Receivers for Integrated Sensing and Communication",
+  "file": "2610.08696v1.pdf",
+  "bytes": 1744955,
+  "sha256": "7e56ec79e971a83889196cd4ab97f695c5df37dbbf647267b26193c35d8d8364"
+ },
+ "2610.08550v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Mutual-Coupling-Aware Electromagnetic and Signal Processing Co-Design for Pixel Antenna Arrays",
+  "file": "2610.08550v1.pdf",
+  "bytes": 560638,
+  "sha256": "aae346aa440dc599da1b86d108c9add8cb267bfa794b34c6a1dcce6e46a5dd3a"
+ },
+ "2610.08461v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Joint EM-BB Beamforming Design for ISAC Systems With Reconfigurable Antenna Arrays",
+  "file": "2610.08461v1.pdf",
+  "bytes": 756724,
+  "sha256": "726e7543b03ef70c250826c12df938b7dac8a709f525d83d86bf0186179e3012"
+ },
+ "2610.08352v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "6G NeXt - Towards 6G Split Computing Network Applications: Use Cases and Architecture",
+  "file": "2610.08352v1.pdf",
+  "bytes": 598896,
+  "sha256": "2abfe57e76d37eef4f30d2684905f4e28afc1f7d543986ff873a92290799a323"
+ },
+ "2610.08267v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "WM4ISAC: World Model for Proactive ISAC Under Dynamic Blockage",
+  "file": "2610.08267v1.pdf",
+  "bytes": 675615,
+  "sha256": "4a7a38823af766ea0e4e33ed5db5d011b83eb2de28b98392c538277defbef149"
+ },
+ "2610.08152v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Movement Stability of D-Optimal Sensor Placement Under Projector Perturbations",
+  "file": "2610.08152v1.pdf",
+  "bytes": 824217,
+  "sha256": "26cf3897cb9f8271c64f859a64e3e24222d396e247f4f2db0cdabe23d52fa9b6"
+ },
+ "2610.08080v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Laplace-Domain Beamforming for Ultrafast Plane-Wave Imaging",
+  "file": "2610.08080v1.pdf",
+  "bytes": 2141227,
+  "sha256": "411f4fc9a6620b6849cd1c64f403a89c7ad03892f810f1e75b3b193a63700054"
+ },
+ "2610.08056v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Noncoherent MIMO in the FR3 Upper Mid-Band Using Grassmannian Signaling: Prototype and Experimental Evaluation",
+  "file": "2610.08056v1.pdf",
+  "bytes": 4858737,
+  "sha256": "9c82b4f9d429f793a748078edc31e2b4e5b9065c51520c76f893e1c353971d6e"
+ },
+ "2610.08041v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "A Continuous High Precision Localization Method for AGVs Based on Interferometric FBG Array Sensing and Hybrid Deep Learning",
+  "file": "2610.08041v1.pdf",
+  "bytes": 1936909,
+  "sha256": "e240c18480fd414bec6812fe57262ca813a89d701950dafa56f47963bd74a541"
+ },
+ "2610.08008v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Movable Antenna-Enabled Multi-Target Sensing: Sidelobe Suppression via Position Optimization",
+  "file": "2610.08008v1.pdf",
+  "bytes": 1628311,
+  "sha256": "6fc527f2ad813d76c065867454934fac7e9094a1beb5a611ce4e0715c0009745"
+ },
+ "2610.07994v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Waveform Randomization for Secure ISAC",
+  "file": "2610.07994v1.pdf",
+  "bytes": 259436,
+  "sha256": "135dcf6f5451e84f47f57278e4a2347b6f68ff1f14fe0e290c964bd8a46997d2"
+ },
+ "2610.07885v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Label-Efficient Deep Learning for ECG Delineation: A Multi-Dataset Benchmark against Widely Used Delineation Tools",
+  "file": "2610.07885v1.pdf",
+  "bytes": 1421500,
+  "sha256": "d4724a24584cb4cc1bf1ed9f469d2ebb5a93cabe6fe6413e8cc404934aa6ddc3"
+ },
+ "2610.07829v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Agentic Semantic Sensing for Resource-Adaptive AI-RAN",
+  "file": "2610.07829v1.pdf",
+  "bytes": 5001034,
+  "sha256": "c03352a865f29a20daa0c7137f998ebb3e97816c1b83d97dc511d9e75ef6238a"
+ },
+ "2610.07824v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "CANDLE: Cortical Null-Space Decomposition for Noninvasive Brain Source Imaging",
+  "file": "2610.07824v1.pdf",
+  "bytes": 5929557,
+  "sha256": "8d27be57ebb00e81498e5a9c14aab4b211899060800045568965fd906b7c0805"
+ },
+ "2610.07670v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Radar Intelligent Detection with Coarse-Grained Labels",
+  "file": "2610.07670v1.pdf",
+  "bytes": 1725730,
+  "sha256": "56064e3cc92c27b18121c18a803073d39d77fb09d46739641312e6193f4f5131"
+ },
+ "2610.07462v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Comparative Analysis of Filter Bank Waveforms for ISAC Systems: 2D-FFT FB and AFBM",
+  "file": "2610.07462v1.pdf",
+  "bytes": 659840,
+  "sha256": "382f404edf1eb187ba0aaccb5c6eadf7a9c87d49988c63b82764359324217adc"
+ },
+ "2610.07438v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Artifact removal improves electrodermal waveforms but not downstream classification in a virtual-reality balance task",
+  "file": "2610.07438v1.pdf",
+  "bytes": 742427,
+  "sha256": "c76083aa91dc1119c2fb7cd91869a1b5597b6fb8fccbdef7e8a7645e219a7fa2"
+ },
+ "2610.07428v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Adaptive Gait Biofeedback With Participant-Held-Out Modeling and Participant-Specific Updating in Chronic Ankle Instability",
+  "file": "2610.07428v1.pdf",
+  "bytes": 1719191,
+  "sha256": "8028a571a7fa53a1b1bf2adbed81cc7c72d1f0c4888a5b40a00735def189e14a"
+ },
+ "2610.07420v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Benchmarking Label-Revealed Online Updates for EEG BCI Decoding",
+  "file": "2610.07420v1.pdf",
+  "bytes": 1235580,
+  "sha256": "e9b44fbcff811ade382dadbdfbfa3eb5df0b7851daf3435b751e5abd817add74"
+ },
+ "2610.07185v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Subspace-based Second-Order Detection Architectures for Radar Signals in the Presence of Unstructured Interference",
+  "file": "2610.07185v1.pdf",
+  "bytes": 4393305,
+  "sha256": "4318d01766ebeb43ed0b8b99b8d5b3415f7db0211b998f7226f8185ecc386c71"
+ },
+ "2610.06839v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Goal-Oriented Wave Computing for Direction-of-Arrival Estimation",
+  "file": "2610.06839v1.pdf",
+  "bytes": 247939,
+  "sha256": "215217ad4accbfb75ce6ffd303b44efe77f6dac5eff69c1750fb48184b332fdc"
+ },
+ "2610.06759v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Pulsar Constellation Evolution and PPP Convergence using LEO GNSS",
+  "file": "2610.06759v1.pdf",
+  "bytes": 1625558,
+  "sha256": "bfb63be06fb5cdf767007e51e68eaa5e5a9c7674b606eff65b1e778593fe07a0"
+ },
+ "2610.06656v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Sample Dependence-Aware Blind Source Separation for Linear Causal Discovery",
+  "file": "2610.06656v1.pdf",
+  "bytes": 296988,
+  "sha256": "8e2070ba4616ebda583e2fe6c19940631ab58ba9f883756e8db0e75413b1e234"
+ },
+ "2610.06630v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "Inverse Cross-spectral Neural Networks for Multivariate Time Series",
+  "file": "2610.06630v1.pdf",
+  "bytes": 956666,
+  "sha256": "edaea08f00c25236344b11b8ca96286ee4a8ad66b697a9acd8ce89dae4261cdd"
+ },
+ "2610.06613v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "A Robust Learning Framework for Deep-Learning-Based Radar Target Detection With Partially Mislabeled Training Data",
+  "file": "2610.06613v1.pdf",
+  "bytes": 3376526,
+  "sha256": "ab0afbea7a5143abecf948d7f2d5cdb742cf3808662ee264445b180ef0147900"
+ },
+ "2610.06583v1": {
+  "status": "ok",
+  "category": "eess.SP",
+  "title": "On the Real Part of Butterfly Factorizations, with Application to Fast Transforms",
+  "file": "2610.06583v1.pdf",
+  "bytes": 511727,
+  "sha256": "3970f74d76a1e3f0852e3df618efcf7ed67e6aa2845095221ca72d76c6bd6ee1"
+ },
+ "2610.09246v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Conditional value-at-risk under reward-penalty mechanism with applications to robust portfolio management",
+  "file": "2610.09246v1.pdf",
+  "bytes": 4592611,
+  "sha256": "c0d26a52479ce4e01cb1113b73e3e01737e58d6da156c6aa44a751608bf8dad1"
+ },
+ "2610.08869v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Learned Monotone Recurrent Features in Governed Credit Scoring: The Price of the Frame and the Necessity of Macro Conditioning",
+  "file": "2610.08869v1.pdf",
+  "bytes": 680187,
+  "sha256": "9d866cb4f8e88f8e788fe6c88f4d2b5289ce72036b5441c703216e4b31b3b2f5"
+ },
+ "2610.07404v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Convex Order Beyond Dimension One: Projection Tests, Counterexamples and Gaussian Mixtures",
+  "file": "2610.07404v1.pdf",
+  "bytes": 612193,
+  "sha256": "1f8fe196ba9f775ed3c6b5d3450cc53cc83445dfcfbc5da11d46919ce7b42a52"
+ },
+ "2610.05926v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Comparing two approaches for modelling the loss given default of credit cards: Run-off triangles vs regression",
+  "file": "2610.05926v1.pdf",
+  "bytes": 2160698,
+  "sha256": "714f13398c8d45af96ebf6f9e45af6bcd6b311f321fc97ab4483b6a8e247f103"
+ },
+ "2610.05741v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "A Dirichlet Mixed-Membership Model for Exact Multivariate Distributional Credibility",
+  "file": "2610.05741v1.pdf",
+  "bytes": 2465725,
+  "sha256": "22689b2ee4393b41bb79fcef98605f75cbba4c5f163b917b91befe7bce369975"
+ },
+ "2610.05196v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Measuring Learned Monotone Temporal Aggregation at Matched Admissibility",
+  "file": "2610.05196v1.pdf",
+  "bytes": 970608,
+  "sha256": "22f24e338a136585894b9dc9e48fac987e29bc92f2adfa5679f157bab2667f69"
+ },
+ "2610.04221v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Robust enhanced index tracking portfolio selection under distributional uncertainty",
+  "file": "2610.04221v1.pdf",
+  "bytes": 5697518,
+  "sha256": "6a4df9ffbcb6008665d73ca5d8c2d9eac9393075f0cf9e030eaeac1094f7113e"
+ },
+ "2610.03161v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Landscape-Dependent Performance of Photonic Quantum Solvers in QUBO Feature Selection for Financial Risk Detection",
+  "file": "2610.03161v1.pdf",
+  "bytes": 572611,
+  "sha256": "1220ebb5dcda9448594bd2148abd5f182055caf510ba679e60da988c4c4a82d3"
+ },
+ "2610.03793v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Optimal Catastrophe Bond Design and its Applications to Climate Change Risk",
+  "file": "2610.03793v1.pdf",
+  "bytes": 1982295,
+  "sha256": "594c1775d07f3a707b6faa5a83b8fe66cf36396f18172e0c3956f207d54bcba9"
+ },
+ "2609.38765v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Multiperiod bond portfolio optimization with transaction costs using a Markov Decision process",
+  "file": "2609.38765v1.pdf",
+  "bytes": 442280,
+  "sha256": "29dff34ee81e87949c891228588a06872645e9954f6640237da0db82bd805519"
+ },
+ "2609.36177v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "A tale of two allocations: Risk capital contributions versus risk contributions in the tail",
+  "file": "2609.36177v1.pdf",
+  "bytes": 543497,
+  "sha256": "ee7cdeedca4ce53e375a77d4dee7f9de86ac8ccbe668b8714d7f193c6e5c62f8"
+ },
+ "2609.34474v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Deep kernel hedging",
+  "file": "2609.34474v1.pdf",
+  "bytes": 1290422,
+  "sha256": "5ec248495af01beda0a3ad9e125b7ba1c045f41c6875f5fa6ad78b72d4578fa3"
+ },
+ "2609.32238v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Exact Trade-Level Attribution of FRTB-IMA Capital",
+  "file": "2609.32238v1.pdf",
+  "bytes": 601726,
+  "sha256": "b732719d816e29c2cc79a17d99f61e9ec46611db20d753985f5827d252338d3b"
+ },
+ "2609.31959v2": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Implementability in Insurance Markets with Adverse Selection",
+  "file": "2609.31959v2.pdf",
+  "bytes": 1131380,
+  "sha256": "c7f23749d69d4ae21a53ced330a1d9c5d0fb550e885520ec4f406eb7098854bf"
+ },
+ "2609.31013v1": {
+  "status": "ok",
+  "category": "q-fin.RM",
+  "title": "Same Text, Different Numbers: The Divergence of LLM-Based Measures",
+  "file": "2609.31013v1.pdf",
+  "bytes": 7494830,
+  "sha256": "14c732d289a247984f31b977535171d4f6649b86abacd816756787009462564c"
+ }
+}
