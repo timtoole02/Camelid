@@ -80,26 +80,56 @@ pub(super) fn library_exists() -> bool {
 }
 
 pub(super) fn prepare_path() -> rusqlite::Result<PathBuf> {
-    let location = current_location().map_err(io_error)?;
+    prepare_at(
+        current_location().map_err(io_error)?,
+        &std::env::temp_dir().join(DB_FILE),
+    )
+}
+
+fn prepare_at(location: Location, legacy: &Path) -> rusqlite::Result<PathBuf> {
     let parent = location
         .path
         .parent()
         .ok_or_else(|| rusqlite::Error::InvalidPath(location.path.clone()))?;
+    let created = !parent.exists();
     fs::create_dir_all(parent).map_err(io_error)?;
+    // Private by default, but only when Camelid creates the directory: a
+    // directory the user made, or permissions they chose, are left alone.
     #[cfg(unix)]
-    if location.migrate_legacy {
+    if created && location.migrate_legacy {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+        if let Err(error) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(%error, dir = %parent.display(), "could not make the library directory private");
+        }
     }
+    #[cfg(not(unix))]
+    let _ = created;
     if location.migrate_legacy {
-        migrate(&std::env::temp_dir().join(DB_FILE), &location.path)?;
+        match migrate(legacy, &location.path) {
+            Ok(true) => tracing::info!(
+                from = %legacy.display(),
+                to = %location.path.display(),
+                "copied the Knowledge Library out of the temporary directory; the original is kept"
+            ),
+            Ok(false) => {}
+            // A library that cannot be copied must not make the library
+            // unusable: say where the old one is and start the new location.
+            Err(error) => tracing::warn!(
+                %error,
+                from = %legacy.display(),
+                to = %location.path.display(),
+                "could not copy the Knowledge Library out of the temporary directory;                  the original is kept, and a new library starts at the persistent location"
+            ),
+        }
     }
     Ok(location.path)
 }
 
-fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
+/// Copies an eligible legacy library to `destination`. `Ok(true)` when a copy
+/// was published, `Ok(false)` when there was nothing to copy.
+fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<bool> {
     if destination.exists() || !eligible_legacy(legacy) {
-        return Ok(());
+        return Ok(false);
     }
     let parent = destination
         .parent()
@@ -113,7 +143,7 @@ fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
         .map_err(io_error)?;
     lock.lock().map_err(io_error)?;
     if destination.exists() || !eligible_legacy(legacy) {
-        return Ok(());
+        return Ok(false);
     }
     // macOS aliases /var to /private/var. Resolve directory aliases while
     // leaving the database filename unresolved so NOFOLLOW still guards it.
@@ -128,7 +158,7 @@ fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
                 .ok_or_else(|| rusqlite::Error::InvalidPath(legacy.into()))?,
         );
     if !eligible_legacy(&source_path) {
-        return Ok(());
+        return Ok(false);
     }
     let source = Connection::open_with_flags(
         source_path,
@@ -150,7 +180,7 @@ fn migrate(legacy: &Path, destination: &Path) -> rusqlite::Result<()> {
     snapshot
         .persist_noclobber(destination)
         .map_err(|error| io_error(error.error))?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -213,6 +243,21 @@ mod tests {
         ] {
             assert_eq!(saved.query_row(query, [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_copied_does_not_block_the_new_one() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy.sqlite3");
+        fs::write(&legacy, b"not a sqlite database").unwrap();
+        let location = Location {
+            path: root.path().join("data").join(DB_FILE),
+            migrate_legacy: true,
+        };
+        let path = prepare_at(location, &legacy).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        super::super::init_db(&conn).unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"not a sqlite database");
     }
 
     #[test]

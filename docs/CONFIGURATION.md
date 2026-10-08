@@ -59,6 +59,8 @@ On the first use of the default persistent location, Camelid snapshots an existi
 temporary library into it without deleting the original. An existing persistent library
 always takes precedence. On Unix, migration accepts only a regular legacy file owned by
 the current user. Watched folders also resume from a migrated library at server startup.
+Camelid logs the copy. If it cannot copy the temporary library, it logs a warning naming
+both files, keeps the original, and starts a new library at the persistent location.
 
 When `nomic-embed-text-v1.5.Q8_0.gguf` (the exact pinned artifact) is in the models directory, attached-document search ranks by keyword and by meaning, and indexes new uploads in the background on the CPU. Set `CAMELID_DOCUMENT_SEMANTIC=0` to keep it keyword-only. Details are in [`architecture/EMBEDDINGS.md`](architecture/EMBEDDINGS.md#knowledge-library-integration).
 
