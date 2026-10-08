@@ -1,0 +1,12 @@
+[hw] GPU: none detected — CPU backend is the inference path
+[hw] CPU: 8 logical cores | SIMD AVX-512 (avx2=true avx512f=true fma=true neon=false) | RAM 12.7 GiB free / 15.3 GiB total
+  Diagnostics log: [REDACTED]/.local/state/Camelid/logs/camelid.log
+
+  ðŸª Warming up the model (building the engine, one-time)â€¦
+[camelid] WARNING: CAMELID_LAZY_Q8_0_LINEAR is set; Q8_0 weights will stream from disk per token instead of residing in RAM (expect ~100x slower decode)
+
+  ðŸª Camelid is ready
+  Open the chat UI:  http://127.0.0.1:18435
+  OpenAI-style API:  http://127.0.0.1:18435/v1/chat/completions
+
+  Workspace CLI: ready
