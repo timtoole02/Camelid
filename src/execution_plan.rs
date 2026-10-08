@@ -4798,114 +4798,165 @@ mod tests {
         clear_profile_env();
     }
 
+    fn isolated_cpu_prefix_plan_test(test_name: &str, assertions: impl FnOnce()) {
+        let _guard = env_lock();
+        const CHILD_ENV: &str = "CAMELID_TEST_CPU_PREFIX_PLANNER_CHILD";
+        let completed = format!("CPU_PREFIX_PLANNER_ASSERTIONS_PASSED:{test_name}");
+        if env::var_os(CHILD_ENV).is_none() {
+            // Applying a plan changes process-global flags. Other inference
+            // tests can read them without the environment mutex, so keep all
+            // mutation inside a single-test child process.
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(format!("execution_plan::tests::{test_name}"))
+                .args(["--nocapture", "--test-threads=1"])
+                .env(CHILD_ENV, test_name)
+                .output()
+                .expect("launch the isolated CPU-prefix planner regression");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated planner regression failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status,
+            );
+            // The exact filter must run the assertion body, not succeed with
+            // zero matches after a test is renamed.
+            assert!(
+                stdout.lines().any(|line| line == completed),
+                "isolated planner regression did not complete its assertions\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+            return;
+        }
+        assert_eq!(
+            env::var(CHILD_ENV).as_deref(),
+            Ok(test_name),
+            "invalid subprocess sentinel",
+        );
+        assertions();
+        println!("\n{completed}");
+    }
+
     #[test]
     fn cuda_cpu_prefix_plan_applies_block_kernels_without_repacking() {
-        let _guard = env_lock();
-        clear_profile_env();
-        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
-        for (name, path, backend) in [
-            (
-                "Llama 3.2 3B Instruct",
-                "/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf",
-                "cuda_resident_q8_runtime",
-            ),
-            (
-                "hub",
-                "/tmp/my-custom-llama-Q8_0.gguf",
-                "cuda_resident_q8_runtime_runnable_unvalidated",
-            ),
-        ] {
-            clear_profile_env();
-            env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", " 16 ");
-            // Even an operator's CPU repack request cannot replace the block
-            // storage consumed by the GPU suffix.
-            env::set_var("CAMELID_X86_Q8_REPACK", "on");
-            let planner_env = PlannerEnv::capture();
-            let plan = || {
-                plan_for_model_with_platform_and_env(
-                    &PathBuf::from(path),
-                    &fixture(name),
-                    Some(6),
-                    cuda_platform("windows", "x86_64", &["avx2"]),
-                    &planner_env,
-                )
-            };
-            let first = plan();
-            assert_eq!(first.plan.selected_backend, backend);
-            planner_env.apply(&first.env_updates);
-            assert_eq!(env::var("CAMELID_PARALLEL_LINEAR").as_deref(), Ok("on"));
-            assert_eq!(env::var("CAMELID_X86_Q8_KERNEL").as_deref(), Ok("avx2"));
-            assert_eq!(env::var("CAMELID_X86_Q8_REPACK").as_deref(), Ok("off"));
-            // A reload must consult the operator baseline, not the applied
-            // repack=off output, and keep the same CPU/GPU storage contract.
-            assert_eq!(plan().env_updates, first.env_updates);
-        }
-        clear_profile_env();
+        isolated_cpu_prefix_plan_test(
+            "cuda_cpu_prefix_plan_applies_block_kernels_without_repacking",
+            || {
+                clear_profile_env();
+                env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+                for (name, path, backend) in [
+                    (
+                        "Llama 3.2 3B Instruct",
+                        "/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf",
+                        "cuda_resident_q8_runtime",
+                    ),
+                    (
+                        "hub",
+                        "/tmp/my-custom-llama-Q8_0.gguf",
+                        "cuda_resident_q8_runtime_runnable_unvalidated",
+                    ),
+                ] {
+                    clear_profile_env();
+                    env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", " 16 ");
+                    // Even an operator's CPU repack request cannot replace the block
+                    // storage consumed by the GPU suffix.
+                    env::set_var("CAMELID_X86_Q8_REPACK", "on");
+                    let planner_env = PlannerEnv::capture();
+                    let plan = || {
+                        plan_for_model_with_platform_and_env(
+                            &PathBuf::from(path),
+                            &fixture(name),
+                            Some(6),
+                            cuda_platform("windows", "x86_64", &["avx2"]),
+                            &planner_env,
+                        )
+                    };
+                    let first = plan();
+                    assert_eq!(first.plan.selected_backend, backend);
+                    planner_env.apply(&first.env_updates);
+                    assert_eq!(env::var("CAMELID_PARALLEL_LINEAR").as_deref(), Ok("on"));
+                    assert_eq!(env::var("CAMELID_X86_Q8_KERNEL").as_deref(), Ok("avx2"));
+                    assert_eq!(env::var("CAMELID_X86_Q8_REPACK").as_deref(), Ok("off"));
+                    // A reload must consult the operator baseline, not the applied
+                    // repack=off output, and keep the same CPU/GPU storage contract.
+                    assert_eq!(plan().env_updates, first.env_updates);
+                }
+                clear_profile_env();
+            },
+        );
     }
 
     #[test]
     fn cuda_cpu_prefix_plan_preserves_opt_outs_and_avx2_requirement() {
-        let _guard = env_lock();
-        for (features, parallel, kernel, expected_parallel, expected_kernel) in [
-            (&["avx2"][..], "off", "0", "off", "off"),
-            (&["avx2"][..], "on", "unknown-kernel", "on", "off"),
-            (&[][..], "on", "avx2", "on", "off"),
-        ] {
-            clear_profile_env();
-            env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", "1");
-            env::set_var("CAMELID_PARALLEL_LINEAR", parallel);
-            env::set_var("CAMELID_X86_Q8_KERNEL", kernel);
-            let planner_env = PlannerEnv::capture();
-            let outcome = plan_for_model_with_platform_and_env(
-                &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
-                &fixture("Llama 3.2 3B Instruct"),
-                Some(6),
-                cuda_platform("windows", "x86_64", features),
-                &planner_env,
-            );
-            assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
-            planner_env.apply(&outcome.env_updates);
-            assert_eq!(
-                env::var("CAMELID_PARALLEL_LINEAR").as_deref(),
-                Ok(expected_parallel)
-            );
-            assert_eq!(
-                env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
-                Ok(expected_kernel)
-            );
-            assert_eq!(env::var("CAMELID_X86_Q8_REPACK").as_deref(), Ok("off"));
-        }
-        clear_profile_env();
+        isolated_cpu_prefix_plan_test(
+            "cuda_cpu_prefix_plan_preserves_opt_outs_and_avx2_requirement",
+            || {
+                for (features, parallel, kernel, expected_parallel, expected_kernel) in [
+                    (&["avx2"][..], "off", "0", "off", "off"),
+                    (&["avx2"][..], "on", "unknown-kernel", "on", "off"),
+                    (&[][..], "on", "avx2", "on", "off"),
+                ] {
+                    clear_profile_env();
+                    env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", "1");
+                    env::set_var("CAMELID_PARALLEL_LINEAR", parallel);
+                    env::set_var("CAMELID_X86_Q8_KERNEL", kernel);
+                    let planner_env = PlannerEnv::capture();
+                    let outcome = plan_for_model_with_platform_and_env(
+                        &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+                        &fixture("Llama 3.2 3B Instruct"),
+                        Some(6),
+                        cuda_platform("windows", "x86_64", features),
+                        &planner_env,
+                    );
+                    assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
+                    planner_env.apply(&outcome.env_updates);
+                    assert_eq!(
+                        env::var("CAMELID_PARALLEL_LINEAR").as_deref(),
+                        Ok(expected_parallel)
+                    );
+                    assert_eq!(
+                        env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
+                        Ok(expected_kernel)
+                    );
+                    assert_eq!(env::var("CAMELID_X86_Q8_REPACK").as_deref(), Ok("off"));
+                }
+                clear_profile_env();
+            },
+        );
     }
 
     #[test]
     fn cuda_cpu_prefix_plan_does_not_change_default_or_invalid_requests() {
-        let _guard = env_lock();
-        for prefix in [None, Some("0"), Some("off"), Some("-1"), Some("invalid")] {
-            clear_profile_env();
-            if let Some(prefix) = prefix {
-                env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", prefix);
-            }
-            let planner_env = PlannerEnv::capture();
-            let outcome = plan_for_model_with_platform_and_env(
-                &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
-                &fixture("Llama 3.2 3B Instruct"),
-                Some(6),
-                cuda_platform("windows", "x86_64", &["avx2"]),
-                &planner_env,
-            );
-            assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
-            for key in [
-                "CAMELID_PARALLEL_LINEAR",
-                "CAMELID_X86_Q8_KERNEL",
-                "CAMELID_X86_Q8_REPACK",
-            ] {
-                assert!(!outcome.env_updates.contains_key(key), "{prefix:?}: {key}");
-            }
-            // Invalid prefix values are still rejected by inference admission;
-            // planning must not turn them into a valid experimental request.
-        }
-        clear_profile_env();
+        isolated_cpu_prefix_plan_test(
+            "cuda_cpu_prefix_plan_does_not_change_default_or_invalid_requests",
+            || {
+                for prefix in [None, Some("0"), Some("off"), Some("-1"), Some("invalid")] {
+                    clear_profile_env();
+                    if let Some(prefix) = prefix {
+                        env::set_var("CAMELID_CUDA_CPU_PREFIX_LAYERS", prefix);
+                    }
+                    let planner_env = PlannerEnv::capture();
+                    let outcome = plan_for_model_with_platform_and_env(
+                        &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+                        &fixture("Llama 3.2 3B Instruct"),
+                        Some(6),
+                        cuda_platform("windows", "x86_64", &["avx2"]),
+                        &planner_env,
+                    );
+                    assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
+                    for key in [
+                        "CAMELID_PARALLEL_LINEAR",
+                        "CAMELID_X86_Q8_KERNEL",
+                        "CAMELID_X86_Q8_REPACK",
+                    ] {
+                        assert!(!outcome.env_updates.contains_key(key), "{prefix:?}: {key}");
+                    }
+                    // Invalid prefix values are still rejected by inference admission;
+                    // planning must not turn them into a valid experimental request.
+                }
+                clear_profile_env();
+            },
+        );
     }
 
     #[test]
