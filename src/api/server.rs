@@ -426,15 +426,25 @@ fn browser_mutation_allowed(headers: &axum::http::HeaderMap, allowed: &[HeaderVa
             .get("host")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
-        return host
-            .as_ref()
-            .is_some_and(|host| origin.authority() == Some(host));
+        // A matching Host proves nothing about a domain name: DNS rebinding
+        // points an attacker's name at this listener, so Origin and Host agree.
+        // Only names that cannot be rebound count as this server's own origin;
+        // a hostname in front of Camelid is listed with `--cors-origin`.
+        return host.as_ref().is_some_and(|host| {
+            origin.authority() == Some(host) && unrebindable_host(host.host())
+        });
     }
     // Origin-less CLI clients keep working. Browser fetch metadata still rejects
     // cross-site and same-site requests whose Origin was stripped or omitted.
     headers
         .get("sec-fetch-site")
         .is_none_or(|value| value == "same-origin" || value == "none")
+}
+
+/// An IP literal, or `localhost`, which browsers resolve to loopback without DNS.
+fn unrebindable_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn parse_bearer(value: &str) -> Option<&str> {
@@ -537,6 +547,11 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{header::ORIGIN, Request},
+    };
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn anonymous_mutations_reject_untrusted_browser_origins() {
@@ -642,11 +657,38 @@ mod tests {
             );
         }
     }
-    use axum::{
-        body::Body,
-        http::{header::ORIGIN, Request},
-    };
-    use tower::ServiceExt;
+
+    #[test]
+    fn a_rebound_hostname_is_not_this_servers_own_origin() {
+        let headers = |host: &str, origin: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            headers.insert("origin", origin.parse().unwrap());
+            headers
+        };
+        // DNS rebinding: the attacker's name resolves here, so Origin and Host agree.
+        assert!(!browser_mutation_allowed(
+            &headers("attacker.example:8181", "http://attacker.example:8181"),
+            &[]
+        ));
+        for (host, origin) in [
+            ("127.0.0.1:8181", "http://127.0.0.1:8181"),
+            ("localhost:8181", "http://localhost:8181"),
+            ("[::1]:8181", "http://[::1]:8181"),
+            ("192.168.1.20:8181", "http://192.168.1.20:8181"),
+        ] {
+            assert!(
+                browser_mutation_allowed(&headers(host, origin), &[]),
+                "{origin}"
+            );
+        }
+        // A hostname in front of Camelid is trusted once it is configured.
+        let configured = [HeaderValue::from_static("https://camelid.example")];
+        assert!(browser_mutation_allowed(
+            &headers("camelid.example", "https://camelid.example"),
+            &configured
+        ));
+    }
 
     #[test]
     fn remote_listener_requires_auth_or_explicit_override() {

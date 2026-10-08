@@ -165,7 +165,10 @@ the Settings credential field; a wrong key remains there instead of reporting th
 
 For an unauthenticated listener, browser requests that change state must come from the
 server's own origin or an origin explicitly listed with `--cors-origin`. This check also
-applies to simple browser POSTs that do not require a CORS preflight. Origin-less
+applies to simple browser POSTs that do not require a CORS preflight. The server's own origin
+means an IP address or `localhost`: a hostname could be pointed at this listener by DNS
+rebinding, so an unauthenticated listener reached through a hostname, such as a reverse
+proxy, lists that origin with `--cors-origin`. Origin-less
 command-line clients remain supported; requests carrying a valid explicit API key use
 the normal authenticated policy.
 The development proxy preserves untrusted browser origins rather than relabelling them
