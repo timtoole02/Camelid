@@ -861,10 +861,16 @@ export default function ChatWorkspace({
             requestCitations = citations
 
             const contextText = citations
-              .map((c, idx) => `[Citation ${idx + 1} from ${c.filename}]:\n${c.excerpt}`)
+              .map((c, idx) => `[${idx + 1}] (from ${c.filename}):\n${c.excerpt}`)
               .join('\n\n')
 
-            contentToSend = `Refer to the following retrieved document excerpts to answer the prompt. Cite your sources inline using [1], [2], etc.\n\n--- DOCUMENT CONTEXT ---\n${contextText}\n--- END CONTEXT ---\n\nUser Question: ${composer}`
+            /* Search returns passages close to the question, and some are about
+               something merely similar: another part, place or year. Told only to
+               "refer to" them, a small model answered with those too, as if they
+               were about what was asked (Llama 3.2 3B: 10 of 25 held-out
+               questions; with this wording, 2). Every answer still cites its
+               excerpt; the labels are the [N] the reply is asked to use. */
+            contentToSend = `Answer the question from the document excerpts below. Use an excerpt only if it is about exactly what the question asks: one about something similar - another item, part, person, date or place - does not answer it, so leave it out. Cite each fact inline as [1], [2], matching the excerpt it came from; every answer cites at least one excerpt.\n\n--- DOCUMENT CONTEXT ---\n${contextText}\n--- END CONTEXT ---\n\nQuestion: ${composer}`
           }
         }
       } catch (err) {

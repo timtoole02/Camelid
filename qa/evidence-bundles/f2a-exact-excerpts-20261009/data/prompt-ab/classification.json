@@ -1,0 +1,148 @@
+[
+ {
+  "file": "dev-1.json",
+  "split": "dev",
+  "prompt": "current",
+  "questions": 25,
+  "right_amount": 25,
+  "decoy_amount_also": 17,
+  "decoy_in_context": 24,
+  "right_and_cited_passage_has_it": 25,
+  "has_citation_marker": 25,
+  "decoy_labelled": 0,
+  "decoy_misattributed": 17,
+  "labelled_ids": [],
+  "misattributed_ids": [
+   0,
+   4,
+   8,
+   10,
+   14,
+   16,
+   18,
+   20,
+   22,
+   24,
+   26,
+   28,
+   32,
+   34,
+   36,
+   40,
+   46
+  ]
+ },
+ {
+  "file": "dev-1.json",
+  "split": "dev",
+  "prompt": "exact",
+  "questions": 25,
+  "right_amount": 24,
+  "decoy_amount_also": 6,
+  "decoy_in_context": 24,
+  "right_and_cited_passage_has_it": 23,
+  "has_citation_marker": 24,
+  "decoy_labelled": 1,
+  "decoy_misattributed": 5,
+  "labelled_ids": [
+   12
+  ],
+  "misattributed_ids": [
+   4,
+   24,
+   28,
+   34,
+   40
+  ]
+ },
+ {
+  "file": "dev-2.json",
+  "split": "dev",
+  "prompt": "exact2",
+  "questions": 25,
+  "right_amount": 25,
+  "decoy_amount_also": 7,
+  "decoy_in_context": 24,
+  "right_and_cited_passage_has_it": 25,
+  "has_citation_marker": 25,
+  "decoy_labelled": 4,
+  "decoy_misattributed": 3,
+  "labelled_ids": [
+   4,
+   28,
+   34,
+   40
+  ],
+  "misattributed_ids": [
+   16,
+   20,
+   46
+  ]
+ },
+ {
+  "file": "test-1.json",
+  "split": "test",
+  "prompt": "current",
+  "questions": 25,
+  "right_amount": 25,
+  "decoy_amount_also": 10,
+  "decoy_in_context": 23,
+  "right_and_cited_passage_has_it": 25,
+  "has_citation_marker": 25,
+  "decoy_labelled": 0,
+  "decoy_misattributed": 10,
+  "labelled_ids": [],
+  "misattributed_ids": [
+   13,
+   19,
+   21,
+   25,
+   29,
+   31,
+   35,
+   41,
+   45,
+   49
+  ]
+ },
+ {
+  "file": "test-1.json",
+  "split": "test",
+  "prompt": "exact",
+  "questions": 25,
+  "right_amount": 25,
+  "decoy_amount_also": 3,
+  "decoy_in_context": 23,
+  "right_and_cited_passage_has_it": 23,
+  "has_citation_marker": 23,
+  "decoy_labelled": 0,
+  "decoy_misattributed": 3,
+  "labelled_ids": [],
+  "misattributed_ids": [
+   19,
+   25,
+   31
+  ]
+ },
+ {
+  "file": "test-2.json",
+  "split": "test",
+  "prompt": "exact2",
+  "questions": 25,
+  "right_amount": 25,
+  "decoy_amount_also": 4,
+  "decoy_in_context": 23,
+  "right_and_cited_passage_has_it": 25,
+  "has_citation_marker": 25,
+  "decoy_labelled": 2,
+  "decoy_misattributed": 2,
+  "labelled_ids": [
+   25,
+   31
+  ],
+  "misattributed_ids": [
+   13,
+   19
+  ]
+ }
+]

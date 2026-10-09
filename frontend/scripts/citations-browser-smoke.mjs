@@ -270,6 +270,8 @@ try {
   assert.deepEqual(searchRequests[0].doc_ids, ['doc-ok'], 'the search is scoped to the attached document')
   const sent = chatRequests[0].messages.filter((m) => m.role === 'user').at(-1).content
   assert.match(sent, /--- DOCUMENT CONTEXT ---/, 'the retrieved excerpts reach the model')
+  assert.match(sent, /Use an excerpt only if it is about exactly what the question asks/, 'passages about something merely similar are ruled out')
+  assert.match(sent, /^\[1\] \(from [^)]+\):$/m, 'each excerpt is labelled with the [N] the reply cites it by')
   const pills = await page.$$eval('main[data-view="chat"] button.citation-pill', (nodes) => nodes.map((n) => n.textContent))
   assert.deepEqual(pills, ['[1]', '[2]', '[3]', '[4]', '[5]', '[6]', '[7]', '[9]'], 'every inline marker renders as a pill')
 
