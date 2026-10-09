@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -38,7 +37,7 @@ const MAX_FOLDER_ENTRIES: usize = 200_000;
 /// Folder nesting a scan descends; deeper folders are not read.
 const MAX_FOLDER_DEPTH: usize = 32;
 /// A larger file is listed as skipped instead of read.
-pub(crate) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = documents::MAX_DOCUMENT_BYTES as u64;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const LISTED_SKIPS: usize = 50;
 
@@ -507,9 +506,7 @@ fn read_document(file: &FoundFile, known: Option<&Known>) -> Read {
         return Read::Same(sha256);
     }
     // A malformed file must not end the scan for every file after it.
-    let Ok(text) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        documents::extract_text_from_bytes(&file.rel_path, &bytes)
-    })) else {
+    let Some(text) = documents::read_document(&file.rel_path, &bytes) else {
         return Read::Skip(EXTRACT_FAILED, Some(sha256));
     };
     let chunks = documents::chunk_document(&text);

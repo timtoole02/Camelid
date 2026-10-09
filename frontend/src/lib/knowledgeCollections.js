@@ -7,10 +7,16 @@ import { getApiBase } from './apiBase.js'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
-export const DOCUMENT_ACCEPT = '.pdf,.docx,.md,.txt,.csv,.json'
+/* The types the server reads, the same list a watched folder picks up.
+   `DOCUMENT_TYPES` in src/api/documents.rs is the source; a server test fails
+   when the two differ. */
+const LIBRARY_EXTENSIONS = ['txt', 'md', 'csv', 'json', 'html', 'htm', 'docx', 'pdf', 'rs', 'py', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'go', 'java', 'kt', 'kts', 'swift', 'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'hh', 'cs', 'rb', 'php', 'scala', 'lua', 'dart', 'sh', 'bash', 'zsh', 'sql']
 
-/* The types the server reads, the same list a watched folder picks up. */
-const LIBRARY_EXTENSIONS = ['pdf', 'docx', 'md', 'txt', 'csv', 'json', 'rs', 'py', 'js']
+export const DOCUMENT_ACCEPT = LIBRARY_EXTENSIONS.map(extension => `.${extension}`).join(',')
+
+/* The largest file the server reads, uploaded or from a watched folder
+   (`MAX_DOCUMENT_BYTES` in src/api/documents.rs). */
+const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 
 export function isLibraryDocument(name) {
   const dot = String(name || '').lastIndexOf('.')
@@ -32,8 +38,10 @@ const readAsBase64 = blob => new Promise((resolve, reject) => {
     `name` defaults to the file's own; a file from a dropped folder passes its
     path inside that folder. */
 export async function ingestLibraryFile(file, collectionIds = [], name = file.name, apiBase = getApiBase()) {
+  if (file.size > MAX_DOCUMENT_BYTES) throw new Error(`${name} is larger than 64 MB, the most the library reads.`)
   const lowerName = name.toLowerCase()
-  const isBinary = lowerName.endsWith('.pdf') || lowerName.endsWith('.docx')
+  // Sent as bytes so the server reads them and hashes the file exactly as it is on disk.
+  const isBinary = ['.pdf', '.docx', '.html', '.htm'].some(extension => lowerName.endsWith(extension))
   const response = await apiFetch('/api/documents/ingest', {
     method: 'POST',
     headers: JSON_HEADERS,

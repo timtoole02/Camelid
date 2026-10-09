@@ -1362,7 +1362,7 @@ export default function ChatWorkspace({
               onClick={() => { close(); docInputRef.current?.click() }}
               disabled={requestActive || documentIngesting}
               aria-label="Attach documents for RAG"
-              title="Drag & drop or attach .pdf, .docx, .md, .txt, .csv documents for local RAG"
+              title="Drag & drop or attach PDF, Word, HTML, Markdown, text or source code documents for local RAG"
             >
               <IconFile size={16} />{' '}
               <span className="cxcomposer__tool-label">

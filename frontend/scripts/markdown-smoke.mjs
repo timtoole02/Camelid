@@ -25,6 +25,14 @@ try {
   const render = (content, streaming = false) =>
     renderToStaticMarkup(React.createElement(AssistantMarkdown, { content, streaming }))
 
+  /* Citation markers: the bracket forms, and the parenthesised label a model
+     copies from its excerpts ("(Citation 2 from report.pdf)"), become pills. */
+  const cited = render('Paid in 2011 (Citation 1) and 2013 (Citation 2 from planted-05.pdf); see [3] and [Source 4]. Citation 1 and Citation 2 differ.')
+  const pills = [...cited.matchAll(/<button type="button" class="citation-pill"[^>]*><span>\[(\d+)\]<\/span><\/button>/g)].map(match => match[1])
+  assert.deepEqual(pills, ['1', '2', '3', '4'], 'every citation marker form should render as a pill, in order')
+  assert.doesNotMatch(cited, /planted-05\.pdf/, 'the file name inside a citation marker is not repeated as text')
+  assert.match(cited, /Citation 1 and Citation 2 differ\./, 'prose that mentions a citation stays text')
+
   /* Tables */
   const table = render(['| Lane | Result |', '| --- | --- |', '| decode | **29.7** tok/s |', '| prefill | 587 tok/s |'].join('\n'))
   assert.match(table, /<table class="message-table">/, 'pipe tables should render as real tables')

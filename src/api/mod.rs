@@ -2929,7 +2929,12 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
         )
-        .route("/api/documents/ingest", post(documents::ingest_document))
+        .route(
+            "/api/documents/ingest",
+            post(documents::ingest_document).layer(DefaultBodyLimit::max(
+                documents::MAX_INGEST_BODY_BYTES.max(body_limit),
+            )),
+        )
         .route("/api/documents/search", post(documents::search_documents))
         .route(
             "/api/documents/citation/resolve",

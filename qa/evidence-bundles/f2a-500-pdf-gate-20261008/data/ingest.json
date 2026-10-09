@@ -1,0 +1,217 @@
+{
+ "documents_ingested": 500,
+ "real_pdfs": 450,
+ "planted_pdfs": 50,
+ "rejected": [
+  {
+   "arxiv_id": "2610.10444v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09835v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09710v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.10513v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.10437v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.10409v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.10381v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.08771v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.10482v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.02232v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2609.35877v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2609.28386v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.10294v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.08223v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.06711v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.06566v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.06209v1",
+   "status": 0,
+   "code": {
+    "transport_error": "<urlopen error [Errno 32] Broken pipe>"
+   }
+  },
+  {
+   "arxiv_id": "2610.05486v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.08922v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.07861v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.06416v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.06332v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.04497v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.04358v1",
+   "status": 413,
+   "code": {
+    "raw": "Failed to buffer the request body: length limit exceeded"
+   }
+  },
+  {
+   "arxiv_id": "2610.04081v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.02956v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.10167v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09984v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09801v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09339v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.09208v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.08041v1",
+   "status": 422,
+   "code": "extract_failed"
+  },
+  {
+   "arxiv_id": "2610.07885v1",
+   "status": 422,
+   "code": "extract_failed"
+  }
+ ],
+ "chunks": 99888,
+ "real_pdf_bytes": 821763300,
+ "real_ingest_seconds": 138.2,
+ "real_ingest_ms_p50": 182.2,
+ "real_ingest_ms_p95": 657.3,
+ "real_ingest_ms_max": 7383.6,
+ "planted_scan": {
+  "documents": 50,
+  "skipped": [],
+  "seconds": 1.0
+ },
+ "categories": {
+  "astro-ph.EP": 39,
+  "cs.CL": 48,
+  "cs.CR": 47,
+  "cs.LG": 40,
+  "econ.EM": 51,
+  "eess.SP": 46,
+  "math.PR": 52,
+  "physics.optics": 42,
+  "q-bio.GN": 43,
+  "stat.ME": 42
+ }
+}

@@ -63,7 +63,7 @@ const openLinkExternally = (event, href) => {
 
 const renderInlineMarkdown = (text, keyPrefix) => {
   const parts = String(text || '')
-    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\)|\[(?:Citation\s+|Source\s+)?\d+\])/gi)
+    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\)|\[(?:Citation\s+|Source\s+)?\d+\]|\(Citation\s+\d+(?:\s+from\s+[^()]+)?\))/gi)
     .filter(Boolean)
   return parts.map((part, index) => {
     const key = `${keyPrefix}-${index}`
@@ -79,9 +79,12 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
       return <em key={key}>{part.slice(1, -1)}</em>
     }
-    const citeMatch = part.match(/^\[(?:Citation\s+|Source\s+)?(\d+)\]$/i)
+    /* Models copy the excerpt labels they were given, so "(Citation 2 from
+       report.pdf)" is a citation marker too; the pill opens the verified
+       source, which names the file. */
+    const citeMatch = part.match(/^(?:\[(?:Citation\s+|Source\s+)?(\d+)\]|\(Citation\s+(\d+)(?:\s+from\s+[^()]+)?\))$/i)
     if (citeMatch) {
-      const citeIndex = citeMatch[1]
+      const citeIndex = citeMatch[1] || citeMatch[2]
       return <CitationPill key={key} citeIndex={citeIndex} />
     }
     const link = part.match(/^\[([^\]]+)\]\(([^()\s]+)\)$/)

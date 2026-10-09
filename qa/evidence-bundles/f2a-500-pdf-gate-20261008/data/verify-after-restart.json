@@ -1,0 +1,15 @@
+{
+ "label": "after-restart",
+ "documents": 500,
+ "citations_resolved": 99721,
+ "citations_refused_as_expected": 167,
+ "failures": [],
+ "source_hash_mismatches": [],
+ "uncovered_documents": [],
+ "leaks": [],
+ "resolve_ms_p50": 16.5,
+ "resolve_ms_p95": 29.1,
+ "source_ms_p50": 2.1,
+ "source_ms_p95": 3.1,
+ "passed": true
+}

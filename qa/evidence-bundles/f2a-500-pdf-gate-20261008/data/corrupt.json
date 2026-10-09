@@ -1,0 +1,33 @@
+{
+ "real_source_text_tampered": "2610.10536v1.pdf",
+ "planted_fact_7": {
+  "file": "planted-07.pdf",
+  "results_from_tampered_document": 0,
+  "top_result": {
+   "file": "planted-06.pdf",
+   "excerpt_has_decoy": true
+  }
+ },
+ "planted_fact_12_excerpt_forged": {
+  "forged_excerpt_served": false,
+  "resolve_status": 200,
+  "resolve_returns_original_text": true
+ },
+ "watched_file_changed_on_disk": {
+  "file": "planted-20.pdf",
+  "old_amount": "342,600",
+  "new_amount": "342,700",
+  "scan_changes": {
+   "added": 0,
+   "updated": 1,
+   "removed": 0,
+   "unchanged": 49,
+   "skipped": 0
+  },
+  "old_citation_status": 409,
+  "old_citation_code": "citation_document_changed",
+  "old_citation_leaks_text": false,
+  "search_now_returns_new_amount": true,
+  "search_still_returns_old_amount": false
+ }
+}

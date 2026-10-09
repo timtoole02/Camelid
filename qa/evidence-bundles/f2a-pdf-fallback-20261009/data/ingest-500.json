@@ -1,0 +1,30 @@
+{
+ "documents_ingested": 550,
+ "real_pdfs": 500,
+ "planted_pdfs": 50,
+ "rejected": [],
+ "chunks": 114083,
+ "real_pdf_bytes": 1072512935,
+ "real_ingest_seconds": 425.3,
+ "real_ingest_ms_p50": 561.4,
+ "real_ingest_ms_p95": 2218.0,
+ "real_ingest_ms_max": 7761.1,
+ "planted_scan": {
+  "documents": 50,
+  "skipped": [],
+  "seconds": 1.0
+ },
+ "categories": {
+  "astro-ph.EP": 47,
+  "cs.CL": 51,
+  "cs.CR": 48,
+  "cs.LG": 44,
+  "econ.EM": 52,
+  "eess.SP": 50,
+  "math.PR": 52,
+  "physics.optics": 47,
+  "q-bio.GN": 47,
+  "q-fin.RM": 15,
+  "stat.ME": 47
+ }
+}

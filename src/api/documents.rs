@@ -6,13 +6,16 @@
 //! the whole library, named documents, or named collections
 //! (see `document_collections`).
 
+mod html;
 mod storage;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -102,55 +105,99 @@ pub(crate) fn open_connection() -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
-/// The file types `extract_text_from_bytes` reads, and the only ones a watched
-/// folder picks up. An upload of any other type is read as lossy UTF-8.
-pub(crate) const DOCUMENT_EXTENSIONS: &[&str] =
-    &["txt", "md", "csv", "json", "rs", "py", "js", "docx", "pdf"];
+/// The largest file the library reads, uploaded or from a watched folder.
+pub(crate) const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) fn has_document_extension(filename: &str) -> bool {
-    filename.rsplit_once('.').is_some_and(|(_, extension)| {
-        DOCUMENT_EXTENSIONS
+/// The body limit of `POST /api/documents/ingest`. An upload carries its file
+/// as base64 inside JSON, 4 bytes for every 3, plus the filename and the rest
+/// of the request; the route takes a file of `MAX_DOCUMENT_BYTES` even when the
+/// server-wide request limit is lower.
+pub(crate) const MAX_INGEST_BODY_BYTES: usize = MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 64 * 1024;
+
+/// How a library document's bytes become its canonical text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentKind {
+    /// Read as UTF-8 exactly as written: plain text, Markdown, data and source code.
+    Text,
+    Html,
+    Docx,
+    Pdf,
+}
+
+/// The file types the library reads, and the only ones a watched folder picks
+/// up. An upload of any other type is read as lossy UTF-8. The web UI keeps
+/// the same list in `frontend/src/lib/knowledgeCollections.js`; a test holds
+/// the two together.
+const DOCUMENT_TYPES: &[(&[&str], DocumentKind)] = &[
+    (&["txt", "md", "csv", "json"], DocumentKind::Text),
+    (&["html", "htm"], DocumentKind::Html),
+    (&["docx"], DocumentKind::Docx),
+    (&["pdf"], DocumentKind::Pdf),
+    (
+        &[
+            "rs", "py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "go", "java", "kt", "kts", "swift",
+            "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", "rb", "php", "scala", "lua", "dart",
+            "sh", "bash", "zsh", "sql",
+        ],
+        DocumentKind::Text,
+    ),
+];
+
+fn document_kind(filename: &str) -> Option<DocumentKind> {
+    let (_, extension) = filename.rsplit_once('.')?;
+    DOCUMENT_TYPES.iter().find_map(|(extensions, kind)| {
+        extensions
             .iter()
             .any(|known| extension.eq_ignore_ascii_case(known))
+            .then_some(*kind)
     })
+}
+
+pub(crate) fn has_document_extension(filename: &str) -> bool {
+    document_kind(filename).is_some()
+}
+
+/// Whether text sent as a string is markup the library reads for its text,
+/// rather than storing as written.
+fn is_markup(filename: &str) -> bool {
+    document_kind(filename) == Some(DocumentKind::Html)
+}
+
+/// A NUL byte in the first 8 KiB marks a binary file, the test `git` uses. A
+/// text extension is no guarantee: `.ts` is also a video container.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8 * 1024).any(|&byte| byte == 0)
+}
+
+/// Reads a document's text, or `None` when its reader fails on the file. A
+/// parser that panics on a damaged or unusual file costs that one document,
+/// not the request or scan reading it.
+pub(crate) fn read_document(filename: &str, raw_bytes: &[u8]) -> Option<String> {
+    guarded(|| extract_text_from_bytes(filename, raw_bytes))
+}
+
+fn guarded(read: impl FnOnce() -> String) -> Option<String> {
+    std::panic::catch_unwind(AssertUnwindSafe(read)).ok()
 }
 
 /// Extract clean textual tokens from supported document formats.
 pub fn extract_text_from_bytes(filename: &str, raw_bytes: &[u8]) -> String {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".txt")
-        || lower.ends_with(".md")
-        || lower.ends_with(".csv")
-        || lower.ends_with(".json")
-        || lower.ends_with(".rs")
-        || lower.ends_with(".py")
-        || lower.ends_with(".js")
-    {
-        return String::from_utf8_lossy(raw_bytes).to_string();
-    }
-
-    // DOCX is a ZIP container. Read the actual XML entry so deflated documents
-    // work as well as the uncommon uncompressed form.
-    if lower.ends_with(".docx") {
-        if let Ok(archive) = zip_extract_text(raw_bytes) {
-            if !archive.is_empty() {
-                return archive;
+    match document_kind(filename) {
+        Some(DocumentKind::Text) => {
+            if looks_binary(raw_bytes) {
+                return String::new();
             }
+            String::from_utf8_lossy(raw_bytes).to_string()
         }
-        return String::new();
+        Some(DocumentKind::Html) => html::extract_text(raw_bytes),
+        // DOCX is a ZIP container. Read the actual XML entry so deflated
+        // documents work as well as the uncommon uncompressed form.
+        Some(DocumentKind::Docx) => zip_extract_text(raw_bytes).unwrap_or_default(),
+        // Let a PDF parser handle compressed streams, encodings, and font maps.
+        Some(DocumentKind::Pdf) => pdf_extract_text(raw_bytes),
+        // Fallback: extract readable UTF-8 strings
+        None => String::from_utf8_lossy(raw_bytes).to_string(),
     }
-
-    // Let a PDF parser handle compressed streams, encodings, and font maps.
-    if lower.ends_with(".pdf") {
-        let extracted = pdf_extract_text(raw_bytes);
-        if !extracted.is_empty() {
-            return extracted;
-        }
-        return String::new();
-    }
-
-    // Fallback: extract readable UTF-8 strings
-    String::from_utf8_lossy(raw_bytes).to_string()
 }
 
 fn zip_extract_text(bytes: &[u8]) -> Result<String, ()> {
@@ -191,9 +238,41 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// A PDF's text. pdf-extract reads most PDFs best, but panics on some real
+/// ones (a font map it cannot parse); then, or when it finds no text, lopdf
+/// reads the file page by page, leaving out only a page it cannot read. A PDF
+/// that pdf-extract reads gives exactly the text it always did.
 fn pdf_extract_text(bytes: &[u8]) -> String {
-    pdf_extract::extract_text_from_mem(bytes)
-        .unwrap_or_default()
+    let primary = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(bytes)
+    }))
+    .ok()
+    .and_then(Result::ok)
+    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+    .unwrap_or_default();
+    if !primary.is_empty() {
+        return primary;
+    }
+    lopdf_page_text(bytes)
+}
+
+/// Every page lopdf can read, in order. A glyph lopdf cannot map to a
+/// character comes out as U+FFFD; it carries no meaning and would only clutter
+/// search and citations, so it is dropped.
+fn lopdf_page_text(bytes: &[u8]) -> String {
+    let Ok(Ok(document)) = std::panic::catch_unwind(|| lopdf::Document::load_mem(bytes)) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for page in document.get_pages().into_keys() {
+        if let Ok(Ok(page_text)) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| document.extract_text(&[page])))
+        {
+            text.push_str(&page_text);
+            text.push(' ');
+        }
+    }
+    text.replace('\u{fffd}', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -321,8 +400,15 @@ pub struct DocumentMetaView {
 /// Endpoint: `POST /api/documents/ingest`
 pub async fn ingest_document(
     State(state): State<AppState>,
-    Json(payload): Json<IngestDocumentRequest>,
+    payload: Result<Json<IngestDocumentRequest>, JsonRejection>,
 ) -> Result<Json<IngestDocumentResponse>, Response> {
+    let Json(payload) = payload.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            StoreError::TooLarge.into_response()
+        } else {
+            super::malformed_json_error(rejection)
+        }
+    })?;
     let doc_id = payload
         .doc_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -340,11 +426,25 @@ pub async fn ingest_document(
                     None,
                 )
             })?;
+        if decoded.len() > MAX_DOCUMENT_BYTES {
+            return Err(StoreError::TooLarge.into_response());
+        }
         let digest = sha256_hex(&decoded);
-        (extract_text_from_bytes(&filename, &decoded), digest)
+        let text = read_document(&filename, &decoded)
+            .ok_or_else(|| StoreError::Unreadable.into_response())?;
+        (text, digest)
     } else {
+        if payload.content.len() > MAX_DOCUMENT_BYTES {
+            return Err(StoreError::TooLarge.into_response());
+        }
         let digest = sha256_hex(payload.content.as_bytes());
-        (payload.content, digest)
+        if is_markup(&filename) {
+            let text = read_document(&filename, payload.content.as_bytes())
+                .ok_or_else(|| StoreError::Unreadable.into_response())?;
+            (text, digest)
+        } else {
+            (payload.content, digest)
+        }
     };
 
     let chunks = chunk_document(&text_content);
@@ -418,6 +518,10 @@ pub(crate) struct NewDocument<'a> {
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Empty,
+    /// The file's reader failed on it.
+    Unreadable,
+    /// The file is larger than `MAX_DOCUMENT_BYTES`.
+    TooLarge,
     Collection(CollectionError),
     Database(&'static str, rusqlite::Error),
 }
@@ -429,6 +533,23 @@ impl StoreError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "empty_document",
                 "The document did not contain any readable text.".to_string(),
+                None,
+            ),
+            Self::TooLarge => api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "document_too_large",
+                format!(
+                    "The file is larger than {} MB, the most the Knowledge Library reads.",
+                    MAX_DOCUMENT_BYTES / (1024 * 1024)
+                ),
+                None,
+            ),
+            Self::Unreadable => api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "extract_failed",
+                "The document could not be read: the file is damaged, or uses a feature \
+                 Camelid's reader does not support."
+                    .to_string(),
                 None,
             ),
             Self::Collection(error) => error.into_response(),
@@ -1344,6 +1465,318 @@ mod tests {
         assert_eq!(
             extract_text_from_bytes("NOTES.DOCX", &bytes),
             "One & two three"
+        );
+    }
+
+    #[test]
+    fn html_and_source_code_are_library_documents() {
+        for name in [
+            "page.html",
+            "PAGE.HTM",
+            "main.go",
+            "App.tsx",
+            "lib.cpp",
+            "q.SQL",
+            "run.sh",
+        ] {
+            assert!(has_document_extension(name), "{name}");
+        }
+        for name in ["photo.png", "archive.zip", "README", "notes.", "data.xlsx"] {
+            assert!(!has_document_extension(name), "{name}");
+        }
+        assert_eq!(
+            extract_text_from_bytes("Guide.HTML", b"<h2>Refunds</h2><p>Five &amp; days.</p>"),
+            "## Refunds\n\nFive & days."
+        );
+        assert_eq!(
+            extract_text_from_bytes("main.go", b"package main\n\nfunc main() {}\n"),
+            "package main\n\nfunc main() {}\n"
+        );
+    }
+
+    #[test]
+    fn a_binary_file_with_a_text_extension_reads_as_empty() {
+        let mut video = vec![0x47, 0x40, 0x00, 0x10, 0x00];
+        video.extend_from_slice(b"looks like text later");
+        assert_eq!(extract_text_from_bytes("clip.ts", &video), "");
+        assert!(chunk_document(&extract_text_from_bytes("clip.ts", &video)).is_empty());
+        assert_eq!(extract_text_from_bytes("notes.txt", b"plain"), "plain");
+    }
+
+    /// A one-page PDF whose font's ToUnicode CMap holds a malformed hex
+    /// string, which panics the PDF reader's CMap parser.
+    fn pdf_with_malformed_cmap() -> Vec<u8> {
+        let cmap = "begincmap\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                    1 beginbfchar\n<041> <0041>\nendbfchar\nendcmap";
+        let content = "BT /F1 12 Tf 72 720 Td <41> Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            format!("<< /Length {} >>\nstream\n{cmap}\nendstream", cmap.len()),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    /// A one-page PDF with plain text in a standard font: what lopdf reads
+    /// when pdf-extract cannot.
+    fn simple_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn a_pdf_pdf_extract_reads_keeps_its_text() {
+        let pdf = simple_pdf("Refunds take five business days.");
+        assert_eq!(pdf_extract_text(&pdf), "Refunds take five business days.");
+    }
+
+    #[test]
+    fn the_page_reader_reads_a_pdf_and_drops_unmapped_glyphs() {
+        let pdf = simple_pdf("Refunds take five business days.");
+        assert_eq!(lopdf_page_text(&pdf), "Refunds take five business days.");
+        assert_eq!(
+            lopdf_page_text(b"not a pdf"),
+            "",
+            "an unreadable file gives no text, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_pdf_pdf_extract_panics_on_is_read_page_by_page() {
+        let pdf = pdf_with_malformed_cmap();
+        assert!(
+            std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&pdf)).is_err(),
+            "the reader still panics on this file"
+        );
+        // The fallback reads it; the malformed map only spoils that font's glyphs.
+        assert!(std::panic::catch_unwind(|| pdf_extract_text(&pdf)).is_ok());
+        assert!(
+            read_document("bad.pdf", &pdf).is_some(),
+            "no longer a failed read"
+        );
+    }
+
+    #[test]
+    fn a_file_its_reader_fails_on_is_refused_not_a_dropped_request() {
+        assert_eq!(
+            guarded(|| panic!("a reader that cannot read this file")),
+            None
+        );
+        let response = StoreError::Unreadable.into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(read_document("ok.txt", b"fine").as_deref(), Some("fine"));
+    }
+
+    fn ingest_request(body: Vec<u8>) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/documents/ingest")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn error_code(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"].clone()
+    }
+
+    /// Every request here is refused before the handler opens a library.
+    #[tokio::test]
+    async fn an_upload_is_held_to_the_library_limit_not_the_server_wide_one() {
+        use tower::ServiceExt;
+        let app = crate::api::router_with_state(AppState::default());
+        let server_wide = crate::api::server::DEFAULT_MAX_REQUEST_BODY_BYTES;
+
+        // Past the server-wide limit and within the route's: read in full.
+        let response = app
+            .clone()
+            .oneshot(ingest_request(vec![b'x'; server_wide + 1]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, "malformed_json");
+
+        // A file of exactly the limit fits the route, sent as base64.
+        assert!(
+            MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 1024 <= MAX_INGEST_BODY_BYTES,
+            "a {MAX_DOCUMENT_BYTES}-byte file must fit the ingest body limit"
+        );
+
+        // One byte over the limit, sent as base64: typed, before anything is read.
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(vec![b'a'; MAX_DOCUMENT_BYTES + 1]);
+        let body = format!(r#"{{"filename":"big.txt","content":"{encoded}","is_base64":true}}"#);
+        let response = app
+            .clone()
+            .oneshot(ingest_request(body.into_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "document_too_large");
+
+        // Past the route's own limit: the same typed refusal, not plain text.
+        let response = app
+            .oneshot(ingest_request(vec![b'x'; MAX_INGEST_BODY_BYTES + 1]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error_code(response).await, "document_too_large");
+    }
+
+    #[test]
+    fn markup_sent_as_text_is_read_for_its_text() {
+        assert!(is_markup("index.html") && is_markup("INDEX.HTM"));
+        assert!(!is_markup("notes.md") && !is_markup("page.html.txt"));
+    }
+
+    /// The web UI offers and uploads the same types the server reads.
+    #[test]
+    fn the_web_ui_offers_exactly_the_library_document_types() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/frontend/src/lib/knowledgeCollections.js"
+        ))
+        .unwrap();
+        let list = source
+            .split_once("const LIBRARY_EXTENSIONS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("LIBRARY_EXTENSIONS in knowledgeCollections.js");
+        let mut frontend: Vec<String> = list
+            .split(',')
+            .map(|item| item.trim().trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        let mut server: Vec<String> = DOCUMENT_TYPES
+            .iter()
+            .flat_map(|(extensions, _)| extensions.iter().map(|ext| ext.to_string()))
+            .collect();
+        frontend.sort();
+        server.sort();
+        assert_eq!(frontend, server);
+    }
+
+    #[test]
+    fn an_html_page_is_stored_searched_and_cited_by_its_text() {
+        let conn = library();
+        // Long enough to span several windows, so the chunker has a choice of where to cut.
+        let refunds =
+            "Refunds are paid within <b>five</b> business days to the card that was charged. "
+                .repeat(4);
+        let security =
+            "We notify affected customers within 72 hours of confirming an incident. ".repeat(4);
+        let page = format!(
+            "<html><head><title>Support policy</title><style>.x{{}}</style></head><body>\
+             <h1>Support policy</h1><h2>Refunds</h2><p>{refunds}</p>\
+             <h2>Security incidents</h2><p>{security}</p>\
+             <script>var refund = 'not page text';</script></body></html>"
+        );
+        let text = extract_text_from_bytes("policy.html", page.as_bytes());
+        assert!(!text.contains('<') && !text.contains("not page text"));
+        let chunks = chunk_document(&text);
+        // Each heading starts its own chunk, so a section is cited on its own.
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.starts_with("## Security incidents")));
+
+        store_document(
+            &conn,
+            &NewDocument {
+                doc_id: "policy",
+                filename: "policy.html",
+                text: &text,
+                source_sha256: &sha256_hex(page.as_bytes()),
+                collection_ids: &[],
+            },
+            &chunks,
+        )
+        .unwrap();
+        let file_type: String = conn
+            .query_row(
+                "SELECT file_type FROM documents WHERE id = 'policy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_type, "html");
+
+        let (results, _) = run_search(&conn, &plan("notify customers hours", None)).unwrap();
+        let top = &results[0];
+        assert!(
+            top.excerpt.starts_with("## Security incidents"),
+            "{:?}",
+            top.excerpt
+        );
+        let (start, end) = (top.byte_start.unwrap(), top.byte_end.unwrap());
+        assert_eq!(&text[start..end], top.excerpt);
+        assert_eq!(
+            top.chunk_sha256.as_deref(),
+            Some(sha256_hex(top.excerpt.as_bytes()).as_str())
+        );
+        assert_eq!(
+            top.doc_sha256.as_deref(),
+            Some(sha256_hex(text.as_bytes()).as_str())
         );
     }
 
