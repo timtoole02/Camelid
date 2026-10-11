@@ -202,8 +202,10 @@ Ignored tests that need a model file:
 - A batched GPU prefill (one command buffer, Metal or CUDA) is checked only
   before it starts.
 - The qwen35 Metal lane gets the per-token check during generation, not
-  during its batched prompt read. No Mac was used here; that path compiled
-  but did not run.
+  during its batched prompt read. That code is macOS-only and was neither
+  compiled nor run here: no Mac was available, and a macOS check from Linux
+  fails on a dependency that needs a macOS C toolchain. Its only change is
+  that the existing per-token stop hook now also reports a cancel.
 - Runnable-lane image prompts (`generate_vision_greedy`) are not wired to the
   disconnect guard.
 - gemma4 and diffusion lanes are unchanged; gemma4 already had a cancellable
