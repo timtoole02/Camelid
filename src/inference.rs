@@ -2755,7 +2755,15 @@ pub struct LlamaInferenceSession {
     /// True for a speculative draft-model session: routes its GPU resident engine to
     /// the dedicated drafter cache so draft + target models stay resident at once.
     is_drafter: bool,
+    /// The owning request's cancel check, polled between prompt layers/chunks/tokens on
+    /// the CPU prefill paths so an abandoned request stops reading its prompt early.
+    /// Per-request state: dropped by Clone (a prompt-prefix-cache copy must never carry
+    /// a finished request's already-fired token), carried by `take_for_step`.
+    prefill_interrupt: Option<PrefillInterrupt>,
 }
+
+/// A request's cancel check, as seen by the prefill loops.
+pub type PrefillInterrupt = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Park the resident Metal engine instead of dropping it.
 ///
@@ -3038,6 +3046,7 @@ impl LlamaInferenceSession {
             #[cfg(feature = "cuda")]
             cuda_cpu_prefix: self.cuda_cpu_prefix.take(),
             is_drafter: self.is_drafter,
+            prefill_interrupt: self.prefill_interrupt.take(),
         }
     }
 
@@ -3139,6 +3148,7 @@ impl Clone for LlamaInferenceSession {
             #[cfg(feature = "cuda")]
             cuda_cpu_prefix: None,
             is_drafter: self.is_drafter,
+            prefill_interrupt: None,
         }
     }
 }
@@ -3190,6 +3200,7 @@ impl LlamaInferenceSession {
             #[cfg(feature = "cuda")]
             cuda_cpu_prefix: None,
             is_drafter: false,
+            prefill_interrupt: None,
         })
     }
 
@@ -3238,6 +3249,21 @@ impl LlamaInferenceSession {
     /// ordinary single-request generation keeps it enabled.
     pub fn set_resident_encode_ahead_enabled(&mut self, enabled: bool) {
         self.resident_encode_ahead_enabled = enabled;
+    }
+
+    /// Install (or clear) the owning request's cancel check. When it reports true the
+    /// prompt read stops at the next boundary with [`BackendError::Cancelled`], leaving a
+    /// partial KV cache the caller must discard: between layers/chunks/tokens on the CPU
+    /// paths, between segments of the serial CUDA-resident prefill. A batched GPU prefill
+    /// is only checked before it starts.
+    pub fn set_prefill_interrupt(&mut self, interrupt: Option<PrefillInterrupt>) {
+        self.prefill_interrupt = interrupt;
+    }
+
+    fn prefill_interrupted(&self) -> bool {
+        self.prefill_interrupt
+            .as_ref()
+            .is_some_and(|interrupted| interrupted())
     }
 
     /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
@@ -4023,16 +4049,33 @@ impl LlamaInferenceSession {
         } else if serial_gpu_prefill {
             // `prefill_from` walks `reuse..end_position` and indexes the slices by that
             // absolute position, so it takes the whole-prompt tables, not the offset ones.
-            slot.engine
-                .prefill_from(
+            // It is one forward per token and a single sync at the end, so running it over
+            // consecutive segments is the same work in the same order. The sync at each
+            // segment end is what lets the request's cancel check stop a long prompt read
+            // (one forward per token is ~17 ms for a 3B Q4_K_M on an L4: 5k tokens ~ 88 s).
+            let interrupt = self.prefill_interrupt.clone();
+            let mut segment_start = reuse;
+            loop {
+                if interrupt.as_ref().is_some_and(|interrupted| interrupted()) {
+                    break Err(BackendError::Cancelled);
+                }
+                let segment_end =
+                    (segment_start + RESIDENT_SERIAL_PREFILL_SEGMENT_TOKENS).min(end_position);
+                if let Err(error) = slot.engine.prefill_from(
                     &embeddings.data,
                     &tables.cos,
                     &tables.sin,
-                    end_position,
+                    segment_end,
                     scale,
-                    reuse,
-                )
-                .map_err(BackendError::RuntimeShapeMismatch)
+                    segment_start,
+                ) {
+                    break Err(BackendError::RuntimeShapeMismatch(error));
+                }
+                segment_start = segment_end;
+                if segment_start >= end_position {
+                    break Ok(());
+                }
+            }
         } else {
             slot.engine
                 .prefill_batched_at(
@@ -4060,6 +4103,10 @@ impl LlamaInferenceSession {
             // mutated KV the caller cannot rebuild, so it still fails loudly.
             slot.engine.set_filled(0);
             slot.engine.set_resident_tokens(&[]);
+            // A cancelled prompt read must not fall back to reading it on the CPU.
+            if matches!(error, BackendError::Cancelled) {
+                return Err(error);
+            }
             if trace {
                 eprintln!("[resident-cuda] GPU prefill failed ({error}); using CPU prefill");
             }
@@ -5715,7 +5762,13 @@ impl LlamaInferenceSession {
         trace_forward_memory("prefill_chunk_embedding_done");
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let interrupt = self.prefill_interrupt.clone();
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            // A chunk of a long prompt can take a minute on a slow CPU; check per layer.
+            if interrupt.as_ref().is_some_and(|interrupted| interrupted()) {
+                metal_seam::end_inference_session();
+                return Err(BackendError::Cancelled);
+            }
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
                     if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
@@ -6110,7 +6163,11 @@ impl LlamaInferenceSession {
         let capture_prefill_attribution = prefill_layer_major_attribution_enabled();
         let mut next_hidden = vec![0.0_f32; hidden.data.len()];
         let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
+        let interrupt = self.prefill_interrupt.clone();
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            if interrupt.as_ref().is_some_and(|interrupted| interrupted()) {
+                return Err(BackendError::Cancelled);
+            }
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
                     if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
@@ -6603,6 +6660,9 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
+        if prefill_count > 0 && self.prefill_interrupted() {
+            return Err(BackendError::Cancelled);
+        }
         let resident_prefill_ok =
             prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])?;
         if resident_prefill_ok {
@@ -6631,6 +6691,9 @@ impl LlamaInferenceSession {
         } else if prefill_count > 0 && prefill_chunk_tokens > 1 {
             let mut telemetry_tokens_done = 0usize;
             for chunk in token_ids[..prefill_count].chunks(prefill_chunk_tokens) {
+                if self.prefill_interrupted() {
+                    return Err(BackendError::Cancelled);
+                }
                 // Compute-bound GEMM: run on the wider prefill pool (see prefill_thread_pool).
                 let chunk_timings =
                     run_on_prefill_pool(|| self.forward_prefill_chunk_timed_fast(chunk))?;
@@ -6644,6 +6707,9 @@ impl LlamaInferenceSession {
             }
         } else {
             for (telemetry_done, token_id) in token_ids[..prefill_count].iter().enumerate() {
+                if self.prefill_interrupted() {
+                    return Err(BackendError::Cancelled);
+                }
                 add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
                 // Prompt tokens (still prefill): run on the wider prefill pool.
                 let timed = run_on_prefill_pool(|| {
@@ -7635,6 +7701,11 @@ fn prefill_chunk_token_count(prefill_count: usize) -> usize {
         DEFAULT_PREFILL_CHUNK_TOKENS,
     )
 }
+
+/// Tokens per segment of the serial GPU-resident prefill: the request's cancel check runs
+/// between segments, so this bounds how long an abandoned prompt read keeps the GPU.
+#[cfg(feature = "cuda")]
+const RESIDENT_SERIAL_PREFILL_SEGMENT_TOKENS: usize = 128;
 
 /// Prefill chunking for THIS session's model. Windowed-attention archs
 /// (gemma3) force the single-token lane: every prompt token must flow through

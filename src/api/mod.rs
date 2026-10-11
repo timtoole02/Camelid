@@ -2250,6 +2250,40 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Reading the prompt is one decode step, so the per-step check above cannot
+/// stop it. Hand the session the same cancel/deadline check: the CPU prefill
+/// polls it between layers/chunks/tokens and gives up with
+/// `BackendError::Cancelled`. Call after any prompt-prefix-cache swap, since a
+/// cached session copy does not carry it.
+fn arm_prefill_interrupt(prepared: &mut PreparedGeneration) {
+    let cancel = prepared.cancel.clone();
+    prepared
+        .session
+        .set_prefill_interrupt(Some(Arc::new(move || cancel.tripped().is_some())));
+}
+
+/// Map a step error to the response for why it stopped: a prefill interrupted
+/// by the cancel/deadline check reports cancellation or timeout like a stop
+/// at a step boundary; anything else is a genuine step failure.
+fn generation_step_error_response(
+    err: BackendError,
+    cancel: &GenerationCancel,
+    generated_tokens: usize,
+) -> Box<Response> {
+    if matches!(err, BackendError::Cancelled) {
+        if let Some(GenerationStopCause::TimedOut) = cancel.tripped() {
+            return generation_timeout_response(cancel.timeout, cancel.started.elapsed(), None);
+        }
+        return generation_cancelled_response(generated_tokens);
+    }
+    Box::new(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "generation_step_failed",
+        err.to_string(),
+        None,
+    ))
+}
+
 /// Response for a decode stopped by cancellation. Never delivered to the
 /// (already disconnected) client; observable only in logs and tests.
 fn generation_cancelled_response(generated_tokens: usize) -> Box<Response> {
@@ -13295,14 +13329,14 @@ pub struct RunnableServeRuntime {
     vision: Option<crate::runnable::PrismVisionProjector>,
 }
 
-/// Lives inside the SSE body. Dropping the response (for example when the UI
-/// aborts a request) flips the flag even if BitNet is still in prompt prefill
-/// and has not emitted a first token yet.
-struct RunnableStreamDisconnectGuard {
+/// Lives inside the SSE body, or in the non-streaming handler's frame. Dropping
+/// it (for example when the UI aborts a request) flips the flag even while the
+/// model is still reading the prompt and has not produced a first token yet.
+struct RunnableDisconnectGuard {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Drop for RunnableStreamDisconnectGuard {
+impl Drop for RunnableDisconnectGuard {
     fn drop(&mut self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -13389,15 +13423,17 @@ impl RunnableServeRuntime {
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
         stop_sequences: &[String],
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
         let should_stop = self.stop_text_predicate(stop_sequences);
-        let ids = self.model.generate_stopping_with_sampling(
+        let ids = self.model.generate_stopping_with_sampling_cancelled(
             prompt_ids,
             max_new,
             &stop,
             sampling,
+            is_cancelled,
             &should_stop,
         )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
@@ -14226,7 +14262,7 @@ mod bitnet_runnable_api_tests {
     fn runnable_disconnect_guard_sets_cancellation_flag() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
-            let _guard = RunnableStreamDisconnectGuard {
+            let _guard = RunnableDisconnectGuard {
                 cancelled: cancelled.clone(),
             };
             assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
@@ -15122,16 +15158,29 @@ async fn runnable_chat_nonstreaming(
     // re-apply truncation across the think split and to classify finish_reason.
     let response_stop_sequences = stop_sequences.clone();
     let rt = runtime.clone();
+    // If the client goes away, the handler future is dropped with this guard,
+    // and the worker stops while reading the prompt or at the next token.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _disconnect_guard = RunnableDisconnectGuard {
+        cancelled: cancelled.clone(),
+    };
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling, &stop_sequences)
-                .map(|(text, generated_token_ids)| RunnableGenerationResult {
-                    text,
-                    generated_token_ids,
-                    prompt_token_ids: Some(prompt_ids),
-                    prompt_token_count,
-                })
+            let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::Acquire);
+            rt.generate_greedy(
+                &prompt_ids,
+                max_tokens,
+                &sampling,
+                &is_cancelled,
+                &stop_sequences,
+            )
+            .map(|(text, generated_token_ids)| RunnableGenerationResult {
+                text,
+                generated_token_ids,
+                prompt_token_ids: Some(prompt_ids),
+                prompt_token_count,
+            })
         }
         RunnablePreparedPrompt::Vision {
             prefix,
@@ -15449,7 +15498,7 @@ async fn runnable_chat_streaming(
     });
 
     let tokenizer = runtime.tokenizer.clone();
-    let disconnect_guard = RunnableStreamDisconnectGuard { cancelled };
+    let disconnect_guard = RunnableDisconnectGuard { cancelled };
     let events = async_stream::stream! {
         // Keep the guard owned by the response body for its full lifetime.
         let _disconnect_guard = disconnect_guard;
@@ -22742,6 +22791,11 @@ fn log_speculative_summary(prepared: &PreparedGeneration, generated: usize) {
 fn generate_token_ids(
     mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedTokens, Box<Response>> {
+    // A job that waited in the engine queue may belong to a client that has
+    // already gone: skip it before any grammar build or prompt read.
+    if let Some(GenerationStopCause::Cancelled) = prepared.cancel.tripped() {
+        return Err(generation_cancelled_response(0));
+    }
     let generation_started = Instant::now();
     let collect_q8_schedule = q8_schedule_telemetry_enabled();
     if collect_q8_schedule {
@@ -22836,6 +22890,7 @@ fn generate_token_ids(
     // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
     // unless deterministic mode is active, so non-deterministic generations never trace.
     let tracing_armed = want_execution_trace && prepared.session.enable_execution_trace();
+    arm_prefill_interrupt(&mut prepared);
 
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
@@ -22992,12 +23047,7 @@ fn generate_token_ids(
                     grammar_allowed,
                 )
                 .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "generation_step_failed",
-                        err.to_string(),
-                        None,
-                    ))
+                    generation_step_error_response(err, &prepared.cancel, generated.len())
                 })?,
         };
         if generated.is_empty()
@@ -24127,6 +24177,7 @@ fn run_stream_decode_job(
         StreamPrologue::Ready => {}
         StreamPrologue::Stop => return,
     }
+    arm_prefill_interrupt(&mut prepared);
 
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
@@ -24506,6 +24557,7 @@ impl CooperativeStreamDecodeJob {
         {
             return None;
         }
+        arm_prefill_interrupt(&mut prepared);
         #[cfg(feature = "cuda")]
         let cuda_prefill =
             CooperativeCudaPrefill::from_env(input.len(), prepared.collect_dense_diagnostics);
@@ -36748,6 +36800,143 @@ mod tests {
         let (after_rollback, _timings) = rolled.forward_greedy_verify_chunk(&[0]).unwrap();
 
         assert_eq!(after_rollback, expected);
+    }
+
+    async fn error_code_of(response: Box<Response>) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("error json");
+        body["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn prefill_step(session: &mut LlamaInferenceSession) -> crate::Result<LlamaGenerationStep> {
+        // tiny_config holds 4 positions: a 3-token prompt reads 2 tokens as
+        // prefill, then decodes the last one.
+        session.generate_next_token_with_history_diagnostics(
+            &[0, 1, 2],
+            LlamaSampler::Greedy,
+            &[0, 1, 2],
+            false,
+            None,
+        )
+    }
+
+    /// Poll 1 is the up-front check before any prompt work. Reporting
+    /// "cancelled" only from poll 2 on can be seen only by a check inside the
+    /// prefill loop (the tiny model takes the chunked CPU path).
+    #[test]
+    fn prefill_interrupt_stops_inside_the_prompt_read() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = polls.clone();
+        session.set_prefill_interrupt(Some(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+        })));
+        let err = prefill_step(&mut session).unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Poll 2 is the check before the first chunk; poll 3 runs inside that chunk,
+    /// before its first layer. A slow CPU spends about a minute on one 256-token
+    /// chunk of a 3B model, so the per-layer check is what makes a stop prompt.
+    #[test]
+    fn prefill_interrupt_stops_between_layers_of_a_chunk() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = polls.clone();
+        session.set_prefill_interrupt(Some(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        })));
+        let err = prefill_step(&mut session).unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn prefill_interrupt_that_never_fires_changes_nothing() {
+        let mut plain = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut armed = plain.clone();
+        armed.set_prefill_interrupt(Some(Arc::new(|| false)));
+        let expected = prefill_step(&mut plain).unwrap();
+        let observed = prefill_step(&mut armed).unwrap();
+        assert_eq!(observed.next_token_id, expected.next_token_id);
+        assert_eq!(observed.logits.data, expected.logits.data);
+        assert_eq!(armed, plain, "same KV cache after the prompt read");
+    }
+
+    #[test]
+    fn prefill_interrupt_is_per_request_state() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        session.set_prefill_interrupt(Some(Arc::new(|| true)));
+        // A prompt-prefix-cache copy outlives its request, whose token has
+        // already fired by then: the copy must not inherit the check.
+        let mut copy = session.clone();
+        prefill_step(&mut copy).expect("a cloned session carries no cancel check");
+        // take_for_step moves the live session for one step and keeps it.
+        let mut taken = session.take_for_step();
+        let err = prefill_step(&mut taken).unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+    }
+
+    #[test]
+    fn prompt_without_prefill_ignores_the_prefill_interrupt() {
+        // A single-token input is one decode step; stopping it is the per-step
+        // check's job, not the prefill's.
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        session.set_prefill_interrupt(Some(Arc::new(|| true)));
+        session
+            .generate_next_token_with_history_diagnostics(
+                &[1],
+                LlamaSampler::Greedy,
+                &[1],
+                false,
+                None,
+            )
+            .expect("no prompt to read");
+    }
+
+    #[tokio::test]
+    async fn armed_prefill_follows_the_request_cancel_token() {
+        let mut live = orphan_test_prepared("model-a.gguf");
+        arm_prefill_interrupt(&mut live);
+        prefill_step(&mut live.session).expect("token not fired: the prompt is read");
+
+        let mut prepared = orphan_test_prepared("model-a.gguf");
+        arm_prefill_interrupt(&mut prepared);
+        prepared.cancel.token.cancel();
+        let err = prefill_step(&mut prepared.session).unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+        let response = generation_step_error_response(err, &prepared.cancel, 0);
+        assert_eq!(error_code_of(response).await, "generation_cancelled");
+    }
+
+    #[tokio::test]
+    async fn prefill_stopped_by_the_deadline_reports_a_timeout() {
+        let mut cancel = GenerationCancel::unbounded();
+        cancel.arm(Duration::ZERO);
+        let response = generation_step_error_response(BackendError::Cancelled, &cancel, 0);
+        assert_eq!(error_code_of(response).await, "generation_timeout");
+        let other = generation_step_error_response(
+            BackendError::InvalidTensorData("boom".to_string()),
+            &cancel,
+            0,
+        );
+        assert_eq!(error_code_of(other).await, "generation_step_failed");
+    }
+
+    #[tokio::test]
+    async fn queued_job_whose_client_left_is_skipped() {
+        let prepared = orphan_test_prepared("model-a.gguf");
+        prepared.cancel.token.cancel();
+        let Err(response) = generate_token_ids(prepared) else {
+            panic!("a cancelled job must not generate");
+        };
+        assert_eq!(error_code_of(response).await, "generation_cancelled");
     }
 
     fn tiny_config() -> LlamaModelConfig {

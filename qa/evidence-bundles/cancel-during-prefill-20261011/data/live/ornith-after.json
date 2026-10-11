@@ -1,0 +1,68 @@
+{
+ "ui": "ornith-after",
+ "short_request_roles": [
+  "user"
+ ],
+ "short_request_chars": 22,
+ "long_message_chars": 1080,
+ "stop_after_ms": 15000,
+ "long_turn_text_at_stop": "Generating response\nOrnith 1.0 9B Q8_0\nVERIFIED\ntokens est. in 295 · out 0\n02:37 AM\nCLIENT-MEASURED",
+ "short_message": "Say hi in three words.",
+ "short_reply": "Hello there!\n\nOrnith 1.0 9B Q8_0\nVERIFIED\ntokens in 18 · out 3\nfirst token 15.8s\n0.6 tok/s\n19.0s\n02:37 AM\nCLIENT-MEASURED\nDeveloper Diagnostics\n0.6 tok/s",
+ "short_answered": true,
+ "short_wait_ms": 18818,
+ "events": [
+  {
+   "at": 4631,
+   "what": "chat request sent"
+  },
+  {
+   "at": 4733,
+   "what": "long message sent"
+  },
+  {
+   "at": 20345,
+   "what": "screenshot ornith-after-1-reading-long-message.png"
+  },
+  {
+   "at": 21302,
+   "what": "chat request ended by the browser: net::ERR_ABORTED"
+  },
+  {
+   "at": 21389,
+   "what": "Stop clicked"
+  },
+  {
+   "at": 21568,
+   "what": "Stop button gone"
+  },
+  {
+   "at": 22682,
+   "what": "screenshot ornith-after-2-stopped.png"
+  },
+  {
+   "at": 22866,
+   "what": "New chat"
+  },
+  {
+   "at": 23157,
+   "what": "chat request sent"
+  },
+  {
+   "at": 23195,
+   "what": "short message sent"
+  },
+  {
+   "at": 42013,
+   "what": "short request finished (response fully received)"
+  },
+  {
+   "at": 43338,
+   "what": "screenshot ornith-after-3-20s-after-short-message.png"
+  },
+  {
+   "at": 44950,
+   "what": "screenshot ornith-after-4-short-reply.png"
+  }
+ ]
+}

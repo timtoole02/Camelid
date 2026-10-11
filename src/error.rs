@@ -71,6 +71,12 @@ pub enum BackendError {
 
     #[error("inference is not implemented yet; current build supports health checks and GGUF metadata inspection only")]
     InferenceNotImplemented,
+
+    /// The caller's cancel check fired part-way through a generation (for
+    /// example while reading the prompt). The partial state is unusable and
+    /// must be dropped, not resumed.
+    #[error("generation cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, BackendError>;
