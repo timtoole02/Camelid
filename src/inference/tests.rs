@@ -19117,3 +19117,70 @@ fn f3_paged_prefix_survives_the_session_that_built_it() {
         "a prompt sharing no leading token must not fork the retained prefix"
     );
 }
+
+/// #803. The serial CUDA-resident prefill (the default for Q4_K/Q6_K rows) reads a long
+/// prompt one forward per token. A request cancelled part-way must stop at the next
+/// segment boundary, and must leave nothing behind on the shared engine that changes the
+/// next request's output.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CAMELID_3B_GGUF and a CUDA device"]
+fn serial_resident_prefill_stops_between_segments_when_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _env_guard = crate::test_support::env_lock();
+    let Some(model) = review_regression_model() else {
+        eprintln!("SKIP cancelled serial prefill gate: set CAMELID_3B_GGUF");
+        return;
+    };
+    if !resident_prefill_is_available(&model, 0x0803_0FF1) {
+        return;
+    }
+    std::env::set_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED", "0");
+    // Three whole segments and a few tokens more.
+    let prompt: Vec<u32> = model.prompts[0]
+        .iter()
+        .copied()
+        .cycle()
+        .take(3 * RESIDENT_SERIAL_PREFILL_SEGMENT_TOKENS + 5)
+        .collect();
+    let step = |session: &mut LlamaInferenceSession| {
+        session.generate_next_token_with_history_diagnostics(
+            &prompt,
+            LlamaSampler::Greedy,
+            &prompt,
+            false,
+            None,
+        )
+    };
+
+    let cache_key = 0x0803_0001_u64;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&polls);
+    let mut cancelled = review_regression_session(&model, cache_key);
+    cancelled.set_prefill_interrupt(Some(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst) >= 2
+    })));
+    let cancelled_result = step(&mut cancelled);
+    drop(cancelled);
+
+    // The same warm engine, the same prompt, nobody cancels.
+    let mut after = review_regression_session(&model, cache_key);
+    let after_result = step(&mut after);
+    drop(after);
+    // Reference: a freshly built engine, with a check that never fires.
+    let mut fresh = review_regression_session(&model, 0x0803_0002);
+    fresh.set_prefill_interrupt(Some(Arc::new(|| false)));
+    let fresh_result = step(&mut fresh);
+    drop(fresh);
+    std::env::remove_var("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED");
+
+    let err = cancelled_result.expect_err("a cancelled prompt read must not finish");
+    assert!(matches!(err, BackendError::Cancelled), "{err}");
+    // Poll 1 is the check before the prompt read, poll 2 runs segment 0, poll 3 stops
+    // before segment 1.
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
+    let after_step = after_result.expect("prefill after a cancelled one");
+    let fresh_step = fresh_result.expect("reference prefill");
+    assert_eq!(after_step.next_token_id, fresh_step.next_token_id);
+    assert_eq!(after_step.logits.data, fresh_step.logits.data);
+}

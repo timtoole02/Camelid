@@ -2757,7 +2757,7 @@ impl RunnableModel {
     fn forward_logits_qwen35(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let _ = rt;
-        let (_cache, logits) = self.prefill_qwen35(tokens)?;
+        let (_cache, logits) = self.prefill_qwen35(tokens, None)?;
         Ok(logits)
     }
 
@@ -2845,11 +2845,18 @@ impl RunnableModel {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn qwen35_prefill_timed(&self, tokens: &[u32]) -> Result<f64> {
         let started = std::time::Instant::now();
-        let (_cache, _logits) = self.prefill_qwen35(tokens)?;
+        let (_cache, _logits) = self.prefill_qwen35(tokens, None)?;
         Ok(started.elapsed().as_secs_f64())
     }
 
-    fn prefill_qwen35(&self, prompt: &[u32]) -> Result<(Qwen35Cache, Vec<f32>)> {
+    /// `cancelled`, when given, is polled before each layer: a long prompt on a
+    /// slow CPU spends seconds per layer, so an abandoned request stops within
+    /// one layer instead of after the whole prompt.
+    fn prefill_qwen35(
+        &self,
+        prompt: &[u32],
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<(Qwen35Cache, Vec<f32>)> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let m = prompt.len();
         let mut cache = Qwen35Cache::new(rt, self.n_layers);
@@ -2866,6 +2873,9 @@ impl RunnableModel {
         }
 
         for (li, layer) in rt.layers.iter().enumerate() {
+            if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+                return Err(BackendError::Cancelled);
+            }
             let xn: Vec<Vec<f32>> = hidden
                 .iter()
                 .map(|h| self.apply_norm(h, &layer.attn_norm))
@@ -2973,12 +2983,27 @@ impl RunnableModel {
     /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
     /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
-        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &|_| false, &mut |_| {})
+        self.generate_qwen35_streaming(
+            prompt,
+            max_new,
+            stop,
+            None,
+            false,
+            &|| false,
+            &|_| false,
+            &mut |_| {},
+        )
     }
 
     /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
     /// every emitted token as soon as it is decided — the serve lane's SSE source.
     /// Token order/content identical to the non-streaming path by construction.
+    ///
+    /// `is_cancelled` stops an abandoned request. The CPU, Metal and CUDA host-fed
+    /// decode loops poll `should_stop` after each token, so the check rides along
+    /// there; the CPU prefill polls it before each layer and the CUDA device loop
+    /// at each sync. A cancelled run returns [`BackendError::Cancelled`], never a
+    /// short reply.
     #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_streaming(
         &self,
@@ -2987,6 +3012,36 @@ impl RunnableModel {
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
         stream_tokens_observable: bool,
+        is_cancelled: &dyn Fn() -> bool,
+        should_stop: &dyn Fn(&[u32]) -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let stop_or_cancelled = |ids: &[u32]| is_cancelled() || should_stop(ids);
+        let tokens = self.generate_qwen35_on_lane(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            stream_tokens_observable,
+            is_cancelled,
+            &stop_or_cancelled,
+            on_token,
+        )?;
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        Ok(tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_qwen35_on_lane(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: Option<&SamplingConfig>,
+        stream_tokens_observable: bool,
+        is_cancelled: &dyn Fn() -> bool,
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
@@ -3025,6 +3080,7 @@ impl RunnableModel {
                             max_new,
                             stop,
                             sampling,
+                            is_cancelled,
                             should_stop,
                             tracked_on_token,
                         )
@@ -3035,6 +3091,7 @@ impl RunnableModel {
                             max_new,
                             stop,
                             sampling,
+                            is_cancelled,
                             should_stop,
                             fallback_on_token,
                         )
@@ -3042,7 +3099,15 @@ impl RunnableModel {
                 );
             }
         }
-        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, should_stop, on_token)
+        self.generate_qwen35_cpu(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            is_cancelled,
+            should_stop,
+            on_token,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -3877,18 +3942,20 @@ impl RunnableModel {
         Ok(generated)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_cpu(
         &self,
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
+        is_cancelled: &dyn Fn() -> bool,
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
-        let (mut cache, last) = self.prefill_qwen35(prompt)?;
+        let (mut cache, last) = self.prefill_qwen35(prompt, Some(is_cancelled))?;
         let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
         let mut token_history = prompt.to_vec();
         let mut out = Vec::with_capacity(max_new);
@@ -3931,13 +3998,20 @@ impl RunnableModel {
     /// GPU resident decode for qwen35. Greedy requests use the device-side token
     /// loop when available; sampled requests keep the layer graph on CUDA and
     /// copy one logits row per token to the CPU sampler.
+    ///
+    /// `is_cancelled` is checked between prompt segments and decode chunks of the
+    /// device loop (each after a sync, so the check sees real GPU progress); the
+    /// host-fed loop checks it before its one-call prefill and, through
+    /// `should_stop`, after every token.
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_cuda(
         &self,
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
+        is_cancelled: &dyn Fn() -> bool,
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
@@ -3983,6 +4057,16 @@ impl RunnableModel {
             // scheduled after a mid-chunk stop token advance the (reset-per-
             // call) SSM/KV state without affecting the returned sequence.
             for (i, &tok) in prompt.iter().enumerate() {
+                // The forwards below are queued asynchronously; wait for each segment
+                // so the cancel check reflects real progress on the GPU.
+                if i > 0 && i % QWEN35_CUDA_PROMPT_CANCEL_SEGMENT == 0 {
+                    engine
+                        .synchronize()
+                        .map_err(BackendError::InvalidTensorData)?;
+                    if is_cancelled() {
+                        return Err(BackendError::Cancelled);
+                    }
+                }
                 let last = i == prompt.len() - 1;
                 engine
                     .forward_token_device(
@@ -4036,6 +4120,10 @@ impl RunnableModel {
                 if scheduled < want {
                     break; // context capacity exhausted
                 }
+                // `read_out_tokens` synced above: nothing is left in flight.
+                if is_cancelled() {
+                    return Err(BackendError::Cancelled);
+                }
             }
             return Ok(out);
         }
@@ -4047,6 +4135,9 @@ impl RunnableModel {
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
         if !prior_prompt.is_empty() {
+            if is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
             let half = self.rope_dim / 2;
             let mut embeddings = Vec::with_capacity(prior_prompt.len() * self.d_model);
             let mut cos_all = Vec::with_capacity(prior_prompt.len() * half);
@@ -4153,6 +4244,7 @@ impl RunnableModel {
                 stop,
                 None,
                 false,
+                &|| false,
                 &|_| false,
                 &mut |_| {},
             );
@@ -4172,10 +4264,36 @@ impl RunnableModel {
         sampling: &SamplingConfig,
         should_stop: &dyn Fn(&[u32]) -> bool,
     ) -> Result<Vec<u32>> {
+        self.generate_stopping_with_sampling_cancelled(
+            prompt,
+            max_new,
+            stop,
+            sampling,
+            &|| false,
+            should_stop,
+        )
+    }
+
+    /// [`generate_stopping_with_sampling`](Self::generate_stopping_with_sampling) with
+    /// cooperative cancellation for the non-streaming serve path: `is_cancelled` is
+    /// polled while reading the prompt and between generated tokens, and a cancelled
+    /// run returns [`BackendError::Cancelled`].
+    pub fn generate_stopping_with_sampling_cancelled(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: &SamplingConfig,
+        is_cancelled: &dyn Fn() -> bool,
+        should_stop: &dyn Fn(&[u32]) -> bool,
+    ) -> Result<Vec<u32>> {
         if prompt.is_empty() {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
+            if is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
             return self.generate_qwen35_streaming(
                 prompt,
@@ -4183,6 +4301,7 @@ impl RunnableModel {
                 stop,
                 sampling,
                 false,
+                is_cancelled,
                 should_stop,
                 &mut |_| {},
             );
@@ -4192,7 +4311,7 @@ impl RunnableModel {
             max_new,
             stop,
             sampling,
-            &|| false,
+            is_cancelled,
             should_stop,
             &mut |_| {},
         )
@@ -4295,6 +4414,7 @@ impl RunnableModel {
                 stop,
                 sampling,
                 true,
+                is_cancelled,
                 should_stop,
                 on_token,
             );
@@ -5079,6 +5199,11 @@ fn qwen35_device_decode_steps(
     })
 }
 
+/// Prompt tokens the qwen35 CUDA device loop queues between syncs; the request's cancel
+/// check runs at each sync, so this bounds how long an abandoned prompt read continues.
+#[cfg(feature = "cuda")]
+const QWEN35_CUDA_PROMPT_CANCEL_SEGMENT: usize = 64;
+
 #[cfg(feature = "cuda")]
 fn qwen35_device_decode_chunk_len() -> usize {
     std::env::var("CAMELID_DEVICE_DECODE_CHUNK")
@@ -5110,6 +5235,8 @@ fn qwen35_cuda_with_cpu_fallback<T>(
 
     match cuda_result {
         Ok(value) => Ok(value),
+        // The client is gone: a CPU retry would only redo work nobody reads.
+        Err(BackendError::Cancelled) => Err(BackendError::Cancelled),
         Err(error) if stream_tokens_observable && emitted => {
             eprintln!(
                 "[qwen35] CUDA lane failed after streaming output ({error}); refusing CPU replay"
@@ -5155,6 +5282,24 @@ mod qwen35_cuda_fallback_tests {
         assert!(result.is_err());
         assert_eq!(delivered, vec![7]);
         assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn cancelled_cuda_run_is_not_retried_on_cpu() {
+        for observable in [false, true] {
+            let fallback_called = Cell::new(false);
+            let result: Result<Vec<u32>> = qwen35_cuda_with_cpu_fallback(
+                &mut |_| {},
+                observable,
+                |_| Err(BackendError::Cancelled),
+                |_| {
+                    fallback_called.set(true);
+                    Ok(vec![11])
+                },
+            );
+            assert!(matches!(result, Err(BackendError::Cancelled)));
+            assert!(!fallback_called.get());
+        }
     }
 
     #[test]
@@ -6695,14 +6840,14 @@ mod gpu_ssm_layer_tests {
         let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
         let n = 8usize;
         let cpu = model
-            .generate_qwen35_cpu(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cpu(&prompt, n, &[], None, &|| false, &|_| false, &mut |_| {})
             .expect("cpu gen");
         let gpu = model
-            .generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &|| false, &|_| false, &mut |_| {})
             .expect("gpu gen");
         // run-twice reuses the cached engine -> validates reset_qwen35_state.
         let gpu2 = model
-            .generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &|| false, &|_| false, &mut |_| {})
             .expect("gpu gen 2");
         eprintln!("cpu ={cpu:?}");
         eprintln!("gpu ={gpu:?}");
@@ -6716,7 +6861,15 @@ mod gpu_ssm_layer_tests {
         if let Ok(gguf) = read_metadata(&path) {
             if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
                 let ids16 = model
-                    .generate_qwen35_cuda(&prompt, 16, &[], None, &|_| false, &mut |_| {})
+                    .generate_qwen35_cuda(
+                        &prompt,
+                        16,
+                        &[],
+                        None,
+                        &|| false,
+                        &|_| false,
+                        &mut |_| {},
+                    )
                     .expect("gpu 16-tok");
                 let text = tok.decode(&ids16, true).unwrap_or_default();
                 eprintln!("qwen35 GPU 16-tok decode: {text}");
@@ -6744,15 +6897,24 @@ mod gpu_ssm_layer_tests {
         let secs = |gpu: bool, n: usize| -> f64 {
             let t = std::time::Instant::now();
             let r = if gpu {
-                model.generate_qwen35_cuda(&prompt, n, &[], None, &|_| false, &mut |_| {})
+                model.generate_qwen35_cuda(
+                    &prompt,
+                    n,
+                    &[],
+                    None,
+                    &|| false,
+                    &|_| false,
+                    &mut |_| {},
+                )
             } else {
-                model.generate_qwen35_cpu(&prompt, n, &[], None, &|_| false, &mut |_| {})
+                model.generate_qwen35_cpu(&prompt, n, &[], None, &|| false, &|_| false, &mut |_| {})
             };
             r.expect("generate");
             t.elapsed().as_secs_f64()
         };
         // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
-        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], None, &|_| false, &mut |_| {});
+        let _ =
+            model.generate_qwen35_cuda(&prompt, 4, &[], None, &|| false, &|_| false, &mut |_| {});
         let g_lo = secs(true, n_lo);
         let g_hi = secs(true, n_hi);
         let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);
@@ -6766,6 +6928,76 @@ mod gpu_ssm_layer_tests {
              CPU {c_lo:.1}s@{n_lo} -> {c_hi:.1}s@{n_hi}]",
             gpu_tokps / cpu_tokps
         );
+    }
+
+    /// Cancellation on the qwen35 CPU lane, against the real model. Poll 1 is the
+    /// up-front check; poll 2 guards layer 0 of the prompt read; flipping at poll 3
+    /// must stop the prompt read before layer 1. During decode the check rides on
+    /// the per-token stop hook, so no token is produced after it fires. And with
+    /// nothing cancelled the output is the plain non-streaming output.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (any qwen35 quant); runs the CPU lane"]
+    fn qwen35_cpu_cancel_stops_prompt_read_and_decode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let greedy = SamplingConfig::default();
+
+        let polls = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let err = model
+            .generate_stopping_with_sampling_cancelled(
+                &prompt,
+                8,
+                &[],
+                &greedy,
+                &|| polls.fetch_add(1, Ordering::SeqCst) >= 2,
+                &|_| false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+        assert_eq!(polls.load(Ordering::SeqCst), 3, "stopped before layer 1");
+        eprintln!(
+            "prompt read stopped after layer 0 in {:?}",
+            started.elapsed()
+        );
+
+        let emitted = AtomicUsize::new(0);
+        let err = model
+            .generate_stopping_streaming_with_sampling_cancelled(
+                &prompt,
+                8,
+                &[],
+                &greedy,
+                &|| emitted.load(Ordering::SeqCst) >= 2,
+                &|_| false,
+                &mut |_| {
+                    emitted.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Cancelled), "{err}");
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            2,
+            "no token after the cancel"
+        );
+
+        let plain = model
+            .generate_stopping_with_sampling(&prompt, 4, &[], &greedy, &|_| false)
+            .expect("plain");
+        let armed = model
+            .generate_stopping_with_sampling_cancelled(&prompt, 4, &[], &greedy, &|| false, &|_| {
+                false
+            })
+            .expect("armed, never fired");
+        assert_eq!(armed, plain);
     }
 
     /// Sparse-KV long-context proof: build the resident engine at max_pos=8192 (which
