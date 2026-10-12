@@ -10,6 +10,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 
+use metal::foreign_types::ForeignType;
+use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
@@ -348,11 +350,42 @@ fn upload<T>(device: &Device, values: &[T]) -> std::result::Result<Buffer, Strin
     if bytes == 0 || bytes as u64 > device.max_buffer_length() {
         return Err("Metal encoder buffer exceeds the device limit".into());
     }
-    Ok(device.new_buffer_with_data(
-        values.as_ptr().cast(),
-        bytes as u64,
-        MTLResourceOptions::StorageModeShared,
-    ))
+    let device: &metal::DeviceRef = device;
+    let data = values.as_ptr().cast::<c_void>();
+    let length = bytes as u64;
+    let options = MTLResourceOptions::StorageModeShared;
+    // SAFETY: device is valid and the byte slice stays alive until Metal has
+    // copied it. Unlike metal 0.31's Buffer-returning wrapper, retain the raw
+    // nullable result so real memory pressure follows the CPU fallback path.
+    let pointer =
+        unsafe { msg_send![device, newBufferWithBytes:data length:length options:options] };
+    // SAFETY: the newBuffer selector returns null or a +1 retained MTLBuffer.
+    unsafe { buffer_from_allocation(pointer) }
+}
+
+fn allocate_buffer(device: &Device, length: u64) -> std::result::Result<Buffer, String> {
+    if length == 0 || length > device.max_buffer_length() {
+        return Err("Metal encoder allocation exceeds device limit".into());
+    }
+    let device: &metal::DeviceRef = device;
+    let options = MTLResourceOptions::StorageModeShared;
+    // SAFETY: device is valid, size is bounded, and the nullable raw pointer
+    // is checked before constructing an owned foreign object.
+    let pointer = unsafe { msg_send![device, newBufferWithLength:length options:options] };
+    // SAFETY: the newBuffer selector returns null or a +1 retained MTLBuffer.
+    unsafe { buffer_from_allocation(pointer) }
+}
+
+/// `pointer` must be null or a valid +1 retained MTLBuffer from a newBuffer
+/// selector. Ownership of a non-null allocation transfers to the result.
+unsafe fn buffer_from_allocation(
+    pointer: *mut metal::MTLBuffer,
+) -> std::result::Result<Buffer, String> {
+    if pointer.is_null() {
+        return Err("Metal encoder buffer allocation failed".into());
+    }
+    // SAFETY: the caller provides a valid retained allocation, checked above.
+    Ok(unsafe { Buffer::from_ptr(pointer) })
 }
 
 fn write<T>(buffer: &Buffer, values: &[T]) {
@@ -567,9 +600,7 @@ impl MetalEncoder {
             if length == 0 || length as u64 > self.device.max_buffer_length() {
                 return Err("Metal encoder allocation exceeds device limit".to_string());
             }
-            Ok(self
-                .device
-                .new_buffer(length as u64, MTLResourceOptions::StorageModeShared))
+            allocate_buffer(&self.device, length as u64)
         };
         Ok(Buffers {
             rows,
@@ -881,6 +912,14 @@ impl MetalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_metal_buffer_allocation_returns_an_error() {
+        // A null allocation satisfies the helper's safety contract and must
+        // never reach Buffer::from_ptr, panic, or dereference a foreign object.
+        let result = unsafe { buffer_from_allocation(std::ptr::null_mut()) };
+        assert!(result.is_err());
+    }
 
     #[derive(serde::Serialize, serde::Deserialize)]
     #[cfg(target_arch = "aarch64")]
