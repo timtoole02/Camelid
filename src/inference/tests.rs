@@ -52,6 +52,200 @@ fn sampling_probabilities_match_the_normal_sampler_candidate_weights() {
 }
 
 #[test]
+fn sampled_resident_filters_decline_before_token_lookup_or_kv_mutation() {
+    let (mut session, _backing) = tiny_kv_budget_session(8);
+    let invalid_token = 2;
+    let before = session.kv_position();
+    for (typical_p, top_n_sigma) in [
+        (Some(0.0), None),
+        (Some(0.9), None),
+        (None, Some(f32::EPSILON)),
+        (None, Some(2.0)),
+    ] {
+        let config = SamplingConfig {
+            temperature: 0.8,
+            typical_p,
+            top_n_sigma,
+            ..SamplingConfig::default()
+        };
+        assert!(session
+            .generate_next_token_sampled_resident(invalid_token, &config)
+            .expect("unsupported filters must decline before looking up the token")
+            .is_none());
+        assert_eq!(session.kv_position(), before);
+        assert!(session.resident_decode.is_none());
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_sampling_guard_session() -> LlamaInferenceSession {
+    let (template, _backing) = tiny_kv_budget_session(8);
+    let mut weights = (*template.weights).clone();
+    let zero_matrix = |name: &str, outputs: usize| {
+        CpuTensor::from_q8_0_blocks(
+            name,
+            TensorShape {
+                dims: vec![32, outputs],
+            },
+            vec![
+                Q8_0Block {
+                    scale: 1.0,
+                    quants: [0; 32],
+                };
+                outputs
+            ],
+        )
+        .unwrap()
+    };
+    weights.token_embedding = CpuTensor::from_q8_0_blocks(
+        "token_embd.weight",
+        TensorShape { dims: vec![2, 32] },
+        vec![
+            Q8_0Block {
+                scale: 0.01,
+                quants: [1; 32],
+            },
+            Q8_0Block {
+                scale: 0.01,
+                quants: [2; 32],
+            },
+        ],
+    )
+    .unwrap();
+    weights.output = Some(zero_matrix("output.weight", 2));
+    weights.output_projection_binding = DecodeBindingCell::default();
+    let layer = &mut weights.layers[0];
+    layer.attention_q = zero_matrix("blk.0.attn_q.weight", 32);
+    layer.attention_k = zero_matrix("blk.0.attn_k.weight", 32);
+    layer.attention_v = zero_matrix("blk.0.attn_v.weight", 32);
+    layer.attention_output = zero_matrix("blk.0.attn_output.weight", 32);
+    layer.ffn_gate = zero_matrix("blk.0.ffn_gate.weight", 32);
+    layer.ffn_up = zero_matrix("blk.0.ffn_up.weight", 32);
+    layer.ffn_down = zero_matrix("blk.0.ffn_down.weight", 32);
+    layer.decode_bindings = DecodeLinearBindings::default();
+    let mut session = LlamaInferenceSession::new(template.config.clone(), weights).unwrap();
+    session.set_resident_encode_ahead_enabled(false);
+    session
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires the Metal resident decode lane"]
+fn sampled_resident_filters_preserve_metal_kv_and_disabled_boundaries() {
+    let mut session = metal_sampling_guard_session();
+    let plain = SamplingConfig {
+        temperature: 0.8,
+        seed: Some(27),
+        ..SamplingConfig::default()
+    };
+    let Some((first, _)) = session
+        .generate_next_token_sampled_resident(0, &plain)
+        .unwrap()
+    else {
+        assert!(
+            std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref() != Ok("1"),
+            "CAMELID_REQUIRE_METAL_TESTS=1 but the synthetic resident sampling control declined"
+        );
+        return;
+    };
+    assert!(first < 2);
+    assert_eq!(
+        session.kv_position(),
+        1,
+        "the control uses the GPU fast lane"
+    );
+    assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 1);
+
+    for (typical_p, top_n_sigma) in [
+        (Some(0.0), None),
+        (Some(0.9), None),
+        (None, Some(f32::EPSILON)),
+        (None, Some(2.0)),
+    ] {
+        let config = SamplingConfig {
+            typical_p,
+            top_n_sigma,
+            ..plain.clone()
+        };
+        assert!(session
+            .generate_next_token_sampled_resident(first, &config)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            session.kv_position(),
+            1,
+            "a declined filter cannot consume KV"
+        );
+        assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 1);
+    }
+
+    for (expected_position, config) in [
+        SamplingConfig {
+            typical_p: Some(1.0),
+            ..plain.clone()
+        },
+        SamplingConfig {
+            top_n_sigma: Some(0.0),
+            ..plain.clone()
+        },
+        SamplingConfig {
+            typical_p: Some(1.0),
+            top_n_sigma: Some(0.0),
+            ..plain
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            session
+                .generate_next_token_sampled_resident(first, config)
+                .unwrap()
+                .is_some(),
+            "disabled filter boundaries preserve the fast lane"
+        );
+        assert_eq!(session.kv_position(), expected_position + 2);
+        assert_eq!(
+            session.resident_decode.as_ref().unwrap().filled(),
+            expected_position + 2
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires Metal resident decode with F32Y and WIRE disabled"]
+fn sampled_resident_without_metal_wire_declines_before_resident_kv_mutation() {
+    if !resident_decode_metal_enabled() || !resident_metal_temperature_sampling_enabled() {
+        assert!(
+            std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref() != Ok("1"),
+            "CAMELID_REQUIRE_METAL_TESTS=1 but Metal resident temperature sampling is disabled"
+        );
+        return;
+    }
+    assert!(
+        !metal_seam::wire_mode_active(),
+        "the wire-off regression requires the Metal wire stack to be disabled"
+    );
+    let mut session = metal_sampling_guard_session();
+    let config = SamplingConfig {
+        temperature: 0.8,
+        seed: Some(27),
+        ..SamplingConfig::default()
+    };
+    assert!(session
+        .generate_next_token_sampled_resident(0, &config)
+        .unwrap()
+        .is_none());
+    assert_eq!(session.kv_position(), 0);
+    assert!(
+        session.resident_decode.is_none(),
+        "declining an unavailable sampling tail must not execute a resident forward"
+    );
+    assert_eq!(session.kv_cache.materialized_through, 0);
+}
+
+#[test]
 fn projection_bias_broadcasts_across_every_token_row() {
     let projection =
         CpuTensor::from_f32("q", vec![2, 3], vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]).unwrap();

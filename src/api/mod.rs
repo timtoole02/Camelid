@@ -22166,8 +22166,9 @@ async fn generate_decoded_tokens_blocking(
 }
 
 struct StreamStepRequest {
-    /// Try the resident GPU-sampling greedy fast lane before the general step.
-    greedy_fast: bool,
+    /// Logits from the first generated token have already been collected.
+    /// The continuation may use resident greedy or temperature sampling.
+    resident_fast: bool,
     input: Vec<u32>,
     sampler: LlamaSampler,
     history: Vec<u32>,
@@ -22217,27 +22218,21 @@ fn run_stream_step(
     request: StreamStepRequest,
 ) -> crate::Result<LlamaGenerationStep> {
     let StreamStepRequest {
-        greedy_fast,
+        resident_fast,
         input,
         sampler,
         history,
         collect_dense_diagnostics,
     } = request;
-    if greedy_fast {
-        if let Some((id, forward_us)) = session.generate_next_token_greedy_resident(input[0])? {
-            return gpu_sampled_generation_step(id, forward_us);
-        }
-    }
-    // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
-    // instead of copying the full logits row to the host and sorting it on the
-    // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
-    if !collect_dense_diagnostics {
-        if let LlamaSampler::Sampling(cfg) = &sampler {
-            if let Some((id, forward_us)) =
+    if resident_fast && input.len() == 1 && !collect_dense_diagnostics {
+        let sampled = match &sampler {
+            LlamaSampler::Greedy => session.generate_next_token_greedy_resident(input[0])?,
+            LlamaSampler::Sampling(cfg) => {
                 session.generate_next_token_sampled_resident(input[0], cfg)?
-            {
-                return gpu_sampled_generation_step(id, forward_us);
             }
+        };
+        if let Some((id, forward_us)) = sampled {
+            return gpu_sampled_generation_step(id, forward_us);
         }
     }
     session.generate_next_token_with_history_diagnostics(
@@ -24267,16 +24262,14 @@ fn run_stream_decode_job(
             }
         };
         if matches!(spec_round, SpeculativeRound::Declined) {
-            // Greedy single-token continuations with no per-step logit consumers
-            // ride the resident GPU-sampling fast lane inside the step.
-            let greedy_fast = input.len() == 1
-                && matches!(sampler, LlamaSampler::Greedy)
-                && !collect_dense_for_step
-                && !top_logits.is_empty();
+            // After first-token logits are collected, single-token continuations
+            // with no per-step logit consumers may sample on the GPU.
+            let resident_fast =
+                input.len() == 1 && !collect_dense_for_step && !top_logits.is_empty();
             let step = match run_stream_step(
                 &mut prepared.session,
                 StreamStepRequest {
-                    greedy_fast,
+                    resident_fast,
                     input: input.clone(),
                     sampler,
                     history: history.clone(),
@@ -25579,14 +25572,12 @@ impl CooperativeStreamDecodeJob {
         if !matches!(spec_round, SpeculativeRound::Declined) {
             return self.emit_step();
         }
-        let greedy_fast = self.input.len() == 1
-            && matches!(sampler, LlamaSampler::Greedy)
-            && !collect_dense_for_step
-            && !self.top_logits.is_empty();
+        let resident_fast =
+            self.input.len() == 1 && !collect_dense_for_step && !self.top_logits.is_empty();
         let step = match run_stream_step(
             &mut self.prepared.session,
             StreamStepRequest {
-                greedy_fast,
+                resident_fast,
                 input: self.input.clone(),
                 sampler,
                 history: self.history.clone(),
@@ -37009,6 +37000,164 @@ mod tests {
             panic!("a cancelled job must not generate");
         };
         assert_eq!(error_code_of(response).await, "generation_cancelled");
+    }
+
+    #[test]
+    fn streaming_empty_input_returns_an_error() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let result = run_stream_step(
+            &mut session,
+            StreamStepRequest {
+                resident_fast: true,
+                input: Vec::new(),
+                sampler: LlamaSampler::Sampling(SamplingConfig::default()),
+                history: Vec::new(),
+                collect_dense_diagnostics: false,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(session.kv_position(), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn streaming_metal_test_session() -> LlamaInferenceSession {
+        use crate::tensor::{Q8_0Block, TensorShape};
+        let mut config = tiny_config();
+        config.context_length = 8;
+        config.embedding_length = 32;
+        config.feed_forward_length = 32;
+        config.attention_head_count = 1;
+        config.attention_head_count_kv = 1;
+        config.rope_dimension_count = Some(32);
+        let q8 = |name: &str, rows: usize| {
+            CpuTensor::from_q8_0_blocks(
+                name,
+                TensorShape {
+                    dims: vec![32, rows],
+                },
+                vec![
+                    Q8_0Block {
+                        scale: 1.0,
+                        quants: [0; 32]
+                    };
+                    rows
+                ],
+            )
+            .unwrap()
+        };
+        let mut weights = tiny_weights();
+        weights.token_embedding = CpuTensor::from_q8_0_blocks(
+            "token_embd.weight",
+            TensorShape { dims: vec![3, 32] },
+            vec![
+                Q8_0Block {
+                    scale: 0.01,
+                    quants: [1; 32]
+                };
+                3
+            ],
+        )
+        .unwrap();
+        weights.output_norm = ones("output_norm.weight", 32);
+        weights.output = Some(q8("output.weight", 3));
+        let layer = &mut weights.layers[0];
+        layer.attention_norm = ones("blk.0.attn_norm.weight", 32);
+        layer.ffn_norm = ones("blk.0.ffn_norm.weight", 32);
+        layer.attention_q = q8("blk.0.attn_q.weight", 32);
+        layer.attention_k = q8("blk.0.attn_k.weight", 32);
+        layer.attention_v = q8("blk.0.attn_v.weight", 32);
+        layer.attention_output = q8("blk.0.attn_output.weight", 32);
+        layer.ffn_gate = q8("blk.0.ffn_gate.weight", 32);
+        layer.ffn_up = q8("blk.0.ffn_up.weight", 32);
+        layer.ffn_down = q8("blk.0.ffn_down.weight", 32);
+        LlamaInferenceSession::new(config, weights).unwrap()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the Metal resident decode lane"]
+    fn streaming_metal_sampling_consumes_the_entire_prompt() {
+        let _env_guard = crate::test_support::env_lock();
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            seed: Some(7),
+            ..SamplingConfig::default()
+        };
+        let mut control = streaming_metal_test_session();
+        let available = control
+            .generate_next_token_sampled_resident(0, &sampling)
+            .unwrap()
+            .is_some();
+        if !available {
+            assert!(
+                std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref() != Ok("1"),
+                "required Metal sampling lane is unavailable"
+            );
+            return;
+        }
+        assert_eq!(control.kv_position(), 1);
+        let mut first = streaming_metal_test_session();
+        let step = run_stream_step(
+            &mut first,
+            StreamStepRequest {
+                resident_fast: false,
+                input: vec![0],
+                sampler: LlamaSampler::Sampling(sampling.clone()),
+                history: Vec::new(),
+                collect_dense_diagnostics: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.kv_position(), 1);
+        assert_eq!(
+            step.logits.shape.dims,
+            vec![1, 3],
+            "first-token logits are required"
+        );
+        for cached_prefix in [false, true] {
+            let mut session = streaming_metal_test_session();
+            if cached_prefix {
+                session
+                    .generate_next_token_sampled_resident(2, &sampling)
+                    .unwrap()
+                    .unwrap();
+            }
+            let before = session.kv_position();
+            let step = run_stream_step(
+                &mut session,
+                StreamStepRequest {
+                    resident_fast: true,
+                    input: vec![0, 1, 2],
+                    sampler: LlamaSampler::Sampling(sampling.clone()),
+                    history: Vec::new(),
+                    collect_dense_diagnostics: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                session.kv_position(),
+                before + 3,
+                "cached prefix: {cached_prefix}"
+            );
+            assert_eq!(step.prompt_token_count, 3);
+            assert_eq!(step.logits.shape.dims, vec![1, 3]);
+        }
+        let step = run_stream_step(
+            &mut control,
+            StreamStepRequest {
+                resident_fast: true,
+                input: vec![1],
+                sampler: LlamaSampler::Sampling(sampling),
+                history: Vec::new(),
+                collect_dense_diagnostics: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(control.kv_position(), 2);
+        assert!(
+            step.logits.data.is_empty(),
+            "single-token continuation stays on the GPU"
+        );
     }
 
     fn tiny_config() -> LlamaModelConfig {

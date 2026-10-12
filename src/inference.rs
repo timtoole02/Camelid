@@ -4502,8 +4502,11 @@ impl LlamaInferenceSession {
         token_id: u32,
         config: &SamplingConfig,
     ) -> Result<Option<(u32, u128)>> {
-        let metal_sampling =
-            resident_decode_metal_enabled() && resident_metal_temperature_sampling_enabled();
+        // The Metal sampling tail requires the wire stack. Without it, the
+        // lower forward omits the tail but still consumes this position's GPU KV.
+        let metal_sampling = resident_decode_metal_enabled()
+            && resident_metal_temperature_sampling_enabled()
+            && metal_seam::wire_mode_active();
         let cuda_sampling =
             resident_decode_cuda_enabled() && resident_gpu_temperature_sampling_enabled();
         if (!metal_sampling && !cuda_sampling)
@@ -4511,6 +4514,8 @@ impl LlamaInferenceSession {
             || config.top_k.is_some()
             || config.top_p.is_some_and(|p| p < 1.0)
             || config.min_p.is_some_and(|p| p > 0.0)
+            || config.typical_p.is_some_and(|p| p < 1.0)
+            || config.top_n_sigma.is_some_and(|sigma| sigma > 0.0)
             || config.presence_penalty != 0.0
             || config.frequency_penalty != 0.0
             || config.repeat_penalty != 1.0
