@@ -421,6 +421,7 @@ fn encode_linear(
     bind(encoder, &[input, &buffers.xs, &buffers.xq]);
     scalar(encoder, 3, &((rows * weight.blocks) as u32));
     dispatch(encoder, &kernels.quantize, rows * weight.blocks);
+    encoder.memory_barrier_with_resources(&[&buffers.xs, &buffers.xq]);
     bind(
         encoder,
         &[
@@ -435,6 +436,8 @@ fn encode_linear(
     scalar(encoder, 6, &(weight.outs as u32));
     scalar(encoder, 7, &(weight.blocks as u32));
     dispatch(encoder, &kernels.gemm, rows * weight.outs);
+    // Also order the quantizer's scratch reuse after this GEMM's reads.
+    encoder.memory_barrier_with_resources(&[output, &buffers.xs, &buffers.xq]);
 }
 
 fn upload_linear(
@@ -498,6 +501,17 @@ impl MetalEncoder {
             || !config.head_dim.is_multiple_of(2)
         {
             return Err("Metal encoder geometry unsupported".into());
+        }
+        // Only the pinned Nomic Q8 geometry is admitted to this internal lane.
+        if (
+            width,
+            ffn,
+            config.head_count,
+            config.head_dim,
+            config.block_count,
+        ) != (768, 3072, 12, 64, 12)
+        {
+            return Err("Metal document encoder needs the pinned Nomic geometry".into());
         }
         let kernels = Kernels::build(&device)?;
         let queue = device.new_command_queue();
@@ -675,6 +689,7 @@ impl MetalEncoder {
                 &self.kernels.rope,
                 rows * self.heads * (self.head_dim / 2),
             );
+            e.memory_barrier_with_resources(&[&b.q, &b.k, &b.v]);
             bind(
                 e,
                 &[
@@ -694,6 +709,7 @@ impl MetalEncoder {
             scalar(e, 11, &(max_len as u32));
             scalar(e, 12, &(1.0 / (self.head_dim as f32).sqrt()));
             dispatch(e, &self.kernels.attention, rows * self.heads);
+            e.memory_barrier_with_resources(&[&b.attended, &b.scores, &b.failed]);
             encode_linear(
                 e,
                 &self.kernels,
@@ -724,6 +740,7 @@ impl MetalEncoder {
             bind(e, &[&b.gate, &b.up]);
             scalar(e, 2, &((rows * self.ffn) as u32));
             dispatch(e, &self.kernels.silu, rows * self.ffn);
+            e.memory_barrier_with_resources(&[&b.gate]);
             encode_linear(e, &self.kernels, &b.gate, &layer.down, &b.hidden, b, rows);
             self.norm(
                 e,
@@ -773,6 +790,7 @@ impl MetalEncoder {
         scalar(e, 5, &(self.width as u32));
         scalar(e, 6, &self.epsilon);
         dispatch(e, &self.kernels.norm, rows);
+        e.memory_barrier_with_resources(&[input]);
     }
 
     #[cfg(test)]
@@ -869,6 +887,7 @@ mod tests {
         bind(e, &[&input, &xs, &xq]);
         scalar(e, 3, &((rows * width / 32) as u32));
         dispatch(e, &kernels.quantize, rows * width / 32);
+        e.memory_barrier_with_resources(&[&xs, &xq]);
         bind(e, &[&xs, &xq, &weight.scales, &weight.quants, &output]);
         scalar(e, 5, &(rows as u32));
         scalar(e, 6, &(outs as u32));
@@ -903,10 +922,16 @@ mod tests {
             "A long passage about invoices, exports, account eligibility and library retrieval. "
                 .repeat(45)
         ));
+        texts.push(texts.last().unwrap().clone());
         let prepared = texts
             .iter()
             .map(|text| runtime.embed_input(text).unwrap())
             .collect::<Vec<_>>();
+        assert!(
+            prepared.iter().map(|item| item.0.len()).sum::<usize>() > MAX_ROWS,
+            "test must split the batch"
+        );
+        assert!(prepared.iter().all(|item| item.0.len() <= MAX_ROWS));
         let rows = prepared[0].0.len();
         let cpu_input = CpuTensor::from_f32(
             "probe",
@@ -936,7 +961,12 @@ mod tests {
             texts.len(),
             started.elapsed().as_secs_f64()
         );
+        // Reuse a grown group's storage for ragged smaller inputs; attention
+        // strides must use the active group, never the allocation's capacity.
+        let reused = gpu.forward(&prepared[..2]).expect("reuse buffers");
+        assert_eq!(reused, hidden[..2]);
         let mut minimum = 1.0_f32;
+        let cpu_started = std::time::Instant::now();
         for ((text, (ids, _)), hidden) in texts.iter().zip(&prepared).zip(hidden) {
             let gpu = runtime
                 .output(ids.clone(), hidden)
@@ -949,6 +979,11 @@ mod tests {
             let norm: f64 = gpu.iter().map(|value| f64::from(*value).powi(2)).sum();
             assert!((norm - 1.0).abs() < 1e-6, "L2 normalization: {norm}");
         }
+        eprintln!(
+            "CPU encoder parity samples: {} chunks in {:.3}s (debug build measurement)",
+            texts.len(),
+            cpu_started.elapsed().as_secs_f64()
+        );
         eprintln!("Metal whole-vector minimum cosine: {minimum:.8}");
         assert!(minimum >= 0.9999, "minimum cosine {minimum}");
         // Exercise the same dispatch as the indexer and search, and the
