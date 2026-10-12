@@ -1044,6 +1044,19 @@ mod tests {
             runtime.embed(&texts[2], None).unwrap()
         );
         drop(occupied);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "needs CAMELID_NOMIC_GGUF and an Apple GPU"]
+    fn metal_failed_document_lane_releases_memory_and_retries_cpu() {
+        let model = std::env::var("CAMELID_NOMIC_GGUF").expect("CAMELID_NOMIC_GGUF");
+        let runtime = NomicBertRuntime::load(&model).expect("load encoder");
+        let texts =
+            ["search_document: Customers may request refunds within sixty days.".to_string()];
+        let expected = runtime.embed(&texts[0], None).unwrap();
+        let (_, lane) = runtime.embed_documents(&texts).unwrap();
+        assert_eq!(lane, super::super::EncoderLane::Metal);
         // A GPU result failure retries on the oracle, disables the lane, and
         // releases its allocations. Corrupt only a resident GPU norm vector;
         // the independent CPU model remains a valid fallback oracle.
@@ -1065,7 +1078,7 @@ mod tests {
         }
         let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
         assert_eq!(lane, super::super::EncoderLane::Cpu);
-        assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
+        assert_eq!(fallback[0], expected);
         assert!(runtime.metal.failed.load(Ordering::Acquire));
         assert!(runtime
             .metal
@@ -1079,6 +1092,6 @@ mod tests {
             .is_none());
         let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
         assert_eq!(lane, super::super::EncoderLane::Cpu);
-        assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
+        assert_eq!(fallback[0], expected);
     }
 }
