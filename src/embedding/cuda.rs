@@ -1109,13 +1109,97 @@ mod tests {
             panic!("not the Nomic encoder");
         };
         let mut encoder = CudaEncoder::build(&nomic).expect("CUDA encoder");
-        encoder.buffers = Some(encoder.take_buffers(64, 2).unwrap());
-        let buffers = encoder.take_buffers(8, 16).unwrap();
-        assert_eq!((buffers.rows, buffers.max_len), (8, 16));
-        assert_eq!(buffers.t.scores.len(), 8 * encoder.heads * 16);
+        // Actual indexing/query dimensions that previously multiplied the two
+        // high-water marks into an eight-times larger attention allocation.
+        encoder.buffers = Some(encoder.take_buffers(8192, 128).unwrap());
+        let buffers = encoder.take_buffers(1024, 1024).unwrap();
+        assert_eq!((buffers.rows, buffers.max_len), (1024, 1024));
+        assert_eq!(buffers.t.scores.len(), 1024 * encoder.heads * 1024);
         encoder.buffers = Some(buffers);
-        let buffers = encoder.take_buffers(4, 8).unwrap();
-        assert_eq!((buffers.rows, buffers.max_len), (8, 16));
+        let buffers = encoder.take_buffers(512, 256).unwrap();
+        assert_eq!((buffers.rows, buffers.max_len), (1024, 1024));
+        encoder.stream.synchronize().unwrap();
+    }
+
+    /// Run this filter in its own process: a real pooling failure deliberately
+    /// disables the process-wide encoder lane for the rest of the process.
+    #[test]
+    #[ignore = "needs CAMELID_NOMIC_GGUF, an enabled CUDA device, and an isolated test process"]
+    fn cuda_real_encoder_failure_reclaims_vram_and_preserves_cpu_fallback() {
+        let model = std::env::var("CAMELID_NOMIC_GGUF").expect("CAMELID_NOMIC_GGUF");
+        let runtime = super::super::EmbeddingRuntime::load(&model).expect("load encoder");
+        let super::super::EmbeddingRuntime::Nomic(mut nomic) = runtime else {
+            panic!("not the Nomic encoder");
+        };
+        assert!(FAILED.get().is_none(), "run this test in its own process");
+        assert!(crate::cuda::gpu_accel_enabled());
+        assert!(!disabled_by_env());
+        // Keep the primary context alive across the drop so free-memory changes
+        // measure allocations returned by Slot::embed, not context destruction.
+        let _ctx = CudaContext::new(crate::cuda::selected_device_ordinal()).unwrap();
+        let slot = Slot::default();
+        let texts = vec![
+            "search_document: Camelid indexes local documents for semantic retrieval.".to_string(),
+            "search_query: How are local documents indexed?".to_string(),
+        ];
+        let expected: Vec<_> = texts
+            .iter()
+            .map(|text| nomic.embed(text, None).expect("CPU reference"))
+            .collect();
+        let actual = slot
+            .embed(&nomic, &texts, true)
+            .expect("CUDA forward")
+            .expect("CUDA lane must execute, not fall back");
+        for (cpu, gpu) in expected.iter().zip(&actual) {
+            assert!(super::super::cosine_similarity(cpu, gpu).unwrap() >= 0.9999);
+        }
+        assert!(slot
+            .0
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_some());
+        let free_active = cudarc::driver::result::mem_get_info().unwrap().0;
+
+        // Inject a validation failure AFTER a complete real CUDA layer stack.
+        // This exercises the production slot's error/drop/sync/trim path without
+        // corrupting a device context or provoking an unrelated system-wide OOM.
+        let pooling = nomic.config.pooling;
+        nomic.config.pooling = super::super::PoolingType::None;
+        assert!(slot.embed(&nomic, &texts, true).unwrap().is_none());
+        nomic.config.pooling = pooling;
+        assert!(FAILED.get().is_some());
+        assert!(slot
+            .0
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_none());
+        let free_reclaimed = cudarc::driver::result::mem_get_info().unwrap().0;
+        let reclaimed = free_reclaimed.saturating_sub(free_active);
+        eprintln!(
+            "Nomic CUDA failure cleanup: free VRAM {} -> {} MiB; reclaimed {} MiB",
+            free_active / (1024 * 1024),
+            free_reclaimed / (1024 * 1024),
+            reclaimed / (1024 * 1024)
+        );
+        assert!(
+            reclaimed >= 64 * 1024 * 1024,
+            "encoder weights were not reclaimed"
+        );
+        assert!(slot.embed(&nomic, &texts, true).unwrap().is_none());
+        let (fallback, lane) = nomic
+            .embed_documents(&texts)
+            .expect("CPU document fallback");
+        assert_eq!(lane, super::super::EncoderLane::Cpu);
+        assert_eq!(fallback, expected);
+        assert_eq!(nomic.embed_query(&texts[1]).unwrap(), expected[1]);
     }
 
     #[test]

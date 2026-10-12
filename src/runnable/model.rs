@@ -7074,6 +7074,177 @@ mod gpu_ssm_layer_tests {
         eprintln!("qwen35_gpu_greedy: PASS (8-tok GPU==CPU, run-twice stable)");
     }
 
+    /// Real-model qualification of the sampled host-fed path across both 64-token
+    /// cancellation boundaries. Run the same filter against each Qwen3.5 quant
+    /// being qualified; CAMELID_ORNITH_GGUF is also accepted for existing runners.
+    #[test]
+    #[ignore = "needs CAMELID_QWEN35_GGUF (or CAMELID_ORNITH_GGUF) and a CUDA device"]
+    fn qwen35_gpu_sampled_segments_match_serial_and_recover_after_cancel() {
+        use std::cell::Cell;
+
+        let path = std::env::var("CAMELID_QWEN35_GGUF")
+            .or_else(|_| std::env::var("CAMELID_ORNITH_GGUF"))
+            .expect("CAMELID_QWEN35_GGUF or CAMELID_ORNITH_GGUF");
+        let model = RunnableModel::load(&path).expect("load Qwen3.5");
+        assert!(model.qwen35.is_some(), "qualification requires Qwen3.5");
+        let prompt: Vec<u32> = [3710, 369, 279, 6511, 314, 9338, 30, 220, 17, 18, 19]
+            .into_iter()
+            .cycle()
+            .take(131)
+            .collect();
+        let (&last, prior) = prompt.split_last().unwrap();
+        let mut embeddings = Vec::new();
+        let mut cos_all = Vec::new();
+        let mut sin_all = Vec::new();
+        for (position, &token) in prior.iter().enumerate() {
+            embeddings.extend_from_slice(
+                &model
+                    .token_embd
+                    .dequant_row(token as usize, "token_embd")
+                    .unwrap(),
+            );
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            cos_all.extend_from_slice(&cos);
+            sin_all.extend_from_slice(&sin);
+        }
+        let last_embedding = model
+            .token_embd
+            .dequant_row(last as usize, "token_embd")
+            .unwrap();
+        let (last_cos, last_sin) = qwen35_rope_tables(prior.len(), model.rope_base, model.rope_dim);
+        let scale = 1.0 / (model.head_dim as f32).sqrt();
+        let mut engine = model
+            .build_qwen35_resident(prompt.len() + 16)
+            .expect("CUDA engine");
+        assert!(
+            engine.supports_batched_prefill(),
+            "qualification must exercise actual resident batched prefill"
+        );
+        let prefers_batched_prefill = engine.prefers_batched_prefill();
+        eprintln!("Qwen3.5 CUDA prefers_batched_prefill={prefers_batched_prefill}");
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .unwrap();
+        let serial = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .unwrap();
+        assert_eq!(serial.len(), model.vocab);
+        assert!(serial.iter().all(|value| value.is_finite()));
+        let sampling = SamplingConfig {
+            temperature: 0.7,
+            top_k: Some(40),
+            top_p: Some(0.9),
+            seed: Some(811812),
+            ..SamplingConfig::default()
+        };
+        let sampler = LlamaSampler::Sampling(sampling.clone());
+        let mut history = prompt.clone();
+        let mut reference = Vec::new();
+        let mut logits = serial.clone();
+        for index in 0..8 {
+            let token = qwen35_sample_logits(logits, &sampler, &history).unwrap();
+            reference.push(token);
+            history.push(token);
+            if index == 7 || qwen35_repetition_loop(&reference) {
+                break;
+            }
+            let embedding = model
+                .token_embd
+                .dequant_row(token as usize, "token_embd")
+                .unwrap();
+            let position = prompt.len() + index;
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            logits = engine
+                .forward_token_logits(&embedding, &cos, &sin, position, scale)
+                .unwrap();
+        }
+
+        for batched in [false, true] {
+            engine.reset_qwen35_state().unwrap();
+            qwen35_cuda_prefill_segments(prior, &|| false, &mut |base, tokens| {
+                let end = base + tokens.len();
+                let result = if batched {
+                    engine.prefill_batched_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                } else {
+                    engine.prefill_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                };
+                result.map_err(BackendError::InvalidTensorData)
+            })
+            .unwrap();
+            let segmented = engine
+                .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+                .unwrap();
+            assert_eq!(segmented.len(), serial.len());
+            let differing = serial
+                .iter()
+                .zip(&segmented)
+                .filter(|(left, right)| left.to_bits() != right.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "batched={batched}: segmented prefill changed logits"
+            );
+        }
+
+        // Production generation must reuse and reset this same resident engine.
+        *model.cuda.lock().unwrap() = Some(engine);
+        let generate = || {
+            model
+                .generate_qwen35_cuda(
+                    &prompt,
+                    8,
+                    &[],
+                    Some(&sampling),
+                    &|| false,
+                    &|_| false,
+                    &mut |_| {},
+                )
+                .expect("sampled CUDA generation")
+        };
+        assert_eq!(
+            generate(),
+            reference,
+            "segmented sampled decode differs from serial"
+        );
+        for cancel_poll in [1, 2, 4] {
+            let polls = Cell::new(0);
+            let emitted = Cell::new(0);
+            let started = std::time::Instant::now();
+            let error = model
+                .generate_qwen35_cuda(
+                    &prompt,
+                    8,
+                    &[],
+                    Some(&sampling),
+                    &|| {
+                        polls.set(polls.get() + 1);
+                        polls.get() >= cancel_poll
+                    },
+                    &|_| false,
+                    &mut |_| emitted.set(emitted.get() + 1),
+                )
+                .unwrap_err();
+            let cancellation_elapsed = started.elapsed();
+            assert!(matches!(error, BackendError::Cancelled), "{error}");
+            assert_eq!(polls.get(), cancel_poll);
+            assert_eq!(emitted.get(), 0, "cancelled prefill emitted a token");
+            let recovery_started = std::time::Instant::now();
+            assert_eq!(
+                generate(),
+                reference,
+                "cancelled state leaked into the next request"
+            );
+            let recovery_elapsed = recovery_started.elapsed();
+            eprintln!(
+                "sampled CUDA cancel poll {cancel_poll}: cancelled in {cancellation_elapsed:?}; recovery request {recovery_elapsed:?}"
+            );
+        }
+        eprintln!(
+            "Qwen3.5 CUDA sampled qualification: 131 prompt tokens, bitwise serial/segmented logits, tokens {reference:?}, 3 cancellation/reuse checks passed"
+        );
+    }
+
     /// Decode tok/s benchmark, GPU resident lane vs CPU runnable lane, same Q4_K_M
     /// model. Two-point timing ((t_hi - t_lo) over (n_hi - n_lo) generated tokens)
     /// cancels the per-call prompt prefill + model-load + GPU build, leaving the

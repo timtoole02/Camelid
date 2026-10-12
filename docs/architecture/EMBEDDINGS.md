@@ -276,6 +276,29 @@ the row count retained from a large indexing batch. A search never waits behind
 an indexing batch. Set `CAMELID_DOCUMENT_GPU_ENCODER=0` to keep
 the encoder on the CPU.
 
+The CUDA allocation and failure gates require the Nomic Q8_0 artifact, a usable
+NVIDIA device, and NVRTC. Run each command separately: the failure test
+intentionally disables the CUDA encoder for its entire process. Keep other GPU
+work idle while measuring reclaimed VRAM.
+
+```sh
+CAMELID_NOMIC_GGUF=/path/to/nomic-embed-text-v1.5.Q8_0.gguf \
+  cargo test --release --locked --features cuda --lib \
+  cuda_buffer_replacement_uses_the_requested_shape \
+  -- --ignored --nocapture --test-threads=1
+
+CAMELID_NOMIC_GGUF=/path/to/nomic-embed-text-v1.5.Q8_0.gguf \
+  cargo test --release --locked --features cuda --lib \
+  cuda_real_encoder_failure_reclaims_vram_and_preserves_cpu_fallback \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The first gate checks actual `8192 x 128` indexing buffers replaced by
+`1024 x 1024` query buffers. The second compares real CPU/CUDA vectors, injects
+a pooling failure after GPU execution, checks that the encoder releases at
+least 64 MiB, and verifies document/query CPU fallback against the original
+vectors. These ignored tests fail when the requested CUDA lane is unavailable.
+
 On Apple GPUs with unified memory, `src/embedding/metal.rs` provides the
 document-indexing and query lane. It keeps the Q8 layer weights and reusable
 activation buffers on the GPU and groups up to 1,024 tokens without padding

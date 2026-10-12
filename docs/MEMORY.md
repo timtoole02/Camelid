@@ -117,3 +117,21 @@ before **Remember**, the origin of each memory, memories reaching the next
 request, cancellation by the next message, the per-chat switch, the plain-request
 fallback, the **Look for things to remember** button for a slow model, and that
 saved notes never reach the model.
+
+The Qwen3.5 CUDA cancellation gate requires a resident-capable model such as
+Qwen3.5-0.8B-Q8_0, a usable NVIDIA device, and NVRTC:
+
+```sh
+CAMELID_QWEN35_GGUF=/path/to/Qwen3.5-0.8B-Q8_0.gguf \
+  cargo test --release --locked --features cuda --lib \
+  qwen35_gpu_sampled_segments_match_serial_and_recover_after_cancel \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This ignored gate compares serial and segmented prefill logits bit for bit
+across a 131-token prompt, checks seeded sampled output, and cancels before
+prefill, after one segment, and before final-token logits. Every cancelled
+request must emit no tokens, and the same engine must reproduce the reference
+output on the next request. The test requires actual batched-prefill support,
+prints the selected prefill policy, and reports cancellation and recovery
+durations separately. Poll counts define correctness; timings are diagnostic.
