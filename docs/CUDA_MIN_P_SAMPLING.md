@@ -3,7 +3,8 @@
 `CAMELID_CUDA_MIN_P_SAMPLING=1` enables a resident CUDA sampling tail for
 `0 < min_p <= 1` with the default candidate floor (`min_keep` absent or one).
 It requires the existing CUDA resident decode and temperature sampling
-lanes. The new tail is disabled by default pending full-model NVIDIA qualification.
+lanes. The new tail is disabled by default; qualification is scoped to the
+specific GPU, model, and configuration tested.
 macOS continues to use its CPU sampler for min-p and its existing Metal paths.
 
 The tail filters the untempered logits, then applies temperature and a seeded
@@ -84,6 +85,42 @@ boundary, checks seeded replay through the public sampling entry point, and
 verifies unsupported filters decline before touching the input token or KV.
 This fixture gate does not replace qualification with a full GGUF model.
 
+The full-model gate loads every layer and weight from a dense Llama Q8_0 GGUF and
+bounds the KV allocation to 256 positions. It runs contiguous, paged, and
+two-layer CPU-prefix modes in separate processes. It fails when the model or
+CUDA device is missing, or when the device sampling tail is never exercised:
+
+```sh
+CAMELID_MIN_P_GGUF=/path/Llama-3.2-1B-Instruct-Q8_0.gguf \
+  cargo test --release --locked --features cuda --lib cuda_min_p_full_gguf_qualification -- --ignored --nocapture --test-threads=1
+```
+
+For each mode it checks nine forced boundary fallbacks (`min_p=1` and a tiny
+normalized threshold) interleaved with ordinary device samples across a 16-token
+page boundary, comparing the logits and full KV history with an independent
+ordinary forward. The tiny-threshold cases retain multiple candidates and check
+advancing seeded CPU draws. It then checks 36 full general
+sampler results against the CPU reference, covering a candidate floor of four
+and combined top-k/top-p/min-p filters. Three autoregressive 24-token requests
+check same-seed replay, changed-seed output, and all 72 emitted tokens against
+the CPU sampler's retained support on independently replayed logits. It also
+checks complete KV equality after every request. The test prints one
+`camelid.cuda-min-p-gguf/v1` JSON receipt per mode, including token streams,
+execution counts, and assertions. Capture those receipts with the source
+revision, model SHA256, and host GPU/driver/NVRTC versions.
+
+Optionally set `CAMELID_MIN_P_BENCH=1` and use `--release` to add a warmed
+matched-input timing section to each receipt. Five paired trials alternate the
+ordinary CUDA-logits/CPU-sampler arm and the CUDA min-p-tail arm. Every arm warms
+eight positions, then measures the same 64 input tokens at the same positions
+and seed. The timer covers synchronized forward plus sampling; model loading,
+JIT, session creation, warmup, assertions, and KV recovery are excluded. Mandatory
+forward work, including the CPU-prefix lane's eager KV mirror, remains timed.
+Receipts include per-token latencies, each trial's mean, the median/minimum/maximum trial
+means, and device/CPU draw counts. There is no performance pass threshold or
+implied speedup, and the result applies only to the measured model, GPU, and
+configuration.
+
 In PowerShell, set required mode before running the same Cargo commands without
 their shell prefixes:
 
@@ -93,6 +130,8 @@ cargo test --locked --features cuda --lib min_p_sampler -- --ignored --nocapture
 cargo test --locked --features cuda --lib sampling_uniform_endpoint_stays_finite_in_both_kernels -- --ignored --nocapture
 cargo test --locked --features cuda --lib gumbel_sampler_matches_stateless_reference -- --ignored --nocapture
 cargo test --locked --features cuda --lib cuda_min_p_model_tails_preserve_fallback_kv_and_seeded_replay -- --ignored --nocapture --test-threads=1
+$env:CAMELID_MIN_P_GGUF = 'C:\models\Llama-3.2-1B-Instruct-Q8_0.gguf'
+cargo test --release --locked --features cuda --lib cuda_min_p_full_gguf_qualification -- --ignored --nocapture --test-threads=1
 ```
 
 ## NVIDIA fixture qualification (2026-10-12)
@@ -112,6 +151,9 @@ Windows x86-64, RTX 3060 Laptop GPU (6 GiB, compute capability 8.6), driver
   unsupported rows, and parsed every sampling kernel body.
 - Formatting and diff checks passed.
 
-These results qualify the kernels and deterministic fixture on this GPU. Full
-GGUF request/decode qualification and throughput measurements remain pending;
-the opt-in stays disabled by default.
+These results cover the kernels and deterministic fixture on this GPU. The
+full-GGUF gate above separately checks model execution and can emit warmed
+timing receipts. See [PR #811](https://github.com/timtoole02/Camelid/pull/811)
+for source revisions, model hashes, qualification status, and measured timing
+summaries. These results do not establish
+a new model support tier or qualify other GPUs; the opt-in remains off by default.

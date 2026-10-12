@@ -836,3 +836,470 @@ fn cuda_min_p_model_tails_preserve_fallback_kv_and_seeded_replay() {
     );
     println!("\n{COMPLETED}");
 }
+
+fn min_p_gguf_history(session: &mut LlamaInferenceSession, route: &str) -> Vec<u32> {
+    if route != "cpu-prefix" {
+        assert!(session
+            .recover_cpu_kv_from_cuda_resident(session.kv_position())
+            .unwrap());
+    }
+    assert!(session.cpu_kv_authoritative());
+    let dims = DenseLlamaDims::from_config(&session.config).unwrap();
+    let mut result = Vec::new();
+    let mut row = vec![0.0; dims.head_dim];
+    for layer in 0..dims.block_count {
+        for position in 0..session.kv_position() {
+            for head in 0..dims.attention_head_count_kv {
+                session
+                    .kv_cache
+                    .copy_key_row_into(layer, position, head, &mut row);
+                result.extend(row.iter().map(|value| value.to_bits()));
+                session
+                    .kv_cache
+                    .copy_value_row_into(layer, position, head, &mut row);
+                result.extend(row.iter().map(|value| value.to_bits()));
+            }
+        }
+    }
+    result
+}
+
+fn min_p_gguf_assert_support(logits: &CpuTensor, config: &SamplingConfig, token: u32) {
+    assert!(
+        sampling_weights_with_config(logits, config, &[])
+            .unwrap()
+            .iter()
+            .any(|(candidate, weight)| *candidate == token as usize && *weight > 0.0),
+        "sampled token {token} must belong to the CPU sampler's retained support"
+    );
+}
+
+fn min_p_gguf_benchmark(
+    model_config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    route: &str,
+    prompt: &[u32],
+    config: &SamplingConfig,
+) -> serde_json::Value {
+    const WARM: usize = 8;
+    const MEASURED: usize = 64;
+    const TRIALS: usize = 5;
+    let inputs: Vec<_> = prompt
+        .iter()
+        .copied()
+        .cycle()
+        .take(WARM + MEASURED)
+        .collect();
+    let mut trials = Vec::new();
+    let mut mean_token_us = [Vec::new(), Vec::new()];
+    let mut device_samples = [0_usize; 2];
+    let mut cpu_samples = [0_usize; 2];
+    for trial in 0..TRIALS {
+        // Alternate which arm runs first to reduce ordering/thermal bias.
+        for device_tail in if trial % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let arm = usize::from(device_tail);
+            let mut session =
+                LlamaInferenceSession::new(model_config.clone(), weights.clone()).unwrap();
+            for &input in &inputs[..WARM] {
+                let output =
+                    min_p_model_forward(&mut session, input, device_tail.then_some(config));
+                session
+                    .finish_resident_temperature_sample(output, config, true)
+                    .unwrap()
+                    .unwrap();
+            }
+            min_p_model_assert_position(&mut session, route, WARM);
+            let mut token_us = Vec::with_capacity(MEASURED);
+            let mut trial_device_samples = 0;
+            let mut trial_cpu_samples = 0;
+            for &input in &inputs[WARM..] {
+                // Both arms consume the same token at the same context position.
+                // Loading, JIT, warmup, bookkeeping and KV verification are all
+                // outside this timer. Each forward synchronizes its result.
+                let started = std::time::Instant::now();
+                let output =
+                    min_p_model_forward(&mut session, input, device_tail.then_some(config));
+                let sampled_on_device = matches!(&output, ResidentForward::Sampled(_));
+                session
+                    .finish_resident_temperature_sample(output, config, true)
+                    .unwrap()
+                    .unwrap();
+                let elapsed = started.elapsed();
+                token_us.push(elapsed.as_secs_f64() * 1_000_000.0);
+                trial_device_samples += usize::from(sampled_on_device);
+                trial_cpu_samples += usize::from(!sampled_on_device);
+            }
+            min_p_model_assert_position(&mut session, route, inputs.len());
+            let total_us = token_us.iter().sum::<f64>();
+            mean_token_us[arm].push(total_us / MEASURED as f64);
+            device_samples[arm] += trial_device_samples;
+            cpu_samples[arm] += trial_cpu_samples;
+            trials.push(serde_json::json!({
+                "trial": trial + 1,
+                "arm": if device_tail { "cuda_min_p_tail" } else { "cuda_logits_cpu_sampler" },
+                "measured_tokens": MEASURED,
+                "total_forward_and_sample_ms": total_us / 1_000.0,
+                "token_latency_us": token_us,
+                "device_samples": trial_device_samples,
+                "cpu_samples": trial_cpu_samples,
+            }));
+        }
+    }
+    let summaries: Vec<_> = mean_token_us
+        .iter()
+        .enumerate()
+        .map(|(arm, means)| {
+            let mut sorted = means.clone();
+            sorted.sort_by(f64::total_cmp);
+            serde_json::json!({
+                "arm": if arm == 1 { "cuda_min_p_tail" } else { "cuda_logits_cpu_sampler" },
+                "mean_token_us_by_trial": means,
+                "median_mean_token_us": sorted[TRIALS / 2],
+                "minimum_mean_token_us": sorted[0],
+                "maximum_mean_token_us": sorted[TRIALS - 1],
+                "measured_tokens": TRIALS * MEASURED,
+                "device_samples": device_samples[arm],
+                "cpu_samples": cpu_samples[arm],
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "mode": "warmed_matched_input_forward_and_sample",
+        "timing_scope": "synchronized forward and sampling only; excludes load, JIT, warmup, session creation, assertions and KV recovery",
+        "warm_positions": WARM,
+        "measured_positions": MEASURED,
+        "paired_trials": TRIALS,
+        "alternating_arm_order": true,
+        "input_ids": inputs,
+        "seed": config.seed,
+        "temperature": config.temperature,
+        "min_p": config.min_p,
+        "summaries": summaries,
+        "trials": trials,
+    })
+}
+
+#[test]
+#[ignore = "requires CAMELID_MIN_P_GGUF and CUDA; runs full GGUF lanes in isolated subprocesses"]
+fn cuda_min_p_full_gguf_qualification() {
+    const CHILD_ENV: &str = "CAMELID_TEST_MIN_P_GGUF_ROUTE";
+    const COMPLETED: &str = "CUDA_MIN_P_GGUF_ASSERTIONS_PASSED";
+    let model = std::env::var_os("CAMELID_MIN_P_GGUF")
+        .map(std::path::PathBuf::from)
+        .expect("set CAMELID_MIN_P_GGUF to a complete dense Llama Q8_0 GGUF");
+    assert!(model.is_file(), "GGUF does not exist: {}", model.display());
+    let Ok(route) = std::env::var(CHILD_ENV) else {
+        for route in ["contiguous", "paged", "cpu-prefix"] {
+            eprintln!("Starting full GGUF min-p qualification: {route}");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inference::cuda_cpu_prefix::integration_tests::cuda_min_p_full_gguf_qualification",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, route)
+                .env(PREFIX_ENV, if route == "cpu-prefix" { "2" } else { "0" })
+                .env("CAMELID_CUDA_PAGED_KV", if route == "paged" { "1" } else { "0" })
+                .env("CAMELID_CUDA_RESIDENT_DECODE", "1")
+                .env("CAMELID_GPU_TEMP_SAMPLING", "1")
+                .env("CAMELID_CUDA_MIN_P_SAMPLING", "1")
+                .env("CAMELID_CUDA_Q8", "0")
+                .env("CAMELID_DETERMINISTIC", "0")
+                .env("CAMELID_CUDA_TWO_SEQUENCE_KV", "0")
+                .env("CAMELID_CUDA_SEQUENCE_SLOTS", "1")
+                .env("CAMELID_CUDA_TRUE_BATCH2", "0")
+                .env("CAMELID_CUDA_TRUE_BATCH", "0")
+                .output()
+                .expect("launch full GGUF qualification subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{route} GGUF qualification failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.lines().any(|line| line == COMPLETED),
+                "{route} did not execute its assertions\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            for line in stdout.lines().filter(|line| line.starts_with('{')) {
+                println!("{line}");
+            }
+        }
+        return;
+    };
+    assert!(["contiguous", "paged", "cpu-prefix"].contains(&route.as_str()));
+    assert!(
+        crate::cuda::is_available(),
+        "a usable CUDA device is required"
+    );
+    crate::cuda::set_gpu_accel_enabled(true);
+    crate::cuda::set_runtime_enabled(false);
+    assert!(resident_decode_cuda_enabled());
+
+    let gguf = crate::gguf::read_metadata(&model).expect("read full GGUF metadata");
+    let mut model_config = LlamaModelConfig::from_gguf(&gguf).expect("dense model config");
+    assert_eq!(
+        model_config.architecture, "llama",
+        "the three-route gate requires Llama because paged KV currently admits only Llama"
+    );
+    // Bound only KV allocation, retaining every original model layer and weight.
+    model_config.context_length = 256;
+    model_config.kv_quant = crate::model::KvCacheQuantization::F16;
+    let binding = crate::model::LlamaTensorBinding::bind(&gguf, &model_config).unwrap();
+    let store = crate::tensor::TensorStore::open(&model, &gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None).unwrap());
+    let tokenizer = crate::tokenizer::Tokenizer::from_gguf(&gguf).unwrap();
+    let prompt = tokenizer
+        .encode("Once upon a time, there was", true, false)
+        .unwrap();
+    assert!(!prompt.is_empty() && prompt.len() < 32);
+    let session = || LlamaInferenceSession::new(model_config.clone(), weights.clone()).unwrap();
+    let config = SamplingConfig {
+        temperature: 1.1,
+        min_p: Some(0.05),
+        seed: Some(27),
+        ..SamplingConfig::default()
+    };
+
+    // Compare every position against an ordinary logits-returning CUDA forward.
+    // Eighteen real tokenizer IDs cross a page boundary in the paged lane.
+    let inputs: Vec<u32> = prompt.iter().copied().cycle().take(18).collect();
+    let mut reference = session();
+    let mut reference_logits = Vec::new();
+    for (position, &input) in inputs.iter().enumerate() {
+        let ResidentForward::Logits(logits) = min_p_model_forward(&mut reference, input, None)
+        else {
+            panic!("reference forward must return logits");
+        };
+        assert!(logits.data.iter().all(|value| value.is_finite()));
+        reference.kv_cache.position += 1;
+        min_p_model_assert_position(&mut reference, &route, position + 1);
+        reference_logits.push(logits);
+    }
+    let reference_history = min_p_gguf_history(&mut reference, &route);
+    drop(reference);
+
+    // Alternate forced boundary fallbacks and ordinary device draws. Tiny
+    // thresholds retain multiple candidates, so fallback seed progression is
+    // observable instead of testing only a p=1 argmax. Position 15 falls back
+    // and position 16 starts a new KV page.
+    let mut fallback = session();
+    let mut boundary_fallbacks = 0;
+    let mut device_samples = 0;
+    for (position, (&input, expected)) in inputs.iter().zip(&reference_logits).enumerate() {
+        let boundary = SamplingConfig {
+            min_p: Some(match position % 4 {
+                1 => 1.0,
+                3 => f32::MIN_POSITIVE,
+                _ => 0.05,
+            }),
+            ..config.clone()
+        };
+        let output = min_p_model_forward(&mut fallback, input, Some(&boundary));
+        if position % 2 == 1 {
+            let ResidentForward::Logits(actual) = &output else {
+                panic!("boundary fallback must return the existing logits for CPU sampling");
+            };
+            assert_eq!(actual.data, expected.data, "boundary logits at {position}");
+            boundary_fallbacks += 1;
+            if position % 4 == 3 {
+                assert!(
+                    sampling_weights_with_config(expected, &boundary, &[])
+                        .unwrap()
+                        .len()
+                        > 1
+                );
+            }
+        } else {
+            device_samples += usize::from(matches!(&output, ResidentForward::Sampled(_)));
+        }
+        let token = fallback
+            .finish_resident_temperature_sample(output, &boundary, true)
+            .unwrap()
+            .unwrap();
+        min_p_gguf_assert_support(expected, &boundary, token);
+        if position % 2 == 1 {
+            assert_eq!(
+                token,
+                sample_with_config(expected, &boundary, &inputs[..=position]).unwrap()
+            );
+        }
+        min_p_model_assert_position(&mut fallback, &route, position + 1);
+    }
+    assert_eq!(boundary_fallbacks, 9);
+    assert!(
+        device_samples > 0,
+        "full model must execute device min-p draws"
+    );
+    assert_eq!(min_p_gguf_history(&mut fallback, &route), reference_history);
+    drop(fallback);
+
+    // Exercise the real general-generation fallback, not only the admission
+    // predicate: it must consume one row and agree with the CPU sampler on the
+    // independently captured reference logits, including its advancing seed.
+    let mut general_samples = 0;
+    for unsupported in [
+        SamplingConfig {
+            min_p: Some(1.0),
+            min_keep: Some(4),
+            ..config.clone()
+        },
+        SamplingConfig {
+            top_k: Some(32),
+            top_p: Some(0.8),
+            min_p: Some(0.2),
+            min_keep: Some(2),
+            ..config.clone()
+        },
+    ] {
+        let mut general = session();
+        for (position, (&input, expected)) in inputs.iter().zip(&reference_logits).enumerate() {
+            assert!(general
+                .generate_next_token_sampled_resident(u32::MAX, &unsupported)
+                .unwrap()
+                .is_none());
+            assert_eq!(general.kv_position(), position);
+            let step = general
+                .generate_next_token_with_history_diagnostics(
+                    &[input],
+                    LlamaSampler::Sampling(unsupported.clone()),
+                    &inputs[..=position],
+                    false,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                step.logits.data, expected.data,
+                "general logits at {position}"
+            );
+            assert_eq!(
+                step.next_token_id,
+                sample_with_config(expected, &unsupported, &inputs[..=position]).unwrap()
+            );
+            if unsupported.min_p == Some(1.0) {
+                assert!(
+                    sampling_weights_with_config(expected, &unsupported, &[])
+                        .unwrap()
+                        .len()
+                        >= 4
+                );
+            }
+            min_p_model_assert_position(&mut general, &route, position + 1);
+            general_samples += 1;
+        }
+        assert_eq!(min_p_gguf_history(&mut general, &route), reference_history);
+    }
+
+    // Real autoregressive requests: generated tokens feed subsequent forwards.
+    // The first request exposes the internal tail for execution counting; its
+    // same-seed replay and the changed-seed request use the public fast entry.
+    let mut streams = Vec::new();
+    let mut autoregressive_device_samples = 0;
+    let mut supported_samples = 0;
+    for (request, seed) in [27, 27, 83].into_iter().enumerate() {
+        let request_config = SamplingConfig {
+            seed: Some(seed),
+            ..config.clone()
+        };
+        let mut generated = session();
+        for &input in &prompt[..prompt.len() - 1] {
+            min_p_model_forward(&mut generated, input, None);
+            generated.kv_cache.position += 1;
+        }
+        let mut input = *prompt.last().unwrap();
+        let mut tokens = Vec::new();
+        for _ in 0..24 {
+            let token = if request == 0 {
+                let output = min_p_model_forward(&mut generated, input, Some(&request_config));
+                autoregressive_device_samples +=
+                    usize::from(matches!(&output, ResidentForward::Sampled(_)));
+                generated
+                    .finish_resident_temperature_sample(output, &request_config, true)
+                    .unwrap()
+                    .unwrap()
+            } else {
+                generated
+                    .generate_next_token_sampled_resident(input, &request_config)
+                    .unwrap()
+                    .expect("public resident min-p request must execute")
+                    .0
+            };
+            tokens.push(token);
+            input = token;
+            min_p_model_assert_position(&mut generated, &route, prompt.len() + tokens.len() - 1);
+        }
+        let generated_history = min_p_gguf_history(&mut generated, &route);
+        drop(generated);
+
+        // Replay the exact consumed inputs through the ordinary logits path,
+        // checking the CPU's retained support for every emitted device token.
+        let mut oracle = session();
+        let consumed: Vec<_> = prompt
+            .iter()
+            .chain(&tokens[..tokens.len() - 1])
+            .copied()
+            .collect();
+        for (position, &input) in consumed.iter().enumerate() {
+            let ResidentForward::Logits(logits) = min_p_model_forward(&mut oracle, input, None)
+            else {
+                panic!("autoregressive oracle must return logits");
+            };
+            oracle.kv_cache.position += 1;
+            if position + 1 >= prompt.len() {
+                min_p_gguf_assert_support(
+                    &logits,
+                    &request_config,
+                    tokens[position + 1 - prompt.len()],
+                );
+                supported_samples += 1;
+            }
+        }
+        assert_eq!(min_p_gguf_history(&mut oracle, &route), generated_history);
+        streams.push(tokens);
+    }
+    assert!(autoregressive_device_samples > 0);
+    assert_eq!(
+        streams[0], streams[1],
+        "same seed must replay the entire request"
+    );
+    assert_ne!(
+        streams[0], streams[2],
+        "changed seed must change the request"
+    );
+    let mut receipt = serde_json::json!({
+        "schema": "camelid.cuda-min-p-gguf/v1",
+        "model": model.file_name().unwrap().to_string_lossy(),
+        "architecture": model_config.architecture,
+        "layers": model_config.block_count,
+        "vocab": model_config.vocab_size,
+        "route": route,
+        "context_capacity": 256,
+        "prompt_ids": prompt,
+        "fixed_input_positions": inputs.len(),
+        "boundary_fallbacks": boundary_fallbacks,
+        "fixed_input_device_samples": device_samples,
+        "general_sampler_reference_matches": general_samples,
+        "autoregressive_device_samples": autoregressive_device_samples,
+        "autoregressive_support_matches": supported_samples,
+        "seeds": [27, 27, 83],
+        "generated_tokens": streams,
+        "same_seed_replay": true,
+        "changed_seed_changes_output": true,
+        "complete_kv_history_matches": true,
+        "one_kv_row_per_forward": true,
+        "passed": true,
+    });
+    if std::env::var("CAMELID_MIN_P_BENCH").as_deref() == Ok("1") {
+        receipt["performance"] =
+            min_p_gguf_benchmark(&model_config, &weights, &route, &prompt, &config);
+    }
+    println!("\n{receipt}");
+    println!("{COMPLETED}");
+}
