@@ -36,10 +36,10 @@ const DISABLE_ENV: &str = "CAMELID_DOCUMENT_SEMANTIC";
 /// Chunks per encoder call. Small batches keep the database lock free for
 /// searches between batches.
 const INDEX_BATCH: usize = 16;
-/// Chunks per encoder call once a batch has run on CUDA. A GPU forward over
+/// Chunks per encoder call once a batch has run on CUDA or Metal. A GPU forward over
 /// many chunks costs little more than over a few, and the database lock is
 /// only held around reading and storing a batch, not while it is embedded.
-const CUDA_INDEX_BATCH: usize = 128;
+const GPU_INDEX_BATCH: usize = 128;
 
 /// The cosine similarity below which a library-wide search leaves a passage
 /// out. It rises with the library's indexed chunks, because the best chance
@@ -784,7 +784,7 @@ fn index_pending(encoder: &Encoder) -> Result<usize, String> {
                 .map_err(|error| format!("chunk embedding failed: {error}"))?;
             record_lane(lane);
             batch_size = match lane {
-                EncoderLane::Cuda => CUDA_INDEX_BATCH,
+                EncoderLane::Cuda | EncoderLane::Metal => GPU_INDEX_BATCH,
                 EncoderLane::Cpu => INDEX_BATCH,
             };
             vectors
@@ -828,13 +828,14 @@ fn has_pending() -> bool {
 
 static INDEXING: AtomicBool = AtomicBool::new(false);
 
-/// The lane of the most recent indexing batch: 0 none yet, 1 CPU, 2 CUDA.
+/// The lane of the most recent indexing batch: 0 none yet, 1 CPU, 2 CUDA, 3 Metal.
 static LAST_LANE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn record_lane(lane: EncoderLane) {
     let value = match lane {
         EncoderLane::Cpu => 1,
         EncoderLane::Cuda => 2,
+        EncoderLane::Metal => 3,
     };
     LAST_LANE.store(value, Ordering::Release);
 }
@@ -843,6 +844,7 @@ fn last_lane() -> Option<&'static str> {
     match LAST_LANE.load(Ordering::Acquire) {
         1 => Some(EncoderLane::Cpu.as_str()),
         2 => Some(EncoderLane::Cuda.as_str()),
+        3 => Some(EncoderLane::Metal.as_str()),
         _ => None,
     }
 }
@@ -922,7 +924,7 @@ pub struct SemanticIndexStatus {
     pub message: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Where the latest batch of chunk vectors was computed: `cpu` or `cuda`.
+    /// Where the latest batch of chunk vectors was computed: `cpu`, `cuda`, or `metal`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lane: Option<&'static str>,
 }

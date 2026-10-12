@@ -21,6 +21,8 @@ use crate::{BackendError, Result};
 
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(target_os = "macos")]
+mod metal;
 
 const NOMIC_BERT_ARCH: &str = "nomic-bert";
 const MAX_BATCH_INPUTS: usize = 256;
@@ -187,6 +189,8 @@ pub struct NomicBertRuntime {
     /// The CUDA layer stack used for document indexing, built on first use.
     #[cfg(feature = "cuda")]
     cuda: cuda::Slot,
+    #[cfg(target_os = "macos")]
+    metal: metal::Slot,
 }
 
 /// API-facing embedding runtime. The enum keeps the established Nomic encoder
@@ -202,6 +206,7 @@ pub enum EmbeddingRuntime {
 pub enum EncoderLane {
     Cpu,
     Cuda,
+    Metal,
 }
 
 impl EncoderLane {
@@ -209,6 +214,7 @@ impl EncoderLane {
         match self {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
+            Self::Metal => "metal",
         }
     }
 }
@@ -279,7 +285,7 @@ impl EmbeddingRuntime {
         }
     }
 
-    /// One search query for the document index: on the Nomic encoder's CUDA
+    /// One search query for the document index: on the Nomic encoder's GPU
     /// lane when it is free, so the query is embedded like the indexed chunks
     /// were, otherwise as [`Self::embed`].
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
@@ -290,7 +296,7 @@ impl EmbeddingRuntime {
     }
 
     /// [`Self::embed_batch`] for the document index, which may run the Nomic
-    /// encoder on CUDA. Reports which lane produced the vectors.
+    /// encoder on CUDA or Metal. Reports which lane produced the vectors.
     pub fn embed_documents(&self, inputs: &[String]) -> Result<(Vec<Vec<f32>>, EncoderLane)> {
         match self {
             Self::Nomic(runtime) => runtime.embed_documents(inputs),
@@ -752,6 +758,8 @@ impl NomicBertRuntime {
             layers,
             #[cfg(feature = "cuda")]
             cuda: cuda::Slot::default(),
+            #[cfg(target_os = "macos")]
+            metal: metal::Slot::default(),
         })
     }
 
@@ -803,9 +811,15 @@ impl NomicBertRuntime {
         })
     }
 
-    /// One document-search query. Uses the CUDA lane only if it is not busy with
+    /// One document-search query. Uses the GPU lane only if it is not busy with
     /// an indexing batch, so a search never waits behind one.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(mut vectors) = self.metal.embed(self, &[text.to_string()], false)? {
+            if let Some(vector) = vectors.pop() {
+                return Ok(vector);
+            }
+        }
         #[cfg(feature = "cuda")]
         if let Some(mut vectors) =
             self.cuda
@@ -818,11 +832,16 @@ impl NomicBertRuntime {
         self.embed(text, None)
     }
 
-    /// Embed documents for the document index: on the CUDA layer stack when GPU
+    /// Embed documents for the document index: on the GPU layer stack when GPU
     /// acceleration is on and the lane builds, otherwise as [`Self::embed_batch`].
-    /// Any CUDA failure falls back to the CPU for that batch and turns the lane
-    /// off for the rest of the process.
+    /// GPU execution failures fall back to the CPU and disable the failed lane.
     pub fn embed_documents(&self, inputs: &[String]) -> Result<(Vec<Vec<f32>>, EncoderLane)> {
+        #[cfg(target_os = "macos")]
+        if !inputs.is_empty() && inputs.len() <= MAX_BATCH_INPUTS {
+            if let Some(vectors) = self.metal.embed(self, inputs, true)? {
+                return Ok((vectors, EncoderLane::Metal));
+            }
+        }
         #[cfg(feature = "cuda")]
         if !inputs.is_empty() && inputs.len() <= MAX_BATCH_INPUTS {
             if let Some(vectors) = self.cuda.embed(self, inputs, true)? {

@@ -268,7 +268,28 @@ host with an L4 a 114,083-chunk library indexed in 1,465 s, against 0.37 chunks
 a second on the CPU (`qa/evidence-bundles/semantic-index-cuda-20261011`). Any
 CUDA failure falls back to the CPU for the rest of the process; a search never
 waits behind an indexing batch. Set `CAMELID_DOCUMENT_GPU_ENCODER=0` to keep
-the encoder on the CPU. Metal is not covered yet.
+the encoder on the CPU.
+
+On Apple GPUs with unified memory, `src/embedding/metal.rs` provides the
+document-indexing and query lane. It keeps the Q8 layer weights and reusable
+activation buffers on the GPU and groups up to 1,024 tokens without padding
+or mixing attention across documents. Longer individual inputs use the CPU.
+Metal has no f64 arithmetic: residual LayerNorm uses compensated f32 sums,
+so complete vectors are checked for cosine agreement with the CPU rather
+than claimed bit-identical. Tokenization, embedding rows, initial LayerNorm,
+and pooling use the CPU implementation. Metal execution errors disable that
+encoder's GPU lane and retry on the CPU; the same GPU switch and environment
+opt-out apply. `/v1/embeddings` remains the supported CPU lane.
+
+The Metal kernel test runs on macOS without model files. The real-artifact
+parity test checks exact Q8 projection bits, complete-vector cosine >= 0.9999,
+finite unit vectors, index/query dispatch, and CPU opt-out:
+
+```sh
+CAMELID_NOMIC_GGUF=/path/to/nomic-embed-text-v1.5.Q8_0.gguf \
+  cargo test --lib embedding::metal::tests::metal_document_vectors_match_the_cpu \
+  -- --ignored --nocapture --test-threads=1
+```
 
 The library's vectors are decoded once and kept in memory (4 bytes per
 dimension per chunk) until a chunk or vector changes; SQLite triggers on both
