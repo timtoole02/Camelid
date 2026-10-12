@@ -3729,6 +3729,11 @@ fn kernels() -> Option<CudaResidentKernels> {
                      {error}"
                 ),
                 Err(_) => {
+                    assert!(
+                        std::env::var("CAMELID_REQUIRE_CUDA_TESTS").as_deref() != Ok("1"),
+                        "CAMELID_REQUIRE_CUDA_TESTS=1 requires a usable CUDA device \
+                         (ordinal {ordinal}): {error}"
+                    );
                     eprintln!("skip: no usable CUDA device (ordinal {ordinal}): {error}");
                     None
                 }
@@ -4640,7 +4645,7 @@ fn gumbel_sampler_matches_stateless_reference() {
         return;
     };
     // With identical logits Gumbel-max selects the largest uniform draw. Compare
-    // the exact 24-bit SplitMix64 value instead of CPU/GPU log implementations,
+    // the rounded, endpoint-clamped SplitMix64 uniform instead of CPU/GPU logs,
     // which proves the RNG, seed plumbing, reduction, and tie-break independently
     // of libm approximation differences.
     let n = 4096usize;
@@ -4649,14 +4654,10 @@ fn gumbel_sampler_matches_stateless_reference() {
     let mut didx = k.stream.alloc_zeros::<u32>(1).unwrap();
     let mut sampled = Vec::new();
     for seed in [0u64, 1, 7, 42, u32::MAX as u64, u64::MAX] {
-        let mut best_uniform = 0u32;
+        let mut best_uniform = 0.0f32;
         let mut expected = 0usize;
         for idx in 0..n {
-            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            let uniform = (z >> 40) as u32;
+            let uniform = sampling_reference_uniform(seed, idx);
             if uniform > best_uniform {
                 best_uniform = uniform;
                 expected = idx;
@@ -4676,6 +4677,327 @@ fn gumbel_sampler_matches_stateless_reference() {
         sampled.len() > 1,
         "different seeds should not collapse to one sampled token"
     );
+}
+
+fn sampling_reference_uniform(seed: u64, index: usize) -> f32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (((z >> 40) as f32 + 0.5) / 16_777_216.0).min(f32::from_bits(1.0f32.to_bits() - 1))
+}
+
+fn cuda_min_p_mask(k: &CudaResidentKernels, logits: &[f32], min_p: f32) -> Vec<i32> {
+    let dl = k.stream.clone_htod(logits).unwrap();
+    let mut dm = k.stream.alloc_zeros::<i32>(logits.len()).unwrap();
+    let n = i32::try_from(logits.len()).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 8,
+    };
+    let mut launch = k.stream.launch_builder(&k.sample_min_p_mask);
+    launch.arg(&dl).arg(&n).arg(&min_p).arg(&mut dm);
+    unsafe { launch.launch(cfg).unwrap() };
+    let mut mask = vec![0; logits.len()];
+    k.stream.memcpy_dtoh(&dm, &mut mask).unwrap();
+    k.ctx.synchronize().unwrap();
+    mask
+}
+
+fn cuda_min_p_draw(
+    k: &CudaResidentKernels,
+    logits: &CudaSlice<f32>,
+    min_p: f32,
+    temperature: f32,
+    seed: u64,
+    output: &mut CudaSlice<u32>,
+) -> u32 {
+    super::launch_sample_gumbel_filtered(
+        &k.stream,
+        &k.sample_gumbel_filtered,
+        logits,
+        logits.len(),
+        temperature,
+        min_p,
+        seed,
+        output,
+    )
+    .unwrap();
+    let mut sample = [0];
+    k.stream.memcpy_dtoh(output, &mut sample).unwrap();
+    k.ctx.synchronize().unwrap();
+    sample[0]
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn min_p_sampler_survivor_masks_match_cpu_or_request_fallback() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut rows = vec![
+        ("single candidate".to_string(), vec![7.0], 0.25, false),
+        (
+            "large common offset".to_string(),
+            vec![100_000_000.0, 99_999_992.0],
+            0.0004,
+            false,
+        ),
+        (
+            "negative logits".to_string(),
+            vec![-70.0, -72.0, -75.0],
+            0.05,
+            false,
+        ),
+        (
+            "inclusive normalized boundary".to_string(),
+            vec![0.0, -0.1],
+            f32::from_bits(0x3f67_a36e),
+            true,
+        ),
+        (
+            "unequal rounded maxima".to_string(),
+            vec![0.0, -2.0f32.powi(-26)],
+            1.0,
+            true,
+        ),
+        (
+            "underflowed normalized threshold".to_string(),
+            vec![0.0, 0.0, -110.0],
+            f32::from_bits(1),
+            true,
+        ),
+    ];
+    for n in [255, 256, 257, 513] {
+        let mut logits: Vec<f32> = (0..n).map(|i| -((i % 31) as f32)).collect();
+        // A maximum beyond the first block catches incomplete row reductions.
+        logits[n - 1] = 2.0;
+        rows.push((format!("vocabulary {n}"), logits, 0.125, false));
+    }
+    let mut rng = Lcg(0x219a_b9c7);
+    for row in 0..48 {
+        let n = [2, 7, 255, 256, 257, 513][row % 6];
+        let offset = [0.0, -100.0, 100.0, 100_000_000.0][row % 4];
+        let logits: Vec<f32> = (0..n).map(|_| offset + rng.next_f32() * 20.0).collect();
+        rows.push((format!("random {row}"), logits.clone(), 0.05, false));
+        let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let boundary = (logits[row % n] - maximum).exp();
+        for delta in -1_i64..=1 {
+            let bits = (i64::from(boundary.to_bits()) + delta).clamp(1, i64::from(1.0f32.to_bits()))
+                as u32;
+            rows.push((
+                format!("random boundary {row}/{delta}"),
+                logits.clone(),
+                f32::from_bits(bits),
+                true,
+            ));
+        }
+    }
+    let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
+    let mut checked = 0;
+    let mut fallback_rows = 0;
+    for (name, logits, min_p, must_fallback) in rows {
+        let mask = cuda_min_p_mask(&k, &logits, min_p);
+        assert!(mask.iter().all(|value| (-1..=1).contains(value)), "{name}");
+        let fallback = mask.contains(&-1);
+        assert!(!must_fallback || fallback, "{name} must request fallback");
+        let dl = k.stream.clone_htod(&logits).unwrap();
+        for temperature in [0.5, 1.0, 2.0] {
+            let expected =
+                crate::inference::sampling_weights_for_cuda_tests(&logits, min_p, temperature)
+                    .unwrap();
+            let sample = cuda_min_p_draw(&k, &dl, min_p, temperature, 42, &mut output);
+            if fallback {
+                assert_eq!(sample, u32::MAX, "{name} at temperature {temperature}");
+            } else {
+                let mut expected_mask = vec![0; logits.len()];
+                for (index, _) in expected {
+                    expected_mask[index] = 1;
+                }
+                assert_eq!(mask, expected_mask, "{name} at temperature {temperature}");
+                assert!(sample < logits.len() as u32, "{name}: sample {sample}");
+                assert_eq!(mask[sample as usize], 1, "{name}: inadmissible token");
+                checked += 1;
+            }
+        }
+        fallback_rows += usize::from(fallback);
+    }
+    assert!(checked > 100, "too few survivor masks checked: {checked}");
+    assert!(
+        fallback_rows > 100,
+        "too few boundary cases: {fallback_rows}"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn min_p_sampler_invalid_rows_and_scales_request_fallback() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
+    for (logits, min_p, temperature) in [
+        (vec![0.0, f32::NAN], 0.1, 1.0),
+        (vec![0.0, f32::INFINITY], 0.1, 1.0),
+        (vec![0.0, f32::NEG_INFINITY], 0.1, 1.0),
+        (vec![0.0, 0.0, -1.0], 1.0, 1.0),
+        (vec![0.0, -90.0], f32::MIN_POSITIVE, 1.0),
+        (vec![0.0, -1.0], f32::NAN, 1.0),
+        (vec![0.0, -1.0], 0.0, 1.0),
+        (vec![0.0, -1.0], 0.1, 0.0),
+        (vec![0.0, -1.0], 0.1, -1.0),
+        (vec![0.0, -1.0], 0.1, f32::NAN),
+        (vec![0.0, -1.0], 0.1, f32::INFINITY),
+        (vec![f32::MAX, f32::MAX], 0.1, 0.5),
+    ] {
+        let dl = k.stream.clone_htod(&logits).unwrap();
+        assert_eq!(
+            cuda_min_p_draw(&k, &dl, min_p, temperature, 7, &mut output),
+            u32::MAX,
+            "logits {logits:?}, min_p {min_p}, temperature {temperature}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn min_p_sampler_seeded_equal_logits_match_uniform_reference() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
+    for n in [1, 255, 256, 257, 513, 4096] {
+        let logits = k.stream.clone_htod(&vec![0.0; n]).unwrap();
+        for seed in [0_u64, 1, 7, 42, u64::MAX, 0x1161_223a_2713_2434] {
+            let mut maximum = 0.0;
+            let mut expected = 0;
+            for index in 0..n {
+                let uniform = sampling_reference_uniform(seed, index);
+                if uniform > maximum {
+                    maximum = uniform;
+                    expected = index;
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    cuda_min_p_draw(&k, &logits, 0.5, 1.0, seed, &mut output),
+                    expected as u32,
+                    "n={n}, seed={seed}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn min_p_sampler_distribution_matches_filtered_cpu_probabilities() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
+    const DRAWS: usize = 8192;
+    for (logits, min_p, temperatures) in [
+        (vec![1.0, 0.5, -0.75, -3.0], 0.15, vec![0.5, 1.0, 2.0]),
+        // CPU temperature scaling divides each logit before subtracting the
+        // maximum. Centering before division gives a different f32 gap here.
+        (vec![100_000_000.0, 99_999_992.0], 0.0001, vec![3.0]),
+    ] {
+        let dl = k.stream.clone_htod(&logits).unwrap();
+        for temperature in temperatures {
+            let weights =
+                crate::inference::sampling_weights_for_cuda_tests(&logits, min_p, temperature)
+                    .unwrap();
+            let mut probabilities = vec![0.0; logits.len()];
+            for (index, probability) in weights {
+                probabilities[index] = probability;
+            }
+            let mut counts = vec![0_usize; logits.len()];
+            for draw in 0..DRAWS {
+                let seed = (draw as u64).wrapping_mul(0xD134_2543_DE82_EF95);
+                let sample = cuda_min_p_draw(&k, &dl, min_p, temperature, seed, &mut output);
+                assert!(sample < logits.len() as u32, "unexpected fallback or token");
+                counts[sample as usize] += 1;
+            }
+            for index in 0..logits.len() {
+                let probability = f64::from(probabilities[index]);
+                if probability == 0.0 {
+                    assert_eq!(counts[index], 0, "a filtered token was sampled");
+                    continue;
+                }
+                let expected = DRAWS as f64 * probability;
+                let tolerance = 6.0 * (expected * (1.0 - probability)).sqrt() + 2.0;
+                assert!(
+                    (counts[index] as f64 - expected).abs() <= tolerance,
+                    "logits {logits:?}, temperature {temperature}, token {index}: {} draws, \
+                     expected {expected:.2} within {tolerance:.2}",
+                    counts[index]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn sampling_uniform_endpoint_stays_finite_in_both_kernels() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let mantissas = [
+        0_u32, 1, 0x7fffff, 0x800000, 0x800001, 0xfffffd, 0xfffffe, 0xffffff,
+    ];
+    let dm = k.stream.clone_htod(&mantissas).unwrap();
+    let mut du = k.stream.alloc_zeros::<f32>(mantissas.len()).unwrap();
+    let n = mantissas.len() as i32;
+    let mut launch = k.stream.launch_builder(&k.sampling_uniform_test);
+    launch.arg(&dm).arg(&n).arg(&mut du);
+    unsafe {
+        launch
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap()
+    };
+    let mut uniforms = [0.0_f32; 8];
+    k.stream.memcpy_dtoh(&du, &mut uniforms).unwrap();
+    k.ctx.synchronize().unwrap();
+    for (mantissa, actual) in mantissas.into_iter().zip(uniforms) {
+        let expected =
+            ((mantissa as f32 + 0.5) / 16_777_216.0).min(f32::from_bits(1.0f32.to_bits() - 1));
+        assert_eq!(actual.to_bits(), expected.to_bits(), "mantissa {mantissa}");
+        assert!(actual > 0.0 && actual < 1.0);
+        let gumbel = -(-actual.ln()).ln();
+        assert!(gumbel.is_finite());
+    }
+
+    // This seed hashes index zero to an all-one 24-bit mantissa. The old upper
+    // endpoint produced infinite Gumbel noise and incorrectly selected token 0.
+    let seed = 0x1161_223a_2713_2434;
+    assert_eq!(
+        sampling_reference_uniform(seed, 0),
+        f32::from_bits(0x3f7f_ffff)
+    );
+    let dl = k.stream.clone_htod(&[-1.0, 0.0]).unwrap();
+    let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
+    super::launch_sample_gumbel(
+        &k.stream,
+        &k.sample_gumbel,
+        &dl,
+        2,
+        1000.0,
+        seed,
+        &mut output,
+    )
+    .unwrap();
+    let mut sampled = [0];
+    k.stream.memcpy_dtoh(&output, &mut sampled).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert_eq!(sampled[0], 1, "plain sampler must keep Gumbel noise finite");
+    assert_eq!(cuda_min_p_draw(&k, &dl, 0.1, 0.001, seed, &mut output), 1);
 }
 
 #[test]

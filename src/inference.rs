@@ -2502,9 +2502,17 @@ pub struct LlamaGenerationStep {
     pub diagnostics: Option<LlamaForwardDiagnostics>,
 }
 
-/// Result of a GPU-resident decode step: either the post-layers hidden state (when logits
-/// weren't requested) or the `[1, vocab]` logits (when the final norm + output projection ran
-/// on the GPU too).
+/// Parameters carried through the contiguous, paged, and CPU-prefix CUDA tails.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct ResidentTemperatureSampling {
+    inv_temp: f32,
+    temperature: f32,
+    seed: u64,
+    min_p: Option<f32>,
+}
+
+/// Result of a GPU-resident decode step: either hidden state, logits, or a sampled token.
 enum ResidentForward {
     Hidden(CpuTensor),
     Logits(CpuTensor),
@@ -4493,10 +4501,10 @@ impl LlamaInferenceSession {
     }
 
     /// Temperature-sampling analog of the greedy resident fast lane: when the
-    /// sampler is plain temperature (no filtering, penalties, or logit bias),
-    /// draw the next token on the GPU via Gumbel-max — no full-vocabulary host
-    /// copy and no CPU sort. Metal and CUDA are enabled by default after their
-    /// device/reference and seeded-streaming gates, with explicit escape hatches.
+    /// sampler is plain temperature, draw the next token on the GPU via
+    /// Gumbel-max. CUDA min-p is separately opt-in; a threshold boundary sends
+    /// the existing logits to the CPU sampler without replaying the forward.
+    /// Other filters, penalties, and logit bias use the general sampling path.
     pub fn generate_next_token_sampled_resident(
         &mut self,
         token_id: u32,
@@ -4504,24 +4512,24 @@ impl LlamaInferenceSession {
     ) -> Result<Option<(u32, u128)>> {
         // The Metal sampling tail requires the wire stack. Without it, the
         // lower forward omits the tail but still consumes this position's GPU KV.
-        let metal_sampling = resident_decode_metal_enabled()
+        let min_p = config.min_p.filter(|p| *p > 0.0);
+        let metal_sampling = min_p.is_none()
+            && resident_decode_metal_enabled()
             && resident_metal_temperature_sampling_enabled()
             && metal_seam::wire_mode_active();
         let cuda_sampling =
             resident_decode_cuda_enabled() && resident_gpu_temperature_sampling_enabled();
+        let cuda_min_p_available = cuda_sampling
+            && min_p.is_some()
+            && resident_cuda_min_p_sampling_enabled()
+            && crate::cuda::is_available();
         if (!metal_sampling && !cuda_sampling)
-            || config.temperature <= 0.0
-            || config.top_k.is_some()
-            || config.top_p.is_some_and(|p| p < 1.0)
-            || config.min_p.is_some_and(|p| p > 0.0)
-            || config.typical_p.is_some_and(|p| p < 1.0)
-            || config.top_n_sigma.is_some_and(|sigma| sigma > 0.0)
-            || config.presence_penalty != 0.0
-            || config.frequency_penalty != 0.0
-            || config.repeat_penalty != 1.0
-            || !config.logit_bias.is_empty()
+            || !resident_sampling_config_supported(config, cuda_min_p_available)
         {
             return Ok(None);
+        }
+        if min_p.is_some() {
+            config.validate()?;
         }
         if !self.kv_cache.can_append() {
             return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -4545,14 +4553,43 @@ impl LlamaInferenceSession {
                 &embedding,
                 true,
                 None,
-                Some((inv_temp, seed)),
+                Some(ResidentTemperatureSampling {
+                    inv_temp,
+                    temperature: config.temperature,
+                    seed,
+                    min_p,
+                }),
                 Some(token_id),
             )?
         };
         match forward {
-            Some(ResidentForward::Sampled(id)) => {
+            Some(forward) => Ok(self
+                .finish_resident_temperature_sample(forward, config, min_p.is_some())?
+                .map(|id| (id, started.elapsed().as_micros()))),
+            None => Ok(None),
+        }
+    }
+
+    /// A min-p boundary fallback returns the logits of an already executed
+    /// forward. Sample those on the CPU without replaying the consumed KV row.
+    fn finish_resident_temperature_sample(
+        &mut self,
+        forward: ResidentForward,
+        config: &SamplingConfig,
+        allow_logits: bool,
+    ) -> Result<Option<u32>> {
+        match forward {
+            ResidentForward::Sampled(id) => {
                 self.kv_cache.position += 1;
-                Ok(Some((id, started.elapsed().as_micros())))
+                Ok(Some(id))
+            }
+            ResidentForward::Logits(logits) if allow_logits => {
+                self.kv_cache.position += 1;
+                // The input token has just joined the context. Use that consumed
+                // position for a fresh draw, as the API's full-history sampler
+                // does, without fabricating token history for inactive penalties.
+                sample_with_config_at_position(&logits, config, &[], self.kv_cache.position as u64)
+                    .map(Some)
             }
             _ => Ok(None),
         }
@@ -4903,7 +4940,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<ResidentTemperatureSampling>,
         input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         if let Some(prefix_layers) = self.cuda_cpu_prefix_layers()? {
@@ -5355,22 +5392,50 @@ impl LlamaInferenceSession {
                     return Ok(None);
                 }
             }
-        } else if let Some((inv_temp, seed)) = sample {
-            match slot.engine.forward_token_sample(
-                embedding_data,
-                &tables.cos,
-                &tables.sin,
-                position,
-                scale,
-                inv_temp,
-                seed,
-            ) {
-                Ok(id) => ResidentForward::Sampled(id),
-                Err(e) => {
-                    if trace {
-                        eprintln!("[resident-cuda] forward_token_sample err at {position}: {e}");
+        } else if let Some(sample) = sample {
+            if let Some(min_p) = sample.min_p {
+                match slot
+                    .engine
+                    .forward_token_sample_min_p(
+                        embedding_data,
+                        &tables.cos,
+                        &tables.sin,
+                        position,
+                        scale,
+                        sample.temperature,
+                        sample.seed,
+                        min_p,
+                    )
+                    .map_err(BackendError::RuntimeShapeMismatch)?
+                {
+                    crate::cuda_resident::CudaMinPSample::Token(id) => ResidentForward::Sampled(id),
+                    crate::cuda_resident::CudaMinPSample::Logits(logits) => {
+                        ResidentForward::Logits(CpuTensor::from_f32(
+                            "resident_min_p_logits",
+                            vec![1, vocab],
+                            logits,
+                        )?)
                     }
-                    return Ok(None);
+                }
+            } else {
+                match slot.engine.forward_token_sample(
+                    embedding_data,
+                    &tables.cos,
+                    &tables.sin,
+                    position,
+                    scale,
+                    sample.inv_temp,
+                    sample.seed,
+                ) {
+                    Ok(id) => ResidentForward::Sampled(id),
+                    Err(e) => {
+                        if trace {
+                            eprintln!(
+                                "[resident-cuda] forward_token_sample err at {position}: {e}"
+                            );
+                        }
+                        return Ok(None);
+                    }
                 }
             }
         } else if gpu_sample_token.is_some() {
@@ -5436,7 +5501,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<ResidentTemperatureSampling>,
         input_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
@@ -9106,16 +9171,47 @@ fn sampling_probs_with_config(
     Ok(probabilities)
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn sampling_weights_for_cuda_tests(
+    logits: &[f32],
+    min_p: f32,
+    temperature: f32,
+) -> Result<Vec<(usize, f32)>> {
+    let logits = CpuTensor::from_f32(
+        "cuda_sampling_oracle",
+        vec![1, logits.len()],
+        logits.to_vec(),
+    )?;
+    sampling_weights_with_config(
+        &logits,
+        &SamplingConfig {
+            temperature,
+            min_p: Some(min_p),
+            ..SamplingConfig::default()
+        },
+        &[],
+    )
+}
+
 fn sample_with_config(
     logits: &CpuTensor,
     config: &SamplingConfig,
     token_history: &[u32],
 ) -> Result<u32> {
-    let weighted = sampling_weights_with_config(logits, config, token_history)?;
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
     // reproduces the whole sequence token-for-token.
-    let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), token_history.len() as u64);
+    sample_with_config_at_position(logits, config, token_history, token_history.len() as u64)
+}
+
+fn sample_with_config_at_position(
+    logits: &CpuTensor,
+    config: &SamplingConfig,
+    token_history: &[u32],
+    draw_position: u64,
+) -> Result<u32> {
+    let weighted = sampling_weights_with_config(logits, config, token_history)?;
+    let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), draw_position);
     let mut cumulative = 0.0;
     for (idx, probability) in &weighted {
         cumulative += *probability;
@@ -15241,22 +15337,45 @@ impl ResidentCudaSlot {
         position: usize,
         scale: f32,
         greedy: bool,
-        sample: Option<(f32, u64)>,
+        sample: Option<ResidentTemperatureSampling>,
     ) -> Result<ResidentCudaPagedForward> {
         let pending = self.prepare_paged_append(sequence_id, 1)?;
-        let kernel_result = if let Some((inv_temp, seed)) = sample {
-            self.engine
-                .forward_token_sample_paged(
-                    embedding,
-                    cos,
-                    sin,
-                    position,
-                    scale,
-                    inv_temp,
-                    seed,
-                    &pending.planned_pages,
-                )
-                .map(ResidentCudaPagedForward::Sampled)
+        let kernel_result = if let Some(sample) = sample {
+            if let Some(min_p) = sample.min_p {
+                self.engine
+                    .forward_token_sample_min_p_paged(
+                        embedding,
+                        cos,
+                        sin,
+                        position,
+                        scale,
+                        sample.temperature,
+                        sample.seed,
+                        min_p,
+                        &pending.planned_pages,
+                    )
+                    .map(|output| match output {
+                        crate::cuda_resident::CudaMinPSample::Token(token) => {
+                            ResidentCudaPagedForward::Sampled(token)
+                        }
+                        crate::cuda_resident::CudaMinPSample::Logits(logits) => {
+                            ResidentCudaPagedForward::Logits(logits)
+                        }
+                    })
+            } else {
+                self.engine
+                    .forward_token_sample_paged(
+                        embedding,
+                        cos,
+                        sin,
+                        position,
+                        scale,
+                        sample.inv_temp,
+                        sample.seed,
+                        &pending.planned_pages,
+                    )
+                    .map(ResidentCudaPagedForward::Sampled)
+            }
         } else if greedy {
             self.engine
                 .forward_token_paged(embedding, cos, sin, position, scale, &pending.planned_pages)
@@ -16815,6 +16934,42 @@ fn resident_gpu_temperature_sampling_enabled() -> bool {
         }
         None => true,
     }
+}
+
+/// The min-p CUDA tail is opt-in until its device-level gates are qualified.
+fn resident_cuda_min_p_sampling_enabled() -> bool {
+    resident_cuda_min_p_sampling_setting_enabled(
+        std::env::var("CAMELID_CUDA_MIN_P_SAMPLING").ok().as_deref(),
+    )
+}
+
+fn resident_cuda_min_p_sampling_setting_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// Only min-p with its default candidate floor is implemented by the new CUDA
+/// tail. Every other active filter or adjustment keeps the full CPU sampler.
+fn resident_sampling_config_supported(config: &SamplingConfig, cuda_min_p_available: bool) -> bool {
+    let invalid_min_p = config
+        .min_p
+        .is_some_and(|p| !p.is_finite() || !(0.0..=1.0).contains(&p));
+    let active_min_p = config.min_p.is_some_and(|p| p > 0.0);
+    !(config.temperature <= 0.0
+        || config.top_k.is_some()
+        || config.top_p.is_some_and(|p| p < 1.0)
+        || invalid_min_p
+        || (active_min_p && (!cuda_min_p_available || config.min_keep.unwrap_or(1).max(1) > 1))
+        || config.typical_p.is_some_and(|p| p < 1.0)
+        || config.top_n_sigma.is_some_and(|sigma| sigma > 0.0)
+        || config.presence_penalty != 0.0
+        || config.frequency_penalty != 0.0
+        || config.repeat_penalty != 1.0
+        || !config.logit_bias.is_empty())
 }
 
 /// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
@@ -30658,5 +30813,7 @@ pub fn tensor_map(tensors: impl IntoIterator<Item = CpuTensor>) -> HashMap<Strin
         .collect()
 }
 
+#[cfg(test)]
+mod cuda_min_p_host_tests;
 #[cfg(test)]
 mod tests;
