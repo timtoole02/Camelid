@@ -53,7 +53,12 @@ memmap2 = "0.9"
 hound = "=3.5.1"
 llguidance = "=1.7.6"
 toktrie = "=1.7.6"
-pdf-extract = "0.12"
+# 0.12.1 resets its font cache per page; 0.12.0 panicked on PDFs that reuse a
+# font name across pages. lopdf is what pdf-extract reads with, at its version
+# and without default features, so it adds no crate; see pdf_extract_text.
+pdf-extract = "0.12.1"
+lopdf = { version = "0.42", default-features = false }
+html5ever = "0.38"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

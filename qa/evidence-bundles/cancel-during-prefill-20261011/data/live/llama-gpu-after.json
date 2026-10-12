@@ -1,0 +1,68 @@
+{
+ "ui": "llama-gpu-after",
+ "short_request_roles": [
+  "user"
+ ],
+ "short_request_chars": 22,
+ "long_message_chars": 20793,
+ "stop_after_ms": 8000,
+ "long_turn_text_at_stop": "Generating response\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens est. in 5224 · out 0\n02:42 AM\nCLIENT-MEASURED",
+ "short_message": "Say hi in three words.",
+ "short_reply": "Hello there!\n\nLlama 3.2 3B Instruct Q4_K_M\nVERIFIED\ntokens in 16 · out 4\nfirst token 330ms\n52 tok/s\n387ms\n02:42 AM\nCLIENT-MEASURED\nDeveloper Diagnostics\n51.8 tok/s",
+ "short_answered": true,
+ "short_wait_ms": 290,
+ "events": [
+  {
+   "at": 4355,
+   "what": "chat request sent"
+  },
+  {
+   "at": 4415,
+   "what": "long message sent"
+  },
+  {
+   "at": 12734,
+   "what": "screenshot llama-gpu-after-1-reading-long-message.png"
+  },
+  {
+   "at": 12890,
+   "what": "chat request ended by the browser: net::ERR_ABORTED"
+  },
+  {
+   "at": 12949,
+   "what": "Stop clicked"
+  },
+  {
+   "at": 13023,
+   "what": "Stop button gone"
+  },
+  {
+   "at": 14139,
+   "what": "screenshot llama-gpu-after-2-stopped.png"
+  },
+  {
+   "at": 14258,
+   "what": "New chat"
+  },
+  {
+   "at": 14502,
+   "what": "chat request sent"
+  },
+  {
+   "at": 14529,
+   "what": "short message sent"
+  },
+  {
+   "at": 14819,
+   "what": "short request finished (response fully received)"
+  },
+  {
+   "at": 34622,
+   "what": "screenshot llama-gpu-after-3-20s-after-short-message.png"
+  },
+  {
+   "at": 36220,
+   "what": "screenshot llama-gpu-after-4-short-reply.png"
+  }
+ ]
+}

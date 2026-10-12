@@ -1,0 +1,15 @@
+{
+ "label": "before",
+ "documents": 500,
+ "citations_resolved": 99888,
+ "citations_refused_as_expected": 0,
+ "failures": [],
+ "source_hash_mismatches": [],
+ "uncovered_documents": [],
+ "leaks": [],
+ "resolve_ms_p50": 16.7,
+ "resolve_ms_p95": 29.6,
+ "source_ms_p50": 2.2,
+ "source_ms_p95": 3.2,
+ "passed": true
+}

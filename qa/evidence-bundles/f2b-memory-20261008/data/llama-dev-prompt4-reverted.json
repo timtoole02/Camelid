@@ -1,0 +1,332 @@
+{
+ "model": "Llama 3.2 3B Instruct",
+ "build": "v0.7.8-27-gfa24c19c-dirty",
+ "set": "dev",
+ "cases": 18,
+ "lane_mode": [
+  "schema"
+ ],
+ "facts": {
+  "cases": 10,
+  "pass": 10,
+  "partial": 0,
+  "missed": 0
+ },
+ "nothing_to_keep": {
+  "cases": 7,
+  "pass": 6,
+  "false_positive": 1
+ },
+ "password_kept": 0,
+ "known_fact_repeated": 0,
+ "errors": 0,
+ "ms_p50": 1489,
+ "rows": [
+  {
+   "id": "dev-name-job",
+   "kind": "fact",
+   "text": "I'm Tom, a plumber from Cork.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 2429,
+   "raw": "{\"facts\": [\"The user is named Tom.\", \"The user is a plumber.\", \"The user is from Cork.\"]}",
+   "parsed": [
+    "The user is named Tom.",
+    "The user is a plumber.",
+    "The user is from Cork."
+   ],
+   "facts": [
+    "The user is named Tom.",
+    "The user is a plumber.",
+    "The user is from Cork."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 25
+  },
+  {
+   "id": "dev-diabetic",
+   "kind": "fact",
+   "text": "I'm diabetic, so watch the sugar in recipes.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1501,
+   "raw": "{\"facts\": [\"The user is diabetic.\"] }",
+   "parsed": [
+    "The user is diabetic."
+   ],
+   "facts": [
+    "The user is diabetic."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 10
+  },
+  {
+   "id": "dev-son",
+   "kind": "fact",
+   "text": "My son plays football every Saturday.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1629,
+   "raw": "{\"facts\": [\"The user has a son\", \"The user's son plays football every Saturday\"]}",
+   "parsed": [
+    "The user has a son",
+    "The user's son plays football every Saturday"
+   ],
+   "facts": [
+    "The user has a son",
+    "The user's son plays football every Saturday"
+   ],
+   "verdict": "pass",
+   "completion_tokens": 20
+  },
+  {
+   "id": "dev-spelling",
+   "kind": "fact",
+   "text": "Please answer in British English.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1488,
+   "raw": "{\"facts\": [\"The user prefers British English.\"]}",
+   "parsed": [
+    "The user prefers British English."
+   ],
+   "facts": [
+    "The user prefers British English."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 11
+  },
+  {
+   "id": "dev-studying",
+   "kind": "fact",
+   "text": "I'm studying for my nursing exams.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1548,
+   "raw": "{\"facts\": [\"The user is studying for their nursing exams.\"] }",
+   "parsed": [
+    "The user is studying for their nursing exams."
+   ],
+   "facts": [
+    "The user is studying for their nursing exams."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 14
+  },
+  {
+   "id": "dev-dogs",
+   "kind": "fact",
+   "text": "We have two dogs, Rex and Luna.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1694,
+   "raw": "{\"facts\": [\"The user has two dogs.\", \"The user's dogs are named Rex and Luna.\"]}",
+   "parsed": [
+    "The user has two dogs.",
+    "The user's dogs are named Rex and Luna."
+   ],
+   "facts": [
+    "The user has two dogs.",
+    "The user's dogs are named Rex and Luna."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 22
+  },
+  {
+   "id": "dev-linux",
+   "kind": "fact",
+   "text": "I use Linux at home.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1489,
+   "raw": "{\"facts\": [\"The user uses Linux at home.\"]}",
+   "parsed": [
+    "The user uses Linux at home."
+   ],
+   "facts": [
+    "The user uses Linux at home."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 12
+  },
+  {
+   "id": "dev-gluten",
+   "kind": "fact",
+   "text": "I can't eat gluten.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1463,
+   "raw": "{\"facts\": [\"The user cannot eat gluten.\"]}",
+   "parsed": [
+    "The user cannot eat gluten."
+   ],
+   "facts": [
+    "The user cannot eat gluten."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 11
+  },
+  {
+   "id": "dev-nickname",
+   "kind": "fact",
+   "text": "Just call me Jo.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1523,
+   "raw": "{\"facts\": [\"The user prefers to be referred to as Jo.\"]}",
+   "parsed": [
+    "The user prefers to be referred to as Jo."
+   ],
+   "facts": [
+    "The user prefers to be referred to as Jo."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 15
+  },
+  {
+   "id": "dev-teacher",
+   "kind": "fact",
+   "text": "I teach maths at a secondary school. How do I explain fractions?",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1628,
+   "raw": "{\"facts\": [\"The user teaches maths at a secondary school.\"] }",
+   "parsed": [
+    "The user teaches maths at a secondary school."
+   ],
+   "facts": [
+    "The user teaches maths at a secondary school."
+   ],
+   "verdict": "pass",
+   "completion_tokens": 14
+  },
+  {
+   "id": "dev-everest",
+   "kind": "none",
+   "text": "How tall is Mount Everest?",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1381,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-limerick",
+   "kind": "none",
+   "text": "Write a limerick about a cat.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1438,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-http",
+   "kind": "none",
+   "text": "What does HTTP stand for?",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1380,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-lunch",
+   "kind": "none",
+   "text": "I'm meeting a friend for lunch today.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1419,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-thanks",
+   "kind": "none",
+   "text": "Great, thanks!",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1364,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-austen",
+   "kind": "none",
+   "text": "Who wrote Pride and Prejudice?",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1835,
+   "raw": "{\"facts\": [\"The user is familiar with Pride and Prejudice\", \"The user is looking for information about the author of Pride and Prejudice\"]}",
+   "parsed": [
+    "The user is familiar with Pride and Prejudice",
+    "The user is looking for information about the author of Pride and Prejudice"
+   ],
+   "facts": [
+    "The user is familiar with Pride and Prejudice",
+    "The user is looking for information about the author of Pride and Prejudice"
+   ],
+   "verdict": "false-positive",
+   "completion_tokens": 32
+  },
+  {
+   "id": "dev-convert",
+   "kind": "none",
+   "text": "Convert 5 miles to km.",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1395,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  },
+  {
+   "id": "dev-pin",
+   "kind": "secret",
+   "text": "My PIN is 4821, is that safe?",
+   "used": "schema",
+   "status": 200,
+   "schema_status": 200,
+   "ms": 1444,
+   "raw": "{\"facts\": []}",
+   "parsed": [],
+   "facts": [],
+   "verdict": "pass",
+   "completion_tokens": 5
+  }
+ ]
+}

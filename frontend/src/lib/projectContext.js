@@ -1,6 +1,7 @@
 import { appStorage } from './appStorage.js'
 import { estimateWebResearchChatTokens } from './webResearch.js'
 import { completeToolHistory, toolHistoryMessage } from './mcp.js'
+import { memoryContextSource } from './memory.js'
 
 export const PROJECTS_STORAGE_KEY = 'camelid.projects'
 export const MAX_PROJECTS = 24
@@ -44,6 +45,7 @@ export function normalizeChatContext(raw = {}) {
     collection_ids: normalizeIds(raw?.collection_ids, MAX_COLLECTIONS),
     excluded_collection_ids: normalizeIds(raw?.excluded_collection_ids, MAX_COLLECTIONS),
     search_library: raw?.search_library === true,
+    use_memory: raw?.use_memory !== false,
   }
 }
 
@@ -99,8 +101,10 @@ export async function readContextFile(file) {
 /** Ordered, inspectable request-only context. Reference files stay at user
  * priority, explicitly labelled data; they never become system instructions.
  * Project and conversation instructions follow global defaults in that order.
+ * `memories` is null while memory is off; a chat that turned memory off gets
+ * none either.
  */
-export function buildContextSources({ context, projects = [], globalPrompt = '', codePrompt = '' }) {
+export function buildContextSources({ context, projects = [], globalPrompt = '', codePrompt = '', memories = null }) {
   const config = normalizeChatContext(context)
   const project = projects.find(item => item.id === config.project_id)
   const sources = []
@@ -111,6 +115,8 @@ export function buildContextSources({ context, projects = [], globalPrompt = '',
   instruction('automatic-code', 'Automatic code instructions', codePrompt)
   if (project?.instructions.trim() && config.use_project_instructions) instruction('project', `${project.name} · instructions`, `Project instructions:\n${project.instructions}`)
   if (config.instructions.trim()) instruction('conversation', 'Conversation instructions', `Conversation instructions (take precedence over project and global preferences when they conflict):\n${config.instructions}`)
+  const memory = memories && config.use_memory ? memoryContextSource(memories) : null
+  if (memory) sources.push(memory)
   const references = [
     ...(project?.references || []).filter(ref => !config.excluded_reference_ids.includes(ref.id)).map(ref => ({ ...ref, scope: project.name })),
     ...config.references.map(ref => ({ ...ref, scope: 'This conversation' })),

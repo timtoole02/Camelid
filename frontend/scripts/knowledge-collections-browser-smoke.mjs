@@ -274,8 +274,9 @@ async function setValue(selector, value) {
   }, value)
 }
 async function clickText(selector, text) {
+  await page.waitForFunction((s, wanted) => [...document.querySelectorAll(s)].some(node => node.textContent.trim() === wanted && !node.disabled), { timeout: 10000 }, selector, text)
   const clicked = await page.$$eval(selector, (nodes, wanted) => {
-    const node = nodes.find((item) => item.textContent.trim() === wanted)
+    const node = nodes.find((item) => item.textContent.trim() === wanted && !item.disabled)
     if (node) node.click()
     return Boolean(node)
   }, text)
@@ -428,7 +429,9 @@ try {
   await page.evaluate(() => document.querySelector('button[aria-label="New chat"]')?.click())
   await openLibrary()
   await page.$eval('.knowledge-search-toggle input', (input) => input.click())
-  await page.click('button[aria-label="Delete HR"]')
+  const deleteHr = 'button[aria-label="Delete HR"]:not([disabled])'
+  await page.waitForSelector(deleteHr, { visible: true, timeout: 10000 })
+  await page.click(deleteHr)
   await clickText(`${library} .knowledge-confirm button`, 'Delete collection')
   await waitText(library, 'No collections yet.')
   await closeLibrary()
@@ -447,12 +450,15 @@ try {
   await waitText('.knowledge-detail h3', 'Finance')
   const dir = mkdtempSync(join(tmpdir(), 'camelid-collections-'))
   const file = join(dir, 'budget.txt')
-  writeFileSync(file, 'The travel budget is reviewed every quarter.')
+  const budgetBytes = Buffer.concat([Buffer.from('\uFEFFThe travel budget is reviewed every quarter.'), Buffer.from([0xff])])
+  writeFileSync(file, budgetBytes)
   const upload = await page.$('input[aria-label="Upload files into Finance"]')
   await upload.uploadFile(file)
   await page.waitForFunction(() => document.querySelectorAll('.knowledge-docs li').length === 1, { timeout: 10000 })
   assert.deepEqual(ingestRequests.at(-1).collection_ids, [collections.at(-1).id], 'the upload names its collection')
   assert.equal(ingestRequests.at(-1).filename, 'budget.txt')
+  assert.equal(ingestRequests.at(-1).is_base64, true, 'text uploads preserve the source bytes')
+  assert.deepEqual(Buffer.from(ingestRequests.at(-1).content, 'base64'), budgetBytes, 'a BOM and invalid UTF-8 survive the upload')
   await page.$eval('.knowledge-search-toggle input', (input) => input.click())
   await closeLibrary()
   assert.deepEqual(await collectionChips(), ['Finance1 doc'])

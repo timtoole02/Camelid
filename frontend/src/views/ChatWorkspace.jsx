@@ -26,6 +26,8 @@ import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose, IconSearch, IconFile, IconCollection } from '../components/ui/icons'
 import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { MemoryOffer, MemorySuggestions } from '../components/chat/MemorySuggestions'
+import { normalizeSuggestions } from '../lib/memory.js'
 import { DocumentViewer } from '../components/chat/DocumentViewer'
 import { VoiceInput } from '../components/chat/VoiceInput'
 import { ChatControls } from '../components/chat/ChatControls'
@@ -215,7 +217,16 @@ export default function ChatWorkspace({
   pendingConversation,
   composer,
   setComposer,
-  saveToMemory,
+  saveReplyAsNote,
+  userMemories = [],
+  memoryEnabled = false,
+  acceptMemorySuggestion = null,
+  dismissMemorySuggestion = null,
+  undoMemorySuggestion = null,
+  lookForMemories = null,
+  memoryLookup = null,
+  focusMessage = null,
+  onOpenMemory = null,
   sendMessage,
   resendFromMessage = null,
   continueFromMessage = null,
@@ -537,8 +548,8 @@ export default function ChatWorkspace({
   const awaitingAssistantLabel = visibleWebResearchStatus?.phase === 'researching'
     ? 'Reading relevant web sources…'
     : PREPARING_STREAMING_LABEL
-  const secondaryActionLabel = canChat ? 'Save to memory' : (apiUnavailable ? 'Open API' : 'Open Models')
-  const secondaryAction = canChat ? saveToMemory : () => setTab(apiUnavailable ? 'api' : 'library')
+  const secondaryActionLabel = canChat ? 'Save as note' : (apiUnavailable ? 'Open API' : 'Open Models')
+  const secondaryAction = canChat ? saveReplyAsNote : () => setTab(apiUnavailable ? 'api' : 'library')
   const secondaryActionDisabled = canChat ? requestActive : false
 
   // ----- Effects -----
@@ -680,6 +691,32 @@ export default function ChatWorkspace({
     })
     return () => window.cancelAnimationFrame(frame)
   }, [followActive, streamingScrollSignature, mcpActivity?.phase, mcpApproval?.id])
+
+  /* Opening a conversation at one message, such as where a memory came from:
+     show it even if it is among the earlier messages, bring it into view, and
+     mark it briefly. Each request is handled once. */
+  const handledFocusRef = useRef(null)
+  useEffect(() => {
+    if (!focusMessage || handledFocusRef.current === focusMessage.at) return undefined
+    if (focusMessage.conversationId !== selectedConversation?.id) return undefined
+    const index = visibleMessages.findIndex((message) => message.id === focusMessage.messageId)
+    if (index === -1) return undefined
+    if (!showAllMessages && index < visibleMessages.length - 60) {
+      setShowAllMessages(true)
+      return undefined
+    }
+    autoFollowGenerationRef.current = false
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.querySelector(`[data-message-id="${CSS.escape(focusMessage.messageId)}"]`)
+      if (!target) return
+      handledFocusRef.current = focusMessage.at
+      target.scrollIntoView({ block: 'center' })
+      target.classList.add('is-focused')
+      // Not tied to this effect's cleanup, so the mark never outlives its moment.
+      window.setTimeout(() => target.classList.remove('is-focused'), 2400)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [focusMessage, selectedConversation?.id, showAllMessages, visibleMessages])
 
   useLayoutEffect(() => {
     const resize = () => resizeComposerInput(composerRef.current)
@@ -861,10 +898,17 @@ export default function ChatWorkspace({
             requestCitations = citations
 
             const contextText = citations
-              .map((c, idx) => `[Citation ${idx + 1} from ${c.filename}]:\n${c.excerpt}`)
+              .map((c, idx) => `[${idx + 1}] (from ${c.filename}):\n${c.excerpt}`)
               .join('\n\n')
 
-            contentToSend = `Refer to the following retrieved document excerpts to answer the prompt. Cite your sources inline using [1], [2], etc.\n\n--- DOCUMENT CONTEXT ---\n${contextText}\n--- END CONTEXT ---\n\nUser Question: ${composer}`
+            /* Search returns passages close to the question, and some are about
+               something merely similar: another part, place or year. Told only to
+               "refer to" them, a small model answered with those too, as if they
+               were about what was asked (Llama 3.2 3B: 10 of 25 held-out
+               questions; with the exact-excerpt instruction, 2). Supported
+               answers cite their excerpts; unrelated passages must also allow
+               the model to say that the answer is missing. */
+            contentToSend = `Answer the question from the document excerpts below. Use an excerpt only if it is about exactly what the question asks: one about something similar - another item, part, person, date or place - does not answer it, so leave it out. Cite each fact inline as [1], [2], matching the excerpt it came from; every factual answer supported by the excerpts cites at least one excerpt. If no excerpt answers the question, say that the documents do not provide the answer. Do not invent an answer or cite an unrelated excerpt.\n\n--- DOCUMENT CONTEXT ---\n${contextText}\n--- END CONTEXT ---\n\nQuestion: ${composer}`
           }
         }
       } catch (err) {
@@ -1059,7 +1103,8 @@ export default function ChatWorkspace({
   ].filter(Boolean).join(' ')
 
   const renderConversationContext = compact => (updateChatContext && <ConversationContext compact={compact} key={selectedConversation?.id || 'draft'} context={chatContext} projects={projects} sources={contextSources} globalPrompt={globalPrompt || ''} onSave={updateChatContext} onManageProjects={() => setTab('projects')} busy={sending}
-    collections={knowledgeEnabled && !knowledge.error ? knowledge.collections : undefined} />)
+    collections={knowledgeEnabled && !knowledge.error ? knowledge.collections : undefined}
+    memories={memoryEnabled ? userMemories : null} />)
 
   const toolActivity = useMemo(() => toolActivityGroups(visibleMessages), [visibleMessages])
   const hasInlineActivity = Boolean(mcpActivity?.messageId && toolActivity.groups.has(mcpActivity.messageId))
@@ -1362,7 +1407,7 @@ export default function ChatWorkspace({
               onClick={() => { close(); docInputRef.current?.click() }}
               disabled={requestActive || documentIngesting}
               aria-label="Attach documents for RAG"
-              title="Drag & drop or attach .pdf, .docx, .md, .txt, .csv documents for local RAG"
+              title="Drag & drop or attach PDF, Word, HTML, Markdown, text or source code documents for local RAG"
             >
               <IconFile size={16} />{' '}
               <span className="cxcomposer__tool-label">
@@ -1821,6 +1866,27 @@ export default function ChatWorkspace({
                       live={mcpActivity?.calls?.[JSON.stringify([message.id, call.id])]}
                       queued={mcpActivity?.messageId === message.id && mcpActivity.phase !== 'idle'}
                       approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} />)}
+                    {/* What the model noticed about the user in the message this reply answers. */}
+                    {message.role === 'assistant' && !message.streaming
+                      && priorUserMessage?.memory_suggestions?.length > 0
+                      && visibleMessages[index + 1]?.role !== 'assistant'
+                      && <MemorySuggestions
+                        suggestions={normalizeSuggestions(priorUserMessage.memory_suggestions)}
+                        memories={userMemories}
+                        disabled={!acceptMemorySuggestion}
+                        onAccept={(id, text) => acceptMemorySuggestion?.(selectedConversation.id, priorUserMessage.id, id, text)}
+                        onDismiss={(id) => dismissMemorySuggestion?.(selectedConversation.id, priorUserMessage.id, id)}
+                        onUndo={(id) => undoMemorySuggestion?.(selectedConversation.id, priorUserMessage.id, id)}
+                        onOpenMemory={onOpenMemory}
+                      />}
+                    {/* A model too slow to ask on its own waits for the user, under the latest reply only. */}
+                    {message.role === 'assistant' && !message.streaming && isLastMessage && memoryEnabled && chatContext.use_memory
+                      && priorUserMessage?.memory_suggestion_offer === true
+                      && <MemoryOffer
+                        looking={memoryLookup?.messageId === priorUserMessage.id}
+                        disabled={!lookForMemories || requestActive}
+                        onLook={() => lookForMemories(selectedConversation.id, priorUserMessage.id)}
+                      />}
 
                   </Fragment>
                 )

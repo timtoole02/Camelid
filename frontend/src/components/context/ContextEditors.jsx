@@ -45,20 +45,20 @@ export function ContextSourceList({ sources }) {
     <h3>Included in the next request</h3>
     <p className="context-muted">{sources.length} sources · ~{tokens.toLocaleString()} tokens, estimated. Your conversation history and next message are added separately.</p>
     {sources.map((source, index) => <details className="context-reference" key={`${source.id}-${index}`}>
-      <summary><span>{source.label}</span><small>{source.role === 'system' ? 'Instructions' : 'Reference'}</small></summary>
+      <summary><span>{source.label}</span><small>{source.id === 'memory' ? 'Memory' : source.role === 'system' ? 'Instructions' : 'Reference'}</small></summary>
       <pre>{source.content}</pre>
     </details>)}
     {!sources.length && <p className="context-muted">No extra instructions or reference files.</p>}
   </section>
 }
 
-function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, onSave, onClose, busy, collections }) {
+function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, onSave, onClose, busy, collections, memories = null }) {
   const [draft, setDraft] = useState(() => normalizeChatContext(context))
   const [readingFiles, setReadingFiles] = useState(false)
   const [error, setError] = useState('')
   const project = projects.find(item => item.id === draft.project_id)
   const patch = values => setDraft(current => ({ ...current, ...values }))
-  const sources = buildContextSources({ context: draft, projects, globalPrompt, codePrompt: automaticCodePrompt })
+  const sources = buildContextSources({ context: draft, projects, globalPrompt, codePrompt: automaticCodePrompt, memories })
   const save = () => {
     try { onSave(draft); onClose() } catch (failure) { setError(failure.message) }
   }
@@ -82,6 +82,10 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
         </>}
         <label className="context-field">Conversation instructions<textarea aria-label="Conversation instructions" rows={4} maxLength={MAX_INSTRUCTION_CHARS} value={draft.instructions} onChange={event => patch({ instructions: event.target.value })} placeholder="Goals, constraints, tone, or decisions to keep in mind for this chat…" /></label>
         <p className="context-muted">Conversation instructions take precedence over project and global preferences. Turn off inheritance above to replace those instructions.</p>
+        {memories && <>
+          <label className="context-check"><input type="checkbox" checked={draft.use_memory} onChange={event => patch({ use_memory: event.target.checked })} />Use memory in this chat</label>
+          <p className="context-muted">Memory is what you chose to keep about yourself. With this off, the chat neither uses it nor suggests anything new to remember.</p>
+        </>}
         <ReferenceEditor references={draft.references} disabled={busy} onReadingChange={setReadingFiles} onChange={references => patch({ references })} />
         {collections !== undefined && <section className="context-collections" aria-label="Knowledge collections">
           <h3>Knowledge collections</h3>
@@ -105,7 +109,7 @@ function ContextDialog({ context, projects, globalPrompt, automaticCodePrompt, o
   </Modal>
 }
 
-export function ConversationContext({ context, projects, sources, globalPrompt, onSave, onManageProjects, busy, compact = false, collections }) {
+export function ConversationContext({ context, projects, sources, globalPrompt, onSave, onManageProjects, busy, compact = false, collections, memories = null }) {
   const [open, setOpen] = useState(false)
   const close = useCallback(() => setOpen(false), [])
   const project = projects.find(item => item.id === context.project_id)
@@ -116,6 +120,6 @@ export function ConversationContext({ context, projects, sources, globalPrompt, 
       <span>{sources.length ? `${sources.length} sources · ~${tokens.toLocaleString()} tokens` : 'Add instructions or files'}</span>
     </button>
     <button type="button" className="cxturn__action" onClick={onManageProjects}>Projects</button>
-    {open && <ContextDialog key={context.project_id} context={context} projects={projects} globalPrompt={globalPrompt} automaticCodePrompt={sources.find(source => source.id === 'automatic-code')?.content || ''} onSave={onSave} onClose={close} busy={busy} collections={collections} />}
+    {open && <ContextDialog key={context.project_id} context={context} projects={projects} globalPrompt={globalPrompt} automaticCodePrompt={sources.find(source => source.id === 'automatic-code')?.content || ''} onSave={onSave} onClose={close} busy={busy} collections={collections} memories={memories} />}
   </div>
 }

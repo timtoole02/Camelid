@@ -18,7 +18,9 @@ reference messages, in order. Global instructions come from Generation controls;
 Camelid's existing automatic code instructions are shown when the draft triggers
 them. Project instructions follow, then conversation instructions, with a stated
 preference for the conversation's instructions when preferences conflict. Turn off
-inheritance to omit global or project instructions entirely.
+inheritance to omit global or project instructions entirely. When memory is on,
+the facts you chose to keep follow as one **Memory** source; **Use memory in this
+chat** turns that off for one conversation. See [Memory](MEMORY.md).
 
 Selected reference files follow as labelled user-role data messages, with their
 names and contents quoted as JSON strings. They are not executed or rendered as
@@ -91,6 +93,18 @@ a message is sent without the library, still searching what is attached. How
 
 ## Files, storage, and scope
 
+- The Knowledge Library reads PDF, Word (`.docx`), HTML (`.html`, `.htm`), plain
+  text, Markdown, CSV, JSON, and source code (`.rs`, `.py`, `.js`, `.mjs`, `.cjs`,
+  `.jsx`, `.ts`, `.tsx`, `.go`, `.java`, `.kt`, `.kts`, `.swift`, `.c`, `.h`, `.cc`,
+  `.cpp`, `.cxx`, `.hpp`, `.hh`, `.cs`, `.rb`, `.php`, `.scala`, `.lua`, `.dart`,
+  `.sh`, `.bash`, `.zsh`, `.sql`). A watched folder picks up only these types. An
+  HTML page is read as its text: tags, scripts, styles, and comments are dropped,
+  and its headings become Markdown headings, so each section is chunked and cited
+  on its own. Its citations still bind the original file's bytes. A PDF that
+  pdf-extract cannot read is read page by page with lopdf instead, leaving out
+  only a page that fails. A text or code
+  file with a NUL byte in its first 8 KiB is binary, not text, and is skipped as
+  having no text. A file over 64 MB is refused, whether uploaded or watched.
 - Reference files are static UTF-8 copies: text, Markdown, code, CSV, or JSON.
   Re-add a file to update its contents. PDF and DOCX extraction continue to use
   the separate document attachment controls.

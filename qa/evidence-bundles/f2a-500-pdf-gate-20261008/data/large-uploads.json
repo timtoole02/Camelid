@@ -1,0 +1,103 @@
+{
+ "previously_refused_for_size": 11,
+ "now_ingested": 11,
+ "now_refused_extract_failed": 0,
+ "citations_resolved": 3408,
+ "citations": 3408,
+ "over_64_mb": {
+  "bytes": 67108865,
+  "status": 413,
+  "code": "document_too_large",
+  "message": "The file is larger than 64 MB, the most the Knowledge Library reads."
+ },
+ "rows": [
+  {
+   "arxiv_id": "2610.09710v1",
+   "bytes": 13817139,
+   "status": 200,
+   "ms": 564.4,
+   "chunk_count": 196,
+   "citations_resolved": 196
+  },
+  {
+   "arxiv_id": "2610.10409v1",
+   "bytes": 12704097,
+   "status": 200,
+   "ms": 525.8,
+   "chunk_count": 434,
+   "citations_resolved": 434
+  },
+  {
+   "arxiv_id": "2609.35877v1",
+   "bytes": 14208788,
+   "status": 200,
+   "ms": 1218.0,
+   "chunk_count": 240,
+   "citations_resolved": 240
+  },
+  {
+   "arxiv_id": "2610.10294v1",
+   "bytes": 12731122,
+   "status": 200,
+   "ms": 6171.0,
+   "chunk_count": 204,
+   "citations_resolved": 204
+  },
+  {
+   "arxiv_id": "2610.08223v1",
+   "bytes": 13694353,
+   "status": 200,
+   "ms": 2624.5,
+   "chunk_count": 132,
+   "citations_resolved": 132
+  },
+  {
+   "arxiv_id": "2610.06711v1",
+   "bytes": 13512444,
+   "status": 200,
+   "ms": 480.7,
+   "chunk_count": 138,
+   "citations_resolved": 138
+  },
+  {
+   "arxiv_id": "2610.06566v1",
+   "bytes": 12809176,
+   "status": 200,
+   "ms": 265.7,
+   "chunk_count": 139,
+   "citations_resolved": 139
+  },
+  {
+   "arxiv_id": "2610.06209v1",
+   "bytes": 14555354,
+   "status": 200,
+   "ms": 2319.4,
+   "chunk_count": 282,
+   "citations_resolved": 282
+  },
+  {
+   "arxiv_id": "2610.06416v1",
+   "bytes": 12706541,
+   "status": 200,
+   "ms": 866.8,
+   "chunk_count": 237,
+   "citations_resolved": 237
+  },
+  {
+   "arxiv_id": "2610.04497v1",
+   "bytes": 14234335,
+   "status": 200,
+   "ms": 1652.5,
+   "chunk_count": 1244,
+   "citations_resolved": 1244
+  },
+  {
+   "arxiv_id": "2610.04358v1",
+   "bytes": 13579449,
+   "status": 200,
+   "ms": 3317.7,
+   "chunk_count": 162,
+   "citations_resolved": 162
+  }
+ ]
+}

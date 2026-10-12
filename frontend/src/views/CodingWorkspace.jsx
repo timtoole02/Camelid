@@ -22,7 +22,10 @@ const relativeName = path => path?.split(/[\\/]/).at(-1) || path
 const ignore = promise => promise?.catch(() => {})
 const FileDiff = ({ diff }) => <pre className="coding-diff">{String(diff || '').split('\n').map((line, index) => <span key={index} className={line.startsWith('+') ? 'is-added' : line.startsWith('-') ? 'is-removed' : ''}>{line}{'\n'}</span>)}</pre>
 
-export default function CodingWorkspace({ apiBase, runtime, selectedModel, capabilities, projects, chatContext, contextSources, updateChatContext, globalPrompt, setTab, onActivity, active }) {
+export default function CodingWorkspace({ apiBase, runtime, selectedModel, capabilities, projects, chatContext, contextSources: chatContextSources, updateChatContext, globalPrompt, setTab, onActivity, active }) {
+  /* Memory is for chat: the user approved those facts for conversations, not
+     as instructions for a coding session. */
+  const contextSources = useMemo(() => chatContextSources.filter((source) => source.id !== 'memory'), [chatContextSources])
   const coding = useCodingSession(apiBase, runtime?.active_model_id, runtime?.loaded_now)
   const { snapshot, busy, connection, selectedId } = coding
   const [workspace, setWorkspace] = useState(() => appStorage.getItem('camelid.codingWorkspace') || '')

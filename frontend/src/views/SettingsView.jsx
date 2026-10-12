@@ -14,6 +14,7 @@ import { appStorage } from '../lib/appStorage.js'
 import { isLanChatOnly } from '../lib/apiSurface.js'
 import { LanSharingCard } from '../components/settings/LanSharingCard'
 import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
+import '../styles/memory.css'
 
 const THEME_OPTS = [
   { value: 'system', label: 'System', Icon: IconMonitor },
@@ -37,6 +38,10 @@ export default function SettingsView({
   onOpenCluster = () => {},
   conversationCount = 0,
   deleteAllConversations = null,
+  memoryEnabled = false,
+  setMemoryEnabled = null,
+  memoryCount = 0,
+  onOpenMemory = null,
   selectedModel = null,
   capabilities = null,
 }) {
@@ -289,6 +294,28 @@ export default function SettingsView({
           />
         </CardBody>
       </Card>
+
+      {setMemoryEnabled && (
+        <Card>
+          <CardHeader eyebrow="Chat" title="Memory" />
+          <CardBody>
+            <label className="memory-switch">
+              <span className="memory-switch__copy">
+                <strong>Remember things about me</strong>
+                <small>After a reply, the model may suggest something about you worth keeping, like your name or a preference. Nothing is kept unless you choose Remember. What you keep is given to the model in later chats, and any chat can turn it off. Off by default.</small>
+              </span>
+              <input type="checkbox" role="switch" aria-label="Remember things about me" checked={memoryEnabled} onChange={(event) => setMemoryEnabled(event.target.checked)} />
+            </label>
+            {onOpenMemory && (
+              <div className="settings-select-row">
+                <Button variant="ghost" onClick={onOpenMemory}>
+                  {memoryCount ? `See what’s remembered (${memoryCount})` : 'Open Memory'}
+                </Button>
+              </div>
+            )}
+          </CardBody>
+        </Card>
+      )}
 
       <Card>
         <CardHeader eyebrow="Chat" title="Local data" />

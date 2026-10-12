@@ -1,0 +1,580 @@
+{
+ "model": "Llama 3.2 3B Instruct",
+ "split": "dev",
+ "prompts": {
+  "current": {
+   "summary": {
+    "questions": 25,
+    "right_amount": 25,
+    "decoy_amount_also": 17,
+    "decoy_in_context": 24,
+    "right_and_cited_passage_has_it": 25,
+    "has_citation_marker": 25
+   },
+   "rows": [
+    {
+     "id": 0,
+     "question": "How much did it cost when the primary mirror of the Varnholt observatory was recoated?",
+     "answer": "According to the document excerpts, the primary mirror of the Varnholt observatory was recoated at a cost of:\n\n* 419,100 euros in 2011 (Citation 1)\n* 569,400 euros in 2013 (Citation 2)\n\nNote that Citation 1 and Citation 2 provide different costs for the recoating of the primary mirror of the Varnholt observatory.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.5
+    },
+    {
+     "id": 2,
+     "question": "How much did it cost when the east turntable of the Oduya rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Oduya rail depot was 700,800 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": false,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.0
+    },
+    {
+     "id": 4,
+     "question": "How much did it cost when the north clarifier of the Tarquin Ridge water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Tarquin Ridge water treatment plant was:\n\n* 686,500 euros in 2016 (as reported in [1])\n* 793,700 euros in 2016 (as reported in [2])\n\nNote that the two citations report the same year and cost, but with slightly different amounts.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.0
+    },
+    {
+     "id": 6,
+     "question": "How much did it cost when the primary mirror of the Brightwater observatory was recoated?",
+     "answer": "According to the document excerpts, the primary mirror of the Brightwater observatory was recoated at a cost of 622,200 euros in 2014 [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 5.9
+    },
+    {
+     "id": 8,
+     "question": "How much did it cost when the east turntable of the Ellismere rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Ellismere rail depot was:\n\n* 420,400 euros in 2010 (Citation 1 from planted-08.pdf)\n* 377,300 euros in 2013 (Citation 3 from planted-07.pdf)\n\nNote that there is no mention of the cost of rebuilding the east turntable of the Ellismere rail depot in 2017 (Citation 2 from planted-44.pdf) or 2018 (Citation 4 from planted-41.pdf), as the depot in question is the Ellismere rail depot, not the Gantry Point rail depot or the Belcastro rail depot.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 8.0
+    },
+    {
+     "id": 10,
+     "question": "How much did it cost when the north clarifier of the Quillon water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Quillon water treatment plant was:\n\n* 558,100 euros in 2015 (Citation 1)\n* 222,100 euros in 2015 (Citation 2)\n* 192,200 euros in 2021 (Citation 4)\n\nNote that the costs in Citations 1 and 2 are the same, but the costs in Citations 3 and 4 are different.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.5
+    },
+    {
+     "id": 12,
+     "question": "How much did it cost when the primary mirror of the Ulmstead observatory was recoated?",
+     "answer": "According to the document excerpts, the cost of recoating the primary mirror of the Ulmstead observatory was 832,600 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.1
+    },
+    {
+     "id": 14,
+     "question": "How much did it cost when the east turntable of the Zephara rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Zephara rail depot was:\n\n* 881,400 euros in 2013 (Citation 1 from planted-14.pdf)\n* 596,500 euros in 2020 (Citation 2 from planted-13.pdf)\n\nNote that there is no mention of the cost of rebuilding the east turntable of the Zephara rail depot in 2018 (Citation 4 from planted-41.pdf) or 2017 (Citation 3 from planted-44.pdf), as these are actually the costs of rebuilding the east turntable of the Belcastro and Gantry Point rail depots, respectively.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 8.1
+    },
+    {
+     "id": 16,
+     "question": "How much did it cost when the north clarifier of the Belcastro water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Belcastro water treatment plant was:\n\n* 598,500 euros in 2018 (Citation 1)\n* 872,400 euros in 2022 (Citation 2)\n\nNote that Citation 3 and Citation 4 mention the north clarifier of the Gantry Point and Joroni water treatment plants, respectively, but do not provide the cost of relining the north clarifier of the Belcastro water treatment plant.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.7
+    },
+    {
+     "id": 18,
+     "question": "How much did it cost when the primary mirror of the Fairhollow observatory was recoated?",
+     "answer": "According to the provided document excerpts, the cost of recoating the primary mirror of the Fairhollow observatory was:\n\n* 161,500 euros in 2009 (Citation 1 from planted-18.pdf)\n* 183,200 euros in 2014 (Citation 2 from planted-17.pdf)\n\nNote that Citation 1 and Citation 2 provide different costs for the same event, which may indicate a discrepancy or a need for further clarification.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.1
+    },
+    {
+     "id": 20,
+     "question": "How much did it cost when the east turntable of the Hesketh rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Hesketh rail depot was:\n\n* 342,600 euros in 2013 (Citation 1)\n* 553,600 euros is not mentioned as the cost of the east turntable of the Hesketh rail depot, but rather the cost of rebuilding the east turntable of the Gantry Point rail depot (Citation 2)\n* 836,300 euros in 2022 (Citation 3)\n\nTherefore, the cost of rebuilding the east turntable of the Hesketh rail depot is not consistently reported across the document excerpts.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.9
+    },
+    {
+     "id": 22,
+     "question": "How much did it cost when the north clarifier of the Lowenmark water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Lowenmark water treatment plant was:\n\n* 279,400 euros in 2023 (from [1])\n* 434,100 euros in 2020 (from [2])\n* 222,100 euros in 2015 (from [3])\n\nNote that the costs are not the same across all three documents, indicating that the information may be outdated or inconsistent.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.3
+    },
+    {
+     "id": 24,
+     "question": "How much did it cost when the primary mirror of the Pellacre observatory was recoated?",
+     "answer": "According to the document excerpts, the primary mirror of the Pellacre observatory was recoated at a cost of:\n\n* 488,400 euros in 2009 (Citation 1)\n* 430,300 euros in 2023 (Citation 2)\n\nNote that the cost in 2009 is higher than the cost in 2023.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.0
+    },
+    {
+     "id": 26,
+     "question": "How much did it cost when the east turntable of the Kessring rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Kessring rail depot was:\n\n* 582,100 euros in 2020 (Citation 1 from planted-26.pdf)\n* 553,600 euros in 2017 (Citation 2 from planted-44.pdf)\n* 362,300 euros in 2022 (Citation 3 from planted-25.pdf)\n\nNote that the costs are reported in different years and are not directly comparable.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.4
+    },
+    {
+     "id": 28,
+     "question": "How much did it cost when the north clarifier of the Marlowe Fen water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Marlowe Fen water treatment plant was:\n\n* 290,400 euros in 2019 (Citation 1 from planted-28.pdf)\n* 593,600 euros in 2015 (Citation 2 from planted-27.pdf)\n\nNote that Citation 3 from planted-19.pdf mentions the north clarifier of the Gantry Point water treatment plant, but it does not provide the cost of relining the Marlowe Fen water treatment plant.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.6
+    },
+    {
+     "id": 30,
+     "question": "How much did it cost when the primary mirror of the Halvesund observatory was recoated?",
+     "answer": "According to the document excerpts, the cost of recoating the primary mirror of the Halvesund observatory was 595,100 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.2
+    },
+    {
+     "id": 32,
+     "question": "How much did it cost when the east turntable of the Corvane rail depot was rebuilt?",
+     "answer": "According to the retrieved document excerpts, the cost of rebuilding the east turntable of the Corvane rail depot was 910,800 euros in 2014 [1], and 760,400 euros in 2021 [3].",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.7
+    },
+    {
+     "id": 34,
+     "question": "How much did it cost when the north clarifier of the Joroni water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Joroni water treatment plant was:\n\n* 857,300 euros in 2021 (Citation 1 from planted-34.pdf)\n* 527,600 euros in 2013 (Citation 2 from planted-33.pdf)\n\nNote that there is no mention of the cost of relining the north clarifier of the Joroni water treatment plant in Citations 3 and 4, which refer to different water treatment plants (Gantry Point and Tarquin Ridge, respectively).",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.7
+    },
+    {
+     "id": 36,
+     "question": "How much did it cost when the primary mirror of the Sabreth observatory was recoated?",
+     "answer": "According to the document excerpts, the cost of recoating the primary mirror of the Sabreth observatory was 209,400 euros in 2017 [1], and 391,400 euros in 2023 [2].",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.6
+    },
+    {
+     "id": 38,
+     "question": "How much did it cost when the east turntable of the Wyncroft rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Wyncroft rail depot was 406,400 euros in 2013 [1], and 553,600 euros in 2017 [2].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.6
+    },
+    {
+     "id": 40,
+     "question": "How much did it cost when the north clarifier of the Aldermoor water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Aldermoor water treatment plant was:\n\n* 580,800 euros in 2010 (Citation 1)\n* 943,600 euros in 2020 (Citation 2)\n\nNote that Citation 1 and Citation 2 provide different costs for the same event, which may indicate a discrepancy or an error in the document.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.3
+    },
+    {
+     "id": 42,
+     "question": "How much did it cost when the primary mirror of the Drovenik observatory was recoated?",
+     "answer": "According to the document excerpts, the primary mirror of the Drovenik observatory was recoated at a cost of 664,500 euros in 2014 [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.2
+    },
+    {
+     "id": 44,
+     "question": "How much did it cost when the east turntable of the Gantry Point rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the cost of rebuilding the east turntable of the Gantry Point rail depot was 553,600 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.1
+    },
+    {
+     "id": 46,
+     "question": "How much did it cost when the north clarifier of the Ivarsdal water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Ivarsdal water treatment plant was:\n\n* 338,100 euros [1]\n* 317,300 euros [2]\n\nNote that the two costs are slightly different, but both are reported in the document excerpts.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.1
+    },
+    {
+     "id": 48,
+     "question": "How much did it cost when the primary mirror of the Norbury observatory was recoated?",
+     "answer": "According to the retrieved document excerpts, the primary mirror of the Norbury observatory was recoated in 2018 at a cost of 330,300 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    }
+   ]
+  },
+  "exact": {
+   "summary": {
+    "questions": 25,
+    "right_amount": 24,
+    "decoy_amount_also": 6,
+    "decoy_in_context": 24,
+    "right_and_cited_passage_has_it": 23,
+    "has_citation_marker": 24
+   },
+   "rows": [
+    {
+     "id": 0,
+     "question": "How much did it cost when the primary mirror of the Varnholt observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Varnholt observatory was recoated in 2011 at a cost of 419,100 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.5
+    },
+    {
+     "id": 2,
+     "question": "How much did it cost when the east turntable of the Oduya rail depot was rebuilt?",
+     "answer": "The east turntable of the Oduya rail depot was rebuilt at a cost of 700,800 euros. [1]",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": false,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.1
+    },
+    {
+     "id": 4,
+     "question": "How much did it cost when the north clarifier of the Tarquin Ridge water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Tarquin Ridge water treatment plant was:\n\n* 686,500 euros in 2016 [1]\n* 793,700 euros in 2016 (from a different plant, but same year) [2]\n\nNote that the cost is the same in both excerpts, but the plant name is different.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.2
+    },
+    {
+     "id": 6,
+     "question": "How much did it cost when the primary mirror of the Brightwater observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Brightwater observatory was recoated in 2014 at a cost of 622,200 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.0
+    },
+    {
+     "id": 8,
+     "question": "How much did it cost when the east turntable of the Ellismere rail depot was rebuilt?",
+     "answer": "According to excerpt [1], the east turntable of the Ellismere rail depot was rebuilt in 2010 at a cost of 420,400 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 10,
+     "question": "How much did it cost when the north clarifier of the Quillon water treatment plant was relined?",
+     "answer": "According to excerpt [1], the cost of relining the north clarifier of the Quillon water treatment plant was 558,100 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.4
+    },
+    {
+     "id": 12,
+     "question": "How much did it cost when the primary mirror of the Ulmstead observatory was recoated?",
+     "answer": "According to the excerpts, the cost of recoating the primary mirror of the Ulmstead observatory was:\n\n* 832,600 euros [1]\n* 567,200 euros [2] (note: this is the cost of recoating the secondary mirror, not the primary mirror)\n\nThe correct answer is 832,600 euros, as stated in excerpt [1].",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.0
+    },
+    {
+     "id": 14,
+     "question": "How much did it cost when the east turntable of the Zephara rail depot was rebuilt?",
+     "answer": "According to excerpt [1], the east turntable of the Zephara rail depot was rebuilt in 2013 at a cost of 881,400 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 16,
+     "question": "How much did it cost when the north clarifier of the Belcastro water treatment plant was relined?",
+     "answer": "According to excerpt [1], the cost of relining the north clarifier of the Belcastro water treatment plant was 598,500 euros.\n\n[1]",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.5
+    },
+    {
+     "id": 18,
+     "question": "How much did it cost when the primary mirror of the Fairhollow observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Fairhollow observatory was recoated in 2009 at a cost of 161,500 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.1
+    },
+    {
+     "id": 20,
+     "question": "How much did it cost when the east turntable of the Hesketh rail depot was rebuilt?",
+     "answer": "According to excerpt [1], the east turntable of the Hesketh rail depot was rebuilt in 2013 at a cost of 342,600 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 22,
+     "question": "How much did it cost when the north clarifier of the Lowenmark water treatment plant was relined?",
+     "answer": "According to excerpt [1], the cost of relining the north clarifier of the Lowenmark water treatment plant was 279,400 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 24,
+     "question": "How much did it cost when the primary mirror of the Pellacre observatory was recoated?",
+     "answer": "According to excerpt [2], the cost of recoating the primary mirror of the Pellacre observatory was 430,300 euros.",
+     "states_answer": false,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": false,
+     "seconds": 6.2
+    },
+    {
+     "id": 26,
+     "question": "How much did it cost when the east turntable of the Kessring rail depot was rebuilt?",
+     "answer": "According to the document excerpts, the east turntable of the Kessring rail depot was rebuilt in 2020 at a cost of 582,100 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 28,
+     "question": "How much did it cost when the north clarifier of the Marlowe Fen water treatment plant was relined?",
+     "answer": "According to the document excerpts, the cost of relining the north clarifier of the Marlowe Fen water treatment plant was:\n\n* 290,400 euros in 2019 [1]\n* 593,600 euros in 2015 [2]\n* 222,100 euros in 2015 [3]\n* 857,300 euros in 2021 [4]\n\nNote that the costs are different in each excerpt, but the question asks for the cost of the relining, not the year. The correct answer is 857,300 euros, as it is the most recent and specific cost mentioned in the excerpts.",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 7.9
+    },
+    {
+     "id": 30,
+     "question": "How much did it cost when the primary mirror of the Halvesund observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Halvesund observatory was recoated in 2020 at a cost of 595,100 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    },
+    {
+     "id": 32,
+     "question": "How much did it cost when the east turntable of the Corvane rail depot was rebuilt?",
+     "answer": "The east turntable of the Corvane rail depot was rebuilt in 2014 at a cost of 910,800 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": false,
+     "cited_passage_has_answer": false,
+     "seconds": 6.4
+    },
+    {
+     "id": 34,
+     "question": "How much did it cost when the north clarifier of the Joroni water treatment plant was relined?",
+     "answer": "According to the excerpts, the cost of relining the north clarifier of the Joroni water treatment plant was:\n\n* 857,300 euros in 2021 [1]\n* 527,600 euros in 2013 [2]",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.6
+    },
+    {
+     "id": 36,
+     "question": "How much did it cost when the primary mirror of the Sabreth observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Sabreth observatory was recoated in 2017 at a cost of 209,400 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.4
+    },
+    {
+     "id": 38,
+     "question": "How much did it cost when the east turntable of the Wyncroft rail depot was rebuilt?",
+     "answer": "According to excerpt [1], the east turntable of the Wyncroft rail depot was rebuilt in 2013 at a cost of 406,400 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.4
+    },
+    {
+     "id": 40,
+     "question": "How much did it cost when the north clarifier of the Aldermoor water treatment plant was relined?",
+     "answer": "According to the document excerpts, the north clarifier of the Aldermoor water treatment plant was relined in 2010 at a cost of 580,800 euros [1], and in 2020 at a cost of 943,600 euros [2].",
+     "states_answer": true,
+     "states_decoy": true,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.8
+    },
+    {
+     "id": 42,
+     "question": "How much did it cost when the primary mirror of the Drovenik observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Drovenik observatory was recoated in 2014 at a cost of 664,500 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.2
+    },
+    {
+     "id": 44,
+     "question": "How much did it cost when the east turntable of the Gantry Point rail depot was rebuilt?",
+     "answer": "According to excerpt [1], the east turntable of the Gantry Point rail depot was rebuilt in 2017 at a cost of 553,600 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.2
+    },
+    {
+     "id": 46,
+     "question": "How much did it cost when the north clarifier of the Ivarsdal water treatment plant was relined?",
+     "answer": "The cost of relining the north clarifier of the Ivarsdal water treatment plant was 338,100 euros [1].",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.5
+    },
+    {
+     "id": 48,
+     "question": "How much did it cost when the primary mirror of the Norbury observatory was recoated?",
+     "answer": "According to excerpt [1], the primary mirror of the Norbury observatory was recoated in 2018 at a cost of 330,300 euros.",
+     "states_answer": true,
+     "states_decoy": false,
+     "decoy_in_context": true,
+     "pill": true,
+     "cited_passage_has_answer": true,
+     "seconds": 6.3
+    }
+   ]
+  }
+ }
+}

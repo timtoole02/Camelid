@@ -19713,6 +19713,16 @@ impl CudaResidentDecode {
             .map_err(map("replay"))
     }
 
+    /// Wait for every queued forward to finish. Lets a caller that queues many
+    /// asynchronous forwards (a long prompt) check for cancellation against real
+    /// GPU progress instead of against how fast the host enqueued them.
+    pub(crate) fn synchronize(&self) -> Result<(), String> {
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("cuda synchronize: {e}"))
+    }
+
     /// Sync once and read `len` generated ids starting at ring slot `start`.
     pub(crate) fn read_out_tokens(&mut self, start: usize, len: usize) -> Result<Vec<u32>, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda device-decode read: {e}");

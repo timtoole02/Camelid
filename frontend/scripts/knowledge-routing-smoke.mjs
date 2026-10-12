@@ -4,6 +4,15 @@ import assert from 'node:assert/strict'
 const values = new Map()
 const requests = []
 const nativeFetch = globalThis.fetch
+const nativeFileReader = globalThis.FileReader
+globalThis.FileReader = class {
+  readAsDataURL(blob) {
+    blob.arrayBuffer().then(bytes => {
+      this.result = `data:application/octet-stream;base64,${Buffer.from(bytes).toString('base64')}`
+      this.onload()
+    }, () => this.onerror())
+  }
+}
 globalThis.window = {
   location: { origin: 'http://ui.example', href: 'http://ui.example/' },
   localStorage: {
@@ -32,7 +41,7 @@ try {
   assert.equal(requests.at(-1).url.href, 'http://ui.example/api/documents', 'the default follows the UI origin and Vite proxy')
   values.set('camelid.apiBase', 'https://backend.example/engine/')
   values.set('camelid.apiKey', 'test-api-key')
-  await collections.ingestLibraryFile({ name: 'notes.txt', text: async () => 'notes' })
+  await collections.ingestLibraryFile({ name: 'notes.txt', arrayBuffer: async () => new TextEncoder().encode('notes').buffer })
   await collections.listCollections()
   await collections.createCollection('Notes')
   await collections.renameCollection('collection', 'Renamed')
@@ -66,9 +75,9 @@ try {
   await collections.listCollections('https://backend.example/engine')
   assert.equal(requests.at(-1).url.href, 'https://backend.example/engine/api/collections', 'a view retains the backend selected alongside its chat request')
   assert.equal(new Headers(requests.at(-1).init.headers).get('x-api-key'), null, 'another connection\'s saved key is not sent to the retained backend')
-  await collections.ingestLibraryFile({ name: 'delayed.txt', text: async () => {
+  await collections.ingestLibraryFile({ name: 'delayed.txt', arrayBuffer: async () => {
     values.set('camelid.apiBase', 'http://third.example')
-    return 'notes'
+    return new TextEncoder().encode('notes').buffer
   } })
   assert.equal(requests.at(-1).url.href, 'http://second.example/api/documents/ingest', 'reading a file asynchronously does not change its upload destination')
   assert.equal(new Headers(requests.at(-1).init.headers).get('x-api-key'), null)
@@ -77,5 +86,7 @@ try {
   console.log('knowledge routing smoke passed')
 } finally {
   globalThis.fetch = nativeFetch
+  if (nativeFileReader) globalThis.FileReader = nativeFileReader
+  else delete globalThis.FileReader
   delete globalThis.window
 }

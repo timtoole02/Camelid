@@ -175,8 +175,11 @@ indexing, waiting to index, or indexing stopped with that error.
 
 `semantic` and `hybrid` return `409` with the reason code instead of silently
 degrading. In `hybrid`, BM25 and cosine each contribute their best 50 chunks
-in scope; each list adds `1 / (60 + rank)` for every chunk it holds, and ties
-break on the better single-list rank, then chunk id. Citation checks run on
+in scope. BM25 adds `4 / (60 + rank)` and cosine adds `1 / (60 + rank)` for
+every chunk each list holds. This gives the question's exact names and parts
+more weight when meaning favours a neighbouring passage, while paraphrases
+with no keyword matches are still ranked by meaning. Ties break on keyword
+rank, then the better single-list rank, then chunk id. Citation checks run on
 the ranked list in order until `top_k` results pass, so a withheld chunk is
 replaced by the next verified one. The response's `retrieval` object reports
 what actually ranked the results and the encoder's availability, plus the

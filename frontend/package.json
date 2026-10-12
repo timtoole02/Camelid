@@ -11,6 +11,8 @@
     "smoke:chat-polish": "node scripts/chat-polish-smoke.mjs",
     "smoke:project-context": "node scripts/project-context-smoke.mjs",
     "smoke:project-context-browser": "node scripts/project-context-browser-smoke.mjs",
+    "smoke:memory": "node scripts/memory-smoke.mjs",
+    "smoke:memory-browser": "node scripts/memory-browser-smoke.mjs",
     "smoke:outputs-changes": "node scripts/outputs-changes-smoke.mjs",
     "smoke:outputs-changes-browser": "node scripts/outputs-changes-browser-smoke.mjs",
     "smoke:mcp": "node scripts/mcp-smoke.mjs",

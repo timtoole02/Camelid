@@ -371,6 +371,11 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
 
+A Knowledge Library upload (`POST /api/documents/ingest`) takes a file of up to 64 MB,
+the same as a watched folder. It is sent as base64 inside JSON, so that route accepts a
+body of up to about 85.4 MiB, or `--max-request-body-bytes` if that is larger. A larger
+file is refused with `413` and `document_too_large`.
+
 `--lan-chat-only` also has the environment alias `CAMELID_LAN_CHAT_ONLY=1` and always requires
 `CAMELID_API_KEY` or `CAMELID_API_KEY_FILE`. The command line refuses it alongside
 `--allow-unauthenticated-remote`. Setting both through the environment is not refused there, but it
