@@ -274,10 +274,12 @@ On Apple GPUs with unified memory, `src/embedding/metal.rs` provides the
 document-indexing and query lane. It keeps the Q8 layer weights and reusable
 activation buffers on the GPU and groups up to 1,024 tokens without padding
 or mixing attention across documents. Longer individual inputs use the CPU.
-Metal has no f64 arithmetic: residual LayerNorm uses compensated f32 sums,
-so complete vectors are checked for cosine agreement with the CPU rather
-than claimed bit-identical. Tokenization, embedding rows, initial LayerNorm,
-and pooling use the CPU implementation. Metal execution errors disable that
+Metal has no f64 arithmetic: residual LayerNorm uses the shared CPU f64
+implementation over completed unified-memory buffers. Q8 projections, RoPE,
+attention and gated-SiLU remain on the GPU. Complete vectors are checked for
+cosine agreement with the CPU rather than claimed bit-identical.
+Tokenization, embedding rows, initial LayerNorm, and pooling also use the CPU
+implementation. Metal execution errors disable that
 encoder's GPU lane and retry on the CPU; the same GPU switch and environment
 opt-out apply. `/v1/embeddings` remains the supported CPU lane.
 

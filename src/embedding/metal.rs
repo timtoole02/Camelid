@@ -1,10 +1,10 @@
 //! Bounded Metal layer stack for Knowledge Library document embeddings.
 //!
 //! Q8 block dots preserve the CPU's integer sum and block accumulation order.
-//! RoPE uses host-computed tables. Metal has no f64 arithmetic, so residual
-//! LayerNorm uses compensated f32 sums; complete vectors are checked against
-//! the CPU oracle rather than claimed bit-identical. Tokenization, embedding
-//! rows, initial LayerNorm and pooling stay shared with the CPU implementation.
+//! RoPE uses host-computed tables. Metal has no f64 arithmetic: residual
+//! LayerNorm runs through the shared CPU f64 implementation over completed
+//! unified-memory buffers. Tokenization, embedding rows, initial LayerNorm
+//! and pooling also stay shared with the CPU implementation.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,34 +137,6 @@ kernel void encoder_attention(
         }
         for (uint j = 0; j < 16u; j++) if (d0 + j < head_dim) out[offset + d0 + j] = acc[j];
     }
-}
-
-kernel void encoder_residual_layer_norm(
-    device float* x [[buffer(0)]], device const float* residual [[buffer(1)]],
-    device const float* weight [[buffer(2)]], device const float* bias [[buffer(3)]],
-    constant uint& rows [[buffer(4)]], constant uint& cols [[buffer(5)]],
-    constant float& epsilon [[buffer(6)]], uint row [[thread_position_in_grid]]
-) {
-    if (row >= rows) return;
-    uint off = row * cols;
-    float sum = 0.0f, correction = 0.0f;
-    for (uint c = 0; c < cols; c++) {
-        float value = x[off + c] + residual[off + c];
-        x[off + c] = value;
-        float y = value - correction, t = sum + y;
-        correction = (t - sum) - y;
-        sum = t;
-    }
-    float mean = sum / float(cols), variance = 0.0f;
-    correction = 0.0f;
-    for (uint c = 0; c < cols; c++) {
-        float delta = x[off + c] - mean;
-        float y = delta * delta - correction, t = variance + y;
-        correction = (t - variance) - y;
-        variance = t;
-    }
-    float inv = 1.0f / sqrt(variance / float(cols) + epsilon);
-    for (uint c = 0; c < cols; c++) x[off + c] = ((x[off + c] - mean) * inv) * weight[c] + bias[c];
 }
 
 kernel void encoder_silu_mul(
@@ -313,7 +285,6 @@ struct Kernels {
     gemm: ComputePipelineState,
     rope: ComputePipelineState,
     attention: ComputePipelineState,
-    norm: ComputePipelineState,
     silu: ComputePipelineState,
 }
 
@@ -333,7 +304,6 @@ impl Kernels {
             gemm: pipeline("encoder_q8_gemm")?,
             rope: pipeline("encoder_rope_split")?,
             attention: pipeline("encoder_attention")?,
-            norm: pipeline("encoder_residual_layer_norm")?,
             silu: pipeline("encoder_silu_mul")?,
         })
     }
@@ -352,6 +322,8 @@ pub(super) struct MetalEncoder {
     head_dim: usize,
     epsilon: f32,
     buffers: Option<Buffers>,
+    #[cfg(test)]
+    trace: Option<Mutex<Vec<Vec<f32>>>>,
 }
 
 struct Buffers {
@@ -455,6 +427,22 @@ fn encode_linear(
     dispatch(encoder, &kernels.gemm, rows * weight.outs);
     // Also order the quantizer's scratch reuse after this GEMM's reads.
     encoder.memory_barrier_with_resources(&[output, &buffers.xs, &buffers.xq]);
+}
+
+fn finish(
+    command: &metal::CommandBufferRef,
+    encoder: &ComputeCommandEncoderRef,
+) -> std::result::Result<(), String> {
+    encoder.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    if command.status() != MTLCommandBufferStatus::Completed {
+        return Err(format!(
+            "Metal encoder command failed: {:?}",
+            command.status()
+        ));
+    }
+    Ok(())
 }
 
 fn upload_linear(
@@ -570,6 +558,8 @@ impl MetalEncoder {
             head_dim: config.head_dim,
             epsilon: config.layer_norm_epsilon,
             buffers: None,
+            #[cfg(test)]
+            trace: None,
         })
     }
 
@@ -685,9 +675,9 @@ impl MetalEncoder {
         write(&b.starts, &starts);
         write(&b.lengths, &lengths);
         write(&b.failed, &[0_u32]);
-        let command = self.queue.new_command_buffer();
-        let e = command.new_compute_command_encoder();
         for layer in &self.layers {
+            let command = self.queue.new_command_buffer();
+            let e = command.new_compute_command_encoder();
             encode_linear(e, &self.kernels, &b.hidden, &layer.qkv, &b.qkv, b, rows);
             bind(
                 e,
@@ -739,14 +729,19 @@ impl MetalEncoder {
                 b,
                 rows,
             );
+            finish(command, e)?;
+            if read::<u32>(&b.failed, 1)[0] != 0 {
+                return Err("Metal encoder attention normalization failed".into());
+            }
             self.norm(
-                e,
                 &b.projected,
                 &b.hidden,
                 &layer.attention_norm_weight,
                 &layer.attention_norm_bias,
                 rows,
-            );
+            )?;
+            let command = self.queue.new_command_buffer();
+            let e = command.new_compute_command_encoder();
             encode_linear(
                 e,
                 &self.kernels,
@@ -762,23 +757,21 @@ impl MetalEncoder {
             dispatch(e, &self.kernels.silu, rows * self.ffn);
             e.memory_barrier_with_resources(&[&b.gate]);
             encode_linear(e, &self.kernels, &b.gate, &layer.down, &b.hidden, b, rows);
+            finish(command, e)?;
             self.norm(
-                e,
                 &b.hidden,
                 &b.projected,
                 &layer.output_norm_weight,
                 &layer.output_norm_bias,
                 rows,
-            );
-        }
-        e.end_encoding();
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Metal encoder command failed: {:?}",
-                command.status()
-            ));
+            )?;
+            #[cfg(test)]
+            if let Some(trace) = &self.trace {
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(read(&b.hidden, rows * self.width));
+            }
         }
         if read::<u32>(&b.failed, 1)[0] != 0 {
             return Err("Metal encoder attention normalization failed".into());
@@ -798,19 +791,34 @@ impl MetalEncoder {
 
     fn norm(
         &self,
-        e: &ComputeCommandEncoderRef,
         input: &Buffer,
         residual: &Buffer,
         weight: &Buffer,
         bias: &Buffer,
         rows: usize,
-    ) {
-        bind(e, &[input, residual, weight, bias]);
-        scalar(e, 4, &(rows as u32));
-        scalar(e, 5, &(self.width as u32));
-        scalar(e, 6, &self.epsilon);
-        dispatch(e, &self.kernels.norm, rows);
-        e.memory_barrier_with_resources(&[input]);
+    ) -> std::result::Result<(), String> {
+        // The preceding command has completed. Metal cannot reproduce the
+        // CPU's f64 mean, variance and normalized term with an f32 reduction;
+        // even sub-ulp errors can cross a later Q8 quantization boundary.
+        // Keep the shared oracle here while all five projections and full
+        // attention remain on the GPU. StorageModeShared needs no GPU copy.
+        let mut values = read::<f32>(input, rows * self.width);
+        let residual = read::<f32>(residual, rows * self.width);
+        super::add_in_place(&mut values, &residual).map_err(|error| error.to_string())?;
+        super::layer_norm_in_place(
+            &mut values,
+            rows,
+            self.width,
+            &read::<f32>(weight, self.width),
+            &read::<f32>(bias, self.width),
+            self.epsilon,
+        )
+        .map_err(|error| error.to_string())?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("Metal encoder normalization returned non-finite rows".into());
+        }
+        write(input, &values);
+        Ok(())
     }
 
     #[cfg(all(test, target_arch = "aarch64"))]
@@ -852,6 +860,102 @@ impl MetalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[cfg(target_arch = "aarch64")]
+    struct CpuOracle {
+        model_sha256: String,
+        texts: Vec<String>,
+        vectors: Vec<Vec<u32>>,
+        probe_layers: Vec<Vec<u32>>,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn cpu_oracle(runtime: &NomicBertRuntime, model: &str, texts: &[String]) -> CpuOracle {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(model).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 65_536];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let model_sha256 = format!("{:x}", hasher.finalize());
+        // Opt-in scratch cache for GPU-only iterations. Refresh it whenever
+        // the CPU oracle changes; f32 bits avoid JSON float round-trip drift.
+        let path = std::env::var_os("CAMELID_METAL_CPU_ORACLE").map(std::path::PathBuf::from);
+        if let Some(path) = &path {
+            if let Ok(bytes) = std::fs::read(path) {
+                let cached: CpuOracle =
+                    serde_json::from_slice(&bytes).expect("valid CPU oracle cache");
+                if cached.model_sha256 == model_sha256
+                    && cached.texts == texts
+                    && cached.vectors.len() == texts.len()
+                    && cached.probe_layers.len() == runtime.layers.len()
+                {
+                    eprintln!("CPU oracle loaded from scratch cache");
+                    return cached;
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let (ids, mut hidden) = runtime.embed_input(&texts[0]).unwrap();
+        let mut probe_layers = Vec::new();
+        for (index, layer) in runtime.layers.iter().enumerate() {
+            hidden = runtime
+                .forward_layer(hidden, ids.len(), index, layer)
+                .unwrap();
+            probe_layers.push(hidden.iter().map(|value| value.to_bits()).collect());
+        }
+        let first = runtime
+            .output(ids, hidden)
+            .pool(runtime.config.pooling)
+            .unwrap();
+        // Duplicate passages exercise separate GPU groups but need only one
+        // deterministic CPU result. Other inputs use the bounded worker pool.
+        let mut unique = Vec::new();
+        for text in &texts[1..] {
+            if text != &texts[0] && !unique.contains(text) {
+                unique.push(text.clone());
+            }
+        }
+        let other = runtime.embed_batch(&unique, None).unwrap();
+        let vectors = texts
+            .iter()
+            .map(|text| {
+                let vector = if text == &texts[0] {
+                    &first
+                } else {
+                    &other[unique.iter().position(|item| item == text).unwrap()]
+                };
+                vector.iter().map(|value| value.to_bits()).collect()
+            })
+            .collect();
+        let oracle = CpuOracle {
+            model_sha256,
+            texts: texts.to_vec(),
+            vectors,
+            probe_layers,
+        };
+        eprintln!(
+            "CPU oracle computed in {:.3}s (debug build measurement)",
+            started.elapsed().as_secs_f64()
+        );
+        // Save before comparisons, so a rejected GPU path never loses an
+        // expensive CPU oracle and later attempts can retain the same gate.
+        if let Some(path) = path {
+            if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, serde_json::to_vec(&oracle).unwrap()).unwrap();
+        }
+        oracle
+    }
 
     #[test]
     fn document_gpu_opt_out_values() {
@@ -957,6 +1061,7 @@ mod tests {
             "test must split the batch"
         );
         assert!(prepared.iter().all(|item| item.0.len() <= MAX_ROWS));
+        let oracle = cpu_oracle(&runtime, &model, &texts);
         let rows = prepared[0].0.len();
         let cpu_input = CpuTensor::from_f32(
             "probe",
@@ -979,6 +1084,22 @@ mod tests {
             gpu_qkv.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "Q8 projection"
         );
+        gpu.trace = Some(Mutex::new(Vec::new()));
+        gpu.forward(&prepared[..1]).expect("Metal layer probe");
+        let trace = gpu.trace.take().unwrap().into_inner().unwrap();
+        for (index, (cpu, metal)) in oracle.probe_layers.iter().zip(&trace).enumerate() {
+            let cpu = cpu.iter().copied().map(f32::from_bits).collect::<Vec<_>>();
+            let maximum = cpu
+                .iter()
+                .zip(metal)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f32, f32::max);
+            let cosine = crate::embedding::cosine_similarity(&cpu, metal).unwrap();
+            eprintln!(
+                "layer {}: cosine {cosine:.8}, max absolute difference {maximum:.3e}",
+                index + 1
+            );
+        }
         let started = std::time::Instant::now();
         let hidden = gpu.forward(&prepared).expect("Metal forward");
         eprintln!(
@@ -991,24 +1112,27 @@ mod tests {
         let reused = gpu.forward(&prepared[..2]).expect("reuse buffers");
         assert_eq!(reused, hidden[..2]);
         let mut minimum = 1.0_f32;
-        let cpu_started = std::time::Instant::now();
-        for ((text, (ids, _)), hidden) in texts.iter().zip(&prepared).zip(hidden) {
+        for (index, ((ids, _), hidden)) in prepared.iter().zip(hidden).enumerate() {
             let gpu = runtime
                 .output(ids.clone(), hidden)
                 .pool(runtime.config.pooling)
                 .unwrap();
-            let cpu = runtime.embed(text, None).unwrap();
+            let cpu = oracle.vectors[index]
+                .iter()
+                .copied()
+                .map(f32::from_bits)
+                .collect::<Vec<_>>();
             let cosine = crate::embedding::cosine_similarity(&cpu, &gpu).unwrap();
+            eprintln!(
+                "sample {} ({} tokens): cosine {cosine:.8}",
+                index + 1,
+                ids.len()
+            );
             minimum = minimum.min(cosine);
             assert!(gpu.iter().all(|value| value.is_finite()));
             let norm: f64 = gpu.iter().map(|value| f64::from(*value).powi(2)).sum();
             assert!((norm - 1.0).abs() < 1e-6, "L2 normalization: {norm}");
         }
-        eprintln!(
-            "CPU encoder parity samples: {} chunks in {:.3}s (debug build measurement)",
-            texts.len(),
-            cpu_started.elapsed().as_secs_f64()
-        );
         eprintln!("Metal whole-vector minimum cosine: {minimum:.8}");
         assert!(minimum >= 0.9999, "minimum cosine {minimum}");
         // Exercise the same dispatch as the indexer and search, and the
