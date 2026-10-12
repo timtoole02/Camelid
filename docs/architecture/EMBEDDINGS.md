@@ -275,8 +275,9 @@ document-indexing and query lane. It keeps the Q8 layer weights and reusable
 activation buffers on the GPU and groups up to 1,024 tokens without padding
 or mixing attention across documents. Longer individual inputs use the CPU.
 Metal has no f64 arithmetic: residual LayerNorm uses the shared CPU f64
-implementation over completed unified-memory buffers. Q8 projections, RoPE,
-attention and gated-SiLU remain on the GPU. Complete vectors are checked for
+implementation over completed unified-memory buffers. SiLU also uses the
+shared CPU function to preserve the host exponential before Q8 quantization.
+Q8 projections, RoPE and attention remain on the GPU. Complete vectors are checked for
 cosine agreement with the CPU rather than claimed bit-identical.
 Tokenization, embedding rows, initial LayerNorm, and pooling also use the CPU
 implementation. Metal execution errors disable that

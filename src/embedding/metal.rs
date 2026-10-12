@@ -139,14 +139,6 @@ kernel void encoder_attention(
     }
 }
 
-kernel void encoder_silu_mul(
-    device float* gate [[buffer(0)]], device const float* up [[buffer(1)]],
-    constant uint& count [[buffer(2)]], uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= count) return;
-    float g = gate[idx];
-    gate[idx] = (g / (1.0f + exp(-g))) * up[idx];
-}
 "#;
 
 #[derive(Default)]
@@ -285,7 +277,6 @@ struct Kernels {
     gemm: ComputePipelineState,
     rope: ComputePipelineState,
     attention: ComputePipelineState,
-    silu: ComputePipelineState,
 }
 
 impl Kernels {
@@ -304,7 +295,6 @@ impl Kernels {
             gemm: pipeline("encoder_q8_gemm")?,
             rope: pipeline("encoder_rope_split")?,
             attention: pipeline("encoder_attention")?,
-            silu: pipeline("encoder_silu_mul")?,
         })
     }
 }
@@ -752,10 +742,10 @@ impl MetalEncoder {
                 rows,
             );
             encode_linear(e, &self.kernels, &b.projected, &layer.up, &b.up, b, rows);
-            bind(e, &[&b.gate, &b.up]);
-            scalar(e, 2, &((rows * self.ffn) as u32));
-            dispatch(e, &self.kernels.silu, rows * self.ffn);
-            e.memory_barrier_with_resources(&[&b.gate]);
+            finish(command, e)?;
+            self.silu(&b.gate, &b.up, rows)?;
+            let command = self.queue.new_command_buffer();
+            let e = command.new_compute_command_encoder();
             encode_linear(e, &self.kernels, &b.gate, &layer.down, &b.hidden, b, rows);
             finish(command, e)?;
             self.norm(
@@ -787,6 +777,19 @@ impl MetalEncoder {
             start += len;
         }
         Ok(output)
+    }
+
+    fn silu(&self, gate: &Buffer, up: &Buffer, rows: usize) -> std::result::Result<(), String> {
+        let mut values = read::<f32>(gate, rows * self.ffn);
+        let up = read::<f32>(up, rows * self.ffn);
+        for (gate, up) in values.iter_mut().zip(up) {
+            *gate = super::silu(*gate) * up;
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("Metal encoder activation returned non-finite values".into());
+        }
+        write(gate, &values);
+        Ok(())
     }
 
     fn norm(
