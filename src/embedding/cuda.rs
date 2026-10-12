@@ -19,7 +19,7 @@
 //!   vectors are very close to the CPU's, not promised bit-identical; the
 //!   ignored test `cuda_document_vectors_match_the_cpu` measures how close.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -28,7 +28,7 @@ use cudarc::nvrtc::CompileOptions;
 
 use super::NomicBertRuntime;
 use crate::tensor::CpuTensor;
-use crate::{BackendError, Result};
+use crate::Result;
 
 const KERNELS: &str = r#"
 __device__ __forceinline__ int camelid_dp4a(int a, int b, int c) {
@@ -359,14 +359,15 @@ pub(super) struct CudaEncoder {
     head_dim: usize,
     epsilon: f32,
     device_name: String,
-    /// Activation buffers, kept between forwards and grown only when a larger
-    /// group arrives, so indexing does not allocate a gigabyte per batch.
+    /// Activation buffers, reused while the next group fits. A replacement
+    /// uses the new group's dimensions so unrelated high-water marks do not
+    /// multiply into an unnecessarily large attention scratch buffer.
     buffers: Option<Buffers>,
 }
 
 /// The lazily built CUDA encoder of one [`NomicBertRuntime`].
 #[derive(Default)]
-pub(super) struct Slot(OnceLock<Option<Mutex<CudaEncoder>>>);
+pub(super) struct Slot(OnceLock<Option<Mutex<Option<CudaEncoder>>>>);
 
 /// Set once a CUDA forward fails: every later batch in this process uses the CPU.
 static FAILED: OnceLock<()> = OnceLock::new();
@@ -391,7 +392,7 @@ impl Slot {
                         "[embedding] document encoder layers run on CUDA ({})",
                         encoder.device_name
                     );
-                    Some(Mutex::new(encoder))
+                    Some(Mutex::new(Some(encoder)))
                 }
                 Err(reason) => {
                     tracing::warn!(%reason, "CUDA document encoder unavailable; using the CPU");
@@ -409,42 +410,88 @@ impl Slot {
                 .map(|input| runtime.embed_input(input))
                 .collect::<Result<Vec<_>>>()
         })?;
-        let mut encoder = if wait {
-            encoder
-                .lock()
-                .map_err(|_| BackendError::InvalidTensorData("CUDA encoder lock poisoned".into()))?
+        let mut slot = match if wait {
+            encoder.lock().map_err(TryLockError::Poisoned)
         } else {
-            match encoder.try_lock() {
-                Ok(encoder) => encoder,
-                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(BackendError::InvalidTensorData(
-                        "CUDA encoder lock poisoned".into(),
-                    ))
-                }
-            }
-        };
-        let hidden = encoder.forward(&prepared);
-        drop(encoder);
-        let hidden = match hidden {
-            Ok(hidden) => hidden,
-            Err(reason) => {
-                tracing::warn!(%reason, "CUDA document encoder failed; using the CPU from now on");
+            encoder.try_lock()
+        } {
+            Ok(slot) => slot,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(poisoned)) => {
                 let _ = FAILED.set(());
+                let mut slot = poisoned.into_inner();
+                if let Some(encoder) = slot.take() {
+                    drop(encoder);
+                    crate::cuda::release_async_pool();
+                }
+                tracing::warn!("CUDA document encoder lock poisoned; using the CPU from now on");
                 return Ok(None);
             }
         };
-        prepared
-            .into_iter()
-            .zip(hidden)
-            .map(|((token_ids, _), hidden)| {
-                runtime
-                    .output(token_ids, hidden)
-                    .pool(runtime.config.pooling)
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
+        // Keep the queue locked until pooling has validated the output. Failure
+        // must disable the lane and release its allocations before a waiting
+        // query can enter or the caller retries on the CPU.
+        let had_encoder = slot.is_some();
+        let result = run_encoder(&mut slot, &FAILED, |encoder| {
+            let hidden = encoder.forward(&prepared)?;
+            prepared
+                .into_iter()
+                .zip(hidden)
+                .map(|((token_ids, _), hidden)| {
+                    runtime
+                        .output(token_ids, hidden)
+                        .pool(runtime.config.pooling)
+                        .map_err(|error| error.to_string())
+                })
+                .collect()
+        });
+        if had_encoder && slot.is_none() {
+            // CudaSlice drops enqueue async frees. Drain and trim the selected
+            // device's pool before CPU fallback so fit probes see reclaimed VRAM.
+            crate::cuda::release_async_pool();
+        }
+        match result {
+            Ok(vectors) => Ok(vectors),
+            Err(reason) => {
+                tracing::warn!(%reason, "CUDA document encoder failed; using the CPU from now on");
+                Ok(None)
+            }
+        }
     }
+}
+
+/// Called with the slot's mutex held, including the failure check and cleanup.
+fn run_encoder<T, R>(
+    slot: &mut Option<T>,
+    failed: &OnceLock<()>,
+    run: impl FnOnce(&mut T) -> std::result::Result<R, String>,
+) -> std::result::Result<Option<R>, String> {
+    // A caller may have queued before another batch disabled the CUDA lane.
+    if failed.get().is_some() {
+        slot.take();
+        return Ok(None);
+    }
+    let Some(encoder) = slot.as_mut() else {
+        return Ok(None);
+    };
+    match run(encoder) {
+        Ok(output) => Ok(Some(output)),
+        Err(reason) => {
+            let _ = failed.set(());
+            slot.take();
+            Err(reason)
+        }
+    }
+}
+
+fn buffer_shape_for_request(
+    cached: Option<(usize, usize)>,
+    rows: usize,
+    max_len: usize,
+) -> (usize, usize) {
+    cached
+        .filter(|&(cached_rows, cached_max_len)| cached_rows >= rows && cached_max_len >= max_len)
+        .unwrap_or((rows, max_len))
 }
 
 fn disabled_by_env() -> bool {
@@ -625,13 +672,18 @@ impl CudaEncoder {
         rows: usize,
         max_len: usize,
     ) -> std::result::Result<Buffers, String> {
+        let (rows, max_len) = buffer_shape_for_request(
+            self.buffers
+                .as_ref()
+                .map(|buffers| (buffers.rows, buffers.max_len)),
+            rows,
+            max_len,
+        );
         if let Some(buffers) = self.buffers.take() {
-            if buffers.rows >= rows && buffers.max_len >= max_len {
+            if (buffers.rows, buffers.max_len) == (rows, max_len) {
                 return Ok(buffers);
             }
-            let (rows, max_len) = (rows.max(buffers.rows), max_len.max(buffers.max_len));
             drop(buffers);
-            return self.allocate(rows, max_len);
         }
         self.allocate(rows, max_len)
     }
@@ -970,6 +1022,101 @@ impl CudaEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn failed_encoder_is_dropped_before_a_waiting_caller_can_run() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = Mutex::new(Some(DropProbe(Arc::clone(&drops))));
+        let failed = OnceLock::new();
+        std::thread::scope(|scope| {
+            let mut active = slot.lock().unwrap();
+            let waiting = scope.spawn(|| {
+                let mut queued = slot.lock().unwrap();
+                run_encoder(
+                    &mut queued,
+                    &failed,
+                    |_| -> std::result::Result<(), String> {
+                        panic!("a queued caller must use the CPU after CUDA fails")
+                    },
+                )
+            });
+            let result = run_encoder(&mut active, &failed, |_| {
+                Err::<(), _>("injected CUDA or pooling failure".to_string())
+            });
+            assert!(result.is_err());
+            assert!(failed.get().is_some());
+            assert!(active.is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(active);
+            assert_eq!(waiting.join().unwrap().unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn process_failure_discards_another_waiting_encoders_allocations() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut slot = Some(DropProbe(Arc::clone(&drops)));
+        let failed = OnceLock::from(());
+        assert_eq!(
+            run_encoder(&mut slot, &failed, |_| -> std::result::Result<(), String> {
+                panic!("an already disabled lane must not run")
+            })
+            .unwrap(),
+            None
+        );
+        assert!(slot.is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_encoder_retains_its_allocations() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut slot = Some(DropProbe(Arc::clone(&drops)));
+        let failed = OnceLock::new();
+        assert_eq!(run_encoder(&mut slot, &failed, |_| Ok(42)), Ok(Some(42)));
+        assert!(slot.is_some());
+        assert!(failed.get().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn buffer_replacement_does_not_multiply_unrelated_high_water_marks() {
+        // A full indexing batch followed by one long query needs the same
+        // attention scratch capacity, not eight times as much.
+        let indexing = buffer_shape_for_request(None, 8192, 128);
+        let query = buffer_shape_for_request(Some(indexing), 1024, 1024);
+        assert_eq!(query, (1024, 1024));
+        assert_eq!(query.0 * query.1, indexing.0 * indexing.1);
+        assert_eq!(buffer_shape_for_request(Some(query), 8192, 128), indexing);
+        assert_eq!(buffer_shape_for_request(Some(indexing), 512, 64), indexing);
+    }
+
+    #[test]
+    #[ignore = "needs CAMELID_NOMIC_GGUF and a CUDA device"]
+    fn cuda_buffer_replacement_uses_the_requested_shape() {
+        let model = std::env::var("CAMELID_NOMIC_GGUF").expect("CAMELID_NOMIC_GGUF");
+        let runtime = super::super::EmbeddingRuntime::load(&model).expect("load encoder");
+        let super::super::EmbeddingRuntime::Nomic(nomic) = runtime else {
+            panic!("not the Nomic encoder");
+        };
+        let mut encoder = CudaEncoder::build(&nomic).expect("CUDA encoder");
+        encoder.buffers = Some(encoder.take_buffers(64, 2).unwrap());
+        let buffers = encoder.take_buffers(8, 16).unwrap();
+        assert_eq!((buffers.rows, buffers.max_len), (8, 16));
+        assert_eq!(buffers.t.scores.len(), 8 * encoder.heads * 16);
+        encoder.buffers = Some(buffers);
+        let buffers = encoder.take_buffers(4, 8).unwrap();
+        assert_eq!((buffers.rows, buffers.max_len), (8, 16));
+    }
 
     #[test]
     fn only_explicit_off_values_disable_the_cuda_lane() {

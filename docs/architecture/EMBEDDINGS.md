@@ -269,8 +269,11 @@ linears return the CPU's bits and whole vectors stay within cosine 0.9999 of
 the CPU's (the ignored test `cuda_document_vectors_match_the_cpu`). On a 4-vCPU
 host with an L4 a 114,083-chunk library indexed in 1,465 s, against 0.37 chunks
 a second on the CPU (`qa/evidence-bundles/semantic-index-cuda-20261011`). Any
-CUDA failure falls back to the CPU for the rest of the process; a search never
-waits behind an indexing batch. Set `CAMELID_DOCUMENT_GPU_ENCODER=0` to keep
+CUDA failure releases the encoder and its buffers, trims the async allocation
+pool, and falls back to the CPU for the rest of the process. Replacement scratch
+buffers use the current request's dimensions, so a long query does not multiply
+the row count retained from a large indexing batch. A search never waits behind
+an indexing batch. Set `CAMELID_DOCUMENT_GPU_ENCODER=0` to keep
 the encoder on the CPU.
 
 On Apple GPUs with unified memory, `src/embedding/metal.rs` provides the

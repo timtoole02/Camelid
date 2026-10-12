@@ -828,9 +828,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const persistUserMemories = (updater) => {
     const next = normalizeMemories(typeof updater === 'function' ? updater(userMemoriesRef.current) : updater)
+    try {
+      persistContextValue(USER_MEMORIES_STORAGE_KEY, next)
+    } catch {
+      showNotice('Memory changes could not be saved. Local storage is full or unavailable. Free space and try again.', 'error')
+      return null
+    }
     userMemoriesRef.current = next
     setUserMemories(next)
-    writeJsonStorage(USER_MEMORIES_STORAGE_KEY, next)
     return next
   }
 
@@ -2714,7 +2719,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       turn: userTurnNumber(conversation.messages, messageId),
       conversation_title: conversation.title || '',
     })
-    persistUserMemories((current) => [memory, ...current])
+    if (!persistUserMemories((current) => [memory, ...current])) return null
     patchSuggestions(conversationId, messageId, (items) => items.map((item) => (
       item.id === suggestionId ? { ...item, text: factText, status: 'saved', memory_id: memory.id } : item
     )))
@@ -2734,7 +2739,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const message = conversation?.messages?.find((item) => item.id === messageId)
     const suggestion = normalizeSuggestions(message?.memory_suggestions).find((item) => item.id === suggestionId)
     if (!suggestion || suggestion.status !== 'saved') return
-    if (suggestion.memory_id) persistUserMemories((current) => current.filter((memory) => memory.id !== suggestion.memory_id))
+    if (suggestion.memory_id && !persistUserMemories((current) => current.filter((memory) => memory.id !== suggestion.memory_id))) return
     patchSuggestions(conversationId, messageId, (items) => items.map((item) => {
       if (item.id !== suggestionId) return item
       const { memory_id: _memoryId, ...rest } = item
@@ -2753,7 +2758,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     }
     if (memoryLimitReached()) return null
     const memory = newMemory(cleaned, source)
-    persistUserMemories((current) => [memory, ...current])
+    if (!persistUserMemories((current) => [memory, ...current])) return null
     showNotice('Added to memory.', 'success')
     return memory
   }
@@ -2761,10 +2766,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const editMemory = (id, factText) => {
     const cleaned = cleanMemoryText(factText)
     if (!cleaned) return false
-    persistUserMemories((current) => current.map((memory) => (
+    return Boolean(persistUserMemories((current) => current.map((memory) => (
       memory.id === id && memory.text !== cleaned ? { ...memory, text: cleaned, edited: true, updated_at: nowIso() } : memory
-    )))
-    return true
+    ))))
   }
 
   /** A memory not in use is kept, but never given to the model. */
@@ -2775,13 +2779,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
   }
 
   const forgetMemory = (id) => {
-    persistUserMemories((current) => current.filter((memory) => memory.id !== id))
+    if (!persistUserMemories((current) => current.filter((memory) => memory.id !== id))) return false
     showNotice('Forgotten.', 'success')
+    return true
   }
 
   const forgetAllMemories = () => {
-    persistUserMemories([])
+    if (!persistUserMemories([])) return false
     showNotice('Memory cleared.', 'success')
+    return true
   }
 
   /** Marks one message for the chat to scroll to once its conversation is

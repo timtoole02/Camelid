@@ -4015,8 +4015,8 @@ impl RunnableModel {
     ///
     /// `is_cancelled` is checked between prompt segments and decode chunks of the
     /// device loop (each after a sync, so the check sees real GPU progress); the
-    /// host-fed loop checks it before its one-call prefill and, through
-    /// `should_stop`, after every token.
+    /// host-fed loop also checks between synchronized prompt segments and,
+    /// through `should_stop`, after every token.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_cuda(
@@ -4148,30 +4148,37 @@ impl RunnableModel {
         let (&last_prompt_token, prior_prompt) = prompt
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
-        if !prior_prompt.is_empty() {
-            if is_cancelled() {
-                return Err(BackendError::Cancelled);
-            }
+        {
             let half = self.rope_dim / 2;
             let mut embeddings = Vec::with_capacity(prior_prompt.len() * self.d_model);
             let mut cos_all = Vec::with_capacity(prior_prompt.len() * half);
             let mut sin_all = Vec::with_capacity(prior_prompt.len() * half);
-            for (position, &token) in prior_prompt.iter().enumerate() {
-                embeddings
-                    .extend_from_slice(&self.token_embd.dequant_row(token as usize, "token_embd")?);
-                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
-                cos_all.extend_from_slice(&cos);
-                sin_all.extend_from_slice(&sin);
-            }
-            if engine.prefers_batched_prefill() {
-                engine
-                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
-                    .map_err(BackendError::InvalidTensorData)?;
-            } else {
-                engine
-                    .prefill(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
-                    .map_err(BackendError::InvalidTensorData)?;
-            }
+            qwen35_cuda_prefill_segments(prior_prompt, is_cancelled, &mut |base, tokens| {
+                for (offset, &token) in tokens.iter().enumerate() {
+                    let position = base + offset;
+                    embeddings.extend_from_slice(
+                        &self.token_embd.dequant_row(token as usize, "token_embd")?,
+                    );
+                    let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                    cos_all.extend_from_slice(&cos);
+                    sin_all.extend_from_slice(&sin);
+                }
+                // Both continuation APIs index the input arrays by absolute position.
+                // Keep the prior rows, but advance only this segment so KV and the SSM
+                // recurrence continue exactly once per token. Each call synchronizes
+                // before returning, making the next cancel check reflect GPU progress.
+                let end = base + tokens.len();
+                if engine.prefers_batched_prefill() {
+                    engine
+                        .prefill_batched_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                        .map_err(BackendError::InvalidTensorData)?;
+                } else {
+                    engine
+                        .prefill_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                        .map_err(BackendError::InvalidTensorData)?;
+                }
+                Ok(())
+            })?;
         }
         let last_position = prior_prompt.len();
         let emb = self
@@ -5279,10 +5286,119 @@ mod qwen35_metal_prompt_cancel_tests {
     }
 }
 
-/// Prompt tokens the qwen35 CUDA device loop queues between syncs; the request's cancel
+/// Prompt tokens the qwen35 CUDA loops queue between syncs; the request's cancel
 /// check runs at each sync, so this bounds how long an abandoned prompt read continues.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const QWEN35_CUDA_PROMPT_CANCEL_SEGMENT: usize = 64;
+
+/// Bound host-fed CUDA prefill work. The forward closure must synchronize its
+/// segment before returning, and continue the existing KV/SSM state at `base`.
+#[cfg(any(feature = "cuda", test))]
+fn qwen35_cuda_prefill_segments(
+    prompt: &[u32],
+    is_cancelled: &dyn Fn() -> bool,
+    forward: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+) -> Result<()> {
+    for (batch, tokens) in prompt.chunks(QWEN35_CUDA_PROMPT_CANCEL_SEGMENT).enumerate() {
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        forward(batch * QWEN35_CUDA_PROMPT_CANCEL_SEGMENT, tokens)?;
+    }
+    // Also check after the final segment (or a single-token prompt's empty
+    // prefix), before the caller dispatches the final prompt token for logits.
+    if is_cancelled() {
+        return Err(BackendError::Cancelled);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod qwen35_cuda_prompt_cancel_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cancelled_cuda_prompt_never_dispatches_the_next_segment() {
+        let stopped = Cell::new(false);
+        let mut processed = Vec::new();
+        let prompt: Vec<u32> = (0..130).collect();
+        let result =
+            qwen35_cuda_prefill_segments(&prompt, &|| stopped.get(), &mut |base, tokens| {
+                processed.push((base, tokens.to_vec()));
+                stopped.set(true);
+                Ok(())
+            });
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+        assert_eq!(processed, vec![(0, prompt[..64].to_vec())]);
+    }
+
+    #[test]
+    fn cancelled_cuda_prompt_never_dispatches_its_first_segment() {
+        let result = qwen35_cuda_prefill_segments(&[1, 2], &|| true, &mut |_, _| {
+            panic!("cancelled request dispatched a prompt segment")
+        });
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+    }
+
+    #[test]
+    fn cancelled_cuda_prompt_stops_before_final_token_logits() {
+        for prefix_len in [0, 1, 64, 65] {
+            let stopped = Cell::new(prefix_len == 0);
+            let prompt: Vec<u32> = (0..prefix_len).collect();
+            let mut final_logits_called = false;
+            let result =
+                qwen35_cuda_prefill_segments(&prompt, &|| stopped.get(), &mut |base, tokens| {
+                    if base + tokens.len() == prompt.len() {
+                        stopped.set(true);
+                    }
+                    Ok(())
+                })
+                .map(|()| final_logits_called = true);
+            assert!(matches!(result, Err(BackendError::Cancelled)));
+            assert!(!final_logits_called);
+        }
+    }
+
+    #[test]
+    fn healthy_cuda_prompt_continues_state_and_preserves_final_logits_position() {
+        let prompt: Vec<u32> = (0..131).map(|i| i * 3 + 7).collect();
+        let (&last_token, prior_prompt) = prompt.split_last().unwrap();
+        let mut positions = Vec::new();
+        let mut prefix_inputs = Vec::new();
+        let mut state = 0_u64;
+        let advance = |state: u64, position: usize, token: u32| {
+            state
+                .wrapping_mul(31)
+                .wrapping_add(position as u64 + token as u64)
+        };
+        qwen35_cuda_prefill_segments(prior_prompt, &|| false, &mut |base, tokens| {
+            assert_eq!(base, positions.len(), "must resume the existing state");
+            prefix_inputs.extend_from_slice(tokens);
+            let end = base + tokens.len();
+            // Model the continuation APIs' absolute indexing into prefix arrays.
+            for (position, &token) in prefix_inputs.iter().enumerate().take(end).skip(base) {
+                state = advance(state, position, token);
+                positions.push(position);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(positions, (0..prior_prompt.len()).collect::<Vec<_>>());
+        assert_eq!(prefix_inputs, prior_prompt);
+        state = advance(state, prior_prompt.len(), last_token);
+        let expected = prompt
+            .iter()
+            .enumerate()
+            .fold(0, |state, (position, &token)| {
+                advance(state, position, token)
+            });
+        assert_eq!(
+            state, expected,
+            "final token must see the complete prefix state"
+        );
+    }
+}
 
 #[cfg(feature = "cuda")]
 fn qwen35_device_decode_chunk_len() -> usize {

@@ -22,6 +22,10 @@ Nothing is kept until you choose **Remember**. You can also add a memory
 yourself on the Memory page, or turn a saved note into one with **Make a memory**
 (you write the fact; the note stays as it is).
 
+If browser storage is full or unavailable, the page reports that the change
+could not be saved. The previous memories and any edited draft stay in place;
+free storage and retry the change.
+
 The suggestion is a second, short request to the same model, made after the
 reply has finished. It contains only your message — not the reply and not the
 rest of the conversation — and the same memories in use that fit the chat's
@@ -33,11 +37,12 @@ read only if it is exactly `{"facts": [...]}`. If anything else comes back, or
 the request fails, there are simply no suggestions for that message.
 
 Sending your next message cancels a suggestion request that is still running.
-The engine stops a cancelled request at its next step, but reading a prompt is a
-single step, so on a slow model a suggestion that has started can still hold up
-your next reply until it has read its prompt — measured with Ornith 9B on a
-4-core CPU: about 145 seconds. So the model is asked automatically only while it
-is quick: when its last suggestion took under 15 seconds, or, before it has made
+Dense and Qwen3.5 generation check cancellation between prompt segments as well
+as decode steps; GPU work already submitted must finish before the next check.
+Earlier versions could hold up the next reply for an entire prompt read —
+measured with Ornith 9B on a 4-core CPU at about 145 seconds. Automatic
+suggestions still run only while the model is quick: when its last suggestion
+took under 15 seconds, or, before it has made
 one, when its reply began within 8 seconds. Otherwise the reply shows **Look for
 things to remember**, and the model is asked only when you choose it. These timings are kept per model on
 this device (`camelid.memorySuggestionMs`); a model that answers in time again —

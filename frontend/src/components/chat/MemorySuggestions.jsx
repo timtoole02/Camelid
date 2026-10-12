@@ -75,7 +75,7 @@ function SuggestionRow({ suggestion, disabled, onAccept, onDismiss, onUndo }) {
 
   if (editing) {
     const cancel = () => { setEditing(false); setDraft(suggestion.text) }
-    const save = () => { if (draft.trim()) { onAccept(draft); setEditing(false) } }
+    const save = () => { if (draft.trim() && onAccept(draft)) setEditing(false) }
     return (
       <li className="memsug__item is-editing">
         <input

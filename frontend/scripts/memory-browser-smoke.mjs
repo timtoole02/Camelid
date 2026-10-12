@@ -206,6 +206,24 @@ await page.evaluateOnNewDocument((noteText) => {
 /* ---- helpers -------------------------------------------------------------- */
 const storage = (key) => page.evaluate((key) => window.localStorage.getItem(key), key)
 const storedMemories = async () => JSON.parse(await storage('camelid.userMemories') || '[]')
+// Simulate a real browser quota failure while retaining the previously saved
+// value. appStorage intentionally catches this exception, so the hook must
+// verify the write before changing the UI or its prompt-memory ref.
+const failMemoryWrites = (fail) => page.evaluate((fail) => {
+  if (!window.memorySmokeSetItem) {
+    window.memorySmokeSetItem = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (window.memorySmokeFailWrites && key === 'camelid.userMemories') throw new DOMException('Storage is full', 'QuotaExceededError')
+      return window.memorySmokeSetItem.call(this, key, value)
+    }
+  }
+  window.memorySmokeFailWrites = fail
+}, fail)
+const expectMemorySaveError = async () => {
+  await page.waitForFunction(() => document.querySelector('[role="alert"]')?.textContent.includes('Memory changes could not be saved'))
+  await page.click('.cx-notice [aria-label="Dismiss"]')
+  await page.waitForSelector('.cx-notice--error', { hidden: true })
+}
 const currentConversation = () => page.evaluate(() => JSON.parse(localStorage.getItem('camelid.conversations') || '[]')
   .find((conversation) => conversation.id === localStorage.getItem('camelid.selectedConversationId')))
 const memoryMessage = (body) => body.messages.find((m) => m.role === 'system' && String(m.content).includes(MEMORY_MARKER))
@@ -327,11 +345,23 @@ try {
   await shot('1-suggestions', '.memsug', { mobile: true })
 
   /* ---- 4. Remember, Edit, Not now, Undo --------------------------------- */
+  await failMemoryWrites(true)
+  await page.click('.memsug .memsug__item:nth-child(1) .memsug__primary')
+  await expectMemorySaveError()
+  assert.deepEqual(await storedMemories(), [], 'a failed Remember saves nothing')
+  assert.ok((await suggestionRows()).every((row) => !row.saved), 'a failed Remember leaves suggestions pending')
+  await failMemoryWrites(false)
   await page.click('.memsug .memsug__item:nth-child(1) .memsug__primary')
   await page.waitForFunction(() => document.querySelector('.memsug .memsug__item:nth-child(1)')?.classList.contains('is-saved'), { timeout: 5000 })
   await clickVisible('.memsug .memsug__item:nth-child(2) button', 'Edit')
   await page.waitForSelector('input[aria-label="Edit what to remember"]')
   await fill('input[aria-label="Edit what to remember"]', 'The user lives in Leeds, UK.')
+  await failMemoryWrites(true)
+  await clickVisible('.memsug .is-editing button', 'Remember')
+  await expectMemorySaveError()
+  assert.equal(await page.$eval('input[aria-label="Edit what to remember"]', (input) => input.value), 'The user lives in Leeds, UK.', 'a failed Remember preserves the edited suggestion')
+  assert.equal((await storedMemories()).length, 1)
+  await failMemoryWrites(false)
   await page.focus('input[aria-label="Edit what to remember"]')
   await page.keyboard.press('Enter')
   await page.waitForFunction(() => document.querySelectorAll('.memsug .memsug__item.is-saved').length === 2, { timeout: 5000 })
@@ -350,6 +380,12 @@ try {
     assert.equal(memory.enabled, true)
   }
 
+  await failMemoryWrites(true)
+  await clickVisible('.memsug .memsug__item:nth-child(1) button', 'Undo')
+  await expectMemorySaveError()
+  assert.equal((await storedMemories()).length, 2, 'a failed Undo retains the memory')
+  assert.ok((await suggestionRows()).every((row) => row.saved), 'a failed Undo keeps the suggestion saved')
+  await failMemoryWrites(false)
   await clickVisible('.memsug .memsug__item:nth-child(1) button', 'Undo')
   await page.waitForFunction(() => document.querySelector('.memsug .memsug__item:nth-child(1) .memsug__primary'), { timeout: 5000 })
   assert.equal((await storedMemories()).length, 1, 'Undo forgets what was just kept')
@@ -413,6 +449,12 @@ try {
   // Rows are found by their memory text: the source line names the chat, whose title mentions both.
   const samRow = await page.waitForFunction(() => [...document.querySelectorAll('.memory-item')]
     .find((row) => row.querySelector('.memory-item__text')?.textContent.includes('Sam')))
+  await failMemoryWrites(true)
+  await (await samRow.asElement().$('.memory-item__use input')).click()
+  await expectMemorySaveError()
+  assert.equal(await samRow.asElement().$eval('.memory-item__use input', (input) => input.checked), true, 'a failed Use toggle retains its saved state')
+  assert.ok((await storedMemories()).find((m) => m.text.includes('Sam')).enabled)
+  await failMemoryWrites(false)
   await (await samRow.asElement().$('.memory-item__use input')).click()
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('camelid.userMemories')).find((m) => m.text.includes('Sam'))?.enabled === false)
   assert.ok(await samRow.asElement().evaluate((row) => row.classList.contains('is-off')))
@@ -423,14 +465,35 @@ try {
     .querySelector('.memory-item__actions button').click())
   await page.waitForSelector('input[aria-label="Edit memory"]')
   await fill('input[aria-label="Edit memory"]', 'The user lives in Leeds, England.')
+  await failMemoryWrites(true)
+  await clickVisible('.memory-item__edit button', 'Save')
+  await expectMemorySaveError()
+  assert.equal(await page.$eval('input[aria-label="Edit memory"]', (input) => input.value), 'The user lives in Leeds, England.', 'a failed edit preserves the draft')
+  assert.ok((await storedMemories()).some((m) => m.text === 'The user lives in Leeds, UK.'))
+  await failMemoryWrites(false)
   await clickVisible('.memory-item__edit button', 'Save')
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('camelid.userMemories')).some((m) => m.text === 'The user lives in Leeds, England.' && m.edited === true && m.enabled))
   assert.ok((await storedMemories()).some((m) => m.text === "The user's name is Sam." && !m.edited), 'only the edited memory changed')
 
   // Add one by hand.
   await fill('input[aria-label="Something to remember"]', 'I prefer metric units.')
+  await failMemoryWrites(true)
+  await clickVisible('.memory-add button', 'Remember')
+  await expectMemorySaveError()
+  assert.equal(await page.$eval('input[aria-label="Something to remember"]', (input) => input.value), 'I prefer metric units.', 'a failed add preserves the draft')
+  assert.equal(await page.$$eval('.memory-item', (items) => items.length), 2, 'a failed add creates no visible memory')
+  assert.equal((await storedMemories()).length, 2)
+  await failMemoryWrites(false)
   await clickVisible('.memory-add button', 'Remember')
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('camelid.userMemories')).some((m) => m.text === 'I prefer metric units.' && m.source.kind === 'manual'))
+
+  await failMemoryWrites(true)
+  await page.click('button[aria-label="Forget “I prefer metric units.”"]')
+  await page.click('button[aria-label="Confirm: forget “I prefer metric units.”"]')
+  await expectMemorySaveError()
+  assert.ok(await page.$('button[aria-label="Confirm: forget “I prefer metric units.”"]'), 'a failed forget keeps the memory and confirmation available')
+  assert.equal((await storedMemories()).length, 3)
+  await failMemoryWrites(false)
 
   // A note becomes a memory only when the user writes it as one.
   await page.click('#memory-tab-notes')
@@ -518,6 +581,15 @@ try {
   /* ---- 11. Forget everything ---------------------------------------------- */
   await navTo('Memory')
   await page.waitForSelector('.memory-list .memory-item', { timeout: 30000 })
+  await clickVisible('.cxv-toolbar button', 'Forget everything')
+  const beforeForgetAll = await storedMemories()
+  await failMemoryWrites(true)
+  await clickVisible('[role="dialog"] button', 'Forget everything')
+  await expectMemorySaveError()
+  assert.equal(await page.$('[role="dialog"]'), null, 'the confirmation closes so the error notice is visible')
+  assert.deepEqual(await storedMemories(), beforeForgetAll)
+  assert.equal(await page.$$eval('.memory-item', (items) => items.length), beforeForgetAll.length, 'failed Forget everything retains visible memories')
+  await failMemoryWrites(false)
   await clickVisible('.cxv-toolbar button', 'Forget everything')
   await clickVisible('[role="dialog"] button', 'Forget everything')
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('camelid.userMemories') || '[]').length === 0, { timeout: 5000 })

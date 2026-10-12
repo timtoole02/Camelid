@@ -281,8 +281,7 @@ function MemoriesSection({
                       aria-label={confirming ? `Confirm: forget “${memory.text}”` : `Forget “${memory.text}”`}
                       onClick={() => {
                         if (!confirming) { setPendingForgetId(memory.id); return }
-                        forgetMemory(memory.id)
-                        setPendingForgetId(null)
+                        if (forgetMemory(memory.id)) setPendingForgetId(null)
                       }}
                     >
                       {confirming ? 'Forget' : ''}
