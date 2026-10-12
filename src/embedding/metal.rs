@@ -220,6 +220,10 @@ impl Slot {
                 return Ok(None);
             }
         };
+        // A caller may have queued behind a batch that disabled this lane.
+        if self.failed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let prepared = super::embedding_batch_pool().install(|| {
             use rayon::prelude::*;
             inputs
@@ -230,20 +234,27 @@ impl Slot {
         if prepared.iter().any(|(ids, _)| ids.len() > MAX_ROWS) {
             return Ok(None);
         }
-        let hidden = encoder.forward(&prepared);
+        let hidden = match encoder.forward(&prepared) {
+            Ok(hidden) => hidden,
+            Err(reason) => {
+                // Publish the failure while still owning the queue; a query
+                // cannot acquire it in the gap before the lane is disabled.
+                self.failed.store(true, Ordering::Release);
+                tracing::warn!(%reason, "Metal document encoder failed; using the CPU");
+                return Ok(None);
+            }
+        };
         drop(encoder);
-        let result = hidden.and_then(|hidden| {
-            prepared
-                .into_iter()
-                .zip(hidden)
-                .map(|((ids, _), hidden)| {
-                    runtime
-                        .output(ids, hidden)
-                        .pool(runtime.config.pooling)
-                        .map_err(|error| error.to_string())
-                })
-                .collect()
-        });
+        let result = prepared
+            .into_iter()
+            .zip(hidden)
+            .map(|((ids, _), hidden)| {
+                runtime
+                    .output(ids, hidden)
+                    .pool(runtime.config.pooling)
+                    .map_err(|error| error.to_string())
+            })
+            .collect();
         match result {
             Ok(vectors) => Ok(Some(vectors)),
             Err(reason) => {
@@ -486,6 +497,9 @@ impl MetalEncoder {
     }
 
     fn build_inner(runtime: &NomicBertRuntime) -> std::result::Result<Self, String> {
+        if !cfg!(target_arch = "aarch64") {
+            return Err("Metal document encoder requires Apple silicon".into());
+        }
         let device = Device::system_default().ok_or("no Metal device")?;
         // The shared-memory lane is deliberately Apple-silicon scoped. Intel
         // discrete GPUs retain the CPU path until they have parity evidence.
@@ -845,8 +859,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn metal_q8_linears_match_cpu_bits_on_ragged_rows() {
-        let device = Device::system_default().expect("Metal device");
+        let Some(device) = Device::system_default() else {
+            eprintln!("Metal kernel test skipped: no Metal device");
+            return;
+        };
         let kernels = Kernels::build(&device).expect("Metal encoder kernels");
         let (rows, width, outs) = (3, 64, 67);
         let input: Vec<f32> = (0..rows * width)
@@ -905,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     #[ignore = "needs CAMELID_NOMIC_GGUF and an Apple GPU"]
     fn metal_document_vectors_match_the_cpu() {
         let model = std::env::var("CAMELID_NOMIC_GGUF").expect("CAMELID_NOMIC_GGUF");
