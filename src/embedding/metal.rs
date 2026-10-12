@@ -813,7 +813,7 @@ impl MetalEncoder {
         e.memory_barrier_with_resources(&[input]);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "aarch64"))]
     fn qkv_for_test(
         &self,
         runtime: &NomicBertRuntime,
