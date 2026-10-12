@@ -123,15 +123,22 @@ Qwen3.5-0.8B-Q8_0, a usable NVIDIA device, and NVRTC:
 
 ```sh
 CAMELID_QWEN35_GGUF=/path/to/Qwen3.5-0.8B-Q8_0.gguf \
+CAMELID_FLASH_PREFILL=0 \
   cargo test --release --locked --features cuda --lib \
   qwen35_gpu_sampled_segments_match_serial_and_recover_after_cancel \
   -- --ignored --nocapture --test-threads=1
 ```
 
-This ignored gate compares serial and segmented prefill logits bit for bit
-across a 131-token prompt, checks seeded sampled output, and cancels before
+This ignored gate compares segmented and unsegmented prefill logits bit for
+bit within each serial/batched lane across a 131-token prompt. It separately
+requires bitwise serial/batched agreement with approximate flash attention
+disabled, checks seeded sampled output against the unsegmented production
+policy, and cancels before
 prefill, after one segment, and before final-token logits. Every cancelled
 request must emit no tokens, and the same engine must reproduce the reference
 output on the next request. The test requires actual batched-prefill support,
 prints the selected prefill policy, and reports cancellation and recovery
 durations separately. Poll counts define correctness; timings are diagnostic.
+The small Qwen3.5 row also exercises batched scratch allocation for fused
+attention and recurrent projections wider than its FFN: these buffers must
+cover every consumer's width, not just the FFN width.

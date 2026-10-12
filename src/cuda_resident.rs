@@ -15236,6 +15236,17 @@ pub(crate) const MAX_VERIFY_K: usize = 16;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
 
+/// Batched Qwen3.5 reuses FFN scratch for the fused attention query/gate and
+/// recurrent mixer. Small rows can have a narrower FFN than either mixer.
+fn qwen35_batched_mixer_width(
+    ffn_dim: usize,
+    q_width: usize,
+    conv_dim: usize,
+    value_dim: usize,
+) -> usize {
+    ffn_dim.max(2 * q_width).max(conv_dim).max(value_dim)
+}
+
 /// Fast Q1 CUDA is the generic default. It matches the established
 /// Q1-by-Q8 contraction used by optimized CUDA runtimes and is deterministic,
 /// but activation quantization means it is not bit-identical to Camelid's
@@ -21238,7 +21249,16 @@ impl CudaResidentDecode {
         let half = self.rope_dim / 2;
         let st = &self.k.stream;
         let mk = cap;
-        let max_in = hidden.max(q_width).max(ffn_dim);
+        let mixer_width = self.qwen35.as_ref().map_or(ffn_dim, |q| {
+            qwen35_batched_mixer_width(ffn_dim, q_width, q.conv_dim, q.value_dim)
+        });
+        let max_in = hidden
+            .max(q_width)
+            .max(ffn_dim)
+            .max(self.qwen35.as_ref().map_or(0, |q| q.value_dim));
+        // The SSM branch reuses Q/K/V and attention scratch for its per-head
+        // alpha, beta, and decay gates; their width is independent of attention.
+        let gate_width = self.qwen35.as_ref().map_or(0, |q| q.num_v_heads);
         let max_paged_pages =
             SPLITK_THRESHOLD.div_ceil(crate::inference::cuda_paged_kv::CUDA_KV_PAGE_TOKENS);
         let page_table_capacity = self.n_layers * mk * max_paged_pages;
@@ -21264,14 +21284,14 @@ impl CudaResidentDecode {
                 .alloc_zeros::<u32>(mk * max_in.div_ceil(128) * 32)
                 .map_err(|e| format!("verify alloc: {e}"))?,
             vibscales: af(mk * max_in.div_ceil(128))?,
-            vq: af(mk * q_width)?,
-            vk: af(mk * kv_width)?,
-            vv: af(mk * kv_width)?,
-            vattn: af(mk * q_width)?,
+            vq: af(mk * q_width.max(gate_width))?,
+            vk: af(mk * kv_width.max(gate_width))?,
+            vv: af(mk * kv_width.max(gate_width))?,
+            vattn: af(mk * q_width.max(gate_width))?,
             vproj: af(mk * hidden)?,
-            vgate: af(mk * ffn_dim)?,
-            vup: af(mk * ffn_dim)?,
-            vact: af(mk * ffn_dim)?,
+            vgate: af(mk * mixer_width)?,
+            vup: af(mk * mixer_width)?,
+            vact: af(mk * mixer_width)?,
             vlogits: if include_logits {
                 af(mk * vocab)?
             } else {

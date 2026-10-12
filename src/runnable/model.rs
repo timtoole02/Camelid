@@ -7131,6 +7131,49 @@ mod gpu_ssm_layer_tests {
             .unwrap();
         assert_eq!(serial.len(), model.vocab);
         assert!(serial.iter().all(|value| value.is_finite()));
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill_batched(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .unwrap();
+        let batched_baseline = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .unwrap();
+        assert_eq!(batched_baseline.len(), serial.len());
+        assert!(batched_baseline.iter().all(|value| value.is_finite()));
+        let differences = |actual: &[f32], expected: &[f32]| {
+            actual.iter().zip(expected).fold(
+                (0usize, 0.0f32, 0.0f32),
+                |(different, absolute, relative), (actual, expected)| {
+                    let delta = (actual - expected).abs();
+                    (
+                        different + usize::from(actual.to_bits() != expected.to_bits()),
+                        absolute.max(delta),
+                        relative.max(delta / expected.abs().max(1.0)),
+                    )
+                },
+            )
+        };
+        let (cross_lane_different, cross_lane_absolute, cross_lane_relative) =
+            differences(&batched_baseline, &serial);
+        eprintln!(
+            "unsegmented batched vs serial: different={cross_lane_different}/{} max_abs={cross_lane_absolute:e} max_relative={cross_lane_relative:e} argmax={}/{}",
+            serial.len(), argmax(&batched_baseline), argmax(&serial)
+        );
+        // Reproduce the old production policy before testing cancellation
+        // segmentation. Cross-lane floating-point differences must not be
+        // mistaken for changes caused by splitting one lane into segments.
+        let baseline = if prefers_batched_prefill {
+            &batched_baseline
+        } else {
+            engine.reset_qwen35_state().unwrap();
+            engine
+                .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+                .unwrap();
+            engine
+                .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+                .unwrap();
+            &serial
+        };
         let sampling = SamplingConfig {
             temperature: 0.7,
             top_k: Some(40),
@@ -7141,7 +7184,7 @@ mod gpu_ssm_layer_tests {
         let sampler = LlamaSampler::Sampling(sampling.clone());
         let mut history = prompt.clone();
         let mut reference = Vec::new();
-        let mut logits = serial.clone();
+        let mut logits = baseline.clone();
         for index in 0..8 {
             let token = qwen35_sample_logits(logits, &sampler, &history).unwrap();
             reference.push(token);
@@ -7175,15 +7218,17 @@ mod gpu_ssm_layer_tests {
             let segmented = engine
                 .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
                 .unwrap();
-            assert_eq!(segmented.len(), serial.len());
-            let differing = serial
-                .iter()
-                .zip(&segmented)
-                .filter(|(left, right)| left.to_bits() != right.to_bits())
-                .count();
+            let expected = if batched { &batched_baseline } else { &serial };
+            assert_eq!(segmented.len(), expected.len());
+            assert!(segmented.iter().all(|value| value.is_finite()));
+            let (differing, absolute, relative) = differences(&segmented, expected);
+            eprintln!(
+                "batched={batched}: segmented vs unsegmented different={differing}/{} max_abs={absolute:e} max_relative={relative:e}",
+                expected.len()
+            );
             assert_eq!(
                 differing, 0,
-                "batched={batched}: segmented prefill changed logits"
+                "batched={batched}: segmentation changed this lane's logits"
             );
         }
 
@@ -7205,7 +7250,7 @@ mod gpu_ssm_layer_tests {
         assert_eq!(
             generate(),
             reference,
-            "segmented sampled decode differs from serial"
+            "segmented sampled decode differs from the unsegmented production policy"
         );
         for cancel_poll in [1, 2, 4] {
             let polls = Cell::new(0);
@@ -7240,8 +7285,20 @@ mod gpu_ssm_layer_tests {
                 "sampled CUDA cancel poll {cancel_poll}: cancelled in {cancellation_elapsed:?}; recovery request {recovery_elapsed:?}"
             );
         }
+        // The default resident stack promises the same arithmetic in both lanes.
+        // Keep this independent from the segmented/unsegmented regression gate;
+        // opt-in approximate flash attention must be off for this qualification.
+        assert_eq!(
+            argmax(&batched_baseline),
+            argmax(&serial),
+            "unsegmented lane argmax mismatch"
+        );
+        assert_eq!(
+            cross_lane_different, 0,
+            "unsegmented batched/serial logits changed; relative error {cross_lane_relative:e}"
+        );
         eprintln!(
-            "Qwen3.5 CUDA sampled qualification: 131 prompt tokens, bitwise serial/segmented logits, tokens {reference:?}, 3 cancellation/reuse checks passed"
+            "Qwen3.5 CUDA sampled qualification: 131 prompt tokens, bitwise segmented/unsegmented logits within each lane, tokens {reference:?}, 3 cancellation/reuse checks passed"
         );
     }
 

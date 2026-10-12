@@ -10,6 +10,29 @@ use super::{
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 #[test]
+fn qwen35_batched_scratch_covers_mixers_wider_than_the_ffn() {
+    // Qwen3.5-0.8B: the Q+gate projection has 4096 outputs and the recurrent
+    // QKV projection has 6144, even though its FFN has only 3584 outputs.
+    assert_eq!(
+        super::qwen35_batched_mixer_width(3584, 2048, 6144, 2048),
+        6144
+    );
+    // Each consumer can be the widest; wider FFNs retain their existing size.
+    assert_eq!(
+        super::qwen35_batched_mixer_width(3584, 4096, 6144, 2048),
+        8192
+    );
+    assert_eq!(
+        super::qwen35_batched_mixer_width(3584, 2048, 6144, 8192),
+        8192
+    );
+    assert_eq!(
+        super::qwen35_batched_mixer_width(14336, 4096, 6144, 2048),
+        14336
+    );
+}
+
+#[test]
 fn q8_resident_cache_rejects_partial_blocks_before_cuda_initialization() {
     let result = CudaResidentDecode::new_for_artifact_with_kv_quant(
         1,
