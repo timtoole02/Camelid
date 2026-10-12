@@ -179,7 +179,7 @@ kernel void encoder_silu_mul(
 
 #[derive(Default)]
 pub(super) struct Slot {
-    encoder: OnceLock<Option<Mutex<MetalEncoder>>>,
+    encoder: OnceLock<Option<Mutex<Option<MetalEncoder>>>>,
     failed: AtomicBool,
 }
 
@@ -199,7 +199,7 @@ impl Slot {
         let Some(encoder) = self
             .encoder
             .get_or_init(|| match MetalEncoder::build(runtime) {
-                Ok(encoder) => Some(Mutex::new(encoder)),
+                Ok(encoder) => Some(Mutex::new(Some(encoder))),
                 Err(reason) => {
                     tracing::warn!(%reason, "Metal document encoder unavailable; using the CPU");
                     None
@@ -208,7 +208,7 @@ impl Slot {
         else {
             return Ok(None);
         };
-        let mut encoder = match if wait {
+        let mut slot = match if wait {
             encoder.lock().map_err(TryLockError::Poisoned)
         } else {
             encoder.try_lock()
@@ -224,6 +224,9 @@ impl Slot {
         if self.failed.load(Ordering::Acquire) {
             return Ok(None);
         }
+        let Some(encoder) = slot.as_mut() else {
+            return Ok(None);
+        };
         let prepared = super::embedding_batch_pool().install(|| {
             use rayon::prelude::*;
             inputs
@@ -240,11 +243,13 @@ impl Slot {
                 // Publish the failure while still owning the queue; a query
                 // cannot acquire it in the gap before the lane is disabled.
                 self.failed.store(true, Ordering::Release);
+                // Release weights and scratch from unified RAM before the
+                // caller retries on the CPU, including allocation failures.
+                slot.take();
                 tracing::warn!(%reason, "Metal document encoder failed; using the CPU");
                 return Ok(None);
             }
         };
-        drop(encoder);
         let result = prepared
             .into_iter()
             .zip(hidden)
@@ -259,6 +264,7 @@ impl Slot {
             Ok(vectors) => Ok(Some(vectors)),
             Err(reason) => {
                 self.failed.store(true, Ordering::Release);
+                slot.take();
                 tracing::warn!(%reason, "Metal document encoder failed; using the CPU");
                 Ok(None)
             }
@@ -1038,8 +1044,39 @@ mod tests {
             runtime.embed(&texts[2], None).unwrap()
         );
         drop(occupied);
-        // A failed GPU lane retries on the oracle without losing its vector.
-        runtime.metal.failed.store(true, Ordering::Release);
+        // A GPU result failure retries on the oracle, disables the lane, and
+        // releases its allocations. Corrupt only a resident GPU norm vector;
+        // the independent CPU model remains a valid fallback oracle.
+        {
+            let mut slot = runtime
+                .metal
+                .encoder
+                .get()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            let encoder = slot.as_mut().unwrap();
+            write(
+                &encoder.layers[0].attention_norm_weight,
+                &vec![f32::NAN; runtime.config.embedding_length],
+            );
+        }
+        let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
+        assert_eq!(lane, super::super::EncoderLane::Cpu);
+        assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
+        assert!(runtime.metal.failed.load(Ordering::Acquire));
+        assert!(runtime
+            .metal
+            .encoder
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_none());
         let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
         assert_eq!(lane, super::super::EncoderLane::Cpu);
         assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
