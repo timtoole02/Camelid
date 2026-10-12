@@ -479,6 +479,10 @@ fn rope_tables(tokens: usize, head_dim: usize, base: f32) -> (Vec<f32>, Vec<f32>
 
 impl MetalEncoder {
     pub(super) fn build(runtime: &NomicBertRuntime) -> std::result::Result<Self, String> {
+        metal::objc::rc::autoreleasepool(|| Self::build_inner(runtime))
+    }
+
+    fn build_inner(runtime: &NomicBertRuntime) -> std::result::Result<Self, String> {
         let device = Device::system_default().ok_or("no Metal device")?;
         // The shared-memory lane is deliberately Apple-silicon scoped. Intel
         // discrete GPUs retain the CPU path until they have parity evidence.
@@ -611,7 +615,11 @@ impl MetalEncoder {
             }
             None => self.allocate(rows, max_len)?,
         };
-        let result = self.run_group(group, rows, max_len, &buffers);
+        // Indexing runs on a Rust worker, without a Cocoa run-loop pool.
+        // Drain each group's autoreleased command buffer and encoder after
+        // completion so a large library does not retain them indefinitely.
+        let result =
+            metal::objc::rc::autoreleasepool(|| self.run_group(group, rows, max_len, &buffers));
         self.buffers = Some(buffers);
         result
     }
@@ -952,9 +960,33 @@ mod tests {
             runtime.embed_query(&texts[2]).unwrap().len(),
             runtime.config.embedding_length
         );
+        let old_opt_out = std::env::var_os("CAMELID_DOCUMENT_GPU_ENCODER");
         std::env::set_var("CAMELID_DOCUMENT_GPU_ENCODER", "0");
         let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
-        std::env::remove_var("CAMELID_DOCUMENT_GPU_ENCODER");
+        match old_opt_out {
+            Some(value) => std::env::set_var("CAMELID_DOCUMENT_GPU_ENCODER", value),
+            None => std::env::remove_var("CAMELID_DOCUMENT_GPU_ENCODER"),
+        }
+        assert_eq!(lane, super::super::EncoderLane::Cpu);
+        assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
+        // Searches fall back immediately while indexing owns the lane.
+        let occupied = runtime
+            .metal
+            .encoder
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert_eq!(
+            runtime.embed_query(&texts[2]).unwrap(),
+            runtime.embed(&texts[2], None).unwrap()
+        );
+        drop(occupied);
+        // A failed GPU lane retries on the oracle without losing its vector.
+        runtime.metal.failed.store(true, Ordering::Release);
+        let (fallback, lane) = runtime.embed_documents(&texts[..1]).unwrap();
         assert_eq!(lane, super::super::EncoderLane::Cpu);
         assert_eq!(fallback[0], runtime.embed(&texts[0], None).unwrap());
     }
