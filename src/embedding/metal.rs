@@ -99,34 +99,39 @@ kernel void encoder_rope_split(
     v[right] = qkv[src + width * 2u + cr];
 }
 
-kernel void encoder_attention(
+// QK score dots on the GPU, in the CPU's scalar reduction order.
+kernel void encoder_attention_scores(
     device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]], device const uint* starts [[buffer(3)]],
-    device const uint* lengths [[buffer(4)]], device float* scores [[buffer(5)]],
-    device float* out [[buffer(6)]], device atomic_uint* failed [[buffer(7)]],
-    constant uint& rows [[buffer(8)]], constant uint& heads [[buffer(9)]],
-    constant uint& head_dim [[buffer(10)]], constant uint& max_len [[buffer(11)]],
-    constant float& scale [[buffer(12)]], uint idx [[thread_position_in_grid]]
+    device const uint* starts [[buffer(2)]], device const uint* lengths [[buffer(3)]],
+    device float* scores [[buffer(4)]], constant uint& rows [[buffer(5)]],
+    constant uint& heads [[buffer(6)]], constant uint& head_dim [[buffer(7)]],
+    constant uint& max_len [[buffer(8)]], constant float& scale [[buffer(9)]],
+    uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= rows * heads) return;
     uint row = idx / heads, head = idx % heads, width = heads * head_dim;
     uint start = starts[row], len = lengths[row], offset = row * width + head * head_dim;
     device float* ss = scores + idx * max_len;
-    float maximum = -INFINITY;
     for (uint key = 0; key < len; key++) {
         uint ko = (start + key) * width + head * head_dim;
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; d++) dot = dot + q[offset + d] * k[ko + d];
         ss[key] = dot * scale;
-        maximum = max(maximum, ss[key]);
     }
-    float sum = 0.0f;
-    for (uint key = 0; key < len; key++) { ss[key] = exp(ss[key] - maximum); sum += ss[key]; }
-    if (!isfinite(sum) || sum <= 0.0f) {
-        atomic_store_explicit(failed, 1u, memory_order_relaxed);
-        return;
-    }
-    for (uint key = 0; key < len; key++) ss[key] /= sum;
+}
+
+// PV after the shared CPU softmax. Keep the key-order f32 accumulation.
+kernel void encoder_attention_values(
+    device const float* scores [[buffer(0)]], device const float* v [[buffer(1)]],
+    device const uint* starts [[buffer(2)]], device const uint* lengths [[buffer(3)]],
+    device float* out [[buffer(4)]], constant uint& rows [[buffer(5)]],
+    constant uint& heads [[buffer(6)]], constant uint& head_dim [[buffer(7)]],
+    constant uint& max_len [[buffer(8)]], uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= rows * heads) return;
+    uint row = idx / heads, head = idx % heads, width = heads * head_dim;
+    uint start = starts[row], len = lengths[row], offset = row * width + head * head_dim;
+    device const float* ss = scores + idx * max_len;
     for (uint d0 = 0; d0 < head_dim; d0 += 16u) {
         float acc[16];
         for (uint j = 0; j < 16u; j++) acc[j] = 0.0f;
@@ -276,7 +281,8 @@ struct Kernels {
     quantize: ComputePipelineState,
     gemm: ComputePipelineState,
     rope: ComputePipelineState,
-    attention: ComputePipelineState,
+    attention_scores: ComputePipelineState,
+    attention_values: ComputePipelineState,
 }
 
 impl Kernels {
@@ -294,7 +300,8 @@ impl Kernels {
             quantize: pipeline("encoder_quantize_q8")?,
             gemm: pipeline("encoder_q8_gemm")?,
             rope: pipeline("encoder_rope_split")?,
-            attention: pipeline("encoder_attention")?,
+            attention_scores: pipeline("encoder_attention_scores")?,
+            attention_values: pipeline("encoder_attention_values")?,
         })
     }
 }
@@ -334,7 +341,6 @@ struct Buffers {
     xs: Buffer,
     xq: Buffer,
     scores: Buffer,
-    failed: Buffer,
 }
 
 fn upload<T>(device: &Device, values: &[T]) -> std::result::Result<Buffer, String> {
@@ -583,7 +589,6 @@ impl MetalEncoder {
             xs: alloc(rows * self.ffn / 32, 4)?,
             xq: alloc(rows * self.ffn, 1)?,
             scores: alloc(rows * self.heads * max_len, 4)?,
-            failed: alloc(1, 4)?,
         })
     }
 
@@ -664,7 +669,9 @@ impl MetalEncoder {
         write(&b.positions, &positions);
         write(&b.starts, &starts);
         write(&b.lengths, &lengths);
-        write(&b.failed, &[0_u32]);
+        // Initialize padding as well: the host normalizes only live scores,
+        // but copies the complete active rectangular scratch buffer.
+        write(&b.scores, &vec![0.0_f32; rows * self.heads * max_len]);
         for layer in &self.layers {
             let command = self.queue.new_command_buffer();
             let e = command.new_compute_command_encoder();
@@ -690,26 +697,24 @@ impl MetalEncoder {
                 rows * self.heads * (self.head_dim / 2),
             );
             e.memory_barrier_with_resources(&[&b.q, &b.k, &b.v]);
-            bind(
-                e,
-                &[
-                    &b.q,
-                    &b.k,
-                    &b.v,
-                    &b.starts,
-                    &b.lengths,
-                    &b.scores,
-                    &b.attended,
-                    &b.failed,
-                ],
-            );
-            scalar(e, 8, &(rows as u32));
-            scalar(e, 9, &(self.heads as u32));
-            scalar(e, 10, &(self.head_dim as u32));
-            scalar(e, 11, &(max_len as u32));
-            scalar(e, 12, &(1.0 / (self.head_dim as f32).sqrt()));
-            dispatch(e, &self.kernels.attention, rows * self.heads);
-            e.memory_barrier_with_resources(&[&b.attended, &b.scores, &b.failed]);
+            bind(e, &[&b.q, &b.k, &b.starts, &b.lengths, &b.scores]);
+            scalar(e, 5, &(rows as u32));
+            scalar(e, 6, &(self.heads as u32));
+            scalar(e, 7, &(self.head_dim as u32));
+            scalar(e, 8, &(max_len as u32));
+            scalar(e, 9, &(1.0 / (self.head_dim as f32).sqrt()));
+            dispatch(e, &self.kernels.attention_scores, rows * self.heads);
+            finish(command, e)?;
+            self.softmax(&b.scores, &lengths, max_len)?;
+            let command = self.queue.new_command_buffer();
+            let e = command.new_compute_command_encoder();
+            bind(e, &[&b.scores, &b.v, &b.starts, &b.lengths, &b.attended]);
+            scalar(e, 5, &(rows as u32));
+            scalar(e, 6, &(self.heads as u32));
+            scalar(e, 7, &(self.head_dim as u32));
+            scalar(e, 8, &(max_len as u32));
+            dispatch(e, &self.kernels.attention_values, rows * self.heads);
+            e.memory_barrier_with_resources(&[&b.attended]);
             encode_linear(
                 e,
                 &self.kernels,
@@ -720,9 +725,6 @@ impl MetalEncoder {
                 rows,
             );
             finish(command, e)?;
-            if read::<u32>(&b.failed, 1)[0] != 0 {
-                return Err("Metal encoder attention normalization failed".into());
-            }
             self.norm(
                 &b.projected,
                 &b.hidden,
@@ -763,9 +765,6 @@ impl MetalEncoder {
                     .push(read(&b.hidden, rows * self.width));
             }
         }
-        if read::<u32>(&b.failed, 1)[0] != 0 {
-            return Err("Metal encoder attention normalization failed".into());
-        }
         let hidden = read::<f32>(&b.hidden, rows * self.width);
         if hidden.iter().any(|value| !value.is_finite()) {
             return Err("Metal encoder returned non-finite rows".into());
@@ -777,6 +776,25 @@ impl MetalEncoder {
             start += len;
         }
         Ok(output)
+    }
+
+    fn softmax(
+        &self,
+        scores: &Buffer,
+        lengths: &[u32],
+        max_len: usize,
+    ) -> std::result::Result<(), String> {
+        use rayon::prelude::*;
+        let mut values = read::<f32>(scores, lengths.len() * self.heads * max_len);
+        values
+            .par_chunks_mut(max_len)
+            .enumerate()
+            .try_for_each(|(index, row)| {
+                super::softmax_in_place(&mut row[..lengths[index / self.heads] as usize])
+                    .map_err(|error| error.to_string())
+            })?;
+        write(scores, &values);
+        Ok(())
     }
 
     fn silu(&self, gate: &Buffer, up: &Buffer, rows: usize) -> std::result::Result<(), String> {
