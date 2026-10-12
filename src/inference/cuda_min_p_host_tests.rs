@@ -119,41 +119,64 @@ fn cuda_min_p_host_classifier_matches_cpu_or_falls_back() {
     });
     std::fs::write(&source, HOST_TEST_SOURCE).expect("write C++ math test");
     std::fs::write(&syntax_source, KERNEL_SYNTAX_SOURCE).expect("write C++ kernel syntax test");
-    let compiler = std::env::var_os("CXX").unwrap_or_else(|| "clang++".into());
-    let compiled = Command::new(&compiler)
-        .args(["-std=c++17", "-O2", "-ffp-contract=off", "-fno-fast-math"])
-        .arg("-I")
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda_resident"))
-        .arg(&source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .expect("run host C++ compiler (set CXX to choose it)");
-    assert!(
-        compiled.status.success(),
-        "C++ compilation failed: {}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
+    // MSVC's flags differ from GCC/Clang's. Run from a Developer Command
+    // Prompt on MSVC, or set CXX to a compiler executable (not shell flags).
+    let compiler = std::env::var_os("CXX").unwrap_or_else(|| {
+        if cfg!(target_env = "msvc") {
+            "cl".into()
+        } else {
+            "clang++".into()
+        }
+    });
+    let msvc = std::path::Path::new(&compiler)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cl") || name.eq_ignore_ascii_case("clang-cl")
+        });
+    let compile = |source: &std::path::Path, output: Option<&std::path::Path>| {
+        let mut command = Command::new(&compiler);
+        // MSVC also writes an object file; keep all generated files temporary.
+        command.current_dir(directory.path());
+        let include = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda_resident");
+        if msvc {
+            command
+                .args(["/nologo", "/std:c++17", "/EHsc", "/fp:strict"])
+                .arg("/I")
+                .arg(include);
+            if let Some(output) = output {
+                command.arg("/O2").arg("/Fe:").arg(output);
+            } else {
+                command.arg("/Zs");
+            }
+        } else {
+            command
+                .args(["-std=c++17", "-ffp-contract=off", "-fno-fast-math"])
+                .arg("-I")
+                .arg(include);
+            if let Some(output) = output {
+                command.arg("-O2").arg("-o").arg(output);
+            } else {
+                command.arg("-fsyntax-only");
+            }
+        }
+        let result = command
+            .arg(source)
+            .output()
+            .expect("run host C++ compiler (set CXX; MSVC requires a Developer Command Prompt)");
+        assert!(
+            result.status.success(),
+            "C++ compilation failed for {}: {}{}",
+            source.display(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    compile(&source, Some(&executable));
     // Parse every production CUDA kernel body as C++ using syntax-only CUDA
     // declarations. This catches ordinary C++ errors on a host without NVRTC;
     // it does not validate CUDA compilation, synchronization, or execution.
-    let syntax = Command::new(&compiler)
-        .args([
-            "-std=c++17",
-            "-fsyntax-only",
-            "-ffp-contract=off",
-            "-fno-fast-math",
-        ])
-        .arg("-I")
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda_resident"))
-        .arg(syntax_source)
-        .output()
-        .expect("parse C++ kernel bodies");
-    assert!(
-        syntax.status.success(),
-        "C++ kernel syntax check failed: {}",
-        String::from_utf8_lossy(&syntax.stderr)
-    );
+    compile(&syntax_source, None);
 
     let mut input = String::new();
     let mut score_probes: Vec<(f32, f32, f32)> = Vec::new();
@@ -358,6 +381,9 @@ const KERNEL_SYNTAX_SOURCE: &str = r#"
 #define __forceinline__ inline
 #define __global__
 #define __shared__
+#ifdef _MSC_VER
+#define __restrict__ __restrict
+#endif
 #define CAMELID_CUDA_SAMPLING_TESTS 1
 using std::isfinite;
 struct NativeCudaDim { unsigned int x, y, z; };

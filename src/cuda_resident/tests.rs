@@ -4769,11 +4769,33 @@ fn min_p_sampler_survivor_masks_match_cpu_or_request_fallback() {
             true,
         ),
     ];
-    for n in [255, 256, 257, 513] {
+    for n in [255, 256, 257, 513, 32_768, 128_256] {
         let mut logits: Vec<f32> = (0..n).map(|i| -((i % 31) as f32)).collect();
-        // A maximum beyond the first block catches incomplete row reductions.
+        // The final token forces the reduction to traverse every stride, even
+        // for a model-sized vocabulary with hundreds of logits per lane.
         logits[n - 1] = 2.0;
         rows.push((format!("vocabulary {n}"), logits, 0.125, false));
+    }
+    for n in [32_768, 128_256] {
+        let mut logits = vec![-10.0; n];
+        logits[n - 1] = 0.0;
+        rows.push((
+            format!("last-token-only vocabulary {n}"),
+            logits,
+            0.5,
+            false,
+        ));
+        // A boundary in the final iteration must invalidate the whole draw,
+        // even when the maximum was found at the start of the vocabulary.
+        let mut logits = vec![-10.0; n];
+        logits[0] = 0.0;
+        logits[n - 1] = -0.1;
+        rows.push((
+            format!("final-token boundary vocabulary {n}"),
+            logits,
+            f32::from_bits(0x3f67_a36e),
+            true,
+        ));
     }
     let mut rng = Lcg(0x219a_b9c7);
     for row in 0..48 {
@@ -4815,7 +4837,12 @@ fn min_p_sampler_survivor_masks_match_cpu_or_request_fallback() {
                 for (index, _) in expected {
                     expected_mask[index] = 1;
                 }
-                assert_eq!(mask, expected_mask, "{name} at temperature {temperature}");
+                if let Some(index) = mask.iter().zip(&expected_mask).position(|(a, b)| a != b) {
+                    assert_eq!(
+                        mask[index], expected_mask[index],
+                        "{name} at temperature {temperature}: survivor mask at token {index}"
+                    );
+                }
                 assert!(sample < logits.len() as u32, "{name}: sample {sample}");
                 assert_eq!(mask[sample as usize], 1, "{name}: inadmissible token");
                 checked += 1;
@@ -4858,6 +4885,17 @@ fn min_p_sampler_invalid_rows_and_scales_request_fallback() {
             "logits {logits:?}, min_p {min_p}, temperature {temperature}"
         );
     }
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut logits = vec![0.0; 128_256];
+        let last = logits.len() - 1;
+        logits[last] = invalid;
+        let dl = k.stream.clone_htod(&logits).unwrap();
+        assert_eq!(
+            cuda_min_p_draw(&k, &dl, 0.1, 1.0, 7, &mut output),
+            u32::MAX,
+            "nonfinite final token {invalid} in a model-sized vocabulary"
+        );
+    }
 }
 
 #[test]
@@ -4867,7 +4905,7 @@ fn min_p_sampler_seeded_equal_logits_match_uniform_reference() {
         return;
     };
     let mut output = k.stream.alloc_zeros::<u32>(1).unwrap();
-    for n in [1, 255, 256, 257, 513, 4096] {
+    for n in [1, 255, 256, 257, 513, 4096, 32_768, 128_256] {
         let logits = k.stream.clone_htod(&vec![0.0; n]).unwrap();
         for seed in [0_u64, 1, 7, 42, u64::MAX, 0x1161_223a_2713_2434] {
             let mut maximum = 0.0;

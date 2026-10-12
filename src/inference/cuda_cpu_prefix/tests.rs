@@ -590,3 +590,249 @@ fn cpu_prefix_partial_failure_poisons_state_and_restores_authority() {
     assert_eq!(session.kv_position(), before_position);
     assert_eq!(session.kv_cache.materialized_through, before_watermark);
 }
+
+fn min_p_model_forward(
+    session: &mut LlamaInferenceSession,
+    token: u32,
+    config: Option<&SamplingConfig>,
+) -> ResidentForward {
+    let input = embedding(session, token);
+    let sample = config.map(|config| ResidentTemperatureSampling {
+        inv_temp: 1.0 / config.temperature,
+        temperature: config.temperature,
+        seed: config.seed.unwrap_or(0)
+            ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(session.kv_position() as u64 + 1),
+        min_p: config.min_p,
+    });
+    session
+        .try_resident_decode_forward_cuda(&input, true, None, sample, Some(token))
+        .unwrap()
+        .expect("the selected CUDA model lane must execute")
+}
+
+fn min_p_model_assert_position(session: &mut LlamaInferenceSession, route: &str, position: usize) {
+    assert_eq!(session.kv_position(), position);
+    if route == "cpu-prefix" {
+        let state = session.cuda_cpu_prefix.as_mut().unwrap().get_mut().unwrap();
+        assert_eq!(state.engine.filled(), position);
+        assert!(!state.poisoned);
+        assert!(session.cpu_kv_authoritative());
+    } else {
+        let cache = session.existing_resident_cache().unwrap();
+        let guard = cache.lock().unwrap();
+        let slot = guard.as_ref().unwrap();
+        assert_eq!(slot.engine.filled(), position);
+        assert_eq!(slot.paged_kv.is_some(), route == "paged");
+        if route == "paged" {
+            assert_eq!(
+                slot.paged_sequence_len(session.cuda_sequence_id).unwrap(),
+                position
+            );
+            let metadata = slot.paged_kv.as_ref().unwrap().pool.snapshot();
+            let device = slot.engine.paged_kv_page_snapshot().unwrap();
+            assert_eq!(metadata.allocated_pages, position.div_ceil(16));
+            assert_eq!(device.resident_pages, metadata.allocated_pages);
+        }
+    }
+}
+
+fn min_p_model_history(session: &mut LlamaInferenceSession, route: &str) -> Vec<u32> {
+    if route != "cpu-prefix" {
+        assert!(session
+            .recover_cpu_kv_from_cuda_resident(session.kv_position())
+            .unwrap());
+    }
+    assert!(session.cpu_kv_authoritative());
+    history(session)
+}
+
+#[test]
+#[ignore = "requires a CUDA device; runs the three model lanes in isolated subprocesses"]
+fn cuda_min_p_model_tails_preserve_fallback_kv_and_seeded_replay() {
+    const CHILD_ENV: &str = "CAMELID_TEST_MIN_P_MODEL_ROUTE";
+    const COMPLETED: &str = "CUDA_MIN_P_MODEL_ASSERTIONS_PASSED";
+    let Ok(route) = std::env::var(CHILD_ENV) else {
+        // Isolate OnceLock/runtime flags and the resident arena. An explicitly
+        // requested device gate must fail if no CUDA device is available.
+        for route in ["contiguous", "paged", "cpu-prefix"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inference::cuda_cpu_prefix::integration_tests::cuda_min_p_model_tails_preserve_fallback_kv_and_seeded_replay",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, route)
+                .env(PREFIX_ENV, if route == "cpu-prefix" { "2" } else { "0" })
+                .env("CAMELID_CUDA_PAGED_KV", if route == "paged" { "1" } else { "0" })
+                .env("CAMELID_CUDA_RESIDENT_DECODE", "1")
+                .env("CAMELID_GPU_TEMP_SAMPLING", "1")
+                .env("CAMELID_CUDA_MIN_P_SAMPLING", "1")
+                .env("CAMELID_CUDA_Q8", "0")
+                .env("CAMELID_DETERMINISTIC", "0")
+                .env("CAMELID_CUDA_TWO_SEQUENCE_KV", "0")
+                .env("CAMELID_CUDA_SEQUENCE_SLOTS", "1")
+                .env("CAMELID_CUDA_TRUE_BATCH2", "0")
+                .env("CAMELID_CUDA_TRUE_BATCH", "0")
+                .output()
+                .expect("launch the isolated CUDA min-p model gate");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{route} min-p model gate failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.lines().any(|line| line == COMPLETED),
+                "{route} did not execute its assertions\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            eprintln!("CUDA min-p {route}: fallback, KV continuation, seeded replay, and filter admission passed");
+        }
+        return;
+    };
+    assert!(["contiguous", "paged", "cpu-prefix"].contains(&route.as_str()));
+    assert!(
+        crate::cuda::is_available(),
+        "CUDA qualification requires a usable device"
+    );
+    crate::cuda::set_gpu_accel_enabled(true);
+    crate::cuda::set_runtime_enabled(false);
+    assert!(resident_decode_cuda_enabled());
+
+    // Cross the 16-token paged boundary while retaining ordinary, nonzero
+    // three-layer Q8 model activations. All runs consume the same input tokens.
+    let inputs: Vec<u32> = (0..18).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
+    let mut reference = fixture();
+    let mut logits = Vec::new();
+    for (position, &input) in inputs.iter().enumerate() {
+        let ResidentForward::Logits(row) = min_p_model_forward(&mut reference, input, None) else {
+            panic!("normal forward must return logits");
+        };
+        assert!(row.data.iter().all(|value| value.is_finite()));
+        reference.kv_cache.position += 1;
+        min_p_model_assert_position(&mut reference, &route, position + 1);
+        logits.push(row);
+    }
+    let expected_history = min_p_model_history(&mut reference, &route);
+    drop(reference);
+
+    let boundary = SamplingConfig {
+        temperature: 0.8,
+        min_p: Some(1.0),
+        seed: Some(27),
+        ..SamplingConfig::default()
+    };
+    let mut fallback = fixture();
+    for (position, (&input, expected)) in inputs.iter().zip(&logits).enumerate() {
+        let output = min_p_model_forward(&mut fallback, input, Some(&boundary));
+        let ResidentForward::Logits(actual) = &output else {
+            panic!("p=1 must take the exact CPU boundary fallback");
+        };
+        assert_eq!(actual.data, expected.data, "fallback logits at {position}");
+        let token = fallback
+            .finish_resident_temperature_sample(output, &boundary, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            token,
+            sample_with_config(expected, &boundary, &inputs[..=position]).unwrap()
+        );
+        min_p_model_assert_position(&mut fallback, &route, position + 1);
+    }
+    assert_eq!(min_p_model_history(&mut fallback, &route), expected_history);
+    drop(fallback);
+
+    let config = SamplingConfig {
+        min_p: Some(0.25),
+        ..boundary
+    };
+    let mut direct = fixture();
+    let mut direct_tokens = Vec::new();
+    let mut device_samples = 0;
+    for (position, (&input, expected)) in inputs.iter().zip(&logits).enumerate() {
+        let output = min_p_model_forward(&mut direct, input, Some(&config));
+        device_samples += usize::from(matches!(&output, ResidentForward::Sampled(_)));
+        let token = direct
+            .finish_resident_temperature_sample(output, &config, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            sampling_weights_with_config(expected, &config, &inputs[..=position])
+                .unwrap()
+                .iter()
+                .any(|(candidate, weight)| *candidate == token as usize && *weight > 0.0)
+        );
+        direct_tokens.push(token);
+        min_p_model_assert_position(&mut direct, &route, position + 1);
+    }
+    assert!(
+        device_samples > 0,
+        "exercise the on-device min-p sampling tail"
+    );
+    assert_eq!(min_p_model_history(&mut direct, &route), expected_history);
+    drop(direct);
+
+    let mut replayed = Vec::new();
+    for seed in [27, 27, 83] {
+        let mut replay = fixture();
+        let config = SamplingConfig {
+            seed: Some(seed),
+            ..config.clone()
+        };
+        let mut tokens = Vec::new();
+        for (position, (&input, expected)) in inputs.iter().zip(&logits).enumerate() {
+            let (token, _) = replay
+                .generate_next_token_sampled_resident(input, &config)
+                .unwrap()
+                .expect("the public sampled resident entry must execute");
+            assert!(
+                sampling_weights_with_config(expected, &config, &inputs[..=position])
+                    .unwrap()
+                    .iter()
+                    .any(|(candidate, weight)| *candidate == token as usize && *weight > 0.0)
+            );
+            tokens.push(token);
+            min_p_model_assert_position(&mut replay, &route, position + 1);
+        }
+        assert_eq!(min_p_model_history(&mut replay, &route), expected_history);
+        // A filtered call must decline before even looking up this invalid
+        // input token, preserving the already-active lane's KV and pages.
+        for unsupported in [
+            SamplingConfig {
+                min_keep: Some(2),
+                ..config.clone()
+            },
+            SamplingConfig {
+                top_k: Some(2),
+                ..config.clone()
+            },
+            SamplingConfig {
+                presence_penalty: 0.1,
+                ..config.clone()
+            },
+        ] {
+            assert!(replay
+                .generate_next_token_sampled_resident(u32::MAX, &unsupported)
+                .unwrap()
+                .is_none());
+            min_p_model_assert_position(&mut replay, &route, inputs.len());
+            assert_eq!(history(&replay), expected_history);
+        }
+        replayed.push(tokens);
+    }
+    assert_eq!(
+        replayed[0], direct_tokens,
+        "public entry must thread the same per-position seed"
+    );
+    assert_eq!(
+        replayed[0], replayed[1],
+        "same seed must replay token-for-token"
+    );
+    assert_ne!(
+        replayed[0], replayed[2],
+        "different seeds must change the sampled stream"
+    );
+    println!("\n{COMPLETED}");
+}
