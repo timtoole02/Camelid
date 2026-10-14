@@ -18,7 +18,8 @@ use cudarc::nvrtc::{CompileOptions, Ptx};
 
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
 /// `--fmad=false` and `arch=compute_61` (for `__dp4a`).
-const KERNELS: &str = r#"
+const KERNELS: &str = concat!(
+    r#"
 #ifdef CAMELID_HAS_WMMA
 #include <mma.h>
 #endif
@@ -6412,52 +6413,9 @@ extern "C" __global__ void argmax_f32(
     if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
 }
 
-// ---- Temperature sampling via the Gumbel-max trick --------------------------
-// A draw from softmax(logits/temp) equals argmax_i(logits[i]/temp + g_i) with
-// g_i ~ Gumbel(0,1) = -log(-log(u_i)), u_i ~ Uniform(0,1). One pass over the
-// vocab (same shape as argmax) — no softmax, no sort, no host logits copy. The
-// per-element uniform is a stateless splitmix64 hash of (seed, index), so the
-// whole draw is reproducible from `seed` (varied per token by the host). As
-// temp -> 0, inv_temp -> inf and the (bounded) Gumbel term is dominated by the
-// logits, so this collapses to the exact greedy argmax — matching the greedy
-// gate. Strict-greater tie-break to the lower index, as in argmax_f32.
-__device__ __forceinline__ float splitmix_uniform(unsigned long long seed, unsigned int idx) {
-    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL * (unsigned long long)(idx + 1u);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z = z ^ (z >> 31);
-    unsigned int m = (unsigned int)(z >> 40); // 24 random bits
-    return ((float)m + 0.5f) / 16777216.0f;   // in (0,1), excludes 0 and 1
-}
-extern "C" __global__ void sample_gumbel(
-    const float* __restrict__ logits, int n, float inv_temp,
-    unsigned long long seed, unsigned int* __restrict__ out_idx
-) {
-    extern __shared__ float sh[];
-    float* sval = sh;
-    int* sidx = (int*)(sh + blockDim.x);
-    int tid = threadIdx.x;
-    float best = -3.4e38f; int besti = 0;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float u = splitmix_uniform(seed, (unsigned int)i);
-        float g = -logf(-logf(u));
-        float v = logits[i] * inv_temp + g;
-        if (v > best) { best = v; besti = i; }
-    }
-    sval[tid] = best; sidx[tid] = besti;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) {
-            float ov = sval[tid + s]; int oi = sidx[tid + s];
-            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
-                sval[tid] = ov; sidx[tid] = oi;
-            }
-        }
-        __syncthreads();
-    }
-    if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
-}
-
+"#,
+    include_str!("cuda_resident/sampling.cuh"),
+    r#"
 // ---- Batched (K-token) variants for the speculative-verify forward ----------
 // Each processes K tokens laid out [token][...] in one launch. Elementwise
 // kernels (quantize/silu/residual) are batched just by launching over K x the
@@ -8875,7 +8833,8 @@ extern "C" __global__ void qwen35_ssm_rmsnorm_gate_q8_d128_batched(
         quants[base + qb * 32 + lane] = (signed char)qv;
     }
 }
-"#;
+"#
+);
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
 /// kernels. (The full per-token `forward_token` orchestration is assembled on
@@ -9001,6 +8960,11 @@ pub struct CudaResidentKernels {
     pub(crate) moe_weighted_sum_batched: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
+    pub(crate) sample_gumbel_filtered: CudaFunction,
+    #[cfg(test)]
+    pub(crate) sample_min_p_mask: CudaFunction,
+    #[cfg(test)]
+    pub(crate) sampling_uniform_test: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
     pub(crate) rms_norm_batched: CudaFunction,
     pub(crate) rms_norm_quantize_batched: CudaFunction,
@@ -9127,6 +9091,8 @@ impl CudaResidentKernels {
         let binary_tensor_core_q1 = cc_major >= 8;
         let mut include_paths = Vec::new();
         let mut options = Vec::new();
+        #[cfg(test)]
+        options.push("-DCAMELID_CUDA_SAMPLING_TESTS=1".to_string());
         if let Some(include) = cuda_include {
             include_paths.push(include.to_string_lossy().into_owned());
             options.push("-DCAMELID_HAS_WMMA=1".to_string());
@@ -9308,6 +9274,11 @@ impl CudaResidentKernels {
             moe_weighted_sum_batched: f("moe_weighted_sum_batched")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
+            sample_gumbel_filtered: f("sample_gumbel_filtered")?,
+            #[cfg(test)]
+            sample_min_p_mask: f("sample_min_p_mask")?,
+            #[cfg(test)]
+            sampling_uniform_test: f("sampling_uniform_test")?,
             gemm_batched: f("q8_gemm_batched")?,
             rms_norm_batched: f("rms_norm_batched")?,
             rms_norm_quantize_batched: f("rms_norm_quantize_batched")?,
@@ -14601,6 +14572,42 @@ pub(crate) fn launch_sample_gumbel(
         .arg(&seed)
         .arg(out_idx);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_sample_gumbel_filtered(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    temperature: f32,
+    min_p: f32,
+    seed: u64,
+    out_idx: &mut CudaSlice<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 12,
+    };
+    let n_i = n as i32;
+    let mut launch = stream.launch_builder(function);
+    launch
+        .arg(logits)
+        .arg(&n_i)
+        .arg(&temperature)
+        .arg(&min_p)
+        .arg(&seed)
+        .arg(out_idx);
+    unsafe { launch.launch(cfg) }.map(|_| ())
+}
+
+/// A completed CUDA forward. Boundary rows carry their existing logits to the
+/// CPU sampler; callers must not run the token's forward a second time.
+pub(crate) enum CudaMinPSample {
+    Token(u32),
+    Logits(Vec<f32>),
 }
 
 /// One layer's GPU-resident Q8_0 weights + norm vectors.
@@ -19920,6 +19927,26 @@ impl CudaResidentDecode {
         Ok(output[0])
     }
 
+    /// Opt-in min-p over the logits from this paged append. An uncertain filter
+    /// returns those logits to the CPU without replaying the append.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_sample_min_p_paged(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        temperature: f32,
+        seed: u64,
+        min_p: f32,
+        pages: &[crate::inference::cuda_paged_kv::CudaKvPageHandle],
+    ) -> Result<CudaMinPSample, String> {
+        self.validate_min_p_request(min_p)?;
+        self.forward_pass_paged(embedding, cos, sin, position, scale, true, pages)?;
+        self.sample_min_p_current_logits(temperature, seed, min_p)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prefill_paged_at(
         &mut self,
@@ -19991,6 +20018,71 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(out[0])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_sample_min_p(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        temperature: f32,
+        seed: u64,
+        min_p: f32,
+    ) -> Result<CudaMinPSample, String> {
+        self.validate_min_p_request(min_p)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
+        self.sample_min_p_current_logits(temperature, seed, min_p)
+    }
+
+    fn validate_min_p_request(&self, min_p: f32) -> Result<(), String> {
+        if self.vocab == 0 || self.vocab > i32::MAX as usize {
+            return Err("CUDA min-p sampling requires a nonempty i32-sized vocabulary".to_string());
+        }
+        if !(min_p.is_finite() && 0.0 < min_p && min_p <= 1.0) {
+            return Err("CUDA min-p sampling requires min_p in (0, 1]".to_string());
+        }
+        Ok(())
+    }
+
+    fn sample_min_p_current_logits(
+        &mut self,
+        temperature: f32,
+        seed: u64,
+        min_p: f32,
+    ) -> Result<CudaMinPSample, String> {
+        let map = |error: cudarc::driver::DriverError| format!("cuda min-p sample: {error}");
+        let stream = self.k.stream.clone();
+        launch_sample_gumbel_filtered(
+            &stream,
+            &self.k.sample_gumbel_filtered,
+            &self.d_logits,
+            self.vocab,
+            temperature,
+            min_p,
+            seed,
+            &mut self.d_sampled,
+        )
+        .map_err(map)?;
+        let mut output = [0u32; 1];
+        stream
+            .memcpy_dtoh(&self.d_sampled, &mut output)
+            .map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        if output[0] == u32::MAX {
+            let mut logits = vec![0.0f32; self.vocab];
+            stream
+                .memcpy_dtoh(&self.d_logits, &mut logits)
+                .map_err(map)?;
+            self.k.ctx.synchronize().map_err(map)?;
+            return Ok(CudaMinPSample::Logits(logits));
+        }
+        if output[0] as usize >= self.vocab {
+            return Err("CUDA min-p sampler returned an invalid token index".to_string());
+        }
+        Ok(CudaMinPSample::Token(output[0]))
     }
 
     /// GPU prefill of `n` prompt tokens. Each token's forward runs at its own

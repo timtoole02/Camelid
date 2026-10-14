@@ -130,7 +130,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         prefix_layers: usize,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<ResidentTemperatureSampling>,
     ) -> Result<ResidentForward> {
         let position = self.kv_cache.position;
         if !self.kv_cache.history_materialized(position) {
@@ -303,21 +303,49 @@ impl LlamaInferenceSession {
                 )?
                 .output;
             }
-            let output = if let Some((inv_temp, seed)) = sample {
-                ResidentForward::Sampled(
-                    state
+            let output = if let Some(sample) = sample {
+                if let Some(min_p) = sample.min_p {
+                    match state
                         .engine
-                        .forward_token_sample(
+                        .forward_token_sample_min_p(
                             &hidden.data,
                             &tables.cos,
                             &tables.sin,
                             position,
                             scale,
-                            inv_temp,
-                            seed,
+                            sample.temperature,
+                            sample.seed,
+                            min_p,
                         )
-                        .map_err(invalid)?,
-                )
+                        .map_err(invalid)?
+                    {
+                        crate::cuda_resident::CudaMinPSample::Token(token) => {
+                            ResidentForward::Sampled(token)
+                        }
+                        crate::cuda_resident::CudaMinPSample::Logits(logits) => {
+                            ResidentForward::Logits(CpuTensor::from_f32(
+                                "cpu_prefix_cuda_min_p_logits",
+                                vec![1, dims.vocab_size],
+                                logits,
+                            )?)
+                        }
+                    }
+                } else {
+                    ResidentForward::Sampled(
+                        state
+                            .engine
+                            .forward_token_sample(
+                                &hidden.data,
+                                &tables.cos,
+                                &tables.sin,
+                                position,
+                                scale,
+                                sample.inv_temp,
+                                sample.seed,
+                            )
+                            .map_err(invalid)?,
+                    )
+                }
             } else if gpu_sample_token.is_some() {
                 ResidentForward::Sampled(
                     state

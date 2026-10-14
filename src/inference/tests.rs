@@ -52,6 +52,225 @@ fn sampling_probabilities_match_the_normal_sampler_candidate_weights() {
 }
 
 #[test]
+fn resident_cuda_min_p_sampling_requires_an_explicit_opt_in() {
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("false"),
+        Some("off"),
+        Some("auto"),
+    ] {
+        assert!(!resident_cuda_min_p_sampling_setting_enabled(value));
+    }
+    for value in ["1", "TRUE", " on ", "yes"] {
+        assert!(resident_cuda_min_p_sampling_setting_enabled(Some(value)));
+    }
+}
+
+#[test]
+fn resident_min_p_sampling_preserves_disabled_boundaries_and_filter_floors() {
+    let plain = SamplingConfig {
+        temperature: 0.8,
+        ..SamplingConfig::default()
+    };
+    for min_p in [None, Some(0.0)] {
+        let config = SamplingConfig {
+            min_p,
+            ..plain.clone()
+        };
+        assert!(resident_sampling_config_supported(&config, false));
+        assert!(resident_sampling_config_supported(&config, true));
+    }
+    for min_p in [f32::MIN_POSITIVE, 0.1, 1.0] {
+        let config = SamplingConfig {
+            min_p: Some(min_p),
+            ..plain.clone()
+        };
+        assert!(!resident_sampling_config_supported(&config, false));
+        assert!(resident_sampling_config_supported(&config, true));
+        let floor = SamplingConfig {
+            min_keep: Some(2),
+            ..config.clone()
+        };
+        assert!(!resident_sampling_config_supported(&floor, true));
+        let one = SamplingConfig {
+            min_keep: Some(1),
+            ..config
+        };
+        assert!(resident_sampling_config_supported(&one, true));
+    }
+    for min_p in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+        let config = SamplingConfig {
+            min_p: Some(min_p),
+            ..plain.clone()
+        };
+        assert!(!resident_sampling_config_supported(&config, true));
+    }
+    let min_p = SamplingConfig {
+        min_p: Some(0.1),
+        ..plain
+    };
+    for config in [
+        SamplingConfig {
+            top_k: Some(2),
+            ..min_p.clone()
+        },
+        SamplingConfig {
+            top_p: Some(0.9),
+            ..min_p.clone()
+        },
+        SamplingConfig {
+            typical_p: Some(0.9),
+            ..min_p.clone()
+        },
+        SamplingConfig {
+            top_n_sigma: Some(1.0),
+            ..min_p.clone()
+        },
+        SamplingConfig {
+            repeat_penalty: 1.1,
+            ..min_p.clone()
+        },
+        SamplingConfig {
+            logit_bias: vec![(0, 1.0)],
+            ..min_p
+        },
+    ] {
+        assert!(!resident_sampling_config_supported(&config, true));
+    }
+}
+
+#[test]
+fn resident_min_p_candidate_floor_declines_before_lookup_or_kv_mutation() {
+    let (mut session, _backing) = tiny_kv_budget_session(8);
+    let config = SamplingConfig {
+        temperature: 0.8,
+        min_p: Some(0.2),
+        min_keep: Some(2),
+        ..SamplingConfig::default()
+    };
+    assert!(session
+        .generate_next_token_sampled_resident(2, &config)
+        .unwrap()
+        .is_none());
+    assert_eq!(session.kv_position(), 0);
+    assert_eq!(session.kv_cache.materialized_through, 0);
+    assert!(session.resident_decode.is_none());
+}
+
+#[test]
+fn resident_min_p_logit_fallback_samples_the_completed_forward_once() {
+    let logits = CpuTensor::from_f32("logits", vec![1, 4], vec![2.5, 1.0, -1.0, -2.0]).unwrap();
+    for min_p in [0.1, 1.0, f32::MIN_POSITIVE] {
+        let config = SamplingConfig {
+            temperature: 0.5,
+            min_p: Some(min_p),
+            seed: Some(27),
+            ..SamplingConfig::default()
+        };
+        let expected = sample_with_config(&logits, &config, &[0, 1, 0, 1]).unwrap();
+        let (mut session, _backing) = tiny_kv_budget_session(8);
+        session.kv_cache.position = 3;
+        let token = session
+            .finish_resident_temperature_sample(
+                ResidentForward::Logits(logits.clone()),
+                &config,
+                true,
+            )
+            .unwrap();
+        assert_eq!(token, Some(expected));
+        assert_eq!(
+            session.kv_position(),
+            4,
+            "the existing forward consumes exactly one KV row"
+        );
+        assert!(
+            session.resident_decode.is_none(),
+            "completion must not create or replay a GPU forward"
+        );
+    }
+}
+
+#[test]
+fn resident_min_p_boundary_fallback_advances_the_seeded_cpu_draw() {
+    // p=1 and rounded-equal maxima always require the exact CPU boundary path.
+    let logits =
+        CpuTensor::from_f32("logits", vec![1, 3], vec![0.0, 0.0, -2.0f32.powi(-26)]).unwrap();
+    let config = SamplingConfig {
+        temperature: 0.8,
+        min_p: Some(1.0),
+        seed: Some(27),
+        ..SamplingConfig::default()
+    };
+    let (mut session, _backing) = tiny_kv_budget_session(32);
+    let mut history = Vec::new();
+    let mut sampled = Vec::new();
+    for _ in 0..24 {
+        history.push(0);
+        let expected = sample_with_config(&logits, &config, &history).unwrap();
+        let token = session
+            .finish_resident_temperature_sample(
+                ResidentForward::Logits(logits.clone()),
+                &config,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            token,
+            expected,
+            "draw after {} consumed tokens",
+            history.len()
+        );
+        assert_eq!(session.kv_position(), history.len());
+        sampled.push(token);
+    }
+    assert!(
+        sampled.iter().any(|token| *token != sampled[0]),
+        "boundary fallbacks must not reuse the same draw at every position"
+    );
+    assert!(session.resident_decode.is_none());
+}
+
+#[test]
+fn resident_sampling_completion_preserves_plain_tail_and_consumes_errors_once() {
+    let config = SamplingConfig {
+        temperature: 0.8,
+        ..SamplingConfig::default()
+    };
+    let logits = CpuTensor::from_f32("logits", vec![1, 2], vec![1.0, 0.0]).unwrap();
+    let (mut session, _backing) = tiny_kv_budget_session(8);
+    assert_eq!(
+        session
+            .finish_resident_temperature_sample(ResidentForward::Logits(logits), &config, false)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        session.kv_position(),
+        0,
+        "plain temperature does not add a logit fallback"
+    );
+    assert_eq!(
+        session
+            .finish_resident_temperature_sample(ResidentForward::Sampled(1), &config, false)
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(session.kv_position(), 1);
+    let invalid = CpuTensor::from_f32("invalid", vec![1, 2], vec![f32::NAN, 0.0]).unwrap();
+    assert!(session
+        .finish_resident_temperature_sample(ResidentForward::Logits(invalid), &config, true)
+        .is_err());
+    assert_eq!(
+        session.kv_position(),
+        2,
+        "a sampling error cannot make the consumed row look replayable"
+    );
+}
+
+#[test]
 fn sampled_resident_filters_decline_before_token_lookup_or_kv_mutation() {
     let (mut session, _backing) = tiny_kv_budget_session(8);
     let invalid_token = 2;
@@ -156,15 +375,17 @@ fn sampled_resident_filters_preserve_metal_kv_and_disabled_boundaries() {
     );
     assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 1);
 
-    for (typical_p, top_n_sigma) in [
-        (Some(0.0), None),
-        (Some(0.9), None),
-        (None, Some(f32::EPSILON)),
-        (None, Some(2.0)),
+    for (typical_p, top_n_sigma, min_p) in [
+        (Some(0.0), None, None),
+        (Some(0.9), None, None),
+        (None, Some(f32::EPSILON), None),
+        (None, Some(2.0), None),
+        (None, None, Some(0.1)),
     ] {
         let config = SamplingConfig {
             typical_p,
             top_n_sigma,
+            min_p,
             ..plain.clone()
         };
         assert!(session
