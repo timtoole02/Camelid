@@ -4015,8 +4015,8 @@ impl RunnableModel {
     ///
     /// `is_cancelled` is checked between prompt segments and decode chunks of the
     /// device loop (each after a sync, so the check sees real GPU progress); the
-    /// host-fed loop checks it before its one-call prefill and, through
-    /// `should_stop`, after every token.
+    /// host-fed loop also checks between synchronized prompt segments and,
+    /// through `should_stop`, after every token.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_cuda(
@@ -4148,30 +4148,37 @@ impl RunnableModel {
         let (&last_prompt_token, prior_prompt) = prompt
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
-        if !prior_prompt.is_empty() {
-            if is_cancelled() {
-                return Err(BackendError::Cancelled);
-            }
+        {
             let half = self.rope_dim / 2;
             let mut embeddings = Vec::with_capacity(prior_prompt.len() * self.d_model);
             let mut cos_all = Vec::with_capacity(prior_prompt.len() * half);
             let mut sin_all = Vec::with_capacity(prior_prompt.len() * half);
-            for (position, &token) in prior_prompt.iter().enumerate() {
-                embeddings
-                    .extend_from_slice(&self.token_embd.dequant_row(token as usize, "token_embd")?);
-                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
-                cos_all.extend_from_slice(&cos);
-                sin_all.extend_from_slice(&sin);
-            }
-            if engine.prefers_batched_prefill() {
-                engine
-                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
-                    .map_err(BackendError::InvalidTensorData)?;
-            } else {
-                engine
-                    .prefill(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
-                    .map_err(BackendError::InvalidTensorData)?;
-            }
+            qwen35_cuda_prefill_segments(prior_prompt, is_cancelled, &mut |base, tokens| {
+                for (offset, &token) in tokens.iter().enumerate() {
+                    let position = base + offset;
+                    embeddings.extend_from_slice(
+                        &self.token_embd.dequant_row(token as usize, "token_embd")?,
+                    );
+                    let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                    cos_all.extend_from_slice(&cos);
+                    sin_all.extend_from_slice(&sin);
+                }
+                // Both continuation APIs index the input arrays by absolute position.
+                // Keep the prior rows, but advance only this segment so KV and the SSM
+                // recurrence continue exactly once per token. Each call synchronizes
+                // before returning, making the next cancel check reflect GPU progress.
+                let end = base + tokens.len();
+                if engine.prefers_batched_prefill() {
+                    engine
+                        .prefill_batched_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                        .map_err(BackendError::InvalidTensorData)?;
+                } else {
+                    engine
+                        .prefill_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                        .map_err(BackendError::InvalidTensorData)?;
+                }
+                Ok(())
+            })?;
         }
         let last_position = prior_prompt.len();
         let emb = self
@@ -5279,10 +5286,119 @@ mod qwen35_metal_prompt_cancel_tests {
     }
 }
 
-/// Prompt tokens the qwen35 CUDA device loop queues between syncs; the request's cancel
+/// Prompt tokens the qwen35 CUDA loops queue between syncs; the request's cancel
 /// check runs at each sync, so this bounds how long an abandoned prompt read continues.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const QWEN35_CUDA_PROMPT_CANCEL_SEGMENT: usize = 64;
+
+/// Bound host-fed CUDA prefill work. The forward closure must synchronize its
+/// segment before returning, and continue the existing KV/SSM state at `base`.
+#[cfg(any(feature = "cuda", test))]
+fn qwen35_cuda_prefill_segments(
+    prompt: &[u32],
+    is_cancelled: &dyn Fn() -> bool,
+    forward: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+) -> Result<()> {
+    for (batch, tokens) in prompt.chunks(QWEN35_CUDA_PROMPT_CANCEL_SEGMENT).enumerate() {
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
+        forward(batch * QWEN35_CUDA_PROMPT_CANCEL_SEGMENT, tokens)?;
+    }
+    // Also check after the final segment (or a single-token prompt's empty
+    // prefix), before the caller dispatches the final prompt token for logits.
+    if is_cancelled() {
+        return Err(BackendError::Cancelled);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod qwen35_cuda_prompt_cancel_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cancelled_cuda_prompt_never_dispatches_the_next_segment() {
+        let stopped = Cell::new(false);
+        let mut processed = Vec::new();
+        let prompt: Vec<u32> = (0..130).collect();
+        let result =
+            qwen35_cuda_prefill_segments(&prompt, &|| stopped.get(), &mut |base, tokens| {
+                processed.push((base, tokens.to_vec()));
+                stopped.set(true);
+                Ok(())
+            });
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+        assert_eq!(processed, vec![(0, prompt[..64].to_vec())]);
+    }
+
+    #[test]
+    fn cancelled_cuda_prompt_never_dispatches_its_first_segment() {
+        let result = qwen35_cuda_prefill_segments(&[1, 2], &|| true, &mut |_, _| {
+            panic!("cancelled request dispatched a prompt segment")
+        });
+        assert!(matches!(result, Err(BackendError::Cancelled)));
+    }
+
+    #[test]
+    fn cancelled_cuda_prompt_stops_before_final_token_logits() {
+        for prefix_len in [0, 1, 64, 65] {
+            let stopped = Cell::new(prefix_len == 0);
+            let prompt: Vec<u32> = (0..prefix_len).collect();
+            let mut final_logits_called = false;
+            let result =
+                qwen35_cuda_prefill_segments(&prompt, &|| stopped.get(), &mut |base, tokens| {
+                    if base + tokens.len() == prompt.len() {
+                        stopped.set(true);
+                    }
+                    Ok(())
+                })
+                .map(|()| final_logits_called = true);
+            assert!(matches!(result, Err(BackendError::Cancelled)));
+            assert!(!final_logits_called);
+        }
+    }
+
+    #[test]
+    fn healthy_cuda_prompt_continues_state_and_preserves_final_logits_position() {
+        let prompt: Vec<u32> = (0..131).map(|i| i * 3 + 7).collect();
+        let (&last_token, prior_prompt) = prompt.split_last().unwrap();
+        let mut positions = Vec::new();
+        let mut prefix_inputs = Vec::new();
+        let mut state = 0_u64;
+        let advance = |state: u64, position: usize, token: u32| {
+            state
+                .wrapping_mul(31)
+                .wrapping_add(position as u64 + token as u64)
+        };
+        qwen35_cuda_prefill_segments(prior_prompt, &|| false, &mut |base, tokens| {
+            assert_eq!(base, positions.len(), "must resume the existing state");
+            prefix_inputs.extend_from_slice(tokens);
+            let end = base + tokens.len();
+            // Model the continuation APIs' absolute indexing into prefix arrays.
+            for (position, &token) in prefix_inputs.iter().enumerate().take(end).skip(base) {
+                state = advance(state, position, token);
+                positions.push(position);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(positions, (0..prior_prompt.len()).collect::<Vec<_>>());
+        assert_eq!(prefix_inputs, prior_prompt);
+        state = advance(state, prior_prompt.len(), last_token);
+        let expected = prompt
+            .iter()
+            .enumerate()
+            .fold(0, |state, (position, &token)| {
+                advance(state, position, token)
+            });
+        assert_eq!(
+            state, expected,
+            "final token must see the complete prefix state"
+        );
+    }
+}
 
 #[cfg(feature = "cuda")]
 fn qwen35_device_decode_chunk_len() -> usize {
@@ -6956,6 +7072,234 @@ mod gpu_ssm_layer_tests {
             }
         }
         eprintln!("qwen35_gpu_greedy: PASS (8-tok GPU==CPU, run-twice stable)");
+    }
+
+    /// Real-model qualification of the sampled host-fed path across both 64-token
+    /// cancellation boundaries. Run the same filter against each Qwen3.5 quant
+    /// being qualified; CAMELID_ORNITH_GGUF is also accepted for existing runners.
+    #[test]
+    #[ignore = "needs CAMELID_QWEN35_GGUF (or CAMELID_ORNITH_GGUF) and a CUDA device"]
+    fn qwen35_gpu_sampled_segments_match_serial_and_recover_after_cancel() {
+        use std::cell::Cell;
+
+        let path = std::env::var("CAMELID_QWEN35_GGUF")
+            .or_else(|_| std::env::var("CAMELID_ORNITH_GGUF"))
+            .expect("CAMELID_QWEN35_GGUF or CAMELID_ORNITH_GGUF");
+        let model = RunnableModel::load(&path).expect("load Qwen3.5");
+        assert!(model.qwen35.is_some(), "qualification requires Qwen3.5");
+        let prompt: Vec<u32> = [3710, 369, 279, 6511, 314, 9338, 30, 220, 17, 18, 19]
+            .into_iter()
+            .cycle()
+            .take(131)
+            .collect();
+        let (&last, prior) = prompt.split_last().unwrap();
+        let mut embeddings = Vec::new();
+        let mut cos_all = Vec::new();
+        let mut sin_all = Vec::new();
+        for (position, &token) in prior.iter().enumerate() {
+            embeddings.extend_from_slice(
+                &model
+                    .token_embd
+                    .dequant_row(token as usize, "token_embd")
+                    .unwrap(),
+            );
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            cos_all.extend_from_slice(&cos);
+            sin_all.extend_from_slice(&sin);
+        }
+        let last_embedding = model
+            .token_embd
+            .dequant_row(last as usize, "token_embd")
+            .unwrap();
+        let (last_cos, last_sin) = qwen35_rope_tables(prior.len(), model.rope_base, model.rope_dim);
+        let scale = 1.0 / (model.head_dim as f32).sqrt();
+        let mut engine = model
+            .build_qwen35_resident(prompt.len() + 16)
+            .expect("CUDA engine");
+        assert!(
+            engine.supports_batched_prefill(),
+            "qualification must exercise actual resident batched prefill"
+        );
+        let prefers_batched_prefill = engine.prefers_batched_prefill();
+        eprintln!("Qwen3.5 CUDA prefers_batched_prefill={prefers_batched_prefill}");
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .unwrap();
+        let serial = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .unwrap();
+        assert_eq!(serial.len(), model.vocab);
+        assert!(serial.iter().all(|value| value.is_finite()));
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill_batched(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .unwrap();
+        let batched_baseline = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .unwrap();
+        assert_eq!(batched_baseline.len(), serial.len());
+        assert!(batched_baseline.iter().all(|value| value.is_finite()));
+        let differences = |actual: &[f32], expected: &[f32]| {
+            actual.iter().zip(expected).fold(
+                (0usize, 0.0f32, 0.0f32),
+                |(different, absolute, relative), (actual, expected)| {
+                    let delta = (actual - expected).abs();
+                    (
+                        different + usize::from(actual.to_bits() != expected.to_bits()),
+                        absolute.max(delta),
+                        relative.max(delta / expected.abs().max(1.0)),
+                    )
+                },
+            )
+        };
+        let (cross_lane_different, cross_lane_absolute, cross_lane_relative) =
+            differences(&batched_baseline, &serial);
+        eprintln!(
+            "unsegmented batched vs serial: different={cross_lane_different}/{} max_abs={cross_lane_absolute:e} max_relative={cross_lane_relative:e} argmax={}/{}",
+            serial.len(), argmax(&batched_baseline), argmax(&serial)
+        );
+        // Reproduce the old production policy before testing cancellation
+        // segmentation. Cross-lane floating-point differences must not be
+        // mistaken for changes caused by splitting one lane into segments.
+        let baseline = if prefers_batched_prefill {
+            &batched_baseline
+        } else {
+            engine.reset_qwen35_state().unwrap();
+            engine
+                .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+                .unwrap();
+            engine
+                .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+                .unwrap();
+            &serial
+        };
+        let sampling = SamplingConfig {
+            temperature: 0.7,
+            top_k: Some(40),
+            top_p: Some(0.9),
+            seed: Some(811812),
+            ..SamplingConfig::default()
+        };
+        let sampler = LlamaSampler::Sampling(sampling.clone());
+        let mut history = prompt.clone();
+        let mut reference = Vec::new();
+        let mut logits = baseline.clone();
+        for index in 0..8 {
+            let token = qwen35_sample_logits(logits, &sampler, &history).unwrap();
+            reference.push(token);
+            history.push(token);
+            if index == 7 || qwen35_repetition_loop(&reference) {
+                break;
+            }
+            let embedding = model
+                .token_embd
+                .dequant_row(token as usize, "token_embd")
+                .unwrap();
+            let position = prompt.len() + index;
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            logits = engine
+                .forward_token_logits(&embedding, &cos, &sin, position, scale)
+                .unwrap();
+        }
+
+        for batched in [false, true] {
+            engine.reset_qwen35_state().unwrap();
+            qwen35_cuda_prefill_segments(prior, &|| false, &mut |base, tokens| {
+                let end = base + tokens.len();
+                let result = if batched {
+                    engine.prefill_batched_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                } else {
+                    engine.prefill_from(&embeddings, &cos_all, &sin_all, end, scale, base)
+                };
+                result.map_err(BackendError::InvalidTensorData)
+            })
+            .unwrap();
+            let segmented = engine
+                .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+                .unwrap();
+            let expected = if batched { &batched_baseline } else { &serial };
+            assert_eq!(segmented.len(), expected.len());
+            assert!(segmented.iter().all(|value| value.is_finite()));
+            let (differing, absolute, relative) = differences(&segmented, expected);
+            eprintln!(
+                "batched={batched}: segmented vs unsegmented different={differing}/{} max_abs={absolute:e} max_relative={relative:e}",
+                expected.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "batched={batched}: segmentation changed this lane's logits"
+            );
+        }
+
+        // Production generation must reuse and reset this same resident engine.
+        *model.cuda.lock().unwrap() = Some(engine);
+        let generate = || {
+            model
+                .generate_qwen35_cuda(
+                    &prompt,
+                    8,
+                    &[],
+                    Some(&sampling),
+                    &|| false,
+                    &|_| false,
+                    &mut |_| {},
+                )
+                .expect("sampled CUDA generation")
+        };
+        assert_eq!(
+            generate(),
+            reference,
+            "segmented sampled decode differs from the unsegmented production policy"
+        );
+        for cancel_poll in [1, 2, 4] {
+            let polls = Cell::new(0);
+            let emitted = Cell::new(0);
+            let started = std::time::Instant::now();
+            let error = model
+                .generate_qwen35_cuda(
+                    &prompt,
+                    8,
+                    &[],
+                    Some(&sampling),
+                    &|| {
+                        polls.set(polls.get() + 1);
+                        polls.get() >= cancel_poll
+                    },
+                    &|_| false,
+                    &mut |_| emitted.set(emitted.get() + 1),
+                )
+                .unwrap_err();
+            let cancellation_elapsed = started.elapsed();
+            assert!(matches!(error, BackendError::Cancelled), "{error}");
+            assert_eq!(polls.get(), cancel_poll);
+            assert_eq!(emitted.get(), 0, "cancelled prefill emitted a token");
+            let recovery_started = std::time::Instant::now();
+            assert_eq!(
+                generate(),
+                reference,
+                "cancelled state leaked into the next request"
+            );
+            let recovery_elapsed = recovery_started.elapsed();
+            eprintln!(
+                "sampled CUDA cancel poll {cancel_poll}: cancelled in {cancellation_elapsed:?}; recovery request {recovery_elapsed:?}"
+            );
+        }
+        // The default resident stack promises the same arithmetic in both lanes.
+        // Keep this independent from the segmented/unsegmented regression gate;
+        // opt-in approximate flash attention must be off for this qualification.
+        assert_eq!(
+            argmax(&batched_baseline),
+            argmax(&serial),
+            "unsegmented lane argmax mismatch"
+        );
+        assert_eq!(
+            cross_lane_different, 0,
+            "unsegmented batched/serial logits changed; relative error {cross_lane_relative:e}"
+        );
+        eprintln!(
+            "Qwen3.5 CUDA sampled qualification: 131 prompt tokens, bitwise segmented/unsegmented logits within each lane, tokens {reference:?}, 3 cancellation/reuse checks passed"
+        );
     }
 
     /// Decode tok/s benchmark, GPU resident lane vs CPU runnable lane, same Q4_K_M
