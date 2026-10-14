@@ -209,16 +209,17 @@ const storedMemories = async () => JSON.parse(await storage('camelid.userMemorie
 // Simulate a real browser quota failure while retaining the previously saved
 // value. appStorage intentionally catches this exception, so the hook must
 // verify the write before changing the UI or its prompt-memory ref.
-const failMemoryWrites = (fail) => page.evaluate((fail) => {
+const failMemoryWrites = (fail, key = 'camelid.userMemories') => page.evaluate(({ fail, key }) => {
   if (!window.memorySmokeSetItem) {
     window.memorySmokeSetItem = Storage.prototype.setItem
     Storage.prototype.setItem = function (key, value) {
-      if (window.memorySmokeFailWrites && key === 'camelid.userMemories') throw new DOMException('Storage is full', 'QuotaExceededError')
+      if (window.memorySmokeFailWrites && key === window.memorySmokeFailWriteKey) throw new DOMException('Storage is full', 'QuotaExceededError')
       return window.memorySmokeSetItem.call(this, key, value)
     }
   }
   window.memorySmokeFailWrites = fail
-}, fail)
+  window.memorySmokeFailWriteKey = key
+}, { fail, key })
 const expectMemorySaveError = async () => {
   await page.waitForFunction(() => document.querySelector('[role="alert"]')?.textContent.includes('Memory changes could not be saved'))
   await page.click('.cx-notice [aria-label="Dismiss"]')
@@ -317,6 +318,12 @@ try {
   await navTo('Settings')
   await page.waitForSelector('input[aria-label="Remember things about me"]', { timeout: 30000 })
   assert.equal(await page.$eval('input[aria-label="Remember things about me"]', (input) => input.checked), false, 'off by default')
+  await failMemoryWrites(true, 'camelid.memoryEnabled')
+  await page.click('input[aria-label="Remember things about me"]')
+  assert.equal(await page.$eval('input[aria-label="Remember things about me"]', (input) => input.checked), false, 'a failed enable must keep memory off')
+  assert.equal(await storage('camelid.memoryEnabled'), null)
+  await expectMemorySaveError()
+  await failMemoryWrites(false)
   await page.click('input[aria-label="Remember things about me"]')
   await page.waitForFunction(() => localStorage.getItem('camelid.memoryEnabled') === 'true', { timeout: 5000 })
   await shot('0-settings', 'input[aria-label="Remember things about me"]')
@@ -595,8 +602,19 @@ try {
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('camelid.userMemories') || '[]').length === 0, { timeout: 5000 })
 
   /* ---- 12. off again -------------------------------------------------------- */
+  await failMemoryWrites(true, 'camelid.memoryEnabled')
+  await page.click('input[aria-label="Remember things about me"]')
+  assert.equal(await page.$eval('input[aria-label="Remember things about me"]', (input) => input.checked), true, 'a failed disable must not look saved')
+  assert.equal(await storage('camelid.memoryEnabled'), 'true')
+  await expectMemorySaveError()
+  await page.reload({ waitUntil: 'networkidle0' })
+  await page.waitForSelector('input[aria-label="Remember things about me"]')
+  assert.equal(await page.$eval('input[aria-label="Remember things about me"]', (input) => input.checked), true, 'reload must agree with the unchanged switch')
   await page.click('input[aria-label="Remember things about me"]')
   await page.waitForFunction(() => localStorage.getItem('camelid.memoryEnabled') === 'false', { timeout: 5000 })
+  await page.reload({ waitUntil: 'networkidle0' })
+  await page.waitForSelector('input[aria-label="Remember things about me"]')
+  assert.equal(await page.$eval('input[aria-label="Remember things about me"]', (input) => input.checked), false, 'a successful disable survives reload')
   await navTo('Chat')
   await openChatReady()
   await newChat()

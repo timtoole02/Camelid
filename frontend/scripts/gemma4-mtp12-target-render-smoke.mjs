@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { createServer } from 'vite'
 import { readExactTargetVerifiedRender, readExactTargetVerifiedSegmentedRender, authoritativeOutputRate, readMtp12NativeReceiptQualification } from '../src/lib/nativeGenerationMetrics.js'
 import { buildGemma4Mtp12ResearchSegments } from '../src/lib/segmentedWebResearchSynthesis.js'
 import {
@@ -148,5 +151,42 @@ assert.match(
   'stream completion must distinguish exact-draft render completion from ordinary length exhaustion',
 )
 assert.match(apiSource, /if target_verified_render \{\s*"stop"/s)
+
+const vite = await createServer({ server: { middlewareMode: true }, appType: 'custom' })
+try {
+  const { MessageTurn } = await vite.ssrLoadModule('/src/components/chat/MessageTurn.jsx')
+  const renderTurn = (message) => renderToStaticMarkup(React.createElement(MessageTurn, {
+    message: { id: 'rate-smoke', role: 'assistant', content: 'A researched answer.', ...message },
+    generationElapsedSeconds: 5,
+  }))
+  const segmented = {
+    streaming: true,
+    synthesis_mode: 'prepared_web_research_multi_pass_lossless',
+    tokens_out_per_sec: null,
+  }
+  assert.doesNotMatch(renderTurn(segmented), /data-live-rate=/, 'a segmented reply must wait for its native measurement')
+  assert.match(
+    renderTurn({ ...segmented, streaming_native_segment_rate: 42 }),
+    /data-live-rate="42" data-rate-source="backend-native"/,
+    'the live badge must show the native rate delivered by the stream',
+  )
+  assert.match(
+    renderTurn({ streaming: true, tokens_out_per_sec: 17 }),
+    /data-live-rate="17" data-rate-source="browser"/,
+    'ordinary replies must retain their browser-measured live rate',
+  )
+  assert.doesNotMatch(
+    renderTurn({ streaming: false, target_verified_render: true, tokens_out_per_sec: 42 }),
+    /Decode rate, measured in this browser/,
+    'a completed native measurement must not be labeled as browser-measured',
+  )
+  assert.match(
+    renderTurn({ streaming: false, tokens_out_per_sec: 17 }),
+    /Decode rate, measured in this browser/,
+    'ordinary completed replies must retain their browser rate',
+  )
+} finally {
+  await vite.close()
+}
 
 console.log('Gemma 4 12B MTP12 target-verified render smoke: ok')

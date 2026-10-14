@@ -841,9 +841,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const setMemoryEnabled = (enabled) => {
     const next = enabled === true
+    try {
+      persistContextValue(MEMORY_ENABLED_STORAGE_KEY, next)
+    } catch {
+      showNotice('Memory changes could not be saved. Local storage is full or unavailable. Free space and try again.', 'error')
+      return null
+    }
     memoryEnabledRef.current = next
     setMemoryEnabledState(next)
-    writeJsonStorage(MEMORY_ENABLED_STORAGE_KEY, next)
     if (!next) memorySuggestionRef.current?.abort()
     return next
   }

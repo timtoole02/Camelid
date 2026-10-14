@@ -37,7 +37,7 @@ cargo build
 cargo test --all-targets --all-features
 ```
 
-Toolchain note: Camelid currently requires Rust/Cargo 1.87+. On Ubuntu hosts that still expose an older distro `cargo` on `/usr/bin`, either source `$HOME/.cargo/env` first or run `scripts/with-rustup-cargo.sh build` / `scripts/with-rustup-cargo.sh test --all-targets --all-features` so the rustup-managed toolchain is used.
+Toolchain note: use the Rust/Cargo version pinned in `rust-toolchain.toml`; `Cargo.toml` declares Rust 1.89 as the minimum. On Ubuntu hosts that still expose an older distro `cargo` on `/usr/bin`, either source `$HOME/.cargo/env` first or run `scripts/with-rustup-cargo.sh build` / `scripts/with-rustup-cargo.sh test --all-targets --all-features` so the rustup-managed toolchain is used.
 
 ### Frontend
 

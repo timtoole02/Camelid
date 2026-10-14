@@ -23,7 +23,7 @@ yourself on the Memory page, or turn a saved note into one with **Make a memory*
 (you write the fact; the note stays as it is).
 
 If browser storage is full or unavailable, the page reports that the change
-could not be saved. The previous memories and any edited draft stay in place;
+could not be saved. The previous memories, on/off setting, and any edited draft stay in place;
 free storage and retry the change.
 
 The suggestion is a second, short request to the same model, made after the
