@@ -156,7 +156,7 @@ function VariantNav({ index, count, onSelect, onDiscard }) {
 function MessageMetaFooter({ message }) {
   const usage = message.usage
   const ttft = formatMs(message.first_content_ms)
-  const rate = formatRate(message.tokens_out_per_sec)
+  const rate = message.target_verified_render ? null : formatRate(message.tokens_out_per_sec)
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
@@ -448,7 +448,15 @@ export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = fa
           />
         )}
         <WebResearchSources research={message.web_research} />
-        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
+        {showLiveGenerationBadge && (
+          <LiveGenerationBadge
+            elapsedSeconds={generationElapsedSeconds}
+            label={liveStatusLabel}
+            tokensPerSec={message.tokens_out_per_sec}
+            nativeSegmentRate={message.streaming_native_segment_rate}
+            waitForNativeRate={message.synthesis_mode === 'prepared_web_research_multi_pass_lossless'}
+          />
+        )}
 
         {noVisibleResponse && (
           <div className="cxturn__warning" role="status">

@@ -94,6 +94,7 @@ assert.deepEqual(
   {
     execution_plan: null,
     backend: 'gemma4-runtime',
+    gemma4_ghost_catalog_managed: null,
     gemma4_ghost_execution_mode: 'hybrid_metal',
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
