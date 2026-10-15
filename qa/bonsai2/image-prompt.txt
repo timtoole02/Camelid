@@ -1,0 +1,7 @@
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>What color is the image? Answer with one color.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

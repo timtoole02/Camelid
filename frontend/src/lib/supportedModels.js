@@ -10,6 +10,26 @@ export const BONSAI_27B_VISION_PROJECTOR = Object.freeze({
 })
 
 export const SUPPORTED_MODELS = [
+  ...[
+    [2, 429183456, 364664352],
+    [4, 949549920, 366894624],
+    [9, 1997486976, 624229664],
+    [27, 5946648928, 629246976],
+  ].map(([size, size_bytes, projector_bytes]) => ({
+    catalog_id: `ternary_bonsai_2_${size}b_ptq1_0`,
+    name: `Bonsai 2 ${size}B PTQ1_0`,
+    repo_id: `prism-ml/Ternary-Bonsai-2-${size}B-gguf`,
+    filename: `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`,
+    size_bytes,
+    quant: 'PTQ1_0',
+    blurb: 'Compact ternary text and image model. Uses the portable decoder; includes its matching vision projector.',
+    companion_artifacts: [{
+      role: 'vision_projector',
+      repo_id: `prism-ml/Ternary-Bonsai-2-${size}B-gguf`,
+      filename: `Ternary-Bonsai-2-${size}B-mmproj-Q8_0.gguf`,
+      size_bytes: projector_bytes,
+    }],
+  })),
   {
     catalog_id: 'llama32_3b_instruct_q8_0',
     name: 'Llama 3.2 3B Instruct',

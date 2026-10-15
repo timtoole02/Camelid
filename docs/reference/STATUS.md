@@ -1,8 +1,16 @@
 # Camelid Status
 
-Last updated: 2026-10-03
+Last updated: 2026-10-15
 
 TinyLlama tokenizer-reference update (2026-10-03): flat-score TinyLlama Q8_0 now uses its merge ranks and is checked against the model's own SentencePiece tokenizer instead of the pinned llama.cpp tokenizer. The existing runtime admission label is retained, but full current-gate support is on hold until the [TinyLlama refresh checklist](#tinyllama-11b-chat-q8_0) passes. Earlier llama.cpp parity, context, API/WebUI, and RSS/perf receipts remain historical evidence; they do not certify the changed tokenizer. The corrected-tokenizer evidence is [spm-flat-scores-20261002](../../qa/evidence-bundles/spm-flat-scores-20261002/README.md).
+
+Bonsai 2 addition (2026-10-15): official 2B/4B/9B/27B PTQ1_0 catalog rows include
+their distinct Q8_0 vision companions. Packed portable text and single-image
+generation implements Hadamard v1/v2, including tied heads and grouped recurrent
+features. These rows remain experimental; resident GPU decoding, tool-call
+qualification and extended context remain unpromoted. Details:
+[`docs/BONSAI2.md`](../BONSAI2.md), `qa/bonsai2/manifest.json`.
+
 
 CUDA continuous-batching rollout note (2026-09-11): the explicit-opt-in Phase 7/8 runtime project
 is implemented and observable without changing any model-support row. Generation-safe paged KV,

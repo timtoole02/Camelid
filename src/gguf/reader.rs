@@ -85,6 +85,8 @@ pub enum GgufTensorType {
     /// Prism's forward-compatible packed Q2 type id 142. Wire-identical to
     /// the legacy g128 layout, but able to coexist with upstream type-42 g64.
     Pq2_0,
+    /// Prism dense ternary: 128 trits in 26 bytes followed by an f16 scale.
+    Ptq1_0,
     Unknown(i32),
 }
 
@@ -120,6 +122,7 @@ impl GgufTensorType {
             41 => Self::Q1_0,
             42 => Self::Q2_0,
             142 => Self::Pq2_0,
+            143 => Self::Ptq1_0,
             other => Self::Unknown(other),
         }
     }
@@ -172,6 +175,7 @@ impl GgufTensorType {
             Self::Q2_0G64 => Some((64, 18)),
             Self::Q2_0G128 => Some((128, 34)),
             Self::Pq2_0 => Some((128, 34)),
+            Self::Ptq1_0 => Some((128, 28)),
             Self::I8 => Some((1, 1)),
             Self::I16 | Self::BF16 => Some((1, 2)),
             Self::I32 => Some((1, 4)),
@@ -885,6 +889,8 @@ mod nvfp4_wire_facts {
         assert_eq!(GgufTensorType::Q2_0G64.layout(), Some((64, 18)));
         assert_eq!(GgufTensorType::Q2_0G128.layout(), Some((128, 34)));
         assert_eq!(GgufTensorType::from_id(142), GgufTensorType::Pq2_0);
+        assert_eq!(GgufTensorType::from_id(143), GgufTensorType::Ptq1_0);
+        assert_eq!(GgufTensorType::Ptq1_0.layout(), Some((128, 28)));
         assert_eq!(GgufTensorType::Pq2_0.layout(), Some((128, 34)));
     }
 
@@ -940,6 +946,7 @@ mod nvfp4_wire_facts {
             (T::Q2_0G64, 64, 18),
             (T::Q2_0G128, 128, 34),
             (T::Pq2_0, 128, 34),
+            (T::Ptq1_0, 128, 28),
             (T::Q4_0, 32, 18),
             (T::Q4_1, 32, 20),
             (T::Q5_0, 32, 22),

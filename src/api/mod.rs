@@ -8509,6 +8509,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             ];
             rows.retain(|row| !phase2_ids.contains(row.id));
             rows.extend(phase2);
+            rows.extend(crate::bonsai2::MODELS.iter().map(crate::bonsai2::compatibility));
             rows
         },
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
@@ -13367,18 +13368,28 @@ impl RunnableServeRuntime {
             .and_then(|filename| filename.to_str())
             .is_some_and(|filename| {
                 prism_supported_artifact_identity_matches(filename, model_sha256)
+                    || crate::bonsai2::identity_matches(filename, model_sha256)
             });
         let vision = if exact_prism_artifact {
             prism_mmproj_path(path)
-                .map(crate::runnable::PrismVisionProjector::load)
+                .map(|projector_path| {
+                    crate::runnable::PrismVisionProjector::load(projector_path).map(|p| {
+                        if gguf.metadata.contains_key("prism.hadamard.version") {
+                            p.with_portable_decode()
+                        } else {
+                            p
+                        }
+                    })
+                })
                 .transpose()?
         } else {
             None
         };
         if let Some(projector) = &vision {
-            if projector.projection_dim() != 5120 {
+            let model_width = gguf.metadata_u32("qwen35.embedding_length").unwrap_or(0) as usize;
+            if projector.projection_dim() != model_width {
                 return Err(BackendError::InvalidModelMetadata(format!(
-                    "Prism projector output width {} does not match Qwen3.5 27B width 5120",
+                    "Prism projector output width {} does not match Qwen3.5 width {model_width}",
                     projector.projection_dim()
                 )));
             }
@@ -37380,14 +37391,28 @@ fn catalog_companion_artifact_by_filename(filename: &str) -> Option<CatalogCompa
     CATALOG_COMPANION_BINDINGS
         .iter()
         .map(|binding| binding.artifact)
+        .chain(crate::bonsai2::MODELS.iter().map(|m| m.projector))
         .find(|artifact| artifact.filename.eq_ignore_ascii_case(filename))
 }
 
 fn catalog_companion_expected_sha256(artifact: &CatalogCompanionArtifact) -> Option<&'static str> {
-    (*artifact == BONSAI_27B_VISION_PROJECTOR).then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+    (*artifact == BONSAI_27B_VISION_PROJECTOR)
+        .then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+        .or_else(|| {
+            crate::bonsai2::MODELS
+                .iter()
+                .find(|m| m.projector == *artifact)
+                .map(|m| m.projector_sha256)
+        })
 }
 
 fn catalog_companion_artifacts(catalog_id: &str) -> Vec<CatalogCompanionArtifact> {
+    if let Some(model) = crate::bonsai2::MODELS
+        .iter()
+        .find(|m| m.catalog.catalog_id == catalog_id)
+    {
+        return vec![model.projector];
+    }
     CATALOG_COMPANION_BINDINGS
         .iter()
         .filter(|binding| binding.catalog_ids.contains(&catalog_id))
@@ -38513,6 +38538,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
     ];
     rows.retain(|item| !phase2_ids.contains(item.catalog_id));
     rows.extend(phase2);
+    rows.extend(crate::bonsai2::MODELS.iter().map(|m| m.catalog.clone()));
     rows
 }
 
@@ -43315,6 +43341,40 @@ mod catalog_fit_tests {
             ),
             "https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf"
         );
+    }
+
+    #[test]
+    fn bonsai2_downloads_bind_distinct_hash_pinned_vision_projectors() {
+        let catalog = curated_catalog();
+        for model in crate::bonsai2::MODELS {
+            let item = catalog
+                .iter()
+                .find(|c| c.catalog_id == model.catalog.catalog_id)
+                .unwrap();
+            assert_eq!(item.filename, model.catalog.filename);
+            assert_eq!(item.quant, "PTQ1_0");
+            assert_eq!(
+                catalog_companion_artifacts(item.catalog_id),
+                vec![model.projector]
+            );
+            assert_eq!(
+                super::catalog_companion_expected_sha256(&model.projector),
+                Some(model.projector_sha256)
+            );
+            assert_eq!(
+                super::prism_vision_companion_for_model(std::path::Path::new(item.filename)),
+                Some(model.projector)
+            );
+            assert_ne!(model.projector, BONSAI_27B_VISION_PROJECTOR);
+            assert!(crate::bonsai2::identity_matches(
+                item.filename,
+                model.sha256
+            ));
+            assert!(!crate::bonsai2::identity_matches(
+                item.filename,
+                &"0".repeat(64)
+            ));
+        }
     }
 
     #[test]

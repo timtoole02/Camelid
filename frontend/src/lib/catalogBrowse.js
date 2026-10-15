@@ -99,6 +99,14 @@ export function catalogQualification(item, capabilities) {
 
   const status = String(target?.status || '').toLowerCase()
   const parity = String(target?.parity_audited || '').toLowerCase()
+  if (status === 'experimental_implemented') {
+    return {
+      kind: 'runnable',
+      label: 'Runnable',
+      detail: 'Camelid implements this model. Full runtime qualification is still pending.',
+      target,
+    }
+  }
   if (status.includes('blocked_load')) {
     return {
       kind: 'blocked',
@@ -309,6 +317,9 @@ const QUANT_BY_TOKEN = new Map(
    0 and no note: the browse layer guesses quants from filenames, so "we do not
    recognize this" must not be dressed up as advice. */
 export function quantAdvice(quant) {
+  if (String(quant || '').toUpperCase() === 'PTQ1_0') {
+    return { token: 'PTQ1_0', tier: 'unknown', rank: 0, note: 'Compact ternary weights — Bonsai 2’s smallest download' }
+  }
   return (
     QUANT_BY_TOKEN.get(String(quant || '').toUpperCase()) || {
       token: quant || '',

@@ -1,5 +1,10 @@
 # Camelid Compatibility Matrix
 
+Bonsai 2 2B/4B/9B/27B PTQ1_0 has an experimental portable text and single-image
+implementation, with exact publisher model/projector pins and GUI downloads.
+These artifacts do not inherit older Bonsai GPU receipts. See
+[Bonsai 2](docs/BONSAI2.md) and `qa/bonsai2/manifest.json` for the checked boundary.
+
 Last updated: 2026-08-10
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.

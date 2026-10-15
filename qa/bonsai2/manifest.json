@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-15",
+  "scope": "experimental packed PTQ1_0 text and single-image implementation; short smoke evidence only",
+  "host": "Windows x86_64",
+  "language_backend": "portable CPU with activation Hadamard transforms",
+  "image_backend": "CUDA streaming projector",
+  "reference": {
+    "repository": "https://github.com/PrismML-Eng/llama.cpp",
+    "release": "prism-b10777-e3de715",
+    "backend": "CPU",
+    "sampling": "greedy, thinking disabled, four merged image tokens"
+  },
+  "publisher_artifact_identities": "../../src/bonsai2.rs",
+  "models": {
+    "2B": { "text": "PASS, seven non-EOS token IDs match reference", "vision": "PASS, The image is red.", "gui": "pending" },
+    "4B": { "text": "PASS, seven non-EOS token IDs match reference", "vision": "PASS, Red", "gui": "pending" },
+    "9B": { "text": "PASS, short semantic smoke", "vision": "pending", "gui": "pending" },
+    "27B": { "metadata": "publisher header and transform contract inspected", "text": "pending", "vision": "pending", "gui": "pending" }
+  },
+  "regression": {
+    "problem": "Qwen3-VL learned position grid used pixel-center interpolation instead of align_corners=true",
+    "before": "2B described the solid red fixture as a black and white photograph on both CPU and CUDA encoders",
+    "after": "2B and 4B correctly identify red after correcting the shared position interpolation",
+    "unit_test": "learned_positions_align_corners_in_tile_order",
+    "reference_source": "https://github.com/PrismML-Eng/llama.cpp/blob/prism/tools/mtmd/models/qwen3vl.cpp"
+  },
+  "not_qualified": ["resident GPU language decoding", "tool calling", "extended context", "arbitrary images", "throughput", "cross-platform parity"],
+  "reproduction": "README.md"
+}

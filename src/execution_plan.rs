@@ -543,7 +543,17 @@ pub fn plan_for_model_with_platform_and_env(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) = if crate::model::is_bitnet_embedding_model(gguf) && has_i2_s_tensors {
+    ) = if gguf.metadata.contains_key("prism.hadamard.version") {
+        reasons.push("Bonsai 2 folded weights use packed portable projections with activation Hadamard transforms; resident GPU decode is not implemented for this basis".into());
+        (
+            "bonsai2_portable_runtime",
+            "packed_hadamard_matvec",
+            "portable_qwen35_prefill",
+            "packed_weights_retained",
+            "portable_qwen35_decode",
+            "no_resident_gpu_hadamard_graph",
+        )
+    } else if crate::model::is_bitnet_embedding_model(gguf) && has_i2_s_tensors {
         reasons.push(format!(
             "exact Microsoft BitNet embedding GGUF: decoder-only qwen3/gemma3 graph with \
              canonical I2_S projections executes through the experimental {bitnet_backend} \
@@ -2356,6 +2366,9 @@ fn quant_type(gguf: &GgufFile) -> String {
     }
     if has(GgufTensorType::Pq2_0) {
         return "PQ2_0".into();
+    }
+    if has(GgufTensorType::Ptq1_0) {
+        return "PTQ1_0".into();
     }
     if has(GgufTensorType::Q2_0G128) {
         return "Q2_0_G128".into();

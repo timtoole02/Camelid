@@ -1,5 +1,10 @@
 # Camelid Roadmap
 
+Bonsai 2 follow-up (2026-10-15): the experimental portable text/vision path and
+GUI downloads cover 2B/4B/9B/27B PTQ1_0. Resident GPU Hadamard execution, tool-call
+qualification, extended context and cross-platform parity remain separate gates;
+see [Bonsai 2](docs/BONSAI2.md).
+
 Last updated: 2026-08-10
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.

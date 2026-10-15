@@ -418,10 +418,10 @@ fn urldecode(s: &str) -> String {
 fn guess_quant(filename: &str) -> Option<String> {
     let upper = filename.to_uppercase();
     const PATTERNS: &[&str] = &[
-        "IQ2_XXS", "IQ3_XXS", "IQ2_XS", "IQ3_XS", "IQ4_XS", "IQ4_NL", "IQ1_S", "IQ1_M", "IQ2_S",
-        "IQ2_M", "IQ3_S", "IQ3_M", "Q2_K_S", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_K_S", "Q4_K_M",
-        "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_K", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q4_0", "Q4_1", "Q5_0",
-        "Q5_1", "Q8_0", "BF16", "F16", "F32",
+        "PTQ1_0", "PQ2_0", "Q2_0", "Q1_0", "IQ2_XXS", "IQ3_XXS", "IQ2_XS", "IQ3_XS", "IQ4_XS",
+        "IQ4_NL", "IQ1_S", "IQ1_M", "IQ2_S", "IQ2_M", "IQ3_S", "IQ3_M", "Q2_K_S", "Q3_K_S",
+        "Q3_K_M", "Q3_K_L", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_K", "Q2_K", "Q3_K",
+        "Q4_K", "Q5_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "BF16", "F16", "F32",
     ];
     PATTERNS
         .iter()
@@ -435,6 +435,7 @@ fn guess_quant(filename: &str) -> Option<String> {
 fn guess_architecture(filename: &str, repo_id: &str) -> String {
     let hay = format!("{repo_id} {filename}").to_lowercase();
     const TABLE: &[(&str, &str)] = &[
+        ("ternary-bonsai-2-", "qwen35"),
         // Match the most specific Qwen spellings first: otherwise every
         // qwen3moe/qwen3.5 repo is swallowed by the broad `qwen3` token and the
         // Models page reports the wrong implementation verdict.
