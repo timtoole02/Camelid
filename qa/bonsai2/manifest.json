@@ -13,9 +13,9 @@
   },
   "publisher_artifact_identities": "../../src/bonsai2.rs",
   "models": {
-    "2B": { "text": "PASS, seven non-EOS token IDs match reference", "vision": "PASS, The image is red.", "gui": "pending" },
+    "2B": { "text": "PASS, seven non-EOS token IDs match reference", "vision": "PASS, The image is red.", "cpu_image_fallback": "PASS, same answer and token IDs", "gui": "pending" },
     "4B": { "text": "PASS, seven non-EOS token IDs match reference", "vision": "PASS, Red", "gui": "pending" },
-    "9B": { "text": "PASS, short semantic smoke", "vision": "pending", "gui": "pending" },
+    "9B": { "text": "PASS, short semantic smoke", "vision": "PASS, Red", "gui": "pending" },
     "27B": { "metadata": "publisher header and transform contract inspected", "text": "pending", "vision": "pending", "gui": "pending" }
   },
   "regression": {

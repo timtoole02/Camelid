@@ -372,6 +372,26 @@ function extractModelCompatibilityRows(src, capabilitiesBlock, parsedCapabilitie
   return baseRows.filter((row) => !phase2Ids.has(row.id)).concat(phase2)
 }
 
+// Bonsai 2 shares a literal contract across four artifact rows. Read the same
+// data and template used by Rust instead of silently omitting composed rows.
+async function extractBonsai2(root) {
+  const src = await readFile(join(root, 'src', 'bonsai2.rs'), 'utf8')
+  const modelsStart = /const MODELS:[^=]+=\s*&\[/.exec(src)
+  const templateStart = /\n\s+crate::api::ModelCompatibilityTarget \{/.exec(src)
+  if (!modelsStart || !templateStart) throw new Error('Bonsai 2 model/contract literal not found')
+  const models = parse(tokenize(balancedBlock(src, modelsStart.index + modelsStart[0].length - 1, '[', ']')))
+  const template = parse(tokenize(balancedBlock(src, templateStart.index + templateStart[0].lastIndexOf('{'))
+    .replace('id: model.catalog.catalog_id,', 'id: "__bonsai2_id__",')))
+  if (!Array.isArray(models) || models.length !== 4 || template.id !== '__bonsai2_id__'
+    || Object.values(template).some(value => value && typeof value === 'object')) {
+    throw new Error('Bonsai 2 contract is no longer a four-row literal template')
+  }
+  return models.map(model => ({
+    contract: { ...template, id: model.catalog.catalog_id },
+    pin: { filename: model.catalog.filename, sha256: model.sha256 },
+  }))
+}
+
 export async function buildLedger(root = ROOT) {
   const src = await readFile(join(root, 'src', 'api', 'mod.rs'), 'utf8')
   const marker = 'CapabilitiesResponse {'
@@ -388,10 +408,12 @@ export async function buildLedger(root = ROOT) {
   // execution_plan is the function param (None) -> null in the static contract
   cr.execution_plan = null
 
-  const rows = extractModelCompatibilityRows(src, block, cr)
+  const bonsai2 = src.includes('crate::bonsai2::compatibility') ? await extractBonsai2(root) : []
+  const rows = extractModelCompatibilityRows(src, block, cr).concat(bonsai2.map(row => row.contract))
   const apiFeatures = await extractApiFeatureContract(root)
 
   const pinned = extractHashPinnedArtifacts(src)
+  for (const { contract, pin } of bonsai2) pinned.byRowId.set(contract.id, pin)
 
   const receiptWarnings = []
   const model_rows = []
