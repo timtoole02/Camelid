@@ -1,5 +1,5 @@
 {
-  "model": "C:\\Users\\timto\\.codex\\worktrees\\bonsai-2-models\\Camelid\\output\\bonsai2-models\\Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+  "model": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
   "projection_policy": "tiled",
   "cases": [
     {

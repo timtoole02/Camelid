@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 const [binary, models, directory, casesDirectory = 'qa/bonsai2/cuda-optimized'] = process.argv.slice(2)
 assert.ok(binary && models && directory, 'TEST_BINARY MODEL_DIRECTORY OUTPUT_DIRECTORY required')
 await mkdir(directory, { recursive: true })
@@ -40,7 +40,7 @@ for (const size of [2, 4, 9, 27]) {
     assert.match(log, /test result: ok\. 1 passed; 0 failed/)
     const receipt = JSON.parse(await readFile(output, 'utf8'))
     assert.equal(receipt.projection_policy, policy)
-    Object.assign(receipt, { model_sha256: modelHash, test_binary_sha256: testHash,
+    Object.assign(receipt, { model: basename(model), model_sha256: modelHash, test_binary_sha256: testHash,
       cases_sha256: await digest(casesPath), log_sha256: createHash('sha256').update(log).digest('hex') })
     await writeFile(output, JSON.stringify(receipt, null, 2) + '\n')
     policies[policy] = receipt.cases.flatMap(row => row.scores)

@@ -104,6 +104,7 @@ for (const size of [2, 4, 9, 27]) {
   const scores = {}
   for (const policy of ['tiled', 'q8']) {
     const receipt = await json(`${size}b-${policy}-quality.json`)
+    assert.equal(receipt.model, native.target)
     assert.equal(receipt.test_binary_sha256, manifest.binaries.tests.sha256)
     assert.equal(receipt.model_sha256, native.target_sha256)
     assert.equal(receipt.projection_policy, policy)
