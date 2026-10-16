@@ -4368,6 +4368,12 @@ impl RunnableModel {
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if max_new == 0 {
+            return Ok(Vec::new());
+        }
         // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
         // layers don't attend — see build_qwen35_resident::sparsify_kv), so KV is ~4x
         // smaller than dense and 8192 positions fit alongside the 5.24 GB Q4_K_M on a 6 GB
@@ -4376,6 +4382,7 @@ impl RunnableModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192);
+        let max_new = qwen35_generation_budget(prompt.len(), max_new, max_pos, "CUDA text")?;
         let mut guard = self
             .cuda
             .lock()
@@ -4491,15 +4498,21 @@ impl RunnableModel {
                 let ids = engine
                     .read_out_tokens(t, readable)
                     .map_err(BackendError::InvalidTensorData)?;
+                if is_cancelled() {
+                    return Err(BackendError::Cancelled);
+                }
                 for id in ids {
                     if stop.contains(&id) {
                         break 'outer;
                     }
                     out.push(id);
                     on_token(id);
-                    // Match the host-fed and multimodal Qwen3.5 loops: a
-                    // device chunk must not bypass the short-cycle guard.
-                    if out.len() >= max_new || qwen35_repetition_loop(&out) {
+                    if is_cancelled() {
+                        return Err(BackendError::Cancelled);
+                    }
+                    // A device chunk must honor the same per-token stopping
+                    // conditions as the host-fed and multimodal loops.
+                    if out.len() >= max_new || should_stop(&out) || qwen35_repetition_loop(&out) {
                         break 'outer;
                     }
                 }
@@ -6061,6 +6074,14 @@ mod qwen35_imrope_tests {
             qwen35_generation_budget(143, 8, 4096, "multimodal").unwrap(),
             8
         );
+        assert_eq!(
+            qwen35_generation_budget(8191, 4096, 8192, "CUDA text").unwrap(),
+            1
+        );
+        assert_eq!(
+            qwen35_generation_budget(8191, 0, 8192, "CUDA text").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -6272,6 +6293,7 @@ impl RunnableModel {
             }
             match m.tt {
                 GgufTensorType::F32 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::F32)),
+                GgufTensorType::BF16 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::BF16)),
                 GgufTensorType::Q8_0 => Ok((widen_q8(m.bytes.as_slice()), ProjQuant::Q8_0)),
                 GgufTensorType::Q2K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2K)),
                 GgufTensorType::Q3K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q3K)),

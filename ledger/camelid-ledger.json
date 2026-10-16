@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "48812c3b",
+    "source_head": "23670e74",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -3746,7 +3746,7 @@
         "metadata_parses": "PTQ1_0_and_Hadamard_v1_v2",
         "tokenizer_works": "qwen2_bpe",
         "tensors_load": "packed_weights_no_full_f32_expansion",
-        "generation_runs": "windows_cpu_text_single_image_and_tools",
+        "generation_runs": "windows_cpu_cuda_text_single_image_and_tools",
         "parity_audited": "see_bonsai2_evidence",
         "performance_measured": "see_bonsai2_evidence",
         "frontend_load_path_verified": "catalog_with_matching_Q8_0_vision_companion",
@@ -3772,9 +3772,9 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
-        "next_step": "qualify Apple Silicon, resident GPU language and extended context separately"
+        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
     {
@@ -3797,7 +3797,7 @@
         "metadata_parses": "PTQ1_0_and_Hadamard_v1_v2",
         "tokenizer_works": "qwen2_bpe",
         "tensors_load": "packed_weights_no_full_f32_expansion",
-        "generation_runs": "windows_cpu_text_single_image_and_tools",
+        "generation_runs": "windows_cpu_cuda_text_single_image_and_tools",
         "parity_audited": "see_bonsai2_evidence",
         "performance_measured": "see_bonsai2_evidence",
         "frontend_load_path_verified": "catalog_with_matching_Q8_0_vision_companion",
@@ -3823,9 +3823,9 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
-        "next_step": "qualify Apple Silicon, resident GPU language and extended context separately"
+        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
     {
@@ -3848,7 +3848,7 @@
         "metadata_parses": "PTQ1_0_and_Hadamard_v1_v2",
         "tokenizer_works": "qwen2_bpe",
         "tensors_load": "packed_weights_no_full_f32_expansion",
-        "generation_runs": "windows_cpu_text_single_image_and_tools",
+        "generation_runs": "windows_cpu_cuda_text_single_image_and_tools",
         "parity_audited": "see_bonsai2_evidence",
         "performance_measured": "see_bonsai2_evidence",
         "frontend_load_path_verified": "catalog_with_matching_Q8_0_vision_companion",
@@ -3874,9 +3874,9 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
-        "next_step": "qualify Apple Silicon, resident GPU language and extended context separately"
+        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
     {
@@ -3899,7 +3899,7 @@
         "metadata_parses": "PTQ1_0_and_Hadamard_v1_v2",
         "tokenizer_works": "qwen2_bpe",
         "tensors_load": "packed_weights_no_full_f32_expansion",
-        "generation_runs": "windows_cpu_text_single_image_and_tools",
+        "generation_runs": "windows_cpu_cuda_text_single_image_and_tools",
         "parity_audited": "see_bonsai2_evidence",
         "performance_measured": "see_bonsai2_evidence",
         "frontend_load_path_verified": "catalog_with_matching_Q8_0_vision_companion",
@@ -3925,9 +3925,9 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
-        "next_step": "qualify Apple Silicon, resident GPU language and extended context separately"
+        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "next_step": "qualify Apple Silicon and extended context separately"
       }
     }
   ]

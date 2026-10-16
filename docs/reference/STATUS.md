@@ -5,14 +5,26 @@ Last updated: 2026-10-15
 TinyLlama tokenizer-reference update (2026-10-03): flat-score TinyLlama Q8_0 now uses its merge ranks and is checked against the model's own SentencePiece tokenizer instead of the pinned llama.cpp tokenizer. The existing runtime admission label is retained, but full current-gate support is on hold until the [TinyLlama refresh checklist](#tinyllama-11b-chat-q8_0) passes. Earlier llama.cpp parity, context, API/WebUI, and RSS/perf receipts remain historical evidence; they do not certify the changed tokenizer. The corrected-tokenizer evidence is [spm-flat-scores-20261002](../../qa/evidence-bundles/spm-flat-scores-20261002/README.md).
 
 Bonsai 2 addition (2026-10-15): official 2B/4B/9B/27B PTQ1_0 catalog rows include
-their distinct Q8_0 vision companions. Packed portable text and single-image
-generation implements Hadamard v1/v2, including tied heads and grouped recurrent
-features. All four rows pass Windows text, function-tool round trips, sampled
-generation, 1,044-token context recall, spatial vision, and GUI attachment
-tests. Windows x86_64 support is enabled for the exact publisher artifacts.
-Apple Silicon, resident GPU language decoding and extended context remain
-separate qualification work. Details:
-[`docs/BONSAI2.md`](../BONSAI2.md), `qa/bonsai2/manifest.json`.
+their distinct Q8_0 vision companions. Packed CPU and CUDA language graphs
+implement Hadamard v1/v2, including tied heads and grouped recurrent features.
+The completed Windows CPU-language qualification covers all four rows for text,
+function-tool round trips, sampled generation, 1,044-token context recall,
+spatial vision, and GUI attachment. Windows x86_64 support is enabled for those
+exact publisher artifacts within the existing evidence boundary.
+
+The CUDA language and draft implementations are now present for all four.
+CUDA verification batches proposed tokens and restores device recurrent,
+convolution, and valid attention state on rejection. The capacity planner can
+stream 27B packed weights from pinned host RAM while executing its layers on
+CUDA. Native CUDA benchmark, API, GUI text/image, and cache/rollback receipts
+are in progress; no completed native CUDA qualification is claimed yet. The
+pinned Prism llama.cpp CUDA comparison side is complete, with ordinary rates
+of 205–221, 113–118, 77–80, and 1.68–1.76 tok/s for 2B/4B/9B/27B respectively;
+its same-2B-drafter cases were slower. The 27B reference uses partial GPU layer
+placement on the 6 GiB host, and its placement changes with drafting. Apple
+Silicon and extended context remain separate qualification work. Details:
+[`docs/BONSAI2.md`](../BONSAI2.md), `qa/bonsai2/manifest.json`, and the
+[CUDA reproduction/evidence workflow](../../qa/bonsai2/cuda/README.md).
 
 
 CUDA continuous-batching rollout note (2026-09-11): the explicit-opt-in Phase 7/8 runtime project

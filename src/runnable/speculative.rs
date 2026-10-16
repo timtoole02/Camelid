@@ -75,6 +75,9 @@ impl RunnableModel {
         if max_new == 0 {
             return Ok(Vec::new());
         }
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         let (path, window) = draft_configuration()?;
         let canonical_path = std::fs::canonicalize(&path).map_err(|error| {
             BackendError::InvalidModelMetadata(format!("draft model path: {error}"))
@@ -99,6 +102,11 @@ impl RunnableModel {
         let mut target_guard = self.cuda.lock().map_err(|_| {
             BackendError::InvalidTensorData("qwen35 CUDA target mutex poisoned".into())
         })?;
+        // A queued request may have been cancelled while another request held
+        // these graphs. Do not start loading or allocating its replacement.
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         let replace_draft = cached.as_ref().is_none_or(|cached| {
             cached.path != canonical_path
                 || cached.len != metadata.len()
@@ -110,6 +118,9 @@ impl RunnableModel {
             // target is necessary only when its proposal model changes: the old
             // residency plan may have consumed the drafter's required VRAM.
             let model = self.load_qwen35_draft_path(&path, false)?;
+            if is_cancelled() {
+                return Err(BackendError::Cancelled);
+            }
             if let Some(engine) = target_guard.as_ref() {
                 engine
                     .synchronize()
@@ -135,11 +146,17 @@ impl RunnableModel {
                     .map_err(BackendError::InvalidTensorData)?,
             );
         }
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         if target_guard.is_none() {
             *target_guard = Some(
                 self.build_qwen35_resident(max_pos)
                     .map_err(BackendError::InvalidTensorData)?,
             );
+        }
+        if is_cancelled() {
+            return Err(BackendError::Cancelled);
         }
         let target = target_guard.as_mut().expect("initialized above");
         let proposal = draft_guard.as_mut().expect("initialized above");
@@ -817,6 +834,48 @@ mod tests {
             "<|im_start|>user\nExplain in three sentences why the sky is blue.<|im_end|>\n<|im_start|>assistant\n",
             false, true,
         ).unwrap();
+        let mut streamed = Vec::new();
+        let initially_cancelled = target.generate_qwen35_cuda_with_draft(
+            &prompt,
+            8,
+            &[],
+            None,
+            &|| true,
+            &|_| false,
+            &mut |token| streamed.push(token),
+        );
+        assert!(matches!(initially_cancelled, Err(BackendError::Cancelled)));
+        assert!(streamed.is_empty());
+        assert!(target.cuda_draft.lock().unwrap().is_none());
+        assert!(!target.cuda_language_active());
+        assert!(target
+            .generate_qwen35_cuda(&prompt, 0, &[], None, &|| false, &|_| false, &mut |token| {
+                streamed.push(token)
+            },)
+            .unwrap()
+            .is_empty());
+        assert!(streamed.is_empty());
+        assert!(!target.cuda_language_active());
+        let max_pos = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8192usize);
+        for invalid_prompt in [&[][..], &vec![prompt[0]; max_pos][..]] {
+            assert!(matches!(
+                target.generate_qwen35_cuda(
+                    invalid_prompt,
+                    1,
+                    &[],
+                    None,
+                    &|| false,
+                    &|_| false,
+                    &mut |token| streamed.push(token),
+                ),
+                Err(BackendError::InvalidTensorData(_))
+            ));
+        }
+        assert!(streamed.is_empty());
+        assert!(!target.cuda_language_active());
         let sampling = SamplingConfig {
             temperature: 0.7,
             top_k: Some(40),
@@ -850,6 +909,36 @@ mod tests {
         let expected = target
             .generate_qwen35_cuda(&prompt, 8, &[], None, &|| false, &|_| false, &mut |_| {})
             .unwrap();
+        let mut streamed = Vec::new();
+        let ordinary_stopped = target
+            .generate_qwen35_cuda(
+                &prompt,
+                8,
+                &[],
+                None,
+                &|| false,
+                &|tokens| tokens.len() == 3,
+                &mut |token| streamed.push(token),
+            )
+            .unwrap();
+        assert_eq!(ordinary_stopped, expected[..3]);
+        assert_eq!(streamed, ordinary_stopped);
+        let cancel_requested = std::cell::Cell::new(false);
+        let mut streamed = Vec::new();
+        let ordinary_cancelled = target.generate_qwen35_cuda(
+            &prompt,
+            8,
+            &[],
+            None,
+            &|| cancel_requested.get(),
+            &|_| false,
+            &mut |token| {
+                streamed.push(token);
+                cancel_requested.set(true);
+            },
+        );
+        assert!(matches!(ordinary_cancelled, Err(BackendError::Cancelled)));
+        assert_eq!(streamed, expected[..1]);
         let actual = target
             .generate_qwen35_cuda_with_draft(
                 &prompt,

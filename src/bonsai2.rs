@@ -134,7 +134,7 @@ pub(crate) fn compatibility(model: &Model) -> crate::api::ModelCompatibilityTarg
         full_support_blockers: "",
         metadata_parses: "PTQ1_0_and_Hadamard_v1_v2",
         tokenizer_works: "qwen2_bpe", tensors_load: "packed_weights_no_full_f32_expansion",
-        generation_runs: "windows_cpu_text_single_image_and_tools",
+        generation_runs: "windows_cpu_cuda_text_single_image_and_tools",
         parity_audited: "see_bonsai2_evidence", performance_measured: "see_bonsai2_evidence",
         frontend_load_path_verified: "catalog_with_matching_Q8_0_vision_companion",
         frontend_readiness_gate: "loaded_now and generation_ready; images additionally require vision_ready and the exact projector digest",
@@ -146,8 +146,8 @@ pub(crate) fn compatibility(model: &Model) -> crate::api::ModelCompatibilityTarg
         bounded_context_4096_pack: "not_checked", bounded_context_4096_pack_id: "", bounded_context_4096_window: 0,
         bounded_context_8192_pack: "not_checked", bounded_context_8192_pack_id: "", bounded_context_8192_window: 0,
         latest_checked_bucket: "windows_api_gui", latest_checked_result: "pass",
-        latest_checked_output: "qa/bonsai2/manifest.json",
-        evidence: "qa/bonsai2/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
-        next_step: "qualify Apple Silicon, resident GPU language and extended context separately",
+        latest_checked_output: "qa/bonsai2/cuda/manifest.json",
+        evidence: "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        next_step: "qualify Apple Silicon and extended context separately",
     }
 }

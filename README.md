@@ -127,8 +127,11 @@ Use a trusted private LAN or private Tailscale HTTPS access with authentication.
 ## Supported models
 
 Bonsai 2 **2B, 4B, 9B, and 27B** PTQ1_0 are supported on Windows x86_64
-for text, GUI image chat, and function calling. Downloads include the matching
-vision projector. See [Bonsai 2](docs/BONSAI2.md) for sizes, execution details, and validation limits.
+for text, GUI image chat, and function calling through the completed CPU-language
+qualification. Downloads include the matching vision projector. Packed CUDA
+language decoding and drafting are implemented for all four, including weight
+streaming for 27B on constrained VRAM; their separate CUDA qualification is in
+progress. See [Bonsai 2](docs/BONSAI2.md) for sizes, execution details, and evidence.
 
 Start with one of these five options. Support applies to exact model files, quantizations, and tested execution paths; see the [compatibility ledger](COMPATIBILITY.md) for each model's limits.
 

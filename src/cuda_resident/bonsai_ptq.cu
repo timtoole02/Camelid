@@ -67,18 +67,60 @@ extern "C" __global__ void bonsai_ptq_matmul(
     int token_count = remaining < 8 ? remaining : 8;
     if (row >= rows) return;
     float partial[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (int i = lane; i < cols; i += 32) {
-        float weight;
-        if (dense) weight = ((const float*)weights)[(size_t)row * cols + i];
-        else {
-            const unsigned char* block = weights + ((size_t)row * (cols / 128) + i / 128) * 28;
-            unsigned short bits = (unsigned short)block[26] | ((unsigned short)block[27] << 8);
-            weight = f16_bits_to_f32(bits) * (float)bonsai_ptq_trit(block, i & 127);
+    if (dense != 0) {
+        for (int i = lane; i < cols; i += 32) {
+            size_t offset = (size_t)row * cols + i;
+            float weight;
+            if (dense == 2) {
+                const unsigned short bits = ((const unsigned short*)weights)[offset];
+                weight = __uint_as_float(((unsigned int)bits) << 16);
+            } else {
+                weight = ((const float*)weights)[offset];
+            }
+            #pragma unroll
+            for (int token = 0; token < 8; ++token) {
+                if (token < token_count)
+                    partial[token] += weight * input[(size_t)(token_base + token) * cols + i];
+            }
         }
-        #pragma unroll
-        for (int token = 0; token < 8; ++token) {
-            if (token < token_count)
-                partial[token] += weight * input[(size_t)(token_base + token) * cols + i];
+    } else {
+        // Each lane visits four trits of every 128-value block. Compute their
+        // interleave geometry once, outside the contraction loop. These are
+        // exactly the lane,lane+32,lane+64,lane+96 positions used previously.
+        const int byte_indices[4] = {
+            lane & 15,
+            lane & 15,
+            lane < 24 ? lane : lane - 8,
+            lane < 8 ? lane + 16 : lane < 16 ? lane + 8 : lane < 24 ? lane : 24 + (lane & 1)
+        };
+        const int powers[4] = {
+            lane < 16 ? 1 : 3,
+            lane < 16 ? 9 : 27,
+            lane < 16 ? 81 : lane < 24 ? 1 : 3,
+            lane < 8 ? 9 : lane < 16 ? 27 : lane < 24 ? 81 : lane < 26 ? 1 : lane < 28 ? 3 : lane < 30 ? 9 : 27
+        };
+        const int blocks = cols / 128;
+        const unsigned char* row_weights = weights + (size_t)row * blocks * 28;
+        for (int block_index = 0; block_index < blocks; ++block_index) {
+            const unsigned char* block = row_weights + block_index * 28;
+            float scale = 0.0f;
+            if (lane == 0) {
+                unsigned short bits = (unsigned short)block[26] | ((unsigned short)block[27] << 8);
+                scale = f16_bits_to_f32(bits);
+            }
+            scale = __shfl_sync(0xffffffffu, scale, 0);
+            #pragma unroll
+            for (int quarter = 0; quarter < 4; ++quarter) {
+                unsigned char code = (unsigned char)(block[byte_indices[quarter]] * powers[quarter]);
+                int trit = (((unsigned int)code * 3u) >> 8) - 1;
+                float weight = scale * (float)trit;
+                int i = block_index * 128 + lane + quarter * 32;
+                #pragma unroll
+                for (int token = 0; token < 8; ++token) {
+                    if (token < token_count)
+                        partial[token] += weight * input[(size_t)(token_base + token) * cols + i];
+                }
+            }
         }
     }
     #pragma unroll

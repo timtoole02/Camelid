@@ -177,7 +177,7 @@ for (const mode of modes) {
       row[mode].repeated_ids_match = runs.every(run => JSON.stringify(run.ids) === JSON.stringify(median.ids))
       if (mode === 'speculative') {
         assert.ok(median.timings?.draft_n > 0, 'Reference speculation did not propose tokens')
-        row.parity = JSON.stringify(row.baseline?.ids) === JSON.stringify(median.ids)
+        row.parity = row.baseline ? JSON.stringify(row.baseline.ids) === JSON.stringify(median.ids) : null
         if (row.baseline) row.total_speedup = row.baseline.seconds / median.seconds
       }
       await save()
@@ -202,3 +202,7 @@ for (const mode of modes) {
     await save()
   }
 }
+report.completion_status = cases.every(name => modes.every(mode =>
+  report.cases.find(row => row.name === name)?.[mode]?.runs?.length === repetitions)) ? 'complete' : 'partial'
+report.completed_at = new Date().toISOString()
+await save()

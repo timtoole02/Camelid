@@ -20,6 +20,10 @@ pub(super) struct BonsaiKernels {
 }
 
 impl BonsaiKernels {
+    pub(super) fn has_graphs(&self) -> bool {
+        !self.body_graphs.is_empty()
+    }
+
     pub(super) fn new(
         load: &impl Fn(&str) -> Result<CudaFunction, String>,
     ) -> Result<Self, String> {
@@ -119,7 +123,7 @@ impl BonsaiKernels {
     pub(super) fn project(
         &self,
         stream: &Arc<CudaStream>,
-        transform_id: Option<usize>,
+        lane: ProjQuant,
         input: &CudaSlice<f32>,
         weights: &CudaView<u8>,
         rows: usize,
@@ -128,6 +132,12 @@ impl BonsaiKernels {
         output: &mut CudaSlice<f32>,
         residual: i32,
     ) -> Result<(), cudarc::driver::DriverError> {
+        let (transform_id, dense) = match lane {
+            ProjQuant::Ptq1_0(id) => (Some(id), 0_i32),
+            ProjQuant::F32 => (None, 1),
+            ProjQuant::BF16 => (None, 2),
+            _ => unreachable!("Bonsai projection received another quant family"),
+        };
         let mut scratch = transform_id.map(|id| {
             self.transforms[id]
                 .scratch
@@ -148,13 +158,7 @@ impl BonsaiKernels {
             )?;
         }
         let activation = scratch.as_deref().unwrap_or(input);
-        let args = [
-            rows as i32,
-            cols as i32,
-            residual,
-            i32::from(transform_id.is_none()),
-            tokens as i32,
-        ];
+        let args = [rows as i32, cols as i32, residual, dense, tokens as i32];
         let mut launch = stream.launch_builder(&self.matmul);
         launch
             .arg(activation)
@@ -308,6 +312,108 @@ impl CudaResidentDecode {
 mod tests {
     use super::*;
 
+    fn warp_dot(weights: &[f32], input: &[f32]) -> f32 {
+        let mut partial = [0.0_f32; 32];
+        for (lane, sum) in partial.iter_mut().enumerate() {
+            for column in (lane..weights.len()).step_by(32) {
+                *sum += weights[column] * input[column];
+            }
+        }
+        for step in [16, 8, 4, 2, 1] {
+            for lane in 0..32 - step {
+                partial[lane] += partial[lane + step];
+            }
+        }
+        partial[0]
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn bonsai_cuda_bf16_projection_matches_warp_reference() {
+        let kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
+        let stream = kernels.stream.clone();
+        for width in [96, 5120] {
+            let rows = 7;
+            let tokens = 9; // Covers a full tile and the partial final tile.
+            let input: Vec<f32> = (0..width * tokens)
+                .map(|i| ((i * 13 % 113) as f32 - 56.0) / 31.0)
+                .collect();
+            let bits: Vec<u16> = (0..rows * width)
+                .map(|i| ((((i * 29 % 257) as f32 - 128.0) / 37.0).to_bits() >> 16) as u16)
+                .collect();
+            let weights: Vec<u8> = bits.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let decoded: Vec<f32> = bits
+                .iter()
+                .map(|&value| f32::from_bits(u32::from(value) << 16))
+                .collect();
+            let device_input = stream.clone_htod(&input).unwrap();
+            let device_weights = stream.clone_htod(&weights).unwrap();
+            let initial: Vec<f32> = (0..rows * tokens).map(|i| i as f32 / 19.0).collect();
+            for residual in [0, 1] {
+                let mut output = stream.clone_htod(&initial).unwrap();
+                kernels
+                    .bonsai
+                    .project(
+                        &stream,
+                        ProjQuant::BF16,
+                        &device_input,
+                        &device_weights.as_view(),
+                        rows,
+                        width,
+                        tokens,
+                        &mut output,
+                        residual,
+                    )
+                    .unwrap();
+                let batched = stream.clone_dtoh(&output).unwrap();
+                for token in 0..tokens {
+                    let single_input = stream
+                        .clone_htod(&input[token * width..(token + 1) * width])
+                        .unwrap();
+                    let mut single_output = stream
+                        .clone_htod(&initial[token * rows..(token + 1) * rows])
+                        .unwrap();
+                    kernels
+                        .bonsai
+                        .project(
+                            &stream,
+                            ProjQuant::BF16,
+                            &single_input,
+                            &device_weights.as_view(),
+                            rows,
+                            width,
+                            1,
+                            &mut single_output,
+                            residual,
+                        )
+                        .unwrap();
+                    let single = stream.clone_dtoh(&single_output).unwrap();
+                    for row in 0..rows {
+                        let dot = warp_dot(
+                            &decoded[row * width..(row + 1) * width],
+                            &input[token * width..(token + 1) * width],
+                        );
+                        let expected = if residual == 0 {
+                            dot
+                        } else {
+                            initial[token * rows + row] + dot
+                        };
+                        assert_eq!(
+                            single[row].to_bits(),
+                            expected.to_bits(),
+                            "BF16 width={width}, row={row}, token={token}, residual={residual}"
+                        );
+                        assert_eq!(
+                            single[row].to_bits(),
+                            batched[token * rows + row].to_bits(),
+                            "BF16 single/batch"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA device"]
     fn bonsai_cuda_transform_projection_and_embedding() {
@@ -325,7 +431,7 @@ mod tests {
                 .register(&stream, metadata.clone(), width)
                 .unwrap();
             let rows = 7;
-            let tokens = 3;
+            let tokens = 9;
             let input: Vec<f32> = (0..width * tokens)
                 .map(|i| ((i * 13 % 113) as f32 - 56.0) / 32.0)
                 .collect();
@@ -378,7 +484,7 @@ mod tests {
                 .bonsai
                 .project(
                     &stream,
-                    Some(id),
+                    ProjQuant::Ptq1_0(id),
                     &device_input,
                     &device_weights.as_view(),
                     rows,
@@ -398,7 +504,7 @@ mod tests {
                     .bonsai
                     .project(
                         &stream,
-                        Some(id),
+                        ProjQuant::Ptq1_0(id),
                         &single_input,
                         &device_weights.as_view(),
                         rows,
@@ -415,16 +521,11 @@ mod tests {
                     "single/batch PTQ"
                 );
                 for row in 0..rows {
-                    let expected: f32 = decoded[row * width..(row + 1) * width]
-                        .iter()
-                        .zip(&expected_rotation[token * width..(token + 1) * width])
-                        .map(|(w, x)| w * x)
-                        .sum();
-                    assert!(
-                        (single[row] - expected).abs() < 0.003,
-                        "PTQ row {row}: {} vs {expected}",
-                        single[row]
+                    let expected = warp_dot(
+                        &decoded[row * width..(row + 1) * width],
+                        &expected_rotation[token * width..(token + 1) * width],
                     );
+                    assert_eq!(single[row].to_bits(), expected.to_bits(), "PTQ row {row}");
                 }
             }
             let token = stream.clone_htod(&[3_u32]).unwrap();

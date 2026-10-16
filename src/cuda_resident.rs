@@ -9847,6 +9847,7 @@ fn repack_for_lane(
         ProjQuant::Q4K => swz_q4k_blocks(bytes),
         ProjQuant::Ptq1_0(_)
         | ProjQuant::F32
+        | ProjQuant::BF16
         | ProjQuant::Q5K
         | ProjQuant::Q2K
         | ProjQuant::Q3K => bytes.to_vec(),
@@ -11380,13 +11381,9 @@ fn dispatch_gemv(
     residual: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     match lane {
-        ProjQuant::Ptq1_0(id) => {
-            kern.bonsai
-                .project(s, Some(id), input_f32, weight, rows, cols, 1, out, residual)
-        }
-        ProjQuant::F32 => kern
+        ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16 => kern
             .bonsai
-            .project(s, None, input_f32, weight, rows, cols, 1, out, residual),
+            .project(s, lane, input_f32, weight, rows, cols, 1, out, residual),
         ProjQuant::Q8_0 => {
             if kern.q8_multirow && kern.sm86 {
                 if let Some(variant) = q8_multirow_variant(rows, cols) {
@@ -11569,24 +11566,16 @@ fn dispatch_gemm_batched(
 ) -> Result<(), cudarc::driver::DriverError> {
     debug_assert!(
         residual == 0
-            || matches!(lane, ProjQuant::Ptq1_0(_) | ProjQuant::F32)
+            || matches!(
+                lane,
+                ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
+            )
             || (lane == ProjQuant::Q1_0 && kern.fast_q1),
         "batched residual epilogue is implemented by the fast Q1 kernels"
     );
     match lane {
-        ProjQuant::Ptq1_0(id) => kern.bonsai.project(
-            s,
-            Some(id),
-            input_f32,
-            weight,
-            rows,
-            cols,
-            k_tokens,
-            out,
-            residual,
-        ),
-        ProjQuant::F32 => kern.bonsai.project(
-            s, None, input_f32, weight, rows, cols, k_tokens, out, residual,
+        ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16 => kern.bonsai.project(
+            s, lane, input_f32, weight, rows, cols, k_tokens, out, residual,
         ),
         ProjQuant::Q8_0 => launch_gemm_batched_view(
             s,
@@ -14858,6 +14847,8 @@ pub enum ProjQuant {
     Ptq1_0(usize),
     /// Small unquantized recurrent gate projections.
     F32,
+    /// Native BF16 recurrent gates, retained at their original two-byte width.
+    BF16,
     Q8_0,
     Q1_0,
     Q2_0G64,
@@ -14882,8 +14873,10 @@ impl ProjQuant {
     /// consume the original f32 activation to preserve the Metal oracle's
     /// reduction association.
     fn is_prism_low_bit(self, fast_q1: bool, fast_q2: bool) -> bool {
-        matches!(self, ProjQuant::Ptq1_0(_) | ProjQuant::F32)
-            || (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && !fast_q2)
+        matches!(
+            self,
+            ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
+        ) || (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && !fast_q2)
             || (self == ProjQuant::Q1_0 && !fast_q1)
     }
 
@@ -14917,6 +14910,7 @@ impl ProjQuant {
             self,
             ProjQuant::Ptq1_0(_)
                 | ProjQuant::F32
+                | ProjQuant::BF16
                 | ProjQuant::Q8_0
                 | ProjQuant::Q1_0
                 | ProjQuant::Q4K
@@ -16856,7 +16850,7 @@ impl CudaResidentDecode {
         let layer_cap = self.batched_layer_token_cap();
         if matches!(
             self.output_quant,
-            ProjQuant::Q8_0 | ProjQuant::Ptq1_0(_) | ProjQuant::F32
+            ProjQuant::Q8_0 | ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
         ) {
             return layer_cap;
         }
@@ -16919,7 +16913,11 @@ impl CudaResidentDecode {
             layer.quants.iter().all(|q| {
                 matches!(
                     q,
-                    ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::Q8_0 | ProjQuant::Q1_0
+                    ProjQuant::Ptq1_0(_)
+                        | ProjQuant::F32
+                        | ProjQuant::BF16
+                        | ProjQuant::Q8_0
+                        | ProjQuant::Q1_0
                 )
             })
         });
@@ -17062,7 +17060,10 @@ impl CudaResidentDecode {
         if self.paged_kv_pages.is_some() {
             return Err("paged CUDA KV does not use contiguous KV slots".into());
         }
-        if !self.decode_graphs.is_empty() || self.device_forward_graph.is_some() {
+        if !self.decode_graphs.is_empty()
+            || self.device_forward_graph.is_some()
+            || self.k.bonsai.has_graphs()
+        {
             return Err("cannot add a CUDA KV slot after graph capture".into());
         }
         let stream = self.k.stream.clone();
@@ -19774,7 +19775,9 @@ impl CudaResidentDecode {
             };
             let f = match family {
                 ProjQuant::Ptq1_0(_) => &this.k.bonsai.embed,
-                ProjQuant::F32 => return Err("f32 embedding gather not implemented".into()),
+                ProjQuant::F32 | ProjQuant::BF16 => {
+                    return Err("dense embedding gather not implemented".into())
+                }
                 ProjQuant::Q1_0 => &this.k.embed_gather_q1_0,
                 ProjQuant::Q2_0G64 => &this.k.embed_gather_q2_0_g64,
                 ProjQuant::Q2_0G128 => &this.k.embed_gather_q2_0_g128,

@@ -1,11 +1,15 @@
 # Camelid Roadmap
 
-Bonsai 2 Windows support (2026-10-15): text, single-image GUI/API chat,
-function calling, and GUI downloads cover 2B/4B/9B/27B PTQ1_0. Apple Silicon,
-resident GPU language execution, and extended context remain separate gates;
-see [Bonsai 2](docs/BONSAI2.md).
+Bonsai 2 Windows support (2026-10-15): the completed CPU-language qualification
+covers text, single-image GUI/API chat, function calling, and GUI downloads for
+2B/4B/9B/27B PTQ1_0. Packed CUDA language decoding and drafting are implemented
+for all four, with weight streaming for 27B when VRAM is constrained. The next
+gate is the native CUDA benchmark, API, GUI, and state-parity evidence bundle;
+the pinned llama.cpp CUDA reference measurements are complete. Apple Silicon
+and extended context remain separate qualification work. See
+[Bonsai 2](docs/BONSAI2.md) and the [CUDA workflow](qa/bonsai2/cuda/README.md).
 
-Last updated: 2026-08-10
+Last updated: 2026-10-15
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 

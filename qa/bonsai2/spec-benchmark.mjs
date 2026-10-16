@@ -47,7 +47,9 @@ async function benchmark(prompt, speculative) {
   const runs = []
   for (let i = 0; i < repetitions; i++) runs.push(await run(prompt, speculative))
   const median = [...runs].sort((a, b) => a.seconds - b.seconds)[Math.floor(runs.length / 2)]
-  return repetitions === 1 ? median : { ...median, runs }
+  const repeatedIdsMatch = runs.every(run => JSON.stringify(run.ids) === JSON.stringify(median.ids))
+  assert.ok(repeatedIdsMatch, 'Repeated greedy benchmark runs produced different token IDs')
+  return repetitions === 1 ? median : { ...median, repeated_ids_match: repeatedIdsMatch, runs }
 }
 const digest = bytes => createHash('sha256').update(bytes).digest('hex')
 async function fileDigest(path) {
