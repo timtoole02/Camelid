@@ -183,9 +183,23 @@ cases, and greedy/seeded/stop/cancel draft parity for all four sizes. It records
 each test's exit status, model hash, environment, and log digest. The checker
 requires all twelve rows; an aggregate success flag alone is insufficient.
 
-After all native receipts exist, validate the complete bundle:
+After all native receipts exist, record the exact build revisions, build
+options, retained probe/test/server binary paths, and server receipt build IDs
+in `output/bonsai2-reference/cuda-build-record.json`. Use
+`node qa/bonsai2/cuda-manifest.mjs --help` for its schema. The build record must
+identify the binaries that actually produced the receipts, including any older
+server still referenced by a receipt.
+
+Generate the comparison and manifest, then validate the complete bundle:
 
 ```powershell
 node qa/bonsai2/compare-cuda-benchmarks.mjs
+node qa/bonsai2/cuda-manifest.mjs output/bonsai2-reference/cuda-build-record.json
 node qa/bonsai2/check-cuda-evidence.mjs
 ```
+
+Manifest generation also runs the receipt checker. It hashes the actual model,
+projector, and retained binary files; records source blobs at the stated build
+commits; and checks each API/GUI receipt's server build association. The saved
+`manifest.json` links the complete CUDA evidence without replacing the earlier
+CPU manifest. No inference or compilation is performed by these three commands.
