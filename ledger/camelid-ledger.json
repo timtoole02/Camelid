@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "23670e74",
+    "source_head": "d8687867",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -3772,8 +3772,8 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "latest_checked_output": "qa/bonsai2/cuda-q8/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; qa/bonsai2/cuda-optimized/manifest.json; qa/bonsai2/cuda-q8/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
         "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
@@ -3823,8 +3823,8 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "latest_checked_output": "qa/bonsai2/cuda-q8/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; qa/bonsai2/cuda-optimized/manifest.json; qa/bonsai2/cuda-q8/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
         "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
@@ -3874,8 +3874,8 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "latest_checked_output": "qa/bonsai2/cuda-q8/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; qa/bonsai2/cuda-optimized/manifest.json; qa/bonsai2/cuda-q8/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
         "next_step": "qualify Apple Silicon and extended context separately"
       }
     },
@@ -3925,8 +3925,8 @@
         "bounded_context_8192_window": 0,
         "latest_checked_bucket": "windows_api_gui",
         "latest_checked_result": "pass",
-        "latest_checked_output": "qa/bonsai2/cuda/manifest.json",
-        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        "latest_checked_output": "qa/bonsai2/cuda-q8/manifest.json",
+        "evidence": "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; qa/bonsai2/cuda-optimized/manifest.json; qa/bonsai2/cuda-q8/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
         "next_step": "qualify Apple Silicon and extended context separately"
       }
     }

@@ -17,7 +17,7 @@ async function fileDigest(path) {
 }
 const source = {}
 for (const path of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/hadamard.rs', 'src/wire_mmap.rs', 'src/cuda_resident.rs',
-  'src/cuda_resident/bonsai_spec.rs', 'src/cuda_resident/bonsai_ptq.rs', 'src/cuda_resident/bonsai_ptq.cu']) {
+  'src/cuda_resident/bonsai_spec.rs', 'src/cuda_resident/bonsai_ptq.rs', 'src/cuda_resident/bonsai_ptq.cu', 'src/cuda_resident/bonsai_q8.cu']) {
   source[path] = digest(await readFile(path))
 }
 const report = { schema: 1, date: new Date().toISOString(), platform: process.platform,
@@ -25,7 +25,7 @@ const report = { schema: 1, date: new Date().toISOString(), platform: process.pl
 const modelPath = size => resolve(models, `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`)
 async function run(name, size = null, context = 'default', overrides = {}, hostOnly = false) {
   const configuration = { RAYON_NUM_THREADS: '8', CAMELID_QWEN35_CUDA: hostOnly ? '0' : '1', CAMELID_QWEN35_METAL: '0',
-    CAMELID_QWEN35_CUDA_MAXPOS: '2048', ...overrides }
+    CAMELID_QWEN35_CUDA_MAXPOS: '2048', CAMELID_BONSAI2_CUDA_PROJECTION: process.env.CAMELID_BONSAI2_CUDA_PROJECTION || 'q8', ...overrides }
   const env = { ...process.env, ...configuration }
   delete env.CAMELID_BONSAI_TEST_CONTEXT
   if (context !== 'default') env.CAMELID_BONSAI_TEST_CONTEXT = context
@@ -55,6 +55,7 @@ await run('bonsai_upload_borrows_unchanged_packed_bytes', null, 'default', {}, t
 await run('bonsai_cuda_transform_projection_and_embedding')
 await run('bonsai_cuda_bf16_projection_matches_warp_reference')
 await run('bonsai_cuda_projection_tiles_match_legacy_bits')
+await run('bonsai_cuda_q8_quantization_projection_and_batch_parity')
 for (const size of [2, 4, 9, 27]) await run('bonsai2_cuda_batch_cache_and_rollback_parity', size)
 for (const context of ['group-boundary', 'splitk-boundary']) {
   await run('bonsai2_cuda_batch_cache_and_rollback_parity', 2, context, { CAMELID_CUDA_GRAPHS: '1' })

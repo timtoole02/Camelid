@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "date": "2026-10-16T16:00:14.691Z",
+  "scope": "Three fixed float-path continuations, 32 tokens each. A bounded numerical regression check, not a general perplexity or task-quality evaluation.",
+  "maximum_mean_nll_increase": 0.1,
+  "models": [
+    {
+      "size": 2,
+      "tokens": 96,
+      "float_mean_nll": 0.14059069390418052,
+      "q8_mean_nll": 0.14070831351345955,
+      "mean_nll_increase": 0.00011761960927902937,
+      "top1_agreement": 1,
+      "maximum_log_probability_change": 0.04816747878693306
+    },
+    {
+      "size": 4,
+      "tokens": 96,
+      "float_mean_nll": 0.12410009760546215,
+      "q8_mean_nll": 0.12483405344106586,
+      "mean_nll_increase": 0.0007339558356037196,
+      "top1_agreement": 1,
+      "maximum_log_probability_change": 0.019795589826774318
+    },
+    {
+      "size": 9,
+      "tokens": 96,
+      "float_mean_nll": 0.12799319101144313,
+      "q8_mean_nll": 0.12808655972977878,
+      "mean_nll_increase": 0.0000933687183356513,
+      "top1_agreement": 1,
+      "maximum_log_probability_change": 0.03939130878257302
+    },
+    {
+      "size": 27,
+      "tokens": 96,
+      "float_mean_nll": 0.13885758724087424,
+      "q8_mean_nll": 0.1395520904542602,
+      "mean_nll_increase": 0.0006945032133859608,
+      "top1_agreement": 1,
+      "maximum_log_probability_change": 0.01759345278969704
+    }
+  ]
+}

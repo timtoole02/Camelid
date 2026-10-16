@@ -1,0 +1,313 @@
+{
+  "schema": 1,
+  "date": "2026-10-16T15:56:14.244Z",
+  "platform": "win32",
+  "test_binary_sha256": "97e8608e15c5080035d7f467406b5a8d262e65123dd993aab07ee580734e399d",
+  "source_sha256": {
+    "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+    "src/runnable/speculative.rs": "9a6a28fe9c97f88d34e4000d2c21b796c820bba4381729625ebe63b5e6b54603",
+    "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+    "src/wire_mmap.rs": "463014c1a54dd2fe571d171b48fb257c3b60fbdbfdc0510e209352ceafddaf52",
+    "src/cuda_resident.rs": "27f7272b3765793032b73b21f08efd6f570a9d3b7fbbea88714a94d3b3183981",
+    "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+    "src/cuda_resident/bonsai_ptq.rs": "9c90cbfa42934a9f94f1c8e7b1770f280a474f03f39e3e5b2ee94538896a3b8e",
+    "src/cuda_resident/bonsai_ptq.cu": "1458bd06197234a13103435523d162ce6e5030e0beec0be245eafbd8fbeaa989",
+    "src/cuda_resident/bonsai_q8.cu": "ef1872210037e7a207f5ad9884fe44bd0b0b0c38d7002f0a6c3868a6f2de2abc"
+  },
+  "log_directory": "output/bonsai2-q8/cache-logs",
+  "pass": true,
+  "host_tests": [
+    {
+      "name": "bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "0",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.6758834999999999,
+      "log_sha256": "9194d2957391dce44db87d8179ed4ad5fc3711d8210634d07b3a1975b30124fd",
+      "log": "host-bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.00s"
+    },
+    {
+      "name": "bonsai_upload_borrows_unchanged_packed_bytes",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "0",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.03616519999999991,
+      "log_sha256": "869336c830690b5cfb216c23a8f0ab9e16cb4e557f56bb3aeef6b2158a07fc05",
+      "log": "host-bonsai_upload_borrows_unchanged_packed_bytes.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.00s"
+    }
+  ],
+  "tests": [
+    {
+      "name": "bonsai_cuda_transform_projection_and_embedding",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.5293745,
+      "log_sha256": "ac13f7402d7ae6516ee06d52c422b5626da4cb7795594fc17bff8fcf5dbb4e8b",
+      "log": "fixture-default-bonsai_cuda_transform_projection_and_embedding.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.48s"
+    },
+    {
+      "name": "bonsai_cuda_bf16_projection_matches_warp_reference",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.4725909999999999,
+      "log_sha256": "1abb834f2181e03ddaed0fd8e7cb4ca9dff401cf82978665c4f9c3f575184f7f",
+      "log": "fixture-default-bonsai_cuda_bf16_projection_matches_warp_reference.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.42s"
+    },
+    {
+      "name": "bonsai_cuda_projection_tiles_match_legacy_bits",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.5044789000000003,
+      "log_sha256": "5cd1a8bb436dfae10f642b755ed05865351b82bbe7fa954429dc36cef32ce84c",
+      "log": "fixture-default-bonsai_cuda_projection_tiles_match_legacy_bits.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.45s"
+    },
+    {
+      "name": "bonsai_cuda_q8_quantization_projection_and_batch_parity",
+      "model": null,
+      "model_sha256": null,
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 0.5334442000000004,
+      "log_sha256": "cbf86e64c4c1ab2058abaef3a5347205ad4a8b66e4f99fc2842b71316f8d060a",
+      "log": "fixture-default-bonsai_cuda_q8_quantization_projection_and_batch_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 0.48s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+      "model_sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 6.882847099999999,
+      "log_sha256": "dc6b9439d3378cda3fe63dbb761777cba4ebe17c6d296e83bd94f59812b0b8aa",
+      "log": "2-default-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 6.43s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+      "model_sha256": "56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 10.2660359,
+      "log_sha256": "6d535786d49e9712607b160f846407b07a34d712877486f614f81c74dc15e410",
+      "log": "4-default-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 9.29s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+      "model_sha256": "3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 11.6037945,
+      "log_sha256": "33b6ae17e9d9b84bae84b14e255099a90666f56310cdfac25f97065dbe5bdf03",
+      "log": "9-default-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 9.74s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+      "model_sha256": "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 41.2145288,
+      "log_sha256": "90c0b205ca7ba732f9e4eff8ef0689242bf7f1c56399926ff225210934e34fcf",
+      "log": "27-default-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 30.27s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+      "model_sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+      "context": "group-boundary",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8",
+        "CAMELID_CUDA_GRAPHS": "1"
+      },
+      "pass": true,
+      "seconds": 9.061311300000002,
+      "log_sha256": "0dc1005bba09db73defa4a947a36d0e49259fffe240c79a9025a668268d67f25",
+      "log": "2-group-boundary-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 8.61s"
+    },
+    {
+      "name": "bonsai2_cuda_batch_cache_and_rollback_parity",
+      "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+      "model_sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+      "context": "splitk-boundary",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8",
+        "CAMELID_CUDA_GRAPHS": "1"
+      },
+      "pass": true,
+      "seconds": 10.577282699999996,
+      "log_sha256": "c5471525a5dda1df2dc3be5dab0e44e07e464937ba4e45efa1b694b437b7c262",
+      "log": "2-splitk-boundary-bonsai2_cuda_batch_cache_and_rollback_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 10.16s"
+    },
+    {
+      "name": "bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity",
+      "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+      "model_sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 15.6563511,
+      "log_sha256": "f5f71a08ccb68444ee9dae7403cf7c547d44e35524c4158234449a312007fab0",
+      "log": "2-default-bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 15.22s"
+    },
+    {
+      "name": "bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity",
+      "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+      "model_sha256": "56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 20.695209900000002,
+      "log_sha256": "d6bd5d3dbcf16ba91c88a3f991c20b68060812953f33ba0f214c8ad1cb9cd0e2",
+      "log": "4-default-bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 19.81s"
+    },
+    {
+      "name": "bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity",
+      "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+      "model_sha256": "3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 23.330887799999996,
+      "log_sha256": "a69f725abbdba9e804389a0386b78579af3c563875cbe25e850591c147977ab1",
+      "log": "9-default-bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 21.60s"
+    },
+    {
+      "name": "bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity",
+      "model": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+      "model_sha256": "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3",
+      "context": "default",
+      "environment": {
+        "RAYON_NUM_THREADS": "8",
+        "CAMELID_QWEN35_CUDA": "1",
+        "CAMELID_QWEN35_METAL": "0",
+        "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+        "CAMELID_BONSAI2_CUDA_PROJECTION": "q8"
+      },
+      "pass": true,
+      "seconds": 87.93168580000001,
+      "log_sha256": "64c4a57dec6d78cac9df2acefe431eeb99aabf1a12ec382790989cf797b39315",
+      "log": "27-default-bonsai2_cuda_draft_greedy_sampled_stop_and_cancel_parity.log",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2935 filtered out; finished in 81.36s"
+    }
+  ]
+}

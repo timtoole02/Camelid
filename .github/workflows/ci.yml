@@ -164,6 +164,7 @@ jobs:
           node qa/bonsai2/check-evidence.mjs
           node qa/bonsai2/check-cuda-evidence.mjs
           node qa/bonsai2/check-cuda-optimized-evidence.mjs
+          node qa/bonsai2/check-cuda-q8-evidence.mjs
 
       - name: Check ledger schema (camelid.ledger/v1)
         run: node scripts/check-ledger-schema.mjs

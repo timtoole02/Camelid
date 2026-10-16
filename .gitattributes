@@ -26,4 +26,7 @@ qa/bonsai2/cuda/*.json text eol=lf
 qa/bonsai2/cuda-optimized/*.json text eol=lf
 qa/bonsai2/cuda-optimized/*.csv text eol=lf
 qa/bonsai2/cuda-optimized/*.md text eol=lf
+qa/bonsai2/cuda-q8/*.json text eol=lf
+qa/bonsai2/cuda-q8/*.csv text eol=lf
+qa/bonsai2/cuda-q8/*.md text eol=lf
 qa/bonsai2/*.mjs text eol=lf

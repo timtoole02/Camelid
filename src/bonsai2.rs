@@ -146,8 +146,8 @@ pub(crate) fn compatibility(model: &Model) -> crate::api::ModelCompatibilityTarg
         bounded_context_4096_pack: "not_checked", bounded_context_4096_pack_id: "", bounded_context_4096_window: 0,
         bounded_context_8192_pack: "not_checked", bounded_context_8192_pack_id: "", bounded_context_8192_window: 0,
         latest_checked_bucket: "windows_api_gui", latest_checked_result: "pass",
-        latest_checked_output: "qa/bonsai2/cuda/manifest.json",
-        evidence: "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
+        latest_checked_output: "qa/bonsai2/cuda-q8/manifest.json",
+        evidence: "qa/bonsai2/manifest.json; qa/bonsai2/cuda/manifest.json; qa/bonsai2/cuda-optimized/manifest.json; qa/bonsai2/cuda-q8/manifest.json; publisher model/projector hashes in src/bonsai2.rs",
         next_step: "qualify Apple Silicon and extended context separately",
     }
 }

@@ -1,0 +1,870 @@
+{
+  "tool": "Nsight Systems 2025.1.3",
+  "scope": "Diagnostic CUDA kernel timings; headline rates use unprofiled requests",
+  "prompt": "qa/bonsai2/count.chatml",
+  "tokens": 32,
+  "warmup_tokens": 8,
+  "context": 2048,
+  "threads": 8,
+  "cuda_event_trace": false,
+  "profiles": [
+    {
+      "size": 2,
+      "projection_policy": "tiled",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "16c2054f39538eba651caf6ae784f424dc4ea55b4e12053722138bef258782df",
+      "kernel_total_ns": 703553818.0,
+      "projection_fraction": 0.7526027625082122,
+      "kernels": [
+        {
+          "Time (%)": "38.6",
+          "Total Time (ns)": "271914698",
+          "Instances": "6300",
+          "Avg (ns)": "43161.1",
+          "Med (ns)": "54434.0",
+          "Min (ns)": "15585",
+          "Max (ns)": "69122",
+          "StdDev (ns)": "17317.4",
+          "Name": "bonsai_ptq_t1_r2"
+        },
+        {
+          "Time (%)": "22.8",
+          "Total Time (ns)": "160446642",
+          "Instances": "600",
+          "Avg (ns)": "267411.1",
+          "Med (ns)": "274457.5",
+          "Min (ns)": "71234",
+          "Max (ns)": "563666",
+          "StdDev (ns)": "121685.9",
+          "Name": "bonsai_ptq_t8_r4"
+        },
+        {
+          "Time (%)": "12.3",
+          "Total Time (ns)": "86450563",
+          "Instances": "42",
+          "Avg (ns)": "2058346.7",
+          "Med (ns)": "2046451.5",
+          "Min (ns)": "1970689",
+          "Max (ns)": "2248555",
+          "StdDev (ns)": "56301.1",
+          "Name": "bonsai_ptq_t1_r4"
+        },
+        {
+          "Time (%)": "5.9",
+          "Total Time (ns)": "41754146",
+          "Instances": "756",
+          "Avg (ns)": "55230.4",
+          "Med (ns)": "54946.0",
+          "Min (ns)": "51586",
+          "Max (ns)": "60610",
+          "StdDev (ns)": "1638.5",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "4.5",
+          "Total Time (ns)": "31374909",
+          "Instances": "2058",
+          "Avg (ns)": "15245.3",
+          "Med (ns)": "15136.0",
+          "Min (ns)": "13760",
+          "Max (ns)": "18273",
+          "StdDev (ns)": "689.0",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "3.9",
+          "Total Time (ns)": "27326075",
+          "Instances": "6984",
+          "Avg (ns)": "3912.7",
+          "Med (ns)": "3649.0",
+          "Min (ns)": "3200",
+          "Max (ns)": "10433",
+          "StdDev (ns)": "732.6",
+          "Name": "bonsai_hadamard"
+        },
+        {
+          "Time (%)": "2.2",
+          "Total Time (ns)": "15628994",
+          "Instances": "42",
+          "Avg (ns)": "372118.9",
+          "Med (ns)": "370940.5",
+          "Min (ns)": "353132",
+          "Max (ns)": "401901",
+          "StdDev (ns)": "8961.0",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "2.1",
+          "Total Time (ns)": "14773603",
+          "Instances": "72",
+          "Avg (ns)": "205188.9",
+          "Med (ns)": "200630.5",
+          "Min (ns)": "160933",
+          "Max (ns)": "256840",
+          "StdDev (ns)": "33479.9",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "1.6",
+          "Total Time (ns)": "11035155",
+          "Instances": "252",
+          "Avg (ns)": "43790.3",
+          "Med (ns)": "43089.0",
+          "Min (ns)": "34465",
+          "Max (ns)": "52097",
+          "StdDev (ns)": "4328.1",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "1.5",
+          "Total Time (ns)": "10871079",
+          "Instances": "1512",
+          "Avg (ns)": "7189.9",
+          "Med (ns)": "7136.0",
+          "Min (ns)": "6464",
+          "Max (ns)": "8225",
+          "StdDev (ns)": "356.9",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "1.0",
+          "Total Time (ns)": "7285586",
+          "Instances": "1512",
+          "Avg (ns)": "4818.5",
+          "Med (ns)": "4800.0",
+          "Min (ns)": "4320",
+          "Max (ns)": "5473",
+          "StdDev (ns)": "174.8",
+          "Name": "bonsai_f32_t1"
+        },
+        {
+          "Time (%)": "0.9",
+          "Total Time (ns)": "6071561",
+          "Instances": "144",
+          "Avg (ns)": "42163.6",
+          "Med (ns)": "41537.0",
+          "Min (ns)": "32193",
+          "Max (ns)": "53570",
+          "StdDev (ns)": "7512.7",
+          "Name": "ssm_l2_norm_per_head_batched"
+        }
+      ]
+    },
+    {
+      "size": 2,
+      "projection_policy": "q8",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "ef940364168f60173ae7530520a9bb0b27e11a9542e6c2498ac6dbbfb6e290ce",
+      "kernel_total_ns": 334901141.0,
+      "projection_fraction": 0.4950782654992507,
+      "kernels": [
+        {
+          "Time (%)": "20.0",
+          "Total Time (ns)": "66924639",
+          "Instances": "5334",
+          "Avg (ns)": "12546.8",
+          "Med (ns)": "11936.0",
+          "Min (ns)": "2465",
+          "Max (ns)": "410029",
+          "StdDev (ns)": "35550.2",
+          "Name": "bonsai_q8_t1_l16"
+        },
+        {
+          "Time (%)": "15.5",
+          "Total Time (ns)": "51900876",
+          "Instances": "504",
+          "Avg (ns)": "102977.9",
+          "Med (ns)": "97651.0",
+          "Min (ns)": "20256",
+          "Max (ns)": "214824",
+          "StdDev (ns)": "47742.0",
+          "Name": "bonsai_q8_t4_l16"
+        },
+        {
+          "Time (%)": "11.7",
+          "Total Time (ns)": "39043285",
+          "Instances": "756",
+          "Avg (ns)": "51644.6",
+          "Med (ns)": "49954.0",
+          "Min (ns)": "49313",
+          "Max (ns)": "60642",
+          "StdDev (ns)": "3761.3",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "9.7",
+          "Total Time (ns)": "32373629",
+          "Instances": "6942",
+          "Avg (ns)": "4663.4",
+          "Med (ns)": "4352.0",
+          "Min (ns)": "3904",
+          "Max (ns)": "14240",
+          "StdDev (ns)": "1145.5",
+          "Name": "bonsai_hadamard_q8"
+        },
+        {
+          "Time (%)": "8.4",
+          "Total Time (ns)": "28287798",
+          "Instances": "2058",
+          "Avg (ns)": "13745.3",
+          "Med (ns)": "13024.0",
+          "Min (ns)": "12832",
+          "Max (ns)": "18273",
+          "StdDev (ns)": "1608.2",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "6.8",
+          "Total Time (ns)": "22787345",
+          "Instances": "96",
+          "Avg (ns)": "237368.2",
+          "Med (ns)": "228967.5",
+          "Min (ns)": "148229",
+          "Max (ns)": "344523",
+          "StdDev (ns)": "57700.0",
+          "Name": "bonsai_q8_t4_l32"
+        },
+        {
+          "Time (%)": "4.4",
+          "Total Time (ns)": "14850061",
+          "Instances": "42",
+          "Avg (ns)": "353572.9",
+          "Med (ns)": "344811.5",
+          "Min (ns)": "342987",
+          "Max (ns)": "399277",
+          "StdDev (ns)": "20247.5",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "4.3",
+          "Total Time (ns)": "14492159",
+          "Instances": "72",
+          "Avg (ns)": "201280.0",
+          "Med (ns)": "197910.0",
+          "Min (ns)": "153125",
+          "Max (ns)": "256713",
+          "StdDev (ns)": "36369.4",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "4.2",
+          "Total Time (ns)": "14092695",
+          "Instances": "1008",
+          "Avg (ns)": "13980.8",
+          "Med (ns)": "13792.0",
+          "Min (ns)": "12897",
+          "Max (ns)": "16064",
+          "StdDev (ns)": "658.2",
+          "Name": "bonsai_q8_t1_l32"
+        },
+        {
+          "Time (%)": "3.0",
+          "Total Time (ns)": "10083220",
+          "Instances": "252",
+          "Avg (ns)": "40012.8",
+          "Med (ns)": "40577.5",
+          "Min (ns)": "32545",
+          "Max (ns)": "46145",
+          "StdDev (ns)": "3853.9",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "2.9",
+          "Total Time (ns)": "9662865",
+          "Instances": "1512",
+          "Avg (ns)": "6390.8",
+          "Med (ns)": "6016.0",
+          "Min (ns)": "5984",
+          "Max (ns)": "8225",
+          "StdDev (ns)": "833.8",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "2.0",
+          "Total Time (ns)": "6758403",
+          "Instances": "1512",
+          "Avg (ns)": "4469.8",
+          "Med (ns)": "4320.0",
+          "Min (ns)": "4096",
+          "Max (ns)": "5601",
+          "StdDev (ns)": "377.7",
+          "Name": "bonsai_f32_t1"
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "projection_policy": "tiled",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "956ab77aade9f1eaa279428dd8b1b0c30b8978be29a7d5affcdc71b8abba0de1",
+      "kernel_total_ns": 1527482251.0,
+      "projection_fraction": 0.7946368759475687,
+      "kernels": [
+        {
+          "Time (%)": "43.8",
+          "Total Time (ns)": "668934041",
+          "Instances": "8400",
+          "Avg (ns)": "79635.0",
+          "Med (ns)": "90627.0",
+          "Min (ns)": "19744",
+          "Max (ns)": "125028",
+          "StdDev (ns)": "28308.6",
+          "Name": "bonsai_ptq_t1_r2"
+        },
+        {
+          "Time (%)": "27.2",
+          "Total Time (ns)": "415430196",
+          "Instances": "800",
+          "Avg (ns)": "519287.7",
+          "Med (ns)": "519985.5",
+          "Min (ns)": "88675",
+          "Max (ns)": "1283787",
+          "StdDev (ns)": "275945.2",
+          "Name": "bonsai_ptq_t8_r4"
+        },
+        {
+          "Time (%)": "7.3",
+          "Total Time (ns)": "111631251",
+          "Instances": "42",
+          "Avg (ns)": "2657886.9",
+          "Med (ns)": "2629527.0",
+          "Min (ns)": "2420336",
+          "Max (ns)": "2900384",
+          "StdDev (ns)": "89006.4",
+          "Name": "bonsai_ptq_t1_r4"
+        },
+        {
+          "Time (%)": "5.2",
+          "Total Time (ns)": "78702542",
+          "Instances": "1008",
+          "Avg (ns)": "78077.9",
+          "Med (ns)": "77859.0",
+          "Min (ns)": "68674",
+          "Max (ns)": "85923",
+          "StdDev (ns)": "2726.7",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "4.0",
+          "Total Time (ns)": "60935650",
+          "Instances": "96",
+          "Avg (ns)": "634746.4",
+          "Med (ns)": "586883.0",
+          "Min (ns)": "489616",
+          "Max (ns)": "855260",
+          "StdDev (ns)": "136840.8",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "3.6",
+          "Total Time (ns)": "54445105",
+          "Instances": "2730",
+          "Avg (ns)": "19943.3",
+          "Med (ns)": "19841.0",
+          "Min (ns)": "16704",
+          "Max (ns)": "22593",
+          "StdDev (ns)": "965.7",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "2.7",
+          "Total Time (ns)": "41533448",
+          "Instances": "9284",
+          "Avg (ns)": "4473.7",
+          "Med (ns)": "4320.0",
+          "Min (ns)": "3168",
+          "Max (ns)": "13569",
+          "StdDev (ns)": "888.4",
+          "Name": "bonsai_hadamard"
+        },
+        {
+          "Time (%)": "1.1",
+          "Total Time (ns)": "16335804",
+          "Instances": "42",
+          "Avg (ns)": "388947.7",
+          "Med (ns)": "386236.0",
+          "Min (ns)": "351756",
+          "Max (ns)": "415662",
+          "StdDev (ns)": "10664.6",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "1.0",
+          "Total Time (ns)": "15458389",
+          "Instances": "336",
+          "Avg (ns)": "46007.1",
+          "Med (ns)": "47921.0",
+          "Min (ns)": "34913",
+          "Max (ns)": "54946",
+          "StdDev (ns)": "5430.4",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "1.0",
+          "Total Time (ns)": "15431834",
+          "Instances": "2016",
+          "Avg (ns)": "7654.7",
+          "Med (ns)": "7584.0",
+          "Min (ns)": "6464",
+          "Max (ns)": "8641",
+          "StdDev (ns)": "396.2",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "0.8",
+          "Total Time (ns)": "11998784",
+          "Instances": "2016",
+          "Avg (ns)": "5951.8",
+          "Med (ns)": "5952.0",
+          "Min (ns)": "5152",
+          "Max (ns)": "6656",
+          "StdDev (ns)": "213.1",
+          "Name": "bonsai_f32_t1"
+        },
+        {
+          "Time (%)": "0.5",
+          "Total Time (ns)": "7637889",
+          "Instances": "192",
+          "Avg (ns)": "39780.7",
+          "Med (ns)": "36593.5",
+          "Min (ns)": "31809",
+          "Max (ns)": "53666",
+          "StdDev (ns)": "8318.6",
+          "Name": "ssm_l2_norm_per_head_batched"
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "projection_policy": "q8",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "3733c91bd954b955168b22c25de28a10eb4204d583e53e7590d779687e0a8d97",
+      "kernel_total_ns": 767600208.0,
+      "projection_fraction": 0.6090408954136187,
+      "kernels": [
+        {
+          "Time (%)": "34.7",
+          "Total Time (ns)": "266153245",
+          "Instances": "800",
+          "Avg (ns)": "332691.6",
+          "Med (ns)": "298682.0",
+          "Min (ns)": "53410",
+          "Max (ns)": "823675",
+          "StdDev (ns)": "186588.0",
+          "Name": "bonsai_q8_t4_l32"
+        },
+        {
+          "Time (%)": "20.9",
+          "Total Time (ns)": "160564324",
+          "Instances": "8400",
+          "Avg (ns)": "19114.8",
+          "Med (ns)": "22017.0",
+          "Min (ns)": "3904",
+          "Max (ns)": "27297",
+          "StdDev (ns)": "6894.2",
+          "Name": "bonsai_q8_t1_l32"
+        },
+        {
+          "Time (%)": "9.3",
+          "Total Time (ns)": "71648891",
+          "Instances": "1008",
+          "Avg (ns)": "71080.2",
+          "Med (ns)": "71395.0",
+          "Min (ns)": "65314",
+          "Max (ns)": "74370",
+          "StdDev (ns)": "1615.9",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "8.0",
+          "Total Time (ns)": "61600415",
+          "Instances": "96",
+          "Avg (ns)": "641671.0",
+          "Med (ns)": "642405.0",
+          "Min (ns)": "484304",
+          "Max (ns)": "853596",
+          "StdDev (ns)": "139158.6",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "6.2",
+          "Total Time (ns)": "47569219",
+          "Instances": "2730",
+          "Avg (ns)": "17424.6",
+          "Med (ns)": "17664.0",
+          "Min (ns)": "15872",
+          "Max (ns)": "18176",
+          "StdDev (ns)": "574.7",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "6.2",
+          "Total Time (ns)": "47254447",
+          "Instances": "9242",
+          "Avg (ns)": "5113.0",
+          "Med (ns)": "4832.0",
+          "Min (ns)": "3904",
+          "Max (ns)": "18656",
+          "StdDev (ns)": "1385.2",
+          "Name": "bonsai_hadamard_q8"
+        },
+        {
+          "Time (%)": "3.2",
+          "Total Time (ns)": "24268902",
+          "Instances": "42",
+          "Avg (ns)": "577831.0",
+          "Med (ns)": "578755.0",
+          "Min (ns)": "561843",
+          "Max (ns)": "587731",
+          "StdDev (ns)": "4550.7",
+          "Name": "bonsai_q8_t1_l16"
+        },
+        {
+          "Time (%)": "2.0",
+          "Total Time (ns)": "15121816",
+          "Instances": "42",
+          "Avg (ns)": "360043.2",
+          "Med (ns)": "362236.0",
+          "Min (ns)": "346091",
+          "Max (ns)": "364813",
+          "StdDev (ns)": "5793.9",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "1.8",
+          "Total Time (ns)": "14027632",
+          "Instances": "336",
+          "Avg (ns)": "41748.9",
+          "Med (ns)": "41729.5",
+          "Min (ns)": "32769",
+          "Max (ns)": "50786",
+          "StdDev (ns)": "5044.9",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "1.7",
+          "Total Time (ns)": "13276118",
+          "Instances": "2016",
+          "Avg (ns)": "6585.4",
+          "Med (ns)": "6688.0",
+          "Min (ns)": "6016",
+          "Max (ns)": "6753",
+          "StdDev (ns)": "231.8",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "1.4",
+          "Total Time (ns)": "10917354",
+          "Instances": "2016",
+          "Avg (ns)": "5415.4",
+          "Med (ns)": "5440.0",
+          "Min (ns)": "4960",
+          "Max (ns)": "5920",
+          "StdDev (ns)": "143.2",
+          "Name": "bonsai_f32_t1"
+        },
+        {
+          "Time (%)": "1.0",
+          "Total Time (ns)": "7737754",
+          "Instances": "192",
+          "Avg (ns)": "40300.8",
+          "Med (ns)": "39457.5",
+          "Min (ns)": "30593",
+          "Max (ns)": "53570",
+          "StdDev (ns)": "8582.5",
+          "Name": "ssm_l2_norm_per_head_batched"
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "projection_policy": "tiled",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "107e100ef8eb0d168e16f220a822729c9592b9e5ab7fbb02d73e9d52fe6b72dd",
+      "kernel_total_ns": 2896828043.0,
+      "projection_fraction": 0.8299966792333348,
+      "kernels": [
+        {
+          "Time (%)": "43.6",
+          "Total Time (ns)": "1263735681",
+          "Instances": "8400",
+          "Avg (ns)": "150444.7",
+          "Med (ns)": "146213.0",
+          "Min (ns)": "30305",
+          "Max (ns)": "248233",
+          "StdDev (ns)": "67593.3",
+          "Name": "bonsai_ptq_t1_r2"
+        },
+        {
+          "Time (%)": "32.2",
+          "Total Time (ns)": "934021226",
+          "Instances": "800",
+          "Avg (ns)": "1167526.5",
+          "Med (ns)": "1216056.5",
+          "Min (ns)": "132356",
+          "Max (ns)": "2703066",
+          "StdDev (ns)": "679048.0",
+          "Name": "bonsai_ptq_t8_r4"
+        },
+        {
+          "Time (%)": "6.5",
+          "Total Time (ns)": "188840173",
+          "Instances": "9284",
+          "Avg (ns)": "20340.4",
+          "Med (ns)": "20576.0",
+          "Min (ns)": "13472",
+          "Max (ns)": "25633",
+          "StdDev (ns)": "1700.4",
+          "Name": "bonsai_hadamard"
+        },
+        {
+          "Time (%)": "6.1",
+          "Total Time (ns)": "177902763",
+          "Instances": "42",
+          "Avg (ns)": "4235780.1",
+          "Med (ns)": "4208748.0",
+          "Min (ns)": "4060647",
+          "Max (ns)": "4426579",
+          "StdDev (ns)": "74589.7",
+          "Name": "bonsai_ptq_t1_r4"
+        },
+        {
+          "Time (%)": "3.0",
+          "Total Time (ns)": "87513027",
+          "Instances": "2730",
+          "Avg (ns)": "32056.1",
+          "Med (ns)": "32385.0",
+          "Min (ns)": "25088",
+          "Max (ns)": "35521",
+          "StdDev (ns)": "1537.5",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "2.7",
+          "Total Time (ns)": "78854284",
+          "Instances": "1008",
+          "Avg (ns)": "78228.5",
+          "Med (ns)": "78275.0",
+          "Min (ns)": "68034",
+          "Max (ns)": "82979",
+          "StdDev (ns)": "2247.5",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "2.0",
+          "Total Time (ns)": "57204914",
+          "Instances": "96",
+          "Avg (ns)": "595884.5",
+          "Med (ns)": "569459.0",
+          "Min (ns)": "481776",
+          "Max (ns)": "853084",
+          "StdDev (ns)": "119116.4",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "0.6",
+          "Total Time (ns)": "17887681",
+          "Instances": "2016",
+          "Avg (ns)": "8872.9",
+          "Med (ns)": "8896.0",
+          "Min (ns)": "7584",
+          "Max (ns)": "9793",
+          "StdDev (ns)": "309.2",
+          "Name": "bonsai_f32_t1"
+        },
+        {
+          "Time (%)": "0.6",
+          "Total Time (ns)": "16234462",
+          "Instances": "42",
+          "Avg (ns)": "386534.8",
+          "Med (ns)": "384893.0",
+          "Min (ns)": "378957",
+          "Max (ns)": "400621",
+          "StdDev (ns)": "4910.6",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "0.5",
+          "Total Time (ns)": "15546105",
+          "Instances": "336",
+          "Avg (ns)": "46268.2",
+          "Med (ns)": "46657.0",
+          "Min (ns)": "33377",
+          "Max (ns)": "57154",
+          "StdDev (ns)": "5362.5",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "0.5",
+          "Total Time (ns)": "15540265",
+          "Instances": "2016",
+          "Avg (ns)": "7708.5",
+          "Med (ns)": "7681.0",
+          "Min (ns)": "6272",
+          "Max (ns)": "8257",
+          "StdDev (ns)": "321.6",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "0.4",
+          "Total Time (ns)": "10810305",
+          "Instances": "192",
+          "Avg (ns)": "56303.7",
+          "Med (ns)": "61218.0",
+          "Min (ns)": "35777",
+          "Max (ns)": "84899",
+          "StdDev (ns)": "16564.1",
+          "Name": "bonsai_f32_t8"
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "projection_policy": "q8",
+      "source_commit": "d86878671f35301a3f84584405f0fa7431219612",
+      "probe_sha256": "089708f8031d87a44316e8db84d5a53c9fca8c121a3aa54c6eed9686c98e3267",
+      "trace_sha256": "801ca70a5693e0d1288337890f0e3730e89dcf25c99e3ee161c842e0f75a0ce4",
+      "kernel_total_ns": 1147543911.0,
+      "projection_fraction": 0.5596173138510949,
+      "kernels": [
+        {
+          "Time (%)": "28.1",
+          "Total Time (ns)": "322625728",
+          "Instances": "800",
+          "Avg (ns)": "403282.2",
+          "Med (ns)": "353692.0",
+          "Min (ns)": "56674",
+          "Max (ns)": "1169991",
+          "StdDev (ns)": "290630.7",
+          "Name": "bonsai_q8_t4_l32"
+        },
+        {
+          "Time (%)": "22.6",
+          "Total Time (ns)": "258822604",
+          "Instances": "8400",
+          "Avg (ns)": "30812.2",
+          "Med (ns)": "29633.0",
+          "Min (ns)": "4896",
+          "Max (ns)": "47170",
+          "StdDev (ns)": "13791.2",
+          "Name": "bonsai_q8_t1_l32"
+        },
+        {
+          "Time (%)": "20.3",
+          "Total Time (ns)": "232937438",
+          "Instances": "9242",
+          "Avg (ns)": "25204.2",
+          "Med (ns)": "25249.0",
+          "Min (ns)": "20833",
+          "Max (ns)": "30625",
+          "StdDev (ns)": "1314.1",
+          "Name": "bonsai_hadamard_q8"
+        },
+        {
+          "Time (%)": "6.4",
+          "Total Time (ns)": "73586177",
+          "Instances": "2730",
+          "Avg (ns)": "26954.6",
+          "Med (ns)": "26721.0",
+          "Min (ns)": "25217",
+          "Max (ns)": "28608",
+          "StdDev (ns)": "762.2",
+          "Name": "rms_norm_f32"
+        },
+        {
+          "Time (%)": "6.1",
+          "Total Time (ns)": "70177719",
+          "Instances": "1008",
+          "Avg (ns)": "69620.8",
+          "Med (ns)": "69571.0",
+          "Min (ns)": "66370",
+          "Max (ns)": "71810",
+          "StdDev (ns)": "880.8",
+          "Name": "ssm_delta_rule"
+        },
+        {
+          "Time (%)": "4.9",
+          "Total Time (ns)": "56000199",
+          "Instances": "96",
+          "Avg (ns)": "583335.4",
+          "Med (ns)": "570723.0",
+          "Min (ns)": "501745",
+          "Max (ns)": "670902",
+          "StdDev (ns)": "78835.3",
+          "Name": "ssm_delta_rule_batched"
+        },
+        {
+          "Time (%)": "3.0",
+          "Total Time (ns)": "34071691",
+          "Instances": "42",
+          "Avg (ns)": "811230.7",
+          "Med (ns)": "811178.5",
+          "Min (ns)": "810331",
+          "Max (ns)": "813339",
+          "StdDev (ns)": "621.0",
+          "Name": "bonsai_q8_t1_l16"
+        },
+        {
+          "Time (%)": "1.4",
+          "Total Time (ns)": "16040360",
+          "Instances": "2016",
+          "Avg (ns)": "7956.5",
+          "Med (ns)": "7905.0",
+          "Min (ns)": "7392",
+          "Max (ns)": "9025",
+          "StdDev (ns)": "253.5",
+          "Name": "bonsai_f32_t1"
+        },
+        {
+          "Time (%)": "1.3",
+          "Total Time (ns)": "14859950",
+          "Instances": "42",
+          "Avg (ns)": "353808.3",
+          "Med (ns)": "354140.0",
+          "Min (ns)": "346828",
+          "Max (ns)": "358732",
+          "StdDev (ns)": "2311.0",
+          "Name": "argmax_f32"
+        },
+        {
+          "Time (%)": "1.2",
+          "Total Time (ns)": "13517631",
+          "Instances": "336",
+          "Avg (ns)": "40231.0",
+          "Med (ns)": "39618.0",
+          "Min (ns)": "33089",
+          "Max (ns)": "48418",
+          "StdDev (ns)": "4371.1",
+          "Name": "attention_decode"
+        },
+        {
+          "Time (%)": "1.1",
+          "Total Time (ns)": "12888603",
+          "Instances": "2016",
+          "Avg (ns)": "6393.2",
+          "Med (ns)": "6400.0",
+          "Min (ns)": "6144",
+          "Max (ns)": "6528",
+          "StdDev (ns)": "72.4",
+          "Name": "ssm_l2_norm_per_head"
+        },
+        {
+          "Time (%)": "0.9",
+          "Total Time (ns)": "10625058",
+          "Instances": "192",
+          "Avg (ns)": "55338.8",
+          "Med (ns)": "56866.0",
+          "Min (ns)": "36577",
+          "Max (ns)": "71554",
+          "StdDev (ns)": "15537.2",
+          "Name": "bonsai_f32_t8"
+        }
+      ]
+    }
+  ]
+}

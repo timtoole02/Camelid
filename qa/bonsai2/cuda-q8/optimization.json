@@ -1,0 +1,182 @@
+{
+  "schema": 1,
+  "date": "2026-10-16T16:35:34.457Z",
+  "models": [
+    {
+      "size": 2,
+      "cases": [
+        {
+          "name": "count",
+          "float_plain": 64.7736827765563,
+          "q8_plain": 141.28147596757944,
+          "plain_speedup": 2.1811555235317543,
+          "float_draft": 41.15956263334251,
+          "q8_draft": 80.40744462376979,
+          "drafter_speedup": 0.5691294210588604,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 194.66046348656388,
+          "port_draft": 79.2179210741949
+        },
+        {
+          "name": "code",
+          "float_plain": 64.73231669881368,
+          "q8_plain": 141.5105186537397,
+          "plain_speedup": 2.1860876586907803,
+          "float_draft": 41.10663163011431,
+          "q8_draft": 78.89828408559971,
+          "drafter_speedup": 0.5575436005478499,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 177.82954593448272,
+          "port_draft": 65.25276167020151
+        },
+        {
+          "name": "explain",
+          "float_plain": 66.57194034321995,
+          "q8_plain": 145.7443780244805,
+          "plain_speedup": 2.189276401935668,
+          "float_draft": 42.690772722997586,
+          "q8_draft": 82.32421849876641,
+          "drafter_speedup": 0.5648534757542313,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 191.52731059744605,
+          "port_draft": 52.92274981977312
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "cases": [
+        {
+          "name": "count",
+          "float_plain": 29.85365922831649,
+          "q8_plain": 61.87240595104268,
+          "plain_speedup": 2.0725233539329775,
+          "float_draft": 27.23653672455452,
+          "q8_draft": 47.13198901117676,
+          "drafter_speedup": 0.761761051420411,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 118.53454263261483,
+          "port_draft": 69.8167550175882
+        },
+        {
+          "name": "code",
+          "float_plain": 29.9472843568582,
+          "q8_plain": 62.93670946821823,
+          "plain_speedup": 2.101583192594395,
+          "float_draft": 27.25025819619641,
+          "q8_draft": 41.852539899857334,
+          "drafter_speedup": 0.664994090944523,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 109.42288319722718,
+          "port_draft": 66.20121694387052
+        },
+        {
+          "name": "explain",
+          "float_plain": 31.10187126352324,
+          "q8_plain": 66.48578378116703,
+          "plain_speedup": 2.137677929981743,
+          "float_draft": 12.191115237126334,
+          "q8_draft": 22.410208073879733,
+          "drafter_speedup": 0.337067667693311,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 117.97783049092789,
+          "port_draft": 45.65163862277005
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "cases": [
+        {
+          "name": "count",
+          "float_plain": 16.04987257153516,
+          "q8_plain": 39.719096618936724,
+          "plain_speedup": 2.474729717753617,
+          "float_draft": 16.540169688702118,
+          "q8_draft": 39.64225835008425,
+          "drafter_speedup": 0.9980654577925158,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 68.56885234169063,
+          "port_draft": 42.45968983196583
+        },
+        {
+          "name": "code",
+          "float_plain": 16.074041859015182,
+          "q8_plain": 39.71520228441843,
+          "plain_speedup": 2.470766384258482,
+          "float_draft": 16.597073064672365,
+          "q8_draft": 39.33949963598669,
+          "drafter_speedup": 0.9905400796969088,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 64.71785039659888,
+          "port_draft": 36.091766926587454
+        },
+        {
+          "name": "explain",
+          "float_plain": 16.77187348430745,
+          "q8_plain": 39.68277096853119,
+          "plain_speedup": 2.366030903205909,
+          "float_draft": 10.062422869170328,
+          "q8_draft": 23.616072331306338,
+          "drafter_speedup": 0.5951215541382961,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 67.28658639797428,
+          "port_draft": 28.367310575067414
+        }
+      ]
+    },
+    {
+      "size": 27,
+      "cases": [
+        {
+          "name": "count",
+          "float_plain": 3.2151584432090288,
+          "q8_plain": 5.330999421786475,
+          "plain_speedup": 1.6580829579476772,
+          "float_draft": 5.168230005099266,
+          "q8_draft": 8.073290542538748,
+          "drafter_speedup": 1.5144046929634258,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 1.4605391153849587,
+          "port_draft": 1.0050893863210957
+        },
+        {
+          "name": "code",
+          "float_plain": 3.9035957264507477,
+          "q8_plain": 6.025480476520604,
+          "plain_speedup": 1.5435718498439719,
+          "float_draft": 5.324203566530898,
+          "q8_draft": 8.049875013112493,
+          "drafter_speedup": 1.33597230038008,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 1.6282082437842114,
+          "port_draft": 1.0979687680725225
+        },
+        {
+          "name": "explain",
+          "float_plain": 3.984657474858804,
+          "q8_plain": 5.101793372840558,
+          "plain_speedup": 1.2803593295108358,
+          "float_draft": 3.708134194456342,
+          "q8_draft": 4.553850318867714,
+          "drafter_speedup": 0.8925979525376657,
+          "q8_float_ids_match": true,
+          "q8_port_ids_match": true,
+          "port_plain": 1.6647596065018146,
+          "port_draft": 0.802037204576018
+        }
+      ]
+    }
+  ]
+}

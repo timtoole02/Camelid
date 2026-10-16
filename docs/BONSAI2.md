@@ -5,8 +5,8 @@ CPU and CUDA language execution. Get models lists all four official compact
 packs and downloads each matching Q8_0 vision projector alongside the language
 model. Windows CPU and CUDA support is qualified for all four exact publisher
 packs. CUDA API/GUI checks, the complete native/reference benchmark, and all
-fourteen final state/kernel and host memory regressions passed. The
-[CUDA manifest](../qa/bonsai2/cuda/manifest.json) records the qualified artifacts;
+sixteen final state/kernel and host memory regressions passed. The
+[Q8 CUDA manifest](../qa/bonsai2/cuda-q8/manifest.json) records the qualified artifacts;
 the earlier CPU qualification remains available separately.
 
 | Model | Language file | Vision projector | Total download |
@@ -38,7 +38,8 @@ sampling. The portable image decoder has an 8192-slot capacity; the advertised
 ## Execution and qualification
 
 PTQ1_0 (GGUF tensor type 143) stores 128 ternary values in a 28-byte block.
-Weights remain packed; matrix operations dequantize rows transiently. Hadamard
+Weights remain packed. CPU operations dequantize rows transiently; CUDA integer
+projections decode packed digits during contraction. Hadamard
 metadata controls activation rotation, inverse embedding lookup, the shared
 embedding/output heads in 2B and 4B, and grouped recurrent features. Unknown or
 inconsistent transform contracts fail at load rather than silently producing
@@ -47,8 +48,9 @@ but the download catalog and artifact identities above cover PTQ1_0 only.
 
 The Windows CUDA language path now implements these transforms for all four
 PTQ1_0 packs. Packed projections, activation rotation, attention, recurrent
-layers, and feed-forward layers execute on CUDA with f32 activations and f16
-attention KV storage. The graph supports ordinary greedy and sampled decoding,
+layers, and feed-forward layers execute on CUDA. Hidden states use f32, packed
+PTQ projections quantize rotated inputs to Q8, and attention KV uses f16.
+The graph supports ordinary greedy and sampled decoding,
 multimodal prefill, and batched speculative verification. GPU selection follows
 the existing GUI/server acceleration setting; a selected Bonsai 2 CUDA path
 reports device/setup failures instead of silently changing to CPU execution.
@@ -73,14 +75,15 @@ Transfer overhead and available VRAM affect the resulting throughput.
 Image encoding uses the matching projector backend, including accurate f32 CUDA
 arithmetic for these models, with a CPU path available. Windows API/GUI checks
 cover all four exact rows with CUDA language decoding: text, single-image chat,
-request sampling, and function-tool round trips. The 27B GUI passes both fresh
-loading and repeated model switches after the host memory fix. Each row passes
+request sampling, and function-tool round trips. The initial CUDA qualification
+checked 27B fresh loading and repeated model switches after the host memory fix;
+the Q8 qualification repeats model switching across all four sizes. Each row passes
 context recall at 1,044 prompt tokens; this does not certify larger windows.
 Apple Silicon remains a separate qualification target.
 
 The [historical CPU manifest](../qa/bonsai2/manifest.json) retains the earlier
-CPU-language results. The [CUDA manifest](../qa/bonsai2/cuda/manifest.json) and
-[reproduction workflow](../qa/bonsai2/cuda/README.md) record the completed CUDA
+CPU-language results. The [Q8 CUDA manifest](../qa/bonsai2/cuda-q8/manifest.json) and
+[reproduction workflow](../qa/bonsai2/cuda-q8/README.md) record the completed CUDA
 qualification. The reproducible native probe is `examples/bonsai2_probe.rs`.
 
 In the completed CPU comparison, the pinned Prism reference matches text,
@@ -103,18 +106,20 @@ camelid serve --model TARGET.gguf --spec-decode draft --spec-draft-model Ternary
 
 The draft and target must have the same token mapping. The target verifies every
 proposal and remains responsible for request sampling. On CUDA, both models use
-the packed PTQ1_0 graph with f32 activations. Batched verification reuses packed
+the packed PTQ1_0 graph with Q8 projection inputs. Batched verification reuses packed
 weights across proposed tokens. Rejection restores device convolution and
 recurrent snapshots plus the attention cache's valid-position watermark before
 replaying the accepted prefix. The drafter is cached across requests, while
 request state is reset; changing its file or context configuration rebuilds it.
 Image requests use the ordinary multimodal decoder.
 
-The Windows CUDA API checks retain identical 32-token seeded continuations with
+The initial Windows CUDA API checks retain identical 32-token seeded continuations with
 and without drafting for all four targets. The
 [active-drafter receipt](../qa/bonsai2/cuda/sampled-draft-runtime.json) preserves
 the server log, proposal/acceptance counters, and the sequential associations
 with those API requests.
+The Q8 hardware tests below repeat greedy and seeded draft parity for all four
+real models.
 
 The CPU drafter uses integer PTQ1_0 x Q8_0 projections; its target verification
 keeps the qualified f32 arithmetic. This CPU optimization and its historical
@@ -151,27 +156,28 @@ exclude the first visible token and are affected by verified-token bursts.
 
 ## CUDA measurements and qualification
 
-The CUDA projection optimization is enabled by default. It specializes scalar
-and batched token tiles, shares activation loads across output rows, uses grouped
-packed-weight reads, and specializes dense F32/BF16 projections. It retains the
-28-byte PTQ blocks and the original float contraction/reduction order. The
-same-binary control is available with `CAMELID_BONSAI2_CUDA_PROJECTION=baseline`.
+The default CUDA PTQ projection now uses transposed Q8 activations and DP4A
+integer dot products. Each group of 32 rotated inputs stores a half scale and
+an exact signed sum; the sum corrects the unsigned ternary digit bias. Coalesced
+activation planes, a fused Hadamard/quantization launch, and four-token tiles
+reduce projection cost without repacking the original 28-byte weights. Hidden
+states, attention, recurrent updates, and dense F32/BF16 gates retain their
+previous arithmetic. Scratch is preallocated before CUDA graph capture.
 
-Nsight Systems profiles of 2B, 4B, and 9B identify projections as the main GPU
-cost. In the final 2B trace, they account for 88.6% of kernel time before the
-change; the vocabulary projection falls from 6.45 to 2.01 ms. The profiles include
-an eight-token warmup plus the 32-token request and both prefills. They are
-diagnostic traces, separate from the unprofiled request measurements below.
-The [profile receipts](../qa/bonsai2/cuda-optimized/profile.json) include before/after
-traces for all three resident sizes and the isolated experiments.
+The pinned [Prism CUDA reference](https://github.com/PrismML-Eng/llama.cpp/blob/prism-b10777-e3de715/ggml/src/ggml-cuda/vecdotq.cuh)
+informed the layout and exact-sum method; attribution is in THIRD_PARTY_NOTICES.
+Q8 changes activation arithmetic. The previous float policy remains available
+with `CAMELID_BONSAI2_CUDA_PROJECTION=tiled`; `baseline` selects the original
+generic float kernel. `q8` explicitly selects the default. Setting
+`CAMELID_BONSAI2_CUDA_Q8_UNFUSED=1` separates rotation and quantization for
+diagnostics while preserving the quantized bytes.
 
-The pinned [Prism CUDA kernel](https://github.com/PrismML-Eng/llama.cpp/blob/prism-b10777-e3de715/ggml/src/ggml-cuda/vecdotq.cuh)
-uses Q8 activations and integer dot products with a transposed activation layout.
-Camelid retains its qualified float target. Independent integer-drafter
-prototypes did not beat the selected float kernel on the 2B proposal-model
-shapes, so they are excluded. A faster isolated weight-repacking experiment
-increased packed storage by 29% and was also excluded. The port remains faster
-on all measured 2B/4B/9B cases; this patch reduces the gap without reaching parity.
+Six final Nsight Systems traces cover 2B, 4B, and 9B under both float and Q8
+policies. Projections account for 75.26–83.00% of float kernel
+time and 49.51–60.90% with Q8. Each trace includes an eight-token
+warmup plus the 32-token request and both prefills. These diagnostic profiles
+are separate from the unprofiled request measurements below; the
+[kernel summaries](../qa/bonsai2/cuda-q8/profile.json) retain all six traces.
 
 Measurements use Windows x86_64, an i7-11800H, 16 GB RAM, RTX 3060 Laptop 6 GiB,
 CUDA 12.9 and driver 576.83. The reference is the official
@@ -183,59 +189,74 @@ three measured repetitions. Drafting uses the official Bonsai 2 2B pack with a
 three-token window.
 
 All rates are **request tokens/second**, based on the median complete uncached
-request duration. Loading and warmup are excluded; prefill and generation are
-included. Native timing starts after tokenization, while the reference also
-includes localhost HTTP, tokenization and JSON parsing. Callback-delivery
-`decode_tokens_per_second` fields are diagnostics, not GPU decode-clock rates.
-Ranges below cover the three prompts, not variation across repetitions.
+request duration. Loading, CUDA compilation, and warmup are excluded; prefill
+and generation are included. Native timing starts after tokenization, while
+the reference also includes localhost HTTP, tokenization and JSON parsing.
+Each native prompt/mode now retains one loaded process across its three uncached
+requests, resetting request KV/recurrent state. The prior bundle used one
+process per repetition, so speedup ratios here use the fresh float control in
+the same final executable. The port also reuses its loaded server.
+Callback-delivery rates remain diagnostic fields, not GPU decode-clock rates.
+Ranges below span the three prompts, not variation across repetitions.
 
-| Model | Before ordinary | Optimized ordinary | Optimized + draft | Port ordinary | Port + draft |
+| Model | Float ordinary | Q8 ordinary | Q8 + draft | Port ordinary | Port + draft |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2B | 29.17–29.89 | 65.35–67.50 | 41.22–42.89 | 198.08–208.80 | 58.34–81.18 |
-| 4B | 13.33–13.67 | 29.90–31.47 | 12.32–27.52 | 115.25–121.05 | 45.99–71.09 |
-| 9B | 7.21–7.39 | 16.10–16.72 | 10.03–16.75 | 77.60–78.84 | 39.26–62.35 |
-| 27B | 2.01–2.14 | 3.45–3.82 | 3.93–5.23 | 1.60–1.66 | 0.81–1.09 |
+| 2B | 64.73–66.57 | 141.28–145.74 | 78.90–82.32 | 177.83–194.66 | 52.92–79.22 |
+| 4B | 29.85–31.10 | 61.87–66.49 | 22.41–47.13 | 109.42–118.53 | 45.65–69.82 |
+| 9B | 16.05–16.77 | 39.68–39.72 | 23.62–39.64 | 64.72–68.57 | 28.37–42.46 |
+| 27B | 3.22–3.98 | 5.10–6.03 | 4.55–8.07 | 1.46–1.66 | 0.80–1.10 |
 
-Ordinary 2B/4B/9B throughput improves 2.23–2.30x against the original kernel in
-the same executable. 27B improves 1.61–1.90x. Drafting is optional: it slows all
-2B and 4B cases, adds only 2–4% on 9B counting/code and slows 9B prose by 40%.
-It improves 27B counting/code by 1.37–1.52x; the 3% prose gain is a near tie,
-not evidence of a broad advantage. These short prompts do not establish a
-universal speedup. The [twelve-case table](../qa/bonsai2/cuda-optimized/RESULTS.md)
-and [raw comparison](../qa/bonsai2/cuda-optimized/comparison.json) retain all cases.
+Ordinary 2B/4B/9B throughput improves 2.07–2.47x against the fresh optimized float
+control. The port's remaining lead is 1.26–1.92x, down from the earlier
+3–5x gap. Ordinary 27B improves 1.28–1.66x. Drafting slows
+all measured 2B and 4B requests. On 9B, counting/code are near ties while prose
+is slower. On 27B, drafting changes throughput by 0.89–1.51x.
+These short prompts do not establish a universal draft advantage, so drafting
+remains opt-in. The [twelve-case table](../qa/bonsai2/cuda-q8/RESULTS.md) includes
+both float draft controls and all Q8/reference measurements.
 
-The first three targets keep their packed weights on CUDA in both engines.
-Native 27B streams 19/64 trailing layers ordinarily and 29/64 with drafting;
-all language-layer computation remains on CUDA. The port places 45/65 target
-layers on GPU ordinarily and 31/65 with drafting, plus all 25/25 drafter layers.
-Its remaining target layers compute on CPU. This compares complete operating
-configurations on a constrained GPU, not entirely resident 27B implementations.
-Native 27B is 2.15–2.39x faster ordinarily and 4.80–5.15x faster with drafting
-than those corresponding port configurations.
+The first three targets keep packed weights on CUDA in both engines. Native
+27B streams 19/64 trailing layers ordinarily and 29/64 with drafting;
+all language-layer computation remains on CUDA. The port places
+45/65 target layers on GPU ordinarily and 31/65 with drafting, plus the full
+25/25-layer drafter. Its remaining target layers compute on CPU. This compares
+complete configurations on a constrained GPU, not entirely resident 27B engines.
+The [raw comparison](../qa/bonsai2/cuda-q8/comparison.json) retains actual placement.
 
-All twelve native ordinary/draft outputs match, match the original kernel,
-and match the port's ordinary output at all 32 generated tokens. Repetitions
-are stable within each mode. The port's own ordinary and drafted prose output
-differs for 2B and 9B; those differences are retained in the receipts.
+All twelve native ordinary/draft outputs match within each policy, match the
+float control, and match the port's ordinary output at all 32 generated tokens.
+Every repetition is stable within its mode. The port's own ordinary/drafted
+prose output differs for 2B and 9B; those differences remain in the receipts.
 
-The optimized build passed thirteen CUDA checks and two host memory regressions,
-including the new bitwise legacy/tiled fixture, independent CPU references,
-all four real-model cache/rollback tests, attention boundaries, and all four
-models' greedy/seeded/stop/cancel draft checks. The test-only build used Rust
-opt-level=1 and one job after an opt-level=3 build exhausted host memory. Probe
-and server benchmarks retain opt-level=3; both builds use identical CUDA source
-and NVRTC settings. The [manifest](../qa/bonsai2/cuda-optimized/manifest.json)
-binds binaries, source identity and receipts.
+The final build passes fourteen CUDA checks and two host memory regressions.
+Coverage includes independently calculated Q8 bytes/integer contractions,
+fused/separate quantization, scalar/batch identity, partial tiles, independent
+float references, all four real-model cache/rollback tests, attention boundaries,
+and greedy/seeded/stop/cancel draft behavior. Fixed-continuation scoring checks
+96 tokens per model under both policies: all 384 top choices agree, with a
+maximum mean NLL increase of 0.000734 nats/token. This is a bounded numerical
+regression check, not broad task-quality or corpus-perplexity qualification.
 
-Fresh production-GUI text/image checks passed for all four models through the
-native library-server harness, using the default image settings and an
-8192-slot allocation. They verify supported Windows CUDA routing, image input,
-answers, and request-rate labels. The original broader API qualification
-(including tools, context recall and seeded API continuations) remains in the
-[initial CUDA bundle](../qa/bonsai2/cuda/README.md). These runs exercise the
-production frontend/API, not an installed Tauri shell. Desktop CI is separate;
-Apple Silicon qualification remains separate. Reproduce this optimization pass
-with the [new workflow](../qa/bonsai2/cuda-optimized/README.md).
+An initial 27B state test overlapped release compilation and failed a 240 MiB
+host allocation. The complete serial rerun after compilation passed all sixteen
+checks. The test-only Rust build uses opt-level=1 and one job; probe/server use
+opt-level=3, with identical CUDA source and NVRTC settings. The
+[manifest](../qa/bonsai2/cuda-q8/manifest.json) binds source identity, retained
+binaries, build settings, and receipts.
+The measured runtime is commit `d86878671f35301a3f84584405f0fa7431219612`;
+the subsequent evidence commit updates QA, documentation, and capability
+evidence links without changing inference code.
+
+Fresh production-GUI text/image and broader API checks pass for all four models
+with the default Q8 policy, supported Windows CUDA routing, default image
+settings, and an 8192-slot allocation. API checks cover text, tool-call/result
+round trips, 1,044-token context recall, seeded sampling, and spatial vision.
+GUI checks verify attachment, answers, supported labels, and request-rate labels.
+These runs exercise the production frontend/API through the native library-server
+harness; installed Tauri execution and Apple Silicon qualification are separate.
+The [reproduction workflow](../qa/bonsai2/cuda-q8/README.md) describes the checks.
+The [earlier float optimization](../qa/bonsai2/cuda-optimized/README.md) and
+[initial CUDA qualification](../qa/bonsai2/cuda/README.md) remain historical evidence.
 
 Publisher references: [2B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf),
 [4B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf),
