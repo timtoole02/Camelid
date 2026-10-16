@@ -305,7 +305,7 @@ impl PrismVisionProjector {
 
     /// The caller has bound the portable Qwen3.5 image decoder. This allows
     /// CPU encoding to remain a usable fallback for Bonsai 2 on GPU-less hosts.
-    pub(crate) fn with_portable_decode(mut self) -> Self {
+    pub fn with_portable_decode(mut self) -> Self {
         self.portable_decode = true;
         self
     }
@@ -507,7 +507,12 @@ impl PrismVisionProjector {
                 self.cuda.mark_ready(false);
                 return Ok(());
             }
-            *lane = match super::vision_cuda::CudaVisionEncoder::new() {
+            // Activation requantization / tensor-core approximations can change
+            // spatial answers on Bonsai 2 (blue-left/yellow-right regression).
+            // Keep CUDA encoding, using the f32 graph qualified against CPU.
+            *lane = match super::vision_cuda::CudaVisionEncoder::new_with_strict_math(
+                self.portable_decode,
+            ) {
                 Ok(encoder) => {
                     eprintln!("[qwen3vl] streaming CUDA projector active (bounded VRAM)");
                     PrismVisionCudaLane::Ready(encoder)

@@ -24,7 +24,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .split_once("<|image_pad|>")
             .ok_or("image prompt needs <|image_pad|>")?;
         let projector = PrismVisionProjector::load(&args[4])?;
-        let image = projector.encode_image(&args[5], 4, 4)?;
+        let projector = if metadata.metadata.contains_key("prism.hadamard.version") {
+            projector.with_portable_decode()
+        } else {
+            projector
+        };
+        let min = std::env::var("CAMELID_PROBE_IMAGE_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let image_max = std::env::var("CAMELID_PROBE_IMAGE_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(min);
+        let image = projector.encode_image(&args[5], min, image_max)?;
         if let Ok(path) = std::env::var("CAMELID_PROBE_EMBEDDINGS") {
             std::fs::write(path, serde_json::to_vec(&image.embeddings)?)?;
         }

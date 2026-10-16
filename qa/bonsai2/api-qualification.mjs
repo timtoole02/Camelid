@@ -71,8 +71,8 @@ if (cases.has('tools')) {
   }, r => { assert.match(content(r), /21/); assert.match(content(r), /sunny/i) })
 }
 if (cases.has('context')) await check('context_recall', {
-  messages: [user('Remember: the secret word is ORCHID.\n' + 'A stone rests beside the river. '.repeat(128) + '\nWhat is the secret word? Answer with just that word.')], max_tokens: 16,
-}, r => { assert.ok(r.usage.prompt_tokens >= 1000); assert.match(content(r), /orchid/i) })
+  messages: [user('Remember: the secret word is ORCHID.\n' + 'A stone rests beside the river. '.repeat(144) + '\nWhat is the secret word? Answer with just that word.')], max_tokens: 16,
+}, r => { assert.ok(r.usage.prompt_tokens >= 1024); assert.match(content(r), /orchid/i) })
 if (cases.has('sampling')) await check('sampled_text', {
   messages: [user('What is 2 plus 2? Answer with one number.')], temperature: 0.7, seed: 42, max_tokens: 16,
 }, r => assert.match(content(r), /4|four/i))

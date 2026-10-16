@@ -13,6 +13,15 @@ cargo run --release --example bonsai2_probe -- MODEL.gguf qa/bonsai2/image-promp
 The probe uses four merged image tokens. Its output includes generated token IDs,
 decoded text, and elapsed generation time. EOS is consumed rather than returned.
 For encoder diagnostics, `CAMELID_PROBE_EMBEDDINGS` may name a JSON output file.
+`CAMELID_PROBE_IMAGE_MIN_TOKENS` and `CAMELID_PROBE_IMAGE_MAX_TOKENS` override
+the probe's image sizing without changing its requested output-token limit.
+
+`reference-text.mjs` captures four 32-token cases from the pinned reference
+server. `compare-reference.mjs` compares native token IDs with those captures
+and retains mismatches in its report. For a divergent case, `reference-score.mjs`
+captures the reference's top 20 token log probabilities along the same greedy
+continuation; compare the first divergent position, where prefixes still agree.
+This distinguishes a measured close decision from an unexamined disagreement.
 
 `gui-smoke.mjs` exercises an actual image attachment and the rendered streamed
 answer through a dedicated test server. The `bonsai2_server` example runs the
