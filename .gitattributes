@@ -14,3 +14,9 @@ tools/bench/system/process/*.sh text eol=lf
 # Keep the Bonsai response receipts portable and preserve SSE frame terminators.
 qa/evidence-bundles/bonsai27b-haber-windows-20260915/** text eol=lf
 qa/evidence-bundles/bonsai27b-haber-windows-20260915/*.sse whitespace=-blank-at-eof
+
+# Preserve the exact raw prompt bytes used by the reference captures.
+qa/bonsai2/*.chatml text eol=lf
+qa/bonsai2/text-prompt.txt text eol=crlf
+qa/bonsai2/image-prompt.txt text eol=crlf
+qa/bonsai2/tool-prompt.txt text eol=lf

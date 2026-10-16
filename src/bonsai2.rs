@@ -105,9 +105,24 @@ pub(crate) const MODELS: &[Model] = &[
 ];
 
 pub(crate) fn identity_matches(filename: &str, sha256: &str) -> bool {
+    expected_sha256(filename).is_some_and(|expected| expected.eq_ignore_ascii_case(sha256))
+}
+
+pub(crate) fn expected_sha256(filename: &str) -> Option<&'static str> {
     MODELS
         .iter()
-        .any(|m| m.catalog.filename == filename && m.sha256.eq_ignore_ascii_case(sha256))
+        .find(|m| m.catalog.filename == filename)
+        .map(|m| m.sha256)
+}
+
+pub(crate) fn host_eligible(operating_system: &str, architecture: &str) -> bool {
+    operating_system == "windows" && architecture == "x86_64"
+}
+
+pub(crate) fn supported_filename(filename: &str) -> bool {
+    MODELS.iter().any(|model| {
+        model.catalog.filename == filename && compatibility(model).status.starts_with("supported")
+    })
 }
 
 pub(crate) fn compatibility(model: &Model) -> crate::api::ModelCompatibilityTarget {

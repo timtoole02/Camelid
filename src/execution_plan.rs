@@ -960,6 +960,17 @@ pub fn plan_for_model_with_platform_and_env(
             "unknown_or_unvalidated".into()
         };
     }
+    // A Windows receipt never promotes another host or a neighboring file.
+    // Final artifact hashing in the load pipeline confirms this provisional plan.
+    if selected_backend == "bonsai2_portable_runtime"
+        && crate::bonsai2::host_eligible(&platform.operating_system, &platform.architecture)
+        && model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(crate::bonsai2::supported_filename)
+    {
+        support_level = "supported_windows_runtime".into();
+    }
     // Preserve the stable reason ordering (profile, row, quant, support, lane)
     // even though platform-scoped support can only be decided after lane selection.
     reasons.insert(3, format!("support_level={support_level}"));

@@ -31243,6 +31243,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bonsai2_windows_plan_requires_exact_bytes_host_and_backend() {
+        for model in crate::bonsai2::MODELS {
+            let mut base = provisional_lfm2_supported_plan();
+            base.model_family = "qwen35".into();
+            base.operating_system = "windows".into();
+            base.architecture = "x86_64".into();
+            base.selected_backend = "bonsai2_portable_runtime".into();
+            base.support_level = "supported_windows_runtime".into();
+            base.reasons = vec!["support_level=supported_windows_runtime".into()];
+            let path = std::path::Path::new(model.catalog.filename);
+            let mut valid = base.clone();
+            finalize_execution_plan_support_for_loaded_artifact(&mut valid, path, model.sha256);
+            assert_eq!(valid.support_level, "supported_windows_runtime");
+            assert_eq!(
+                supported_artifact_expected_sha256(model.catalog.filename),
+                Some(model.sha256)
+            );
+            for failure in [
+                "digest",
+                "filename",
+                "macos",
+                "linux",
+                "architecture",
+                "backend",
+            ] {
+                let mut plan = base.clone();
+                match failure {
+                    "macos" | "linux" => plan.operating_system = failure.into(),
+                    "architecture" => plan.architecture = "aarch64".into(),
+                    "backend" => plan.selected_backend = "cpu_reference".into(),
+                    _ => {}
+                }
+                finalize_execution_plan_support_for_loaded_artifact(
+                    &mut plan,
+                    if failure == "filename" {
+                        std::path::Path::new("neighbor.gguf")
+                    } else {
+                        path
+                    },
+                    if failure == "digest" {
+                        "00"
+                    } else {
+                        model.sha256
+                    },
+                );
+                assert_eq!(plan.support_level, "unknown_or_unvalidated", "{failure}");
+                assert!(plan
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+            }
+        }
+    }
+
     /// Every artifact whose supported-row identity is pinned to exact bytes:
     /// the paired Prism evidence bundles, the non-catalog allowlist, and the
     /// curated rows carrying a recorded digest. `classify_model_lane` only
@@ -41387,6 +41442,7 @@ fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) 
 /// row", never "any bytes will do knowingly".
 fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
     prism_supported_artifact_expected_sha256(filename)
+        .or_else(|| crate::bonsai2::expected_sha256(filename))
         .or_else(|| {
             NON_CATALOG_SUPPORTED_ARTIFACTS
                 .iter()
@@ -41562,6 +41618,9 @@ fn phi3_supported_on_current_host() -> bool {
 }
 
 fn supported_exact_row_host_eligible(filename: &str) -> bool {
+    if crate::bonsai2::expected_sha256(filename).is_some() {
+        return crate::bonsai2::host_eligible(env::consts::OS, env::consts::ARCH);
+    }
     match filename {
         LFM2_5_2_6B_Q8_0_FILENAME => lfm2_supported_on_current_host(),
         PHI3_MINI_4K_Q8_0_FILENAME => phi3_supported_on_current_host(),
@@ -41579,6 +41638,29 @@ fn finalize_execution_plan_support_for_loaded_artifact(
     model_path: &std::path::Path,
     gguf_sha256: &str,
 ) {
+    if plan.support_level == "supported_windows_runtime" {
+        let filename = model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if plan.selected_backend == "bonsai2_portable_runtime"
+            && crate::bonsai2::host_eligible(&plan.operating_system, &plan.architecture)
+            && crate::bonsai2::identity_matches(filename, gguf_sha256)
+        {
+            return;
+        }
+        plan.support_level = "unknown_or_unvalidated".into();
+        for reason in &mut plan.reasons {
+            if reason.starts_with("support_level=") {
+                *reason = "support_level=unknown_or_unvalidated".into();
+            }
+        }
+        plan.reasons.push(
+            "Bonsai 2 Windows support requires the exact publisher digest and qualified host"
+                .into(),
+        );
+        return;
+    }
     if plan.support_level != "supported_exact_row_smoke" {
         return;
     }
@@ -41619,10 +41701,11 @@ fn catalog_host_lane_class_with_eligibility(
     item: &CatalogItem,
     host_eligible: bool,
 ) -> Option<ModelLaneClass> {
-    if matches!(
+    if (matches!(
         item.filename,
         LFM2_5_2_6B_Q8_0_FILENAME | PHI3_MINI_4K_Q8_0_FILENAME
-    ) && supported_compatibility_row_ids().contains(item.catalog_id)
+    ) || crate::bonsai2::expected_sha256(item.filename).is_some())
+        && supported_compatibility_row_ids().contains(item.catalog_id)
     {
         return Some(if host_eligible {
             ModelLaneClass::Supported
