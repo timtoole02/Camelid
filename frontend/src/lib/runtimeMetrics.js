@@ -234,6 +234,9 @@ const EVIDENCED_BACKENDS = new Set([
 /* Lanes deliberately left OUT of the set above, so that "not listed" cannot mean
    "nobody looked". The smoke asserts this partition covers the planner. */
 export const UNEVIDENCED_BACKENDS = new Set([
+  // Bonsai 2's packed CPU lane is still completing the model qualification
+  // matrix; track it explicitly until its support receipts are promoted.
+  'bonsai2_portable_runtime',
   /* The engine itself treats this one as unvalidated: the admission check in
      `src/api/mod.rs` gates on `selected_backend.contains("_runnable_unvalidated")`.
      Claiming evidence for it here would contradict the engine. */

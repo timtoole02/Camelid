@@ -1,5 +1,5 @@
 // Run against a dedicated Camelid test server, never the user's active server.
-// node qa/bonsai2/gui-smoke.mjs MODEL_PATH OUTPUT_PREFIX [API_URL] [--send]
+// node qa/bonsai2/gui-smoke.mjs MODEL_PATH OUTPUT_PREFIX [API_URL] [--send] [--default-image]
 import assert from 'node:assert/strict'
 import { resolve } from 'node:path'
 import { writeFile } from 'node:fs/promises'
@@ -8,6 +8,7 @@ import { launchBrowser } from '../../frontend/scripts/lib/launch-browser.mjs'
 const [modelPath, outputPrefix, api = 'http://127.0.0.1:28182'] = process.argv.slice(2)
 assert.ok(modelPath && outputPrefix, 'MODEL_PATH and OUTPUT_PREFIX are required')
 const send = process.argv.includes('--send')
+const defaultImage = process.argv.includes('--default-image')
 const loaded = await fetch(`${api}/api/models/load`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ path: resolve(modelPath), replace: true, id: 'bonsai2-gui-smoke' }),
@@ -22,7 +23,7 @@ for (let i = 0; i < 120; i++) {
 }
 assert.equal(health.generation_ready, true)
 assert.equal(health.vision_ready, true)
-const browser = await launchBrowser({ purpose: 'Bonsai 2 image attachment smoke', headless: true })
+const browser = await launchBrowser({ purpose: 'Bonsai 2 image attachment smoke', headless: true, protocolTimeout: 900000 })
 try {
   const page = await browser.newPage()
   await page.setViewport({ width: 1440, height: 1000 })
@@ -34,8 +35,10 @@ try {
       if (req.url().endsWith('/v1/chat/completions') && req.method() === 'POST') {
         const body = JSON.parse(req.postData())
         body.max_tokens = 16
-        body.camelid_image_min_tokens = 4
-        body.camelid_image_max_tokens = 4
+        if (!defaultImage) {
+          body.camelid_image_min_tokens = 4
+          body.camelid_image_max_tokens = 4
+        }
         assert.ok(body.messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')))
         req.continue({ postData: JSON.stringify(body) })
       } else req.continue()
@@ -43,7 +46,7 @@ try {
   }
   await page.goto(`${api}/#chat`, { waitUntil: 'networkidle2', timeout: 60000 })
   const input = await page.waitForSelector('input[accept="image/png,image/jpeg"]', { timeout: 30000 })
-  const receipt = { generation_ready: health.generation_ready, vision_ready: health.vision_ready, image_input_present: true }
+  const receipt = { generation_ready: health.generation_ready, vision_ready: health.vision_ready, image_input_present: true, image_limits: defaultImage ? 'GUI defaults' : 'four merged tokens' }
   if (send) {
     await input.uploadFile(resolve('qa/bonsai2/red.png'))
     await page.type('textarea[aria-label="Message Camelid"]', 'What color is the image? Answer with one color.')
@@ -56,7 +59,7 @@ try {
     await page.waitForFunction(() => {
       const turns = [...document.querySelectorAll('.cxturn--assistant')]
       const last = turns.at(-1)
-      return last && !last.classList.contains('is-streaming') && /red/i.test(last.innerText)
+      return last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
     }, { timeout: 900000 })
     receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
     assert.match(receipt.answer, /red/i)

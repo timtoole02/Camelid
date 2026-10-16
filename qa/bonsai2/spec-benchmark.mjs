@@ -3,17 +3,19 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { readFile, writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
 
 const [probe, target, draft, output, tokens = '48'] = process.argv.slice(2)
 assert.ok(probe && target && draft && output, 'PROBE TARGET DRAFT OUTPUT required')
-const cases = ['count', 'code', 'explain']
+const cases = (process.env.CAMELID_BENCH_CASES || 'count,code,explain').split(',')
+const window = process.env.CAMELID_SPEC_DRAFT_TOKENS || '3'
 async function run(prompt, speculative) {
   const env = { ...process.env, RAYON_NUM_THREADS: '8', CAMELID_QWEN35_CUDA: '0', CAMELID_QWEN35_METAL: '0' }
   delete env.CAMELID_SPEC_DECODE
   delete env.CAMELID_SPEC_DRAFT_MODEL
   if (speculative) Object.assign(env, {
-    CAMELID_SPEC_DECODE: 'draft', CAMELID_SPEC_DRAFT_MODEL: resolve(draft), CAMELID_SPEC_DRAFT_TOKENS: '3',
+    CAMELID_SPEC_DECODE: 'draft', CAMELID_SPEC_DRAFT_MODEL: resolve(draft), CAMELID_SPEC_DRAFT_TOKENS: window,
   })
   const child = spawn(resolve(probe), [resolve(target), prompt, tokens], { env, windowsHide: true })
   let stdout = '', stderr = ''
@@ -31,7 +33,14 @@ async function run(prompt, speculative) {
     speculative: match ? { accepted: +match[1], proposed: +match[2], decode_seconds: +match[4] } : null,
   }
 }
-const report = { target: resolve(target), draft: resolve(draft), threads: 8, draft_tokens: 3, cases: [] }
+const digest = bytes => createHash('sha256').update(bytes).digest('hex')
+const source = {}
+for (const path of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/batched_dot.rs']) {
+  source[path] = digest(await readFile(path))
+}
+const report = { target: basename(target), draft: basename(draft), date: new Date().toISOString(),
+  probe_sha256: digest(await readFile(probe)), source_sha256: source,
+  threads: 8, draft_tokens: Number(window), max_tokens: Number(tokens), cases: [] }
 for (const name of cases) {
   const path = resolve(`qa/bonsai2/${name}.chatml`)
   await readFile(path) // fail before spawning if a prompt was omitted

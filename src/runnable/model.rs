@@ -731,11 +731,16 @@ impl RawMat {
                 .collect(),
             _ => {
                 // Unpack each row once for the whole verification batch.
+                // SIMD runs across tokens, preserving each token's f32 sum order.
+                let packed = (m > 1).then(|| batched_dot::BatchedInputs::new(xs, self.in_features));
                 let rows: Result<Vec<Vec<f32>>> = (0..out_f)
                     .into_par_iter()
                     .map(|r| {
                         let row = self.dequant_row(r, "matmul")?;
-                        Ok(xs.iter().map(|x| dot(&row, x)).collect())
+                        Ok(match &packed {
+                            Some(packed) => packed.dot_row(&row),
+                            None => xs.iter().map(|x| dot(&row, x)).collect(),
+                        })
                     })
                     .collect();
                 rows?.into_iter().flatten().collect()
@@ -810,6 +815,8 @@ impl KvCache {
     }
 }
 
+#[path = "batched_dot.rs"]
+mod batched_dot;
 /// A loaded runnable model: parametric config + quantized weights, ready for greedy
 /// decode. Weights are dequantized to f32 on demand during the forward pass.
 #[path = "speculative.rs"]
