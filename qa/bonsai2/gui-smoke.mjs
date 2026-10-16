@@ -9,6 +9,7 @@ const [modelPath, outputPrefix, api = 'http://127.0.0.1:28182'] = process.argv.s
 assert.ok(modelPath && outputPrefix, 'MODEL_PATH and OUTPUT_PREFIX are required')
 const send = process.argv.includes('--send')
 const defaultImage = process.argv.includes('--default-image')
+const requireSupported = process.argv.includes('--require-supported')
 const loaded = await fetch(`${api}/api/models/load`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ path: resolve(modelPath), replace: true, id: 'bonsai2-gui-smoke' }),
@@ -23,6 +24,7 @@ for (let i = 0; i < 120; i++) {
 }
 assert.equal(health.generation_ready, true)
 assert.equal(health.vision_ready, true)
+if (requireSupported) assert.equal(health.execution_plan?.support_level, 'supported_windows_runtime')
 console.log(`${basename(modelPath)}: generation and vision ready (${health.build})`)
 const browser = await launchBrowser({ purpose: 'Bonsai 2 image attachment smoke', headless: true, protocolTimeout: 900000 })
 try {
@@ -50,6 +52,8 @@ try {
   const receipt = {
     model: basename(modelPath), platform: process.platform, backend_build: health.build,
     selected_backend: health.execution_plan?.selected_backend, date: new Date().toISOString(),
+    support_level: health.execution_plan?.support_level,
+    operating_system: health.execution_plan?.operating_system, architecture: health.execution_plan?.architecture,
     generation_ready: health.generation_ready, vision_ready: health.vision_ready,
     image_input_present: true, image_limits: defaultImage ? 'GUI defaults' : 'four merged tokens',
   }
@@ -70,6 +74,10 @@ try {
     }, { timeout: 900000 })
     receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
     assert.match(receipt.answer, /red/i)
+    if (requireSupported) {
+      assert.doesNotMatch(receipt.answer, /unverified/i)
+      assert.match(receipt.answer, /\bverified\b/i)
+    }
   }
   await page.screenshot({ path: `${outputPrefix}.png`, fullPage: true })
   await writeFile(`${outputPrefix}.json`, JSON.stringify(receipt, null, 2))

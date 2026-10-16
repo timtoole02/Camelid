@@ -45,7 +45,7 @@ async function fileDigest(path) {
   return hash.digest('hex')
 }
 const source = {}
-for (const path of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/batched_dot.rs']) {
+for (const path of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/batched_dot.rs', 'src/runnable/ptq_dot.rs']) {
   source[path] = digest(await readFile(path))
 }
 const report = { target: basename(target), draft: basename(draft), date: new Date().toISOString(),

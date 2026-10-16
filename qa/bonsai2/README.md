@@ -1,4 +1,4 @@
-# Bonsai 2 smoke probes
+# Bonsai 2 Windows qualification
 
 The artifact identities are pinned in `src/bonsai2.rs`. Download the language
 file and matching projector from the corresponding publisher repository. These
@@ -67,5 +67,7 @@ Text comparison uses the exact raw prompt in `text-prompt.txt`; image comparison
 uses the same image and question through the reference chat endpoint. Image
 answers are semantic smoke checks, not a token-parity claim across templates.
 
-These short probes do not qualify tools, long context, throughput, all images,
-or other platforms. See `manifest.json` for the recorded per-model results.
+The API pack also qualifies function-tool round trips, sampled generation and
+context recall at 1,044 prompt tokens. Add `--require-supported` to the GUI
+harness to assert the Windows support badge. See `manifest.json` for per-model
+results; larger context and other platforms remain separate qualification work.

@@ -126,9 +126,9 @@ Use a trusted private LAN or private Tailscale HTTPS access with authentication.
 
 ## Supported models
 
-Bonsai 2 **2B, 4B, 9B, and 27B** compact PTQ1_0 downloads are also available
-on the experimental portable lane, with matching vision projectors for GUI image
-chat. See [Bonsai 2](docs/BONSAI2.md) for sizes, execution details, and validation limits.
+Bonsai 2 **2B, 4B, 9B, and 27B** PTQ1_0 are supported on Windows x86_64
+for text, GUI image chat, and function calling. Downloads include the matching
+vision projector. See [Bonsai 2](docs/BONSAI2.md) for sizes, execution details, and validation limits.
 
 Start with one of these five options. Support applies to exact model files, quantizations, and tested execution paths; see the [compatibility ledger](COMPATIBILITY.md) for each model's limits.
 

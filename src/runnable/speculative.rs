@@ -135,7 +135,7 @@ mod tests {
                 bytes.extend(0x3800_u16.to_le_bytes());
             }
         }
-        let mat = RawMat {
+        let mut mat = RawMat {
             bytes: RawMatBytes::owned(bytes),
             tt: GgufTensorType::Ptq1_0,
             in_features: 256,
@@ -144,6 +144,7 @@ mod tests {
                 super::super::super::hadamard::Transform::test_rotation(256),
             )),
             inverse_transform: None,
+            draft_quantized_ptq: false,
         };
         let inputs: Vec<Vec<f32>> = (0..4)
             .map(|p| (0..256).map(|i| ((i * 7 + p * 11) as f32).sin()).collect())
@@ -151,6 +152,12 @@ mod tests {
         let expected: Vec<_> = inputs
             .iter()
             .map(|x| mat.par_matvec(x, "test").unwrap())
+            .collect();
+        assert_eq!(mat.par_matmul(&inputs).unwrap(), expected);
+        mat.draft_quantized_ptq = true;
+        let expected: Vec<_> = inputs
+            .iter()
+            .map(|x| mat.par_matvec(x, "draft test").unwrap())
             .collect();
         assert_eq!(mat.par_matmul(&inputs).unwrap(), expected);
     }
@@ -162,7 +169,7 @@ mod tests {
         let target_path = std::env::var("CAMELID_BONSAI_TARGET").unwrap();
         let draft_path = std::env::var("CAMELID_BONSAI_DRAFT").unwrap();
         let target = RunnableModel::load(&target_path).unwrap();
-        let draft = RunnableModel::load(&draft_path).unwrap();
+        let draft = RunnableModel::load_with_draft_activations(&draft_path, true).unwrap();
         let tokenizer =
             crate::tokenizer::Tokenizer::from_gguf(&read_metadata(&target_path).unwrap()).unwrap();
         let prompt = tokenizer

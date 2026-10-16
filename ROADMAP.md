@@ -1,8 +1,8 @@
 # Camelid Roadmap
 
-Bonsai 2 follow-up (2026-10-15): the experimental portable text/vision path and
-GUI downloads cover 2B/4B/9B/27B PTQ1_0. Resident GPU Hadamard execution, tool-call
-qualification, extended context and cross-platform parity remain separate gates;
+Bonsai 2 Windows support (2026-10-15): text, single-image GUI/API chat,
+function calling, and GUI downloads cover 2B/4B/9B/27B PTQ1_0. Apple Silicon,
+resident GPU language execution, and extended context remain separate gates;
 see [Bonsai 2](docs/BONSAI2.md).
 
 Last updated: 2026-08-10

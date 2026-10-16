@@ -43,9 +43,12 @@ but the download catalog and artifact identities above cover PTQ1_0 only.
 Language decoding uses the portable CPU path. The existing Metal/CUDA resident
 language graphs do not yet implement these rotations. Image encoding can use
 the existing projector backend, with CPU fallback on non-Metal hosts. These
-rows remain explicitly experimental; the old Bonsai 4B/8B/27B GPU support
-receipts do not apply to Bonsai 2. Tool calling, extended context, production
-throughput, and cross-platform parity are not promoted by this change.
+four exact rows are supported on Windows x86_64 for text, single-image GUI/API
+chat, request sampling, and function-tool round trips. The CUDA image encoder
+automatically uses accurate f32 arithmetic for these models. Each row passes
+context recall at 1,044 prompt tokens; this does not certify larger windows.
+Apple Silicon and resident GPU language decoding require separate validation.
+See the evidence manifest for measured performance and reference comparisons.
 
 Validation results and exact source references are recorded in
 [`qa/bonsai2/manifest.json`](../qa/bonsai2/manifest.json). The reproducible native
@@ -65,7 +68,8 @@ camelid serve --model TARGET.gguf --spec-decode draft --spec-draft-model Ternary
 
 The draft and target must have the same token mapping. The target verifies every
 proposal, and rejection restores attention, convolution, and recurrent state.
-The target remains responsible for request sampling. Image requests currently
+The target remains responsible for request sampling. The drafter uses integer
+PTQ1_0 x Q8_0 projections; target verification keeps the qualified f32 arithmetic. Image requests currently
 use the ordinary multimodal decoder.
 
 Prism's published DSpark assistants target the earlier Bonsai generation.

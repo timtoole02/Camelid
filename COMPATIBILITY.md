@@ -1,8 +1,10 @@
 # Camelid Compatibility Matrix
 
-Bonsai 2 2B/4B/9B/27B PTQ1_0 has an experimental portable text and single-image
-implementation, with exact publisher model/projector pins and GUI downloads.
-These artifacts do not inherit older Bonsai GPU receipts. See
+Bonsai 2 2B/4B/9B/27B PTQ1_0 is supported on Windows x86_64 for text,
+single-image GUI/API chat, sampling, and function-tool round trips. The exact
+publisher files use CPU language decoding and a CUDA or CPU image encoder.
+Context recall is checked at 1,044 prompt tokens; larger context and Apple
+Silicon require separate qualification. See
 [Bonsai 2](docs/BONSAI2.md) and `qa/bonsai2/manifest.json` for the checked boundary.
 
 Last updated: 2026-08-10

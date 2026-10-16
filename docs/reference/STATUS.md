@@ -7,8 +7,11 @@ TinyLlama tokenizer-reference update (2026-10-03): flat-score TinyLlama Q8_0 now
 Bonsai 2 addition (2026-10-15): official 2B/4B/9B/27B PTQ1_0 catalog rows include
 their distinct Q8_0 vision companions. Packed portable text and single-image
 generation implements Hadamard v1/v2, including tied heads and grouped recurrent
-features. These rows remain experimental; resident GPU decoding, tool-call
-qualification and extended context remain unpromoted. Details:
+features. All four rows pass Windows text, function-tool round trips, sampled
+generation, 1,044-token context recall, spatial vision, and GUI attachment
+tests. Windows x86_64 support is enabled for the exact publisher artifacts.
+Apple Silicon, resident GPU language decoding and extended context remain
+separate qualification work. Details:
 [`docs/BONSAI2.md`](../BONSAI2.md), `qa/bonsai2/manifest.json`.
 
 

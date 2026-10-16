@@ -251,6 +251,8 @@ struct RawMat {
     out_features: usize,
     forward_transform: Option<std::sync::Arc<super::hadamard::Transform>>,
     inverse_transform: Option<std::sync::Arc<super::hadamard::Transform>>,
+    /// Proposal-only arithmetic; public target loading always leaves this off.
+    draft_quantized_ptq: bool,
 }
 
 /// A dequantized 2-D weight (f32), produced transiently from a [`RawMat`].
@@ -392,6 +394,7 @@ impl RawMat {
             out_features: len,
             forward_transform: self.forward_transform.clone(),
             inverse_transform: self.inverse_transform.clone(),
+            draft_quantized_ptq: self.draft_quantized_ptq,
         }
     }
 
@@ -407,6 +410,14 @@ impl RawMat {
         debug_assert_eq!(x.len(), self.in_features);
         let transformed = self.forward_transform.as_ref().map(|t| t.forward(x));
         let x = transformed.as_deref().unwrap_or(x);
+        if self.draft_quantized_ptq && self.tt == GgufTensorType::Ptq1_0 {
+            let input = crate::inference::quantize_q8_0_blocks(x);
+            let rb = self.row_bytes();
+            return Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| ptq_dot::dot_row(&self.bytes.as_slice()[r * rb..(r + 1) * rb], &input))
+                .collect());
+        }
         if self.tt == GgufTensorType::I2S {
             let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
             let mut output = vec![0.0_f32; self.out_features];
@@ -705,6 +716,18 @@ impl RawMat {
         let rb = self.row_bytes();
         // flat[r*m + p] = dot(row_r, xs[p]); par over rows so each row is read once.
         let flat: Vec<f32> = match self.tt {
+            GgufTensorType::Ptq1_0 if self.draft_quantized_ptq => {
+                let inputs: Vec<_> = xs
+                    .iter()
+                    .map(|x| crate::inference::quantize_q8_0_blocks(x))
+                    .collect();
+                (0..out_f)
+                    .into_par_iter()
+                    .flat_map_iter(|r| {
+                        ptq_dot::dot_rows(&self.bytes.as_slice()[r * rb..(r + 1) * rb], &inputs)
+                    })
+                    .collect()
+            }
             GgufTensorType::Q8_0 => {
                 // Quantize each batched activation to Q8 ONCE (outside the per-row
                 // parallel loop), then every row reads the resident weight once and
@@ -817,11 +840,13 @@ impl KvCache {
 
 #[path = "batched_dot.rs"]
 mod batched_dot;
-/// A loaded runnable model: parametric config + quantized weights, ready for greedy
-/// decode. Weights are dequantized to f32 on demand during the forward pass.
+#[path = "ptq_dot.rs"]
+mod ptq_dot;
 #[path = "speculative.rs"]
 mod speculative;
 
+/// A loaded runnable model: parametric config + quantized weights, ready for greedy
+/// decode. Weights are dequantized to f32 on demand during the forward pass.
 pub struct RunnableModel {
     source_path: String,
     pub architecture: String,
@@ -1039,6 +1064,10 @@ fn command_r_parallel_residual(
 impl RunnableModel {
     /// Admit, parse config, and read every weight into resident quantized form.
     pub fn load(path: &str) -> Result<Self> {
+        Self::load_with_draft_activations(path, false)
+    }
+
+    fn load_with_draft_activations(path: &str, draft_quantized_ptq: bool) -> Result<Self> {
         let gguf = read_metadata(path)?;
         admit::admit(&gguf).map_err(BackendError::from)?;
         let cfg = LlamaModelConfig::from_gguf(&gguf)?;
@@ -1119,6 +1148,7 @@ impl RunnableModel {
                 out_features: outf,
                 forward_transform: hadamard.forward.get(name).cloned(),
                 inverse_transform: hadamard.inverse.get(name).cloned(),
+                draft_quantized_ptq,
             })
         };
         let load_vec = |f: &mut File, name: &str| -> Result<Vec<f32>> {
@@ -1147,6 +1177,7 @@ impl RunnableModel {
                 out_features: token_embd.out_features,
                 forward_transform: token_embd.forward_transform.clone(),
                 inverse_transform: None,
+                draft_quantized_ptq,
             }
         };
         // LFM2 spells its final RMSNorm `token_embd_norm` rather than
@@ -4230,7 +4261,7 @@ impl RunnableModel {
                     "draft and target token mappings differ".into(),
                 ));
             }
-            let draft = Self::load(&path)?;
+            let draft = Self::load_with_draft_activations(&path, true)?;
             if draft.qwen35.is_none() {
                 return Err(BackendError::InvalidModelMetadata(
                     "Bonsai draft must use the qwen35 runtime".into(),
@@ -6535,6 +6566,7 @@ mod resident_metal_q8_admission_tests {
             out_features,
             forward_transform: None,
             inverse_transform: None,
+            draft_quantized_ptq: false,
         }
     }
 

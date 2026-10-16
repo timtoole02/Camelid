@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "date": "2026-10-15",
-  "scope": "experimental packed PTQ1_0 text and single-image implementation; short smoke evidence only",
+  "scope": "Supported Windows x86_64 exact-artifact text, single-image GUI/API chat, sampling and function-tool round trips",
   "host": "Windows x86_64",
   "language_backend": "portable CPU with activation Hadamard transforms",
-  "image_backend": "CUDA streaming projector",
+  "image_backend": "CUDA f32 projector; CPU fallback",
   "reference": {
     "repository": "https://github.com/PrismML-Eng/llama.cpp",
     "release": "prism-b10777-e3de715",
@@ -14,26 +14,32 @@
   "publisher_artifact_identities": "../../src/bonsai2.rs",
   "models": {
     "2B": {
-      "text": "PASS, seven non-EOS token IDs match reference",
-      "vision": "PASS, The image is red.",
-      "cpu_image_fallback": "PASS, same answer and token IDs",
-      "gui": "PASS, image attachment and rendered red answer"
+      "api": "2b-api-qualified.json",
+      "gui": "2b-gui-qualified.json",
+      "result": "PASS six API cases and actual GUI image attachment",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "2b-reference-text.json"
     },
     "4B": {
-      "text": "PASS, seven non-EOS token IDs match reference",
-      "vision": "PASS, Red",
-      "gui": "PASS, image attachment and rendered red answer"
+      "api": "4b-api-qualified.json",
+      "gui": "4b-gui-qualified.json",
+      "result": "PASS six API cases and actual GUI image attachment",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "4b-reference-text.json"
     },
     "9B": {
-      "text": "PASS, short semantic smoke",
-      "vision": "PASS, Red",
-      "gui": "PASS, image attachment and rendered red answer"
+      "api": "9b-api-qualified.json",
+      "gui": "9b-gui-qualified.json",
+      "result": "PASS six API cases and actual GUI image attachment",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "9b-reference-text.json"
     },
     "27B": {
-      "metadata": "full publisher model and projector downloaded; both SHA256 pins verified",
-      "text": "pending",
-      "vision": "PASS, Red with GUI default image limits",
-      "gui": "PASS, actual attachment and rendered streamed answer; 27b-gui.json"
+      "api": "27b-api-qualified.json",
+      "gui": "27b-gui-qualified.json",
+      "result": "PASS six API cases and actual GUI image attachment",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "27b-reference-text.json"
     }
   },
   "regression": {
@@ -44,12 +50,17 @@
     "reference_source": "https://github.com/PrismML-Eng/llama.cpp/blob/prism/tools/mtmd/models/qwen3vl.cpp"
   },
   "not_qualified": [
+    "Apple Silicon and other platforms",
     "resident GPU language decoding",
-    "tool calling",
-    "extended context",
-    "arbitrary images",
-    "throughput",
-    "cross-platform parity"
+    "model-native 262K or extended context",
+    "multiple images, audio and video"
   ],
-  "reproduction": "README.md"
+  "reproduction": "README.md",
+  "qualification_binary_sha256": "77c36fb3fefe6664cf9ce1c1e6a34f8f53b0a5af15c5445b4b88cf601ef74103",
+  "reference_divergences": "reference-divergences.json",
+  "cuda_precision_regression": {
+    "before": "Approximate CUDA encoder answered Yellow for left blue/right yellow fixture",
+    "after": "Automatic accurate f32 encoder answers Blue on all four sizes at default image limits",
+    "evidence": "vision case in each api-qualified receipt"
+  }
 }

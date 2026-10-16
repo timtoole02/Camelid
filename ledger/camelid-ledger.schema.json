@@ -64,6 +64,7 @@
         "supported_exact_row_smoke_lane",
         "supported_exact_row_smoke_lanes",
         "supported_named_exact_rows_only",
+        "supported_windows_runtime",
         "unsupported"
       ]
     },
@@ -99,13 +100,14 @@
         "exact_row_windows_x86_64_cpu_reference_short_greedy",
         "future_exact_row_planning_only",
         "phase2_exact_row_validation_only",
-        "packed_portable_text_and_single_image"
+        "packed_portable_text_and_single_image",
+        "exact_row_windows_x86_64_text_single_image_and_tools"
       ]
     },
     "fullSupportStatusVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `full_support_status:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_before_support_promotion", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_context_performance_and_portability", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support", "not_promoted"]
+      "enum": ["blocked_before_support_promotion", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_context_performance_and_portability", "blocked_pending_normalized_full_support", "blocked_pending_portability_and_bounded_context", "blocked_pending_portability_bounded_context_and_multimodal_expansion", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support", "not_promoted", "supported_windows_runtime"]
     },
     "latestCheckedResultVocabulary": {
       "type": "string",
