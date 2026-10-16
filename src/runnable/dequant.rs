@@ -79,7 +79,7 @@ pub fn dequantize(
 /// 16 + 8 interleaved five-trit bytes, then two interleaved four-trit bytes.
 /// The scale is at the END of each 28-byte block (unlike PQ2_0).
 fn dequantize_ptq1_0(bytes: &[u8], n: usize, name: &str) -> Result<Vec<f32>> {
-    if n % 128 != 0 {
+    if !n.is_multiple_of(128) {
         return Err(BackendError::InvalidTensorData(format!(
             "tensor {name} PTQ1_0 element count must be divisible by 128"
         )));

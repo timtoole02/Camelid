@@ -16,6 +16,17 @@ pub(crate) struct Transform {
 }
 
 impl Transform {
+    #[cfg(test)]
+    pub(crate) fn test_rotation(width: usize) -> Self {
+        Self {
+            block: 128,
+            signs: (0..width)
+                .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+                .collect(),
+            permutation: None,
+        }
+    }
+
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut out = input.to_vec();
         if let Some((hd, nk, rep)) = self.permutation {
@@ -193,7 +204,7 @@ impl Hadamard {
                     .find(|t| &t.name == name)
                     .ok_or_else(|| invalid(format!("missing tensor {name}")))?;
                 let width = tensor.dimensions.first().copied().unwrap_or(0) as usize;
-                if tensor.dimensions.len() != 2 || width == 0 || width % block != 0 {
+                if tensor.dimensions.len() != 2 || width == 0 || !width.is_multiple_of(block) {
                     return Err(invalid(format!("block size does not divide {name}")));
                 }
                 let sign = if signs.is_empty() {
@@ -207,7 +218,7 @@ impl Hadamard {
                 let permutation = if grouped && name.ends_with(".ssm_out.weight") {
                     let nk = gguf.metadata_u32("qwen35.ssm.group_count").unwrap_or(0) as usize;
                     let nv = gguf.metadata_u32("qwen35.ssm.time_step_rank").unwrap_or(0) as usize;
-                    if nk == 0 || nv == 0 || nv % nk != 0 || width % nv != 0 {
+                    if nk == 0 || nv == 0 || !nv.is_multiple_of(nk) || !width.is_multiple_of(nv) {
                         return Err(invalid("invalid grouped GDN geometry"));
                     }
                     Some((width / nv, nk, nv / nk))

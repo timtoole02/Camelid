@@ -640,12 +640,11 @@ impl RawMat {
     /// calling `par_matvec` on each input separately (same per-element arithmetic and
     /// accumulation order — the row dot is unchanged; only the batching differs).
     fn par_matmul(&self, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        if self.forward_transform.is_some() {
-            return xs
-                .iter()
-                .map(|x| self.par_matvec(x, "Hadamard matmul"))
-                .collect();
-        }
+        let transformed = self
+            .forward_transform
+            .as_ref()
+            .map(|transform| xs.iter().map(|x| transform.forward(x)).collect::<Vec<_>>());
+        let xs = transformed.as_deref().unwrap_or(xs);
         let m = xs.len();
         let out_f = self.out_features;
         if self.tt == GgufTensorType::I2S {
@@ -731,12 +730,15 @@ impl RawMat {
                 })
                 .collect(),
             _ => {
-                // Fallback (never hit for the Q8_0+F32 qwen35 model): per-input matvec.
-                let mut out = Vec::with_capacity(m);
-                for x in xs {
-                    out.push(self.par_matvec(x, "matmul")?);
-                }
-                return Ok(out);
+                // Unpack each row once for the whole verification batch.
+                let rows: Result<Vec<Vec<f32>>> = (0..out_f)
+                    .into_par_iter()
+                    .map(|r| {
+                        let row = self.dequant_row(r, "matmul")?;
+                        Ok(xs.iter().map(|x| dot(&row, x)).collect())
+                    })
+                    .collect();
+                rows?.into_iter().flatten().collect()
             }
         };
         // Transpose flat[r*m + p] -> out[p][r].
@@ -810,7 +812,11 @@ impl KvCache {
 
 /// A loaded runnable model: parametric config + quantized weights, ready for greedy
 /// decode. Weights are dequantized to f32 on demand during the forward pass.
+#[path = "speculative.rs"]
+mod speculative;
+
 pub struct RunnableModel {
+    source_path: String,
     pub architecture: String,
     pub d_model: usize,
     pub n_layers: usize,
@@ -1275,6 +1281,7 @@ impl RunnableModel {
             };
 
             return Ok(Self {
+                source_path: path.to_owned(),
                 architecture: arch,
                 d_model,
                 n_heads,
@@ -1441,6 +1448,7 @@ impl RunnableModel {
             }
 
             return Ok(RunnableModel {
+                source_path: path.to_owned(),
                 architecture: arch,
                 d_model,
                 n_heads,
@@ -1583,6 +1591,7 @@ impl RunnableModel {
         let logit_scale = gguf.metadata_f32(&format!("{arch}.logit_scale"));
 
         Ok(Self {
+            source_path: path.to_owned(),
             architecture: arch,
             d_model,
             n_heads,
@@ -2773,6 +2782,7 @@ struct Lfm2Runtime {
 /// Per-layer incremental state for qwen35 decode. Full-attention layers grow a
 /// standard K/V cache; SSM layers keep a causal-conv ring buffer and the recurrent
 /// per-head state matrix (`num_v_heads` × `d_state` × `d_state`).
+#[derive(Clone)]
 struct Qwen35Cache {
     rope_override: Option<(Vec<f32>, Vec<f32>)>,
     k: Vec<Vec<f32>>,
@@ -2914,9 +2924,25 @@ impl RunnableModel {
         prompt: &[u32],
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<(Qwen35Cache, Vec<f32>)> {
+        let mut cache = Qwen35Cache::new(self.qwen35.as_ref().unwrap(), self.n_layers);
+        let hidden = self.qwen35_batch_hidden(prompt, 0, &mut cache, cancelled)?;
+        let last = hidden
+            .last()
+            .ok_or_else(|| BackendError::InvalidTensorData("empty qwen35 prompt".into()))?;
+        let normed = self.apply_norm(last, &self.output_norm);
+        Ok((cache, self.output.par_matvec(&normed, "output")?))
+    }
+
+    /// Advance an existing hybrid cache in causal order; share weight reads across tokens.
+    fn qwen35_batch_hidden(
+        &self,
+        prompt: &[u32],
+        position: usize,
+        cache: &mut Qwen35Cache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<Vec<f32>>> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let m = prompt.len();
-        let mut cache = Qwen35Cache::new(rt, self.n_layers);
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(m);
         for &tok in prompt {
             let t = tok as usize;
@@ -2952,7 +2978,14 @@ impl RunnableModel {
                     let mut attn_outs = Vec::with_capacity(m);
                     for p in 0..m {
                         attn_outs.push(self.qwen35_attn_compute(
-                            q_norm, k_norm, &qg[p], &k[p], &v[p], p, li, &mut cache,
+                            q_norm,
+                            k_norm,
+                            &qg[p],
+                            &k[p],
+                            &v[p],
+                            position + p,
+                            li,
+                            cache,
                         ));
                     }
                     wo.par_matmul(&attn_outs)?
@@ -2985,7 +3018,7 @@ impl RunnableModel {
                             &z[p],
                             &beta_raw[p],
                             &alpha_raw[p],
-                            &mut cache,
+                            cache,
                         ));
                     }
                     ssm_out.par_matmul(&finals)?
@@ -3022,9 +3055,7 @@ impl RunnableModel {
             }
         }
 
-        let normed = self.apply_norm(&hidden[m - 1], &self.output_norm);
-        let logits = self.output.par_matvec(&normed, "output")?;
-        Ok((cache, logits))
+        Ok(hidden)
     }
 
     /// Greedy decode for qwen35: prefill the prompt position-by-position into the
@@ -4138,6 +4169,52 @@ impl RunnableModel {
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if self.output.forward_transform.is_some()
+            && std::env::var("CAMELID_SPEC_DECODE").as_deref() == Ok("draft")
+        {
+            let path = std::env::var("CAMELID_SPEC_DRAFT_MODEL").map_err(|_| {
+                BackendError::InvalidModelMetadata(
+                    "draft mode requires CAMELID_SPEC_DRAFT_MODEL".into(),
+                )
+            })?;
+            let target_tokens =
+                crate::tokenizer::Tokenizer::from_gguf(&read_metadata(&self.source_path)?)?;
+            let draft_tokens = crate::tokenizer::Tokenizer::from_gguf(&read_metadata(&path)?)?;
+            if target_tokens.model != draft_tokens.model
+                || target_tokens.tokens.len() != draft_tokens.tokens.len()
+                || !target_tokens
+                    .tokens
+                    .iter()
+                    .zip(&draft_tokens.tokens)
+                    .all(|(a, b)| a.text == b.text)
+            {
+                return Err(BackendError::InvalidModelMetadata(
+                    "draft and target token mappings differ".into(),
+                ));
+            }
+            let draft = Self::load(&path)?;
+            if draft.qwen35.is_none() {
+                return Err(BackendError::InvalidModelMetadata(
+                    "Bonsai draft must use the qwen35 runtime".into(),
+                ));
+            }
+            let window = std::env::var("CAMELID_SPEC_DRAFT_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+            return self.generate_qwen35_with_draft(
+                &draft,
+                window,
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                is_cancelled,
+                should_stop,
+                on_token,
+            );
+        }
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
         let (mut cache, last) = self.prefill_qwen35(prompt, Some(is_cancelled))?;

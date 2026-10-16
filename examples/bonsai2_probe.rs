@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max = args[3].parse()?;
     let stop = tokenizer.special.eog.iter().copied().collect::<Vec<_>>();
     let start = std::time::Instant::now();
+    let mut token_times = Vec::new();
     let ids = if args.len() == 6 {
         let (prefix, suffix) = prompt
             .split_once("<|image_pad|>")
@@ -33,14 +34,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &tokenizer.encode(suffix, false, true)?,
             max,
             &stop,
-            &mut |_| {},
+            &mut |_| token_times.push(start.elapsed().as_secs_f64()),
         )?
     } else {
-        model.generate_stopping(&tokenizer.encode(&prompt, false, true)?, max, &stop)?
+        model.generate_stopping_streaming(
+            &tokenizer.encode(&prompt, false, true)?,
+            max,
+            &stop,
+            &mut |_| token_times.push(start.elapsed().as_secs_f64()),
+        )?
     };
     println!(
         "{}",
-        serde_json::json!({"ids": ids, "text":tokenizer.decode(&ids, true)?, "seconds":start.elapsed().as_secs_f64()})
+        serde_json::json!({"ids": ids, "text":tokenizer.decode(&ids, true)?, "seconds":start.elapsed().as_secs_f64(), "token_seconds": token_times})
     );
     Ok(())
 }

@@ -51,8 +51,14 @@ try {
     await page.click('button[aria-label="Send message"]')
     const response = await responsePromise
     assert.ok(response.ok(), `image request returned ${response.status()}`)
-    const body = await response.text()
-    receipt.answer = body.split('\n').filter(line => line.startsWith('data: ') && !line.includes('[DONE]')).map(line => JSON.parse(line.slice(6)).choices?.[0]?.delta?.content || '').join('')
+    // Read the rendered completion: long SSE responses can be evicted from
+    // Chromium's inspector cache even though the GUI received them correctly.
+    await page.waitForFunction(() => {
+      const turns = [...document.querySelectorAll('.cxturn--assistant')]
+      const last = turns.at(-1)
+      return last && !last.classList.contains('is-streaming') && /red/i.test(last.innerText)
+    }, { timeout: 600000 })
+    receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
     assert.match(receipt.answer, /red/i)
   }
   await page.screenshot({ path: `${outputPrefix}.png`, fullPage: true })
