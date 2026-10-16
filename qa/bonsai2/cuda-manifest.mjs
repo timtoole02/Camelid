@@ -36,7 +36,7 @@ Build record (supply the actual revisions, build options and retained paths):
 }
 
 Each binary may override build_configuration and include build_command,
-build_log, built_at, and notes. Server receipt_build_id must exactly match its
+build_log, build_outputs (an array of artifact paths), built_at, and notes. Server receipt_build_id must exactly match its
 API/GUI receipt. Keep historical server binaries when receipts use an older
 build by adding another named server entry. One server entry is sufficient
 when all API/GUI receipts were regenerated with the same final build.
@@ -103,6 +103,7 @@ for (const [name, entry] of Object.entries(record.binaries)) {
     ...(entry.receipt_build_id ? { receipt_build_id: entry.receipt_build_id } : {}),
     ...(entry.build_command ? { build_command: entry.build_command } : {}),
     ...(entry.build_log ? { build_log: await fileIdentity(entry.build_log) } : {}),
+    ...(entry.build_outputs ? { build_outputs: await Promise.all(entry.build_outputs.map(fileIdentity)) } : {}),
     ...(entry.built_at ? { built_at: entry.built_at } : {}),
     ...(entry.notes ? { notes: entry.notes } : {}),
   }
@@ -127,7 +128,14 @@ const artifactPattern = /repo_id: "(prism-ml\/[^\"]+)",\s*filename: "(Ternary-Bo
 const artifacts = [...catalog.matchAll(artifactPattern)]
 assert.equal(artifacts.length, 4, 'publisher catalog must identify all four language/projector pairs')
 const cache = await receipt('cache-parity.json')
+const sampledRuntime = await receipt('sampled-draft-runtime.json')
 assert.equal(cache.data.test_binary_sha256, tests.sha256, 'retained test binary differs from cache receipt')
+const memoryLogs = []
+for (const row of cache.data.host_tests) {
+  const log = await fileIdentity(resolve(root, cache.data.log_directory, row.log))
+  assert.equal(log.sha256, row.log_sha256, `host memory regression log differs: ${row.name}`)
+  memoryLogs.push({ name: row.name, ...log, summary: row.summary })
+}
 const comparison = await receipt('comparison.json')
 assert.deepEqual(comparison.data.models.map(model => model.size), [2, 4, 9, 27])
 const models = {}
@@ -196,17 +204,23 @@ for (const [, repository, language, size, languageBytes, languageHash, projector
     reference_layer_placement: Object.fromEntries(['baseline', 'speculative'].map(mode => [mode,
       reference.data.modes[mode].offload.filter(line => /offloaded \d+\/\d+ layers to GPU/.test(line))])),
   }
+  if (size === '27') {
+    const fresh = await receipt('27b-gui-fresh.json')
+    models['27B'].receipts.fresh_process_gui = serverReceipt(fresh)
+    models['27B'].memory_regression = 'A fresh server process completed GUI text and image requests after switching PTQ tensors to immutable file mappings. The regular GUI receipt separately covers loading after the smaller models.'
+  }
 }
 
 const manifest = {
   schema_version: 2, generated_at: new Date().toISOString(), status: 'pass',
-  scope: 'Exact official Bonsai 2 2B/4B/9B/27B artifacts on Windows x86_64 CUDA, including the packaged GUI.',
+  scope: 'Exact official Bonsai 2 2B/4B/9B/27B artifacts on Windows x86_64 CUDA, including the production GUI and API served by the native library-server harness.',
   host: { ...host, identity_source: 'Consistent native/reference benchmark receipts; GPU and driver reported by reference harness.' },
   native: {
     language_backend: 'bonsai2_cuda_runtime; packed PTQ1_0 and native BF16 language computations on CUDA',
     image_backend: 'Accurate f32 CUDA image projector with the matching pinned Q8_0 companion',
     constrained_memory: '27B streams packed weights from host memory and executes language layer computations on CUDA. This is distinct from reference hybrid CPU/GPU layer execution.',
     draft: 'Same official Bonsai 2 2B model, three-token proposal window, batched target verification and recurrent/KV rollback.',
+    sampled_draft_runtime: serverReceipt(sampledRuntime),
     tested_context: '1044 prompt tokens with context recall; benchmark and device-test allocation is 2048 slots, not a full 2048-token semantic qualification.',
   },
   binaries,
@@ -220,6 +234,8 @@ const manifest = {
   models,
   device_tests: { ...cache.identity, binary: testsName, passed: cache.data.tests.length,
     coverage: 'PTQ/FWHT/embedding and BF16 fixtures; all four sizes: every logit, KV, convolution/SSM state, rollback, greedy/seeded generation, stop and cancellation; 2B attention-group and split-K boundaries.' },
+  host_memory_tests: { receipt: cache.identity, binary: testsName, passed: memoryLogs.length, logs: memoryLogs,
+    coverage: 'File mapping bounds and overflow rejection, shared tensor/tied-head lifetime, final mapping release, and borrowed PTQ/BF16/F32 CUDA upload bytes.' },
   reference: { repository: 'https://github.com/PrismML-Eng/llama.cpp', ...referenceIdentity,
     configuration_note: '2B/4B/9B fit all target layers on CUDA. 27B uses automatic hybrid CPU/GPU placement; actual per-mode placement is retained above. Draft state can change placement.' },
   performance: { ...comparison.identity,
@@ -229,6 +245,7 @@ const manifest = {
     parity_note: 'Native ordinary/draft token IDs must match exactly. Cross-engine differences and reference ordinary/draft divergences remain in comparison.json and the original receipts.',
   },
   not_qualified: ['Apple Silicon and other operating systems or GPU families',
+    'Installed Tauri desktop-package execution; GUI evidence uses the production library-server harness and bundled frontend',
     'Model-native 262K or extended context', 'Multiple images, audio and video',
     'Previous-generation DSpark assistants as Bonsai 2 drafters'],
   reproduction: 'qa/bonsai2/cuda/README.md', historical_cpu_manifest: 'qa/bonsai2/manifest.json',

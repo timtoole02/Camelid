@@ -1,18 +1,23 @@
 # Camelid Compatibility Matrix
 
-Bonsai 2 2B/4B/9B/27B PTQ1_0 is supported on Windows x86_64 for text,
-single-image GUI/API chat, sampling, and function-tool round trips. The completed
-qualification uses CPU language decoding and a CUDA or CPU image encoder.
-Packed CUDA language decoding and drafting are now implemented for all four;
-the capacity planner streams 27B weights when VRAM is insufficient while keeping
-layer computation on CUDA. Native CUDA benchmark, API, GUI, and state-parity
-qualification is in progress and does not yet widen this checked boundary.
-Context recall is checked at 1,044 prompt tokens; larger context and Apple
-Silicon require separate qualification. See
-[Bonsai 2](docs/BONSAI2.md), `qa/bonsai2/manifest.json`, and the separate
+Bonsai 2 2B/4B/9B/27B PTQ1_0 is supported on Windows x86_64 through completed
+CPU and CUDA qualifications. CUDA production GUI/API checks through the native
+library-server harness pass for all four exact publisher packs: text,
+single-image chat, sampling, function-tool round trips, and 1,044-token context
+recall. All twelve CUDA benchmark outputs match the
+pinned reference baseline and the native draft route exactly at 32 tokens;
+all four seeded API continuations also match with and without drafting.
+
+CUDA language layers compute on the GPU. On the tested RTX 3060 Laptop GPU with
+6 GiB VRAM and 16 GB host RAM, 27B streams selected packed weights from host
+memory. The final rebuilt suite passed all twelve CUDA tests and both host
+memory regressions. The [CUDA manifest](qa/bonsai2/cuda/manifest.json) binds the
+qualified models, projectors, binaries, and receipts. Larger context and Apple
+Silicon require separate qualification. See [Bonsai 2](docs/BONSAI2.md), the
+[historical CPU manifest](qa/bonsai2/manifest.json), and the
 [CUDA evidence workflow](qa/bonsai2/cuda/README.md).
 
-Last updated: 2026-10-15
+Last updated: 2026-10-16
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 

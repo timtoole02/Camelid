@@ -27,7 +27,9 @@ for (const size of [2, 4, 9, 27]) {
   assert.equal(gui.support_level, 'supported_windows_runtime')
   assert.ok(gui.generation_ready && gui.vision_ready && gui.image_input_present)
   assert.equal(gui.image_limits, 'GUI defaults')
-  assert.match(gui.answer, /red/i)
+  // The historical 2B answer is "The image is red."; the others say "Red".
+  // Check only that generated line, never the CLIENT-MEASURED footer.
+  assert.match(gui.answer.split(/\r?\n/, 1)[0], /^\s*(?:the image is )?red[.!]?\s*$/i)
   assert.match(gui.answer, /\bverified\b/i)
   assert.doesNotMatch(gui.answer, /unverified/i)
   const bench = await read(`${size}b-draft-benchmark.json`)

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "build_configuration": {
+    "profile": "release",
+    "features": ["cuda"],
+    "target_cpu": "x86-64-v3",
+    "lto": false,
+    "codegen_units": 16,
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cuda_runtime": "Installed CUDA 12.9; NVIDIA driver 576.83"
+  },
+  "binaries": {
+    "probe": {
+      "role": "probe",
+      "path": "output/bonsai2-reference/bonsai2-probe-cuda-qualified.exe",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "build_command": "cargo build --release --features cuda --example bonsai2_probe --example bonsai2_server --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": "output/bonsai2-reference/build-cuda-mapped-final.log",
+      "notes": "All runtime source and frontend changes were committed at this revision. Documentation edits during compilation account for the dirty suffix; no runtime inputs changed."
+    },
+    "tests": {
+      "role": "tests",
+      "path": "output/bonsai2-reference/bonsai2-tests-cuda-qualified.exe",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "build_command": "cargo test --release --features cuda --lib --no-run --message-format=json --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": "output/bonsai2-reference/build-cuda-tests-qualified.log",
+      "build_outputs": ["output/bonsai2-reference/build-cuda-tests-qualified.jsonl"]
+    },
+    "server": {
+      "role": "server",
+      "path": "output/bonsai2-reference/bonsai2-server-cuda-qualified.exe",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "receipt_build_id": "v0.8.0-20-gf37d1ccb-dirty",
+      "build_command": "npm --prefix frontend run build; cargo build --release --features cuda --example bonsai2_probe --example bonsai2_server --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": "output/bonsai2-reference/build-cuda-mapped-final.log",
+      "additional_source_files": [
+        "src/api/mod.rs",
+        "src/execution_plan.rs",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+        "frontend/src/hooks/useDashboardData.js",
+        "frontend/src/lib/nativeGenerationMetrics.js",
+        "frontend/src/lib/telemetryLog.js",
+        "frontend/src/lib/conversationExport.js",
+        "frontend/src/components/chat/MessageTurn.jsx",
+        "frontend/src/components/chat/render/Diagnostics.jsx",
+        "frontend/src/components/chat/render/StreamingIndicator.jsx",
+        "frontend/src/views/TelemetryView.jsx",
+        "frontend/src/views/InferenceObservatoryView.jsx"
+      ],
+      "notes": "Production API and embedded frontend through the small library-server harness. Runtime and frontend source match this commit; the dirty suffix records documentation edits made during the build. GUI/API context allocation was 8192 slots; tested context recall used 1044 prompt tokens."
+    }
+  }
+}

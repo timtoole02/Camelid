@@ -21,16 +21,8 @@ function checkTimedResult(result, tokens, label) {
   const median = result.runs.map(run => run.seconds).sort((a, b) => a - b)[1]
   assert.equal(result.seconds, median, `${label}: selected run is not the median`)
 }
-for (const size of [2, 4, 9, 27]) {
-  const filename = `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`
-  const api = await read(`${size}b-api-qualified.json`)
-  assert.equal(api.model, filename)
-  assert.equal(api.selected_backend, 'bonsai2_cuda_runtime')
-  for (const name of ['text', 'tool_call', 'tool_result', 'context_recall', 'sampled_text', 'vision_spatial']) {
-    assert.equal(api.cases.find(c => c.name === name)?.pass, true, `${size}B ${name}`)
-  }
-  const gui = await read(`${size}b-gui-supported.json`)
-  assert.equal(gui.model, filename)
+function checkGuiResult(gui, size) {
+  assert.equal(gui.model, `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`)
   assert.equal(gui.selected_backend, 'bonsai2_cuda_runtime')
   assert.equal(gui.operating_system, 'windows')
   assert.equal(gui.architecture, 'x86_64')
@@ -40,11 +32,67 @@ for (const size of [2, 4, 9, 27]) {
   assert.match(gui.text_answer, /Paris/i)
   assert.equal(gui.output_rate_source, 'client_request')
   assert.match(gui.text_answer, /tok\/s request/)
-  assert.match(gui.answer, /red/i)
+  assert.match(gui.answer.split(/\r?\n/, 1)[0], /^\s*red[.!]?\s*$/i)
   for (const answer of [gui.text_answer, gui.answer]) {
     assert.match(answer, /\bverified\b/i)
     assert.doesNotMatch(answer, /unverified/i)
   }
+}
+const sampledRuntime = await read('sampled-draft-runtime.json')
+assert.equal(sampledRuntime.schema_version, 1)
+assert.equal(sampledRuntime.platform, 'win32')
+assert.equal(sampledRuntime.selected_backend, 'bonsai2_cuda_runtime')
+assert.equal(sampledRuntime.source_log.encoding, 'utf-8')
+const sampledLogBytes = Buffer.from(sampledRuntime.source_log.text, 'utf8')
+assert.equal(sampledLogBytes.length, sampledRuntime.source_log.size_bytes)
+assert.equal(createHash('sha256').update(sampledLogBytes).digest('hex'), sampledRuntime.source_log.sha256)
+const sampledLogLines = sampledRuntime.source_log.text.split(/\r?\n/)
+const draftSummaryPattern = /^\[bonsai2-spec-cuda\] accepted (\d+)\/(\d+) drafts; (\d+) tokens in ([\d.]+)s decode$/
+const draftSummaryLines = sampledLogLines.flatMap((text, index) => draftSummaryPattern.test(text) ? [index + 1] : [])
+assert.equal(draftSummaryLines.length, 4)
+assert.equal(sampledRuntime.runs.length, 4)
+let previousSampledDate = -Infinity
+for (const [index, size] of [2, 4, 9, 27].entries()) {
+  const row = sampledRuntime.runs[index]
+  const bytes = await readFile(new URL(`cuda/${size}b-sampled-draft.json`, import.meta.url))
+  const api = JSON.parse(bytes)
+  assert.equal(row.ordinal, index + 1)
+  assert.equal(row.model, `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`)
+  assert.equal(row.model, api.model)
+  assert.equal(api.backend_build, sampledRuntime.backend_build)
+  assert.equal(api.selected_backend, sampledRuntime.selected_backend)
+  assert.equal(row.api_receipt.path, `qa/bonsai2/cuda/${size}b-sampled-draft.json`)
+  assert.equal(row.api_receipt.sha256, createHash('sha256').update(bytes).digest('hex'))
+  assert.equal(row.api_receipt.started_at, api.date)
+  assert.ok(Date.parse(api.date) > previousSampledDate, 'sampled API receipt order changed')
+  previousSampledDate = Date.parse(api.date)
+  assert.equal(row.summary.line, draftSummaryLines[index])
+  assert.equal(row.summary.text, sampledLogLines[row.summary.line - 1])
+  const [, accepted, proposed, outputTokens, decodeSeconds] = row.summary.text.match(draftSummaryPattern)
+  assert.equal(row.summary.accepted, Number(accepted))
+  assert.equal(row.summary.proposed, Number(proposed))
+  assert.ok(row.summary.proposed > 0 && row.summary.accepted <= row.summary.proposed)
+  assert.equal(row.summary.output_tokens, Number(outputTokens))
+  assert.equal(row.summary.output_tokens, 32)
+  assert.equal(row.summary.decode_seconds_reported, Number(decodeSeconds))
+  assert.ok(row.summary.decode_seconds_reported > 0)
+  const loadLine = sampledLogLines.slice(0, row.summary.line - 1)
+    .lastIndexOf('[qwen3vl] streaming CUDA projector active (bounded VRAM)') + 1
+  assert.ok(loadLine > (draftSummaryLines[index - 1] || 0))
+  assert.equal(row.preceding_load_event.line, loadLine)
+  assert.equal(row.preceding_load_event.text, sampledLogLines[loadLine - 1])
+}
+console.log('Active CUDA drafting log and recorded sequential API receipt associations verified')
+for (const size of [2, 4, 9, 27]) {
+  const filename = `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`
+  const api = await read(`${size}b-api-qualified.json`)
+  assert.equal(api.model, filename)
+  assert.equal(api.selected_backend, 'bonsai2_cuda_runtime')
+  for (const name of ['text', 'tool_call', 'tool_result', 'context_recall', 'sampled_text', 'vision_spatial']) {
+    assert.equal(api.cases.find(c => c.name === name)?.pass, true, `${size}B ${name}`)
+  }
+  const gui = await read(`${size}b-gui-supported.json`)
+  checkGuiResult(gui, size)
   const native = await read(`${size}b-native-benchmark.json`)
   const reference = await read(`${size}b-reference-benchmark.json`)
   assert.equal(native.target, filename)
@@ -114,15 +162,36 @@ for (const size of [2, 4, 9, 27]) {
   assert.deepEqual(draft.response.camelid.generated_token_ids, plain.response.camelid.generated_token_ids)
   console.log(`${size}B: CUDA API, GUI text/image, seeded drafting and reference benchmark receipts verified`)
 }
+checkGuiResult(await read('27b-gui-fresh.json'), 27)
+console.log('27B fresh-process GUI text/image and request-rate receipt verified')
 const cache = await read('cache-parity.json')
 assert.equal(cache.schema, 1)
 assert.equal(cache.pass, true)
 assert.equal(cache.platform, 'win32')
 assert.match(cache.test_binary_sha256, /^[a-f0-9]{64}$/)
 for (const file of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/hadamard.rs',
-  'src/cuda_resident.rs', 'src/cuda_resident/bonsai_spec.rs', 'src/cuda_resident/bonsai_ptq.rs', 'src/cuda_resident/bonsai_ptq.cu']) {
+  'src/wire_mmap.rs', 'src/cuda_resident.rs', 'src/cuda_resident/bonsai_spec.rs', 'src/cuda_resident/bonsai_ptq.rs', 'src/cuda_resident/bonsai_ptq.cu']) {
   assert.match(cache.source_sha256[file], /^[a-f0-9]{64}$/, `cache source hash missing: ${file}`)
 }
+const requiredHostTests = ['bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime',
+  'bonsai_upload_borrows_unchanged_packed_bytes']
+assert.equal(cache.host_tests?.length, requiredHostTests.length)
+for (const name of requiredHostTests) {
+  const matches = cache.host_tests.filter(row => row.name === name)
+  assert.equal(matches.length, 1, `missing or duplicate host memory test: ${name}`)
+  const row = matches[0]
+  assert.equal(row.pass, true)
+  assert.equal(row.model, null)
+  assert.equal(row.model_sha256, null)
+  assert.equal(row.context, 'default')
+  assert.ok(Number.isFinite(row.seconds) && row.seconds > 0)
+  assert.match(row.log_sha256, /^[a-f0-9]{64}$/)
+  assert.equal(row.log, `host-${name}.log`)
+  assert.match(row.summary, /test result: ok\. 1 passed; 0 failed/)
+  assert.equal(row.environment.CAMELID_QWEN35_CUDA, '0')
+  assert.equal(row.environment.CAMELID_QWEN35_METAL, '0')
+}
+console.log('Mapped tensor bounds/lifetime and borrowed upload memory regressions verified')
 const requiredCacheTests = [
   { name: 'bonsai_cuda_transform_projection_and_embedding', size: null, context: 'default' },
   { name: 'bonsai_cuda_bf16_projection_matches_warp_reference', size: null, context: 'default' },

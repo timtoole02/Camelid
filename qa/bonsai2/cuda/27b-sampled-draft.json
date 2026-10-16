@@ -1,0 +1,97 @@
+{
+  "model": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+  "platform": "win32",
+  "date": "2026-10-16T06:49:29.098Z",
+  "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+  "selected_backend": "bonsai2_cuda_runtime",
+  "cases": [
+    {
+      "name": "sampled_continuation",
+      "seconds": 42.57841530000001,
+      "response": {
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion",
+        "created": 1792133411,
+        "model": "bonsai2-qualification",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Rainbows form when sunlight enters a water droplet, refracts (bends) as it passes from air into water, and then reflects off the inner back"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 22,
+          "completion_tokens": 32,
+          "total_tokens": 54
+        },
+        "camelid": {
+          "generated_token_ids": [
+            57044,
+            52701,
+            1304,
+            948,
+            37728,
+            27891,
+            264,
+            2919,
+            6756,
+            10502,
+            11,
+            18766,
+            11031,
+            318,
+            65,
+            1364,
+            8,
+            430,
+            424,
+            15734,
+            494,
+            3594,
+            1083,
+            2919,
+            11,
+            321,
+            1179,
+            25133,
+            974,
+            279,
+            8906,
+            1142
+          ],
+          "lane": "runnable",
+          "architecture": "qwen35",
+          "prompt_token_ids": [
+            248045,
+            846,
+            198,
+            814,
+            20139,
+            1204,
+            10849,
+            52701,
+            1304,
+            303,
+            2250,
+            22157,
+            13,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            271,
+            248069,
+            271
+          ]
+        }
+      },
+      "pass": true
+    }
+  ]
+}

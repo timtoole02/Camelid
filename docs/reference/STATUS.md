@@ -1,29 +1,37 @@
 # Camelid Status
 
-Last updated: 2026-10-15
+Last updated: 2026-10-16
 
 TinyLlama tokenizer-reference update (2026-10-03): flat-score TinyLlama Q8_0 now uses its merge ranks and is checked against the model's own SentencePiece tokenizer instead of the pinned llama.cpp tokenizer. The existing runtime admission label is retained, but full current-gate support is on hold until the [TinyLlama refresh checklist](#tinyllama-11b-chat-q8_0) passes. Earlier llama.cpp parity, context, API/WebUI, and RSS/perf receipts remain historical evidence; they do not certify the changed tokenizer. The corrected-tokenizer evidence is [spm-flat-scores-20261002](../../qa/evidence-bundles/spm-flat-scores-20261002/README.md).
 
-Bonsai 2 addition (2026-10-15): official 2B/4B/9B/27B PTQ1_0 catalog rows include
-their distinct Q8_0 vision companions. Packed CPU and CUDA language graphs
-implement Hadamard v1/v2, including tied heads and grouped recurrent features.
-The completed Windows CPU-language qualification covers all four rows for text,
-function-tool round trips, sampled generation, 1,044-token context recall,
-spatial vision, and GUI attachment. Windows x86_64 support is enabled for those
-exact publisher artifacts within the existing evidence boundary.
+Bonsai 2 Windows CUDA qualification (2026-10-16): official 2B/4B/9B/27B PTQ1_0
+catalog rows include their distinct Q8_0 vision companions. All four now pass
+CUDA text, function-tool round trips, seeded sampling, 1,044-token context
+recall, spatial vision, and production GUI text/image checks through the native
+library-server harness. Installed Tauri execution was not part of these model
+runs; desktop shell CI is separate. The 27B GUI passes
+both a fresh load and a repeated model switch after the read-only mapping and
+borrowed-upload memory fix. GUI client timing is labelled `tok/s request`.
 
-The CUDA language and draft implementations are now present for all four.
-CUDA verification batches proposed tokens and restores device recurrent,
-convolution, and valid attention state on rejection. The capacity planner can
-stream 27B packed weights from pinned host RAM while executing its layers on
-CUDA. Native CUDA benchmark, API, GUI text/image, and cache/rollback receipts
-are in progress; no completed native CUDA qualification is claimed yet. The
-pinned Prism llama.cpp CUDA comparison side is complete, with ordinary rates
-of 205–221, 113–118, 77–80, and 1.68–1.76 tok/s for 2B/4B/9B/27B respectively;
-its same-2B-drafter cases were slower. The 27B reference uses partial GPU layer
-placement on the 6 GiB host, and its placement changes with drafting. Apple
-Silicon and extended context remain separate qualification work. Details:
-[`docs/BONSAI2.md`](../BONSAI2.md), `qa/bonsai2/manifest.json`, and the
+The completed CUDA benchmark uses three repetitions of counting, code, and
+prose for each size, with ordinary and three-token-window 2B drafting. All twelve
+native ordinary/draft outputs and reference-baseline comparisons match exactly
+at 32 tokens. All four seeded API continuations also match, with active-drafter
+counters retained. Native drafting is 1.20–1.21x on 4B counting/code, 1.59x on
+9B counting/code, and 1.38–2.19x across 27B; it slows all 2B cases and the 4B/9B
+prose cases. The pinned Prism port is faster for every measured 2B/4B/9B case.
+Camelid is 1.18–1.25x faster for ordinary 27B and 3.29–3.78x faster for draft 27B
+on this 6 GiB GPU. The engines use different 27B memory strategies: Camelid
+streams weights while all layers compute on CUDA; the port executes some
+layers on CPU and changes GPU placement when drafting.
+
+The final rebuilt suite passed all twelve CUDA tests and both host memory
+regressions. The [CUDA manifest](../../qa/bonsai2/cuda/manifest.json) records the
+completed Windows qualification; the earlier CPU qualification remains separate.
+Apple Silicon, extended context, multi-image, audio, and video are outside this
+qualification. Details: [Bonsai 2](../BONSAI2.md), the
+[complete comparison](../../qa/bonsai2/cuda/comparison.json), the
+[active-drafter receipt](../../qa/bonsai2/cuda/sampled-draft-runtime.json), and
 [CUDA reproduction/evidence workflow](../../qa/bonsai2/cuda/README.md).
 
 

@@ -1,0 +1,97 @@
+{
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "platform": "win32",
+  "date": "2026-10-16T06:47:51.327Z",
+  "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+  "selected_backend": "bonsai2_cuda_runtime",
+  "cases": [
+    {
+      "name": "sampled_continuation",
+      "seconds": 9.9152116,
+      "response": {
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion",
+        "created": 1792133281,
+        "model": "bonsai2-qualification",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "When sunlight enters a raindrop, it is dispersed into its constituent colors due to refraction and internal reflection. These colors then refract differently as they exit the"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 22,
+          "completion_tokens": 32,
+          "total_tokens": 54
+        },
+        "camelid": {
+          "generated_token_ids": [
+            4350,
+            37728,
+            27891,
+            264,
+            10849,
+            6508,
+            11,
+            424,
+            369,
+            74087,
+            1083,
+            1141,
+            71545,
+            7736,
+            4016,
+            310,
+            1985,
+            15722,
+            321,
+            5138,
+            21172,
+            13,
+            4081,
+            7736,
+            1179,
+            18766,
+            519,
+            20648,
+            430,
+            781,
+            4713,
+            279
+          ],
+          "lane": "runnable",
+          "architecture": "qwen35",
+          "prompt_token_ids": [
+            248045,
+            846,
+            198,
+            814,
+            20139,
+            1204,
+            10849,
+            52701,
+            1304,
+            303,
+            2250,
+            22157,
+            13,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            271,
+            248069,
+            271
+          ]
+        }
+      },
+      "pass": true
+    }
+  ]
+}

@@ -23,3 +23,4 @@ qa/bonsai2/tool-prompt.txt text eol=lf
 
 # Keep the CUDA manifest's receipt digests stable across Windows and Unix clones.
 qa/bonsai2/cuda/*.json text eol=lf
+qa/bonsai2/*.mjs text eol=lf

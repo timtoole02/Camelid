@@ -11,7 +11,7 @@ const report = {
   notes: [
     'Request time includes full prompt prefill and decoding; model loading and warmup are excluded for both engines.',
     'Entry points differ: native timing surrounds the Rust generation call after tokenization; reference timing includes a localhost HTTP completion request, tokenization, serialization and JSON response parsing. Model-work settings are matched; these are request-level measurements.',
-    'Native streaming callback timing can be bursty during speculation; complete request wall time is the comparison metric.',
+    'Native decode_tokens_per_second and decode_speedup are legacy callback-delivery diagnostics, not GPU decode-clock measurements. CUDA and speculation can deliver callbacks in bursts; this comparison uses complete request wall time.',
     'The llama.cpp port records its actual layer offload for each mode; a 27B target may use CPU layers on a 6 GiB GPU.',
     'Automatic fitting may assign fewer target layers to the GPU when draft state and the draft model are resident. Speedups therefore describe complete operating configurations on this hardware.',
     'Greedy speculative parity is checked independently within each engine. Differences from the reference are recorded rather than hidden.',

@@ -111,7 +111,9 @@ try {
       return turns.length >= expected && last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
     }, { timeout: 900000 }, requireCuda ? 2 : 1)
     receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
-    assert.match(receipt.answer, /red/i)
+    // The body includes footer text such as CLIENT-MEASURED, whose suffix
+    // matches /red/i even when the generated answer is the wrong color.
+    assert.match(receipt.answer.split(/\r?\n/, 1)[0], /^\s*red[.!]?\s*$/i)
     if (requireSupported) {
       assert.doesNotMatch(receipt.answer, /unverified/i)
       assert.match(receipt.answer, /\bverified\b/i)

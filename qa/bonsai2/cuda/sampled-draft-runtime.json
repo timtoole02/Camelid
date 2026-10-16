@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "platform": "win32",
+  "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+  "selected_backend": "bonsai2_cuda_runtime",
+  "association_basis": "Operator-recorded sequential 2B, 4B, 9B, 27B qualification requests in one dedicated server process. The API receipt timestamps increase in the same order. The server log records preceding projector-load events but contains no model names or timestamps; model association is not independently encoded in those log lines.",
+  "source_log": {
+    "path": "output/bonsai2-reference/cuda-server-qualified-draft.log",
+    "sha256": "d08b35ae4a49658c8b22ec39c5e5cfb1dd696cf7358d747e05762a5a7a494452",
+    "size_bytes": 1513,
+    "encoding": "utf-8",
+    "text": "[cuda] selected device 0 of 1: \"NVIDIA GeForce RTX 3060 Laptop GPU\" (compute capability 8.6) | VRAM 5122 MiB free / 6143 MiB total\r\n\r\n  ðŸª Camelid is ready\r\n  Open the chat UI:  http://127.0.0.1:28183\r\n  OpenAI-style API:  http://127.0.0.1:28183/v1/chat/completions\r\n\r\n  Workspace CLI: ready\r\n[qwen3vl] streaming CUDA projector active (bounded VRAM)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[bonsai2-spec-cuda] accepted 22/27 drafts; 32 tokens in 1.890s decode\r\n[qwen3vl] streaming CUDA projector active (bounded VRAM)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[bonsai2-spec-cuda] accepted 19/36 drafts; 32 tokens in 3.344s decode\r\n[qwen3vl] streaming CUDA projector active (bounded VRAM)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[bonsai2-spec-cuda] accepted 18/37 drafts; 32 tokens in 4.901s decode\r\n[qwen3vl] streaming CUDA projector active (bounded VRAM)\r\n[qwen35] CUDA capacity plan: 36/64 trailing layers stream from pinned host RAM; required resident weights 3180 MiB, budget 3190 MiB (free 4470 MiB, sparse KV 512 MiB, headroom 768 MiB)\r\n[qwen35] Bonsai 2 CUDA graph active (live attention groups, packed PTQ)\r\n[bonsai2-spec-cuda] accepted 20/33 drafts; 32 tokens in 13.167s decode\r\n"
+  },
+  "runs": [
+    {
+      "ordinal": 1,
+      "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+      "api_receipt": {
+        "path": "qa/bonsai2/cuda/2b-sampled-draft.json",
+        "sha256": "d271e877f16c959e1bda37d4cd9abdb59057f19de86d4c85a5547d12df73a5f1",
+        "started_at": "2026-10-16T06:47:51.327Z"
+      },
+      "preceding_load_event": {
+        "line": 8,
+        "text": "[qwen3vl] streaming CUDA projector active (bounded VRAM)"
+      },
+      "summary": {
+        "line": 11,
+        "text": "[bonsai2-spec-cuda] accepted 22/27 drafts; 32 tokens in 1.890s decode",
+        "accepted": 22,
+        "proposed": 27,
+        "output_tokens": 32,
+        "decode_seconds_reported": 1.89
+      }
+    },
+    {
+      "ordinal": 2,
+      "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+      "api_receipt": {
+        "path": "qa/bonsai2/cuda/4b-sampled-draft.json",
+        "sha256": "dc72db2de64e266b3b6422433c2567c3aa6416fe0a792b8783cd3ad2bb5f6604",
+        "started_at": "2026-10-16T06:48:16.000Z"
+      },
+      "preceding_load_event": {
+        "line": 12,
+        "text": "[qwen3vl] streaming CUDA projector active (bounded VRAM)"
+      },
+      "summary": {
+        "line": 15,
+        "text": "[bonsai2-spec-cuda] accepted 19/36 drafts; 32 tokens in 3.344s decode",
+        "accepted": 19,
+        "proposed": 36,
+        "output_tokens": 32,
+        "decode_seconds_reported": 3.344
+      }
+    },
+    {
+      "ordinal": 3,
+      "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+      "api_receipt": {
+        "path": "qa/bonsai2/cuda/9b-sampled-draft.json",
+        "sha256": "24c4910dcc1340bd8ddd45a16ff3e6cba3e19c00ca5bab28912d5e56286c9569",
+        "started_at": "2026-10-16T06:48:43.429Z"
+      },
+      "preceding_load_event": {
+        "line": 16,
+        "text": "[qwen3vl] streaming CUDA projector active (bounded VRAM)"
+      },
+      "summary": {
+        "line": 19,
+        "text": "[bonsai2-spec-cuda] accepted 18/37 drafts; 32 tokens in 4.901s decode",
+        "accepted": 18,
+        "proposed": 37,
+        "output_tokens": 32,
+        "decode_seconds_reported": 4.901
+      }
+    },
+    {
+      "ordinal": 4,
+      "model": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+      "api_receipt": {
+        "path": "qa/bonsai2/cuda/27b-sampled-draft.json",
+        "sha256": "35ed8e5e7b7c5e110e6c3001a0740636203a0d4836a44d51f627ef47d39c86cd",
+        "started_at": "2026-10-16T06:49:29.098Z"
+      },
+      "preceding_load_event": {
+        "line": 20,
+        "text": "[qwen3vl] streaming CUDA projector active (bounded VRAM)"
+      },
+      "summary": {
+        "line": 23,
+        "text": "[bonsai2-spec-cuda] accepted 20/33 drafts; 32 tokens in 13.167s decode",
+        "accepted": 20,
+        "proposed": 33,
+        "output_tokens": 32,
+        "decode_seconds_reported": 13.167
+      }
+    }
+  ]
+}
