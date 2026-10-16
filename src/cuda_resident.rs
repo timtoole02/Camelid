@@ -8838,7 +8838,8 @@ extern "C" __global__ void qwen35_ssm_rmsnorm_gate_q8_d128_batched(
     }
 }
 "#,
-    include_str!("cuda_resident/bonsai_ptq.cu")
+    include_str!("cuda_resident/bonsai_ptq.cu"),
+    include_str!("cuda_resident/bonsai_q8.cu")
 );
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode

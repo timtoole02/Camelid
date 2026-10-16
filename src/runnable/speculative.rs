@@ -685,9 +685,87 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// Requires a CUDA device and CAMELID_BONSAI_TARGET. This checks every logit
-    /// and the live attention/conv/SSM state, including an intentionally rejected
-    /// proposal suffix; matching a few argmax tokens alone is not sufficient.
+    /// Score fixed float-path continuations without feeding Q8 choices back in.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires CUDA and an official Bonsai model"]
+    fn bonsai2_cuda_teacher_forced_quality() {
+        // Score a fixed continuation under each arithmetic policy. Greedy text
+        // alone can hide near ties or accumulated probability drift.
+        let target_path = std::env::var("CAMELID_BONSAI_TARGET").unwrap();
+        let cases_path = std::env::var("CAMELID_BONSAI_QUALITY_CASES").unwrap();
+        let output_path = std::env::var("CAMELID_BONSAI_QUALITY_OUTPUT").unwrap();
+        let cases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cases_path).unwrap()).unwrap();
+        let target = RunnableModel::load(&target_path).unwrap();
+        let tokenizer =
+            crate::tokenizer::Tokenizer::from_gguf(&read_metadata(&target_path).unwrap()).unwrap();
+        let scale = 1.0_f32 / (target.head_dim as f32).sqrt();
+        let mut engine = target.build_qwen35_resident(2048).unwrap();
+        let mut report = Vec::new();
+        for (name, prompt) in [
+            ("count", include_str!("../../qa/bonsai2/count.chatml")),
+            ("code", include_str!("../../qa/bonsai2/code.chatml")),
+            ("explain", include_str!("../../qa/bonsai2/explain.chatml")),
+        ] {
+            let tokens = tokenizer.encode(prompt, false, true).unwrap();
+            let case = cases["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap();
+            let continuation: Vec<u32> = case["baseline"]["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(continuation.len(), 32);
+            engine.reset_qwen35_state().unwrap();
+            let mut logits = target
+                .prefill_qwen35_cuda_draft(&mut engine, &tokens, scale, &|| false)
+                .unwrap();
+            let mut scores = Vec::new();
+            for (offset, &token) in continuation.iter().enumerate() {
+                assert!(logits.iter().all(|v| v.is_finite()));
+                let (argmax, &maximum) = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap();
+                let normalizer = logits
+                    .iter()
+                    .map(|&v| (f64::from(v) - f64::from(maximum)).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + f64::from(maximum);
+                scores.push(serde_json::json!({ "token": token, "argmax": argmax,
+                    "log_probability": f64::from(logits[token as usize]) - normalizer,
+                    "top1_log_probability": f64::from(maximum) - normalizer }));
+                if offset + 1 < continuation.len() {
+                    let position = tokens.len() + offset;
+                    let embedding = target
+                        .token_embd
+                        .dequant_row(token as usize, "token_embd")
+                        .unwrap();
+                    let (cos, sin) =
+                        qwen35_rope_tables(position, target.rope_base, target.rope_dim);
+                    logits = engine
+                        .forward_token_logits(&embedding, &cos, &sin, position, scale)
+                        .unwrap();
+                    engine.set_filled(position + 1);
+                }
+            }
+            report.push(serde_json::json!({ "name": name, "scores": scores }));
+        }
+        std::fs::write(output_path, serde_json::to_vec_pretty(&serde_json::json!({
+            "model": target_path,
+            "projection_policy": std::env::var("CAMELID_BONSAI2_CUDA_PROJECTION").unwrap_or_else(|_| "tiled".into()),
+            "cases": report,
+        })).unwrap()).unwrap();
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires CUDA and an official Bonsai model"]

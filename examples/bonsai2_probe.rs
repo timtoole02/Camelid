@@ -63,6 +63,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model.generate_stopping_streaming(&tokens, 8, &stop, &mut |_| {})?;
             warmup_seconds.push(warmup.elapsed().as_secs_f64());
         }
+        // Benchmark repetitions share loaded weights and compiled kernels;
+        // generate_stopping_streaming resets the request's KV/recurrent state.
+        // This keeps full uncached requests while avoiding repeated NVRTC startup.
+        let repetitions = std::env::var("CAMELID_PROBE_REPETITIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        if repetitions > 1 {
+            for _ in 0..repetitions {
+                let request_start = std::time::Instant::now();
+                let mut times = Vec::new();
+                let ids = model.generate_stopping_streaming(&tokens, max, &stop, &mut |_| {
+                    times.push(request_start.elapsed().as_secs_f64());
+                })?;
+                let seconds = request_start.elapsed().as_secs_f64();
+                let cuda_active = model.cuda_language_active();
+                if std::env::var("CAMELID_PROBE_REQUIRE_CUDA").as_deref() == Ok("1") && !cuda_active
+                {
+                    return Err("CUDA language execution was required".into());
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"ids": ids, "text": tokenizer.decode(&ids, true)?,
+                    "seconds": seconds, "token_seconds": times,
+                    "backend": if cuda_active { "cuda" } else { "cpu" },
+                    "model_load_seconds": model_load_seconds, "warmup_seconds": warmup_seconds})
+                );
+            }
+            return Ok(());
+        }
         start = std::time::Instant::now();
         model.generate_stopping_streaming(&tokens, max, &stop, &mut |_| {
             token_times.push(start.elapsed().as_secs_f64())

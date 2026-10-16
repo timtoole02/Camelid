@@ -8,6 +8,7 @@ struct ResidentTransform {
     width: usize,
     signs: CudaSlice<f32>,
     scratch: Mutex<CudaSlice<f32>>,
+    quantized: Mutex<CudaSlice<u32>>,
 }
 
 pub(super) struct BonsaiKernels {
@@ -17,6 +18,11 @@ pub(super) struct BonsaiKernels {
     f32_tiles: [CudaFunction; 3],
     bf16_tiles: [CudaFunction; 3],
     legacy_projection: bool,
+    q8_projection: bool,
+    q8_fused: bool,
+    quantize: CudaFunction,
+    transform_q8: CudaFunction,
+    q8_tiles: [CudaFunction; 4],
     pub(super) embed: CudaFunction,
     // Destroy captured graphs before the transform buffers they reference.
     body_graphs: Vec<(u32, u32, SendCudaGraph)>,
@@ -55,6 +61,19 @@ impl BonsaiKernels {
             // graph capture, sampling, or placement between measurements.
             legacy_projection: std::env::var("CAMELID_BONSAI2_CUDA_PROJECTION").as_deref()
                 == Ok("baseline"),
+            q8_projection: !matches!(
+                std::env::var("CAMELID_BONSAI2_CUDA_PROJECTION").as_deref(),
+                Ok("baseline" | "tiled")
+            ),
+            q8_fused: std::env::var("CAMELID_BONSAI2_CUDA_Q8_UNFUSED").as_deref() != Ok("1"),
+            quantize: load("bonsai_quantize_q8")?,
+            transform_q8: load("bonsai_hadamard_q8")?,
+            q8_tiles: [
+                load("bonsai_q8_t1_l16")?,
+                load("bonsai_q8_t1_l32")?,
+                load("bonsai_q8_t4_l16")?,
+                load("bonsai_q8_t4_l32")?,
+            ],
             embed: load("embed_gather_ptq1_0")?,
             body_graphs: Vec::new(),
             transforms: Vec::new(),
@@ -91,12 +110,18 @@ impl BonsaiKernels {
         let scratch = stream
             .alloc_zeros::<f32>(width * MAX_PRISM_PREFILL_K)
             .map_err(|e| format!("Bonsai CUDA transform scratch: {e}"))?;
+        // Allocate before graph capture. Quantization and contraction use the
+        // ordered compute stream and reuse this per-transform scratch.
+        let quantized = stream
+            .alloc_zeros::<u32>((width / 128).div_ceil(32) * 36 * 32 * MAX_PRISM_PREFILL_K)
+            .map_err(|e| format!("Bonsai CUDA Q8 scratch: {e}"))?;
         let id = self.transforms.len();
         self.transforms.push(ResidentTransform {
             metadata,
             width,
             signs,
             scratch: Mutex::new(scratch),
+            quantized: Mutex::new(quantized),
         });
         Ok(id)
     }
@@ -173,16 +198,100 @@ impl BonsaiKernels {
             let transform = &self.transforms[id];
             debug_assert_eq!(cols, transform.width);
             debug_assert!(tokens <= MAX_PRISM_PREFILL_K);
-            self.rotate(
-                stream,
-                transform,
-                input,
-                scratch.as_mut().unwrap(),
-                tokens,
-                false,
-            )?;
+            if !self.q8_projection || !self.q8_fused {
+                self.rotate(
+                    stream,
+                    transform,
+                    input,
+                    scratch.as_mut().unwrap(),
+                    tokens,
+                    false,
+                )?;
+            }
         }
         let activation = scratch.as_deref().unwrap_or(input);
+        if self.q8_projection {
+            if let Some(id) = transform_id {
+                let mut quantized = self.transforms[id]
+                    .quantized
+                    .lock()
+                    .expect("Bonsai Q8 scratch poisoned");
+                let c = cols as i32;
+                let n = tokens as i32;
+                if self.q8_fused {
+                    let transform = &self.transforms[id];
+                    let (block, signs, permutation) = transform.metadata.cuda_parts();
+                    let (hd, nk, rep) = permutation.unwrap_or((0, 0, 0));
+                    let args = [
+                        c,
+                        block as i32,
+                        signs.len() as i32,
+                        hd as i32,
+                        nk as i32,
+                        rep as i32,
+                    ];
+                    let mut launch = stream.launch_builder(&self.transform_q8);
+                    launch.arg(input).arg(&transform.signs).arg(&mut *quantized);
+                    for arg in &args {
+                        launch.arg(arg);
+                    }
+                    unsafe {
+                        launch.launch(LaunchConfig {
+                            grid_dim: ((cols / block) as u32, tokens as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: (block * 4) as u32,
+                        })?;
+                    }
+                } else {
+                    let mut quantize = stream.launch_builder(&self.quantize);
+                    quantize
+                        .arg(activation)
+                        .arg(&mut *quantized)
+                        .arg(&c)
+                        .arg(&n);
+                    unsafe {
+                        quantize.launch(LaunchConfig {
+                            grid_dim: ((cols as u32).div_ceil(128), tokens as u32, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    }
+                }
+                // Keep K partitioning identical for scalar and batch calls:
+                // draft verification must preserve the target reduction order.
+                let narrow = cols <= 2048 || (cols <= 4096 && rows >= 32768);
+                let lanes = if narrow { 16 } else { 32 };
+                let (tile, index) = match tokens {
+                    1 => (1, 0),
+                    // Four-token tiles avoid the register/occupancy cost of
+                    // eight accumulators, also during longer prompt prefills.
+                    _ => (4, 2),
+                };
+                let kernel = &self.q8_tiles[index + usize::from(!narrow)];
+                let r = rows as i32;
+                let mut launch = stream.launch_builder(kernel);
+                launch
+                    .arg(&*quantized)
+                    .arg(weights)
+                    .arg(output)
+                    .arg(&r)
+                    .arg(&c)
+                    .arg(&residual)
+                    .arg(&n);
+                return unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (
+                            (rows as u32).div_ceil(128 / lanes),
+                            (tokens as u32).div_ceil(tile),
+                            1,
+                        ),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map(|_| ());
+            }
+        }
         let args = [rows as i32, cols as i32, residual, dense, tokens as i32];
         let (kernel, token_tile, row_tile) = if self.legacy_projection {
             (&self.matmul, 8, 4)
@@ -397,6 +506,7 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn bonsai_cuda_projection_tiles_match_legacy_bits() {
         let mut kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
+        kernels.bonsai.q8_projection = false;
         let stream = kernels.stream.clone();
         // Include partial row/token tiles, the vocabulary dispatch threshold,
         // representative widths, residual addition, and finite half-scale extremes.
@@ -471,6 +581,187 @@ mod tests {
                         );
                     }
                     assert_eq!(results[0], results[1], "rows={rows} width={width} dense={dense} tokens={tokens} residual={residual}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn bonsai_cuda_q8_quantization_projection_and_batch_parity() {
+        use crate::inference::{f16_bits_to_f32, f32_to_f16_bits};
+        let mut kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
+        kernels.bonsai.q8_projection = true;
+        let stream = kernels.stream.clone();
+        // Exercise padded K planes, both lane partitions, the vocabulary
+        // dispatch, partial token/row tiles, zero groups, and residual writes.
+        for (rows, width, block, permutation) in [
+            (7, 128, 128, None),
+            (7, 2048, 512, None),
+            (7, 4096, 512, Some((128, 8, 4))),
+            (7, 5120, 1024, None),
+            (7, 6144, 1024, Some((128, 16, 3))),
+            (32769, 4096, 4096, None),
+        ] {
+            let metadata = Arc::new(Transform::test_rotation_geometry(width, block, permutation));
+            let id = kernels
+                .bonsai
+                .register(&stream, metadata.clone(), width)
+                .unwrap();
+            let blocks = width / 128;
+            let stride = blocks.div_ceil(32) * 36 * 32;
+            let lanes = if width <= 2048 || (width <= 4096 && rows >= 32768) {
+                16
+            } else {
+                32
+            };
+            let mut weights = Vec::with_capacity(rows * blocks * 28);
+            for b in 0..rows * blocks {
+                weights.extend((0..26).map(|i| (b * 17 + i * 31) as u8));
+                weights.extend_from_slice(&0x3000_u16.to_le_bytes());
+            }
+            let device_weights = stream.clone_htod(&weights).unwrap();
+            for tokens in [1, 2, 3, 4, 5, 8, 9] {
+                let input: Vec<_> = (0..width * tokens)
+                    .map(|i| {
+                        if (i / 128) % 5 == 0 {
+                            0.0
+                        } else {
+                            ((i * 13 % 113) as f32 - 56.0) / 31.0
+                        }
+                    })
+                    .collect();
+                let rotated: Vec<_> = input
+                    .chunks_exact(width)
+                    .flat_map(|x| metadata.forward(x))
+                    .collect();
+                let device_input = stream.clone_htod(&input).unwrap();
+                let mut q = vec![0_i32; width * tokens];
+                let mut scales = vec![0.0; width * tokens / 32];
+                let mut expected_planes = vec![0_u32; stride * tokens];
+                for (group, values) in rotated.chunks_exact(32).enumerate() {
+                    let max = values.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+                    let scale = max / 127.0;
+                    let bits = f32_to_f16_bits(scale);
+                    scales[group] = f16_bits_to_f32(bits);
+                    let token = group / (width / 32);
+                    let b = (group % (width / 32)) / 4;
+                    let sub = group % 4;
+                    let base = token * stride + (b / 32) * 36 * 32 + b % 32;
+                    let mut sum = 0_i32;
+                    for (i, &x) in values.iter().enumerate() {
+                        let value = if max == 0.0 {
+                            0
+                        } else {
+                            (x / scale).round() as i32
+                        };
+                        q[group * 32 + i] = value;
+                        sum += value;
+                        expected_planes[base + (sub * 8 + i / 4) * 32] |=
+                            (value as u32 & 255) << ((i % 4) * 8);
+                    }
+                    expected_planes[base + (32 + sub) * 32] =
+                        u32::from(bits) | ((sum as u32 & 65535) << 16);
+                }
+                let initial: Vec<_> = (0..rows * tokens).map(|i| (i % 53) as f32 / 19.0).collect();
+                for residual in [0, 1] {
+                    kernels.bonsai.q8_fused = residual == 0;
+                    let mut output = stream.clone_htod(&initial).unwrap();
+                    kernels
+                        .bonsai
+                        .project(
+                            &stream,
+                            ProjQuant::Ptq1_0(id),
+                            &device_input,
+                            &device_weights.as_view(),
+                            rows,
+                            width,
+                            tokens,
+                            &mut output,
+                            residual,
+                        )
+                        .unwrap();
+                    let actual = stream.clone_dtoh(&output).unwrap();
+                    {
+                        let planes = kernels.bonsai.transforms[id].quantized.lock().unwrap();
+                        let device_planes =
+                            stream.clone_dtoh(&planes.slice(..stride * tokens)).unwrap();
+                        assert_eq!(
+                            device_planes, expected_planes,
+                            "Q8 bytes width={width} tokens={tokens}"
+                        );
+                    }
+                    for token in 0..tokens {
+                        let single_input = stream
+                            .clone_htod(&input[token * width..(token + 1) * width])
+                            .unwrap();
+                        let mut single_output = stream
+                            .clone_htod(&initial[token * rows..(token + 1) * rows])
+                            .unwrap();
+                        kernels
+                            .bonsai
+                            .project(
+                                &stream,
+                                ProjQuant::Ptq1_0(id),
+                                &single_input,
+                                &device_weights.as_view(),
+                                rows,
+                                width,
+                                1,
+                                &mut single_output,
+                                residual,
+                            )
+                            .unwrap();
+                        let single = stream.clone_dtoh(&single_output).unwrap();
+                        assert_eq!(
+                            single,
+                            actual[token * rows..(token + 1) * rows],
+                            "Q8 scalar/batch width={width} tokens={tokens}"
+                        );
+                        for row in [0, 1, 3, rows - 1] {
+                            let mut partial = vec![0.0_f32; lanes];
+                            for (lane, accumulator) in partial.iter_mut().enumerate() {
+                                for b in (lane..blocks).step_by(lanes) {
+                                    let packed = &weights[(row * blocks + b) * 28..];
+                                    let mut subtotal = 0.0_f32;
+                                    for sub in 0..4 {
+                                        let mut dot = 0_i32;
+                                        for i in 0..32 {
+                                            let pos = sub * 32 + i;
+                                            let (byte, digit) = if pos < 80 {
+                                                (pos % 16, pos / 16)
+                                            } else if pos < 120 {
+                                                (16 + (pos - 80) % 8, (pos - 80) / 8)
+                                            } else {
+                                                (24 + (pos - 120) % 2, (pos - 120) / 2)
+                                            };
+                                            let code =
+                                                packed[byte].wrapping_mul(3_u8.pow(digit as u32));
+                                            let trit = ((u16::from(code) * 3) >> 8) as i32 - 1;
+                                            dot += trit * q[token * width + b * 128 + pos];
+                                        }
+                                        subtotal +=
+                                            scales[token * width / 32 + b * 4 + sub] * dot as f32;
+                                    }
+                                    *accumulator += 0.125 * subtotal;
+                                }
+                            }
+                            let mut step = lanes / 2;
+                            while step > 0 {
+                                for lane in 0..lanes - step {
+                                    partial[lane] += partial[lane + step];
+                                }
+                                step /= 2;
+                            }
+                            let expected = if residual == 0 {
+                                partial[0]
+                            } else {
+                                initial[token * rows + row] + partial[0]
+                            };
+                            assert_eq!(actual[token * rows + row].to_bits(), expected.to_bits(),
+                                "Q8 CPU reference width={width} row={row} token={token} residual={residual}");
+                        }
+                    }
                 }
             }
         }
@@ -567,6 +858,7 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn bonsai_cuda_transform_projection_and_embedding() {
         let mut kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
+        kernels.bonsai.q8_projection = false;
         let stream = kernels.stream.clone();
         for (block, width, permutation) in [
             (512, 2048, None),
