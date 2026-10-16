@@ -22,7 +22,7 @@
     "4B": {
       "text": "PASS, seven non-EOS token IDs match reference",
       "vision": "PASS, Red",
-      "gui": "pending"
+      "gui": "PASS, image attachment and rendered red answer"
     },
     "9B": {
       "text": "PASS, short semantic smoke",

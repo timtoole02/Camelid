@@ -2828,8 +2828,8 @@ impl RunnableModel {
         Ok(logits)
     }
 
-    /// Batched prompt prefill: process ALL prompt positions through the stack, reading
-    /// each weight once per layer (`par_matmul`) instead of once per token — the
+    /// Batched prompt prefill: process bounded chunks through the stack, reading
+    /// each weight once per layer and chunk (`par_matmul`) instead of once per token — the
     /// memory-bandwidth amortization that makes the prompt fast. Builds `cache` (KV for
     /// full-attn layers; conv + recurrent state for SSM layers) identically to running
     /// `decode_token_qwen35` over the prompt — causal attention means each position
@@ -2925,7 +2925,10 @@ impl RunnableModel {
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<(Qwen35Cache, Vec<f32>)> {
         let mut cache = Qwen35Cache::new(self.qwen35.as_ref().unwrap(), self.n_layers);
-        let hidden = self.qwen35_batch_hidden(prompt, 0, &mut cache, cancelled)?;
+        let mut hidden = Vec::new();
+        for (chunk, tokens) in prompt.chunks(128).enumerate() {
+            hidden = self.qwen35_batch_hidden(tokens, chunk * 128, &mut cache, cancelled)?;
+        }
         let last = hidden
             .last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty qwen35 prompt".into()))?;
@@ -2941,7 +2944,6 @@ impl RunnableModel {
         cache: &mut Qwen35Cache,
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<Vec<Vec<f32>>> {
-        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let m = prompt.len();
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(m);
         for &tok in prompt {
@@ -2954,6 +2956,22 @@ impl RunnableModel {
             }
             hidden.push(self.token_embd.dequant_row(t, "token_embd")?);
         }
+
+        self.qwen35_batch_embeddings(hidden, position, None, cache, cancelled)
+    }
+
+    /// Image rows carry their own logical IMRoPE coordinates; physical KV slots
+    /// remain contiguous. Bound prompt batches to keep temporary activations small.
+    fn qwen35_batch_embeddings(
+        &self,
+        mut hidden: Vec<Vec<f32>>,
+        position: usize,
+        rope_positions: Option<&[[usize; 4]]>,
+        cache: &mut Qwen35Cache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let m = hidden.len();
 
         for (li, layer) in rt.layers.iter().enumerate() {
             if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
@@ -2977,6 +2995,14 @@ impl RunnableModel {
                     let v = wv.par_matmul(&xn)?;
                     let mut attn_outs = Vec::with_capacity(m);
                     for p in 0..m {
+                        if let Some(positions) = rope_positions {
+                            cache.rope_override = Some(qwen35_imrope_tables(
+                                positions[p],
+                                rt.rope_sections,
+                                self.rope_base,
+                                self.rope_dim,
+                            ));
+                        }
                         attn_outs.push(self.qwen35_attn_compute(
                             q_norm,
                             k_norm,
@@ -3397,21 +3423,26 @@ impl RunnableModel {
         for (i, &token) in suffix.iter().enumerate() {
             inputs.push((embed(token)?, [suffix_start + i; 4]));
         }
-        let mut logits = Vec::new();
-        for (slot, (embedding, positions)) in inputs.into_iter().enumerate() {
-            cache.rope_override = Some(qwen35_imrope_tables(
-                positions,
-                rt.rope_sections,
-                self.rope_base,
-                self.rope_dim,
-            ));
-            logits = self.decode_hidden_qwen35(
-                embedding,
-                slot,
+        let mut last_hidden = Vec::new();
+        for (chunk_index, chunk) in inputs.chunks(64).enumerate() {
+            let embeddings = chunk
+                .iter()
+                .map(|(embedding, _)| embedding.clone())
+                .collect();
+            let positions: Vec<_> = chunk.iter().map(|(_, positions)| *positions).collect();
+            last_hidden = self.qwen35_batch_embeddings(
+                embeddings,
+                chunk_index * 64,
+                Some(&positions),
                 &mut cache,
-                slot + 1 == cursor.kv_position,
+                None,
             )?;
         }
+        let normed = self.apply_norm(
+            last_hidden.last().expect("nonempty image prompt"),
+            &self.output_norm,
+        );
+        let mut logits = self.output.par_matvec(&normed, "output")?;
         let sampler = sampling.map(|s| LlamaSampler::Sampling(s.clone()));
         let mut history = [prefix, suffix].concat();
         let mut out = Vec::with_capacity(max_new);

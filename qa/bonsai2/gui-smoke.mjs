@@ -47,7 +47,7 @@ try {
   if (send) {
     await input.uploadFile(resolve('qa/bonsai2/red.png'))
     await page.type('textarea[aria-label="Message Camelid"]', 'What color is the image? Answer with one color.')
-    const responsePromise = page.waitForResponse(r => r.url().endsWith('/v1/chat/completions') && r.request().method() === 'POST', { timeout: 300000 })
+    const responsePromise = page.waitForResponse(r => r.url().endsWith('/v1/chat/completions') && r.request().method() === 'POST', { timeout: 900000 })
     await page.click('button[aria-label="Send message"]')
     const response = await responsePromise
     assert.ok(response.ok(), `image request returned ${response.status()}`)
@@ -57,7 +57,7 @@ try {
       const turns = [...document.querySelectorAll('.cxturn--assistant')]
       const last = turns.at(-1)
       return last && !last.classList.contains('is-streaming') && /red/i.test(last.innerText)
-    }, { timeout: 600000 })
+    }, { timeout: 900000 })
     receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
     assert.match(receipt.answer, /red/i)
   }

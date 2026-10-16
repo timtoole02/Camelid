@@ -14,6 +14,24 @@ The probe uses four merged image tokens. Its output includes generated token IDs
 decoded text, and elapsed generation time. EOS is consumed rather than returned.
 For encoder diagnostics, `CAMELID_PROBE_EMBEDDINGS` may name a JSON output file.
 
+`gui-smoke.mjs` exercises an actual image attachment and the rendered streamed
+answer through a dedicated test server. The `bonsai2_server` example runs the
+production API without CLI startup work; set `CAMELID_DATA_DIR`,
+`CAMELID_RESPONSES_DB` and `CAMELID_WORKSPACE_MEMORY_DB` to isolated test paths.
+
+The draft benchmark runs plain and speculative decoding in separate processes:
+
+```sh
+node qa/bonsai2/spec-benchmark.mjs PROBE TARGET.gguf DRAFT.gguf RESULT.json 48
+```
+
+It records token IDs, first-token and total latency, streaming decode rate,
+accepted/proposed draft counts, and before/after ratios. Token disagreement fails
+the run. Streaming rate excludes time before the first visible token; total
+latency includes draft loading and both prefills. Neither metric is an SLA.
+Prism's official DSpark drafters target the earlier Bonsai generation; this
+benchmark uses an independent Qwen3.5 model with an identical token mapping.
+
 Reference: PrismML-Eng/llama.cpp release `prism-b10777-e3de715`, CPU execution,
 greedy sampling, thinking disabled, image minimum/maximum tokens both four.
 Text comparison uses the exact raw prompt in `text-prompt.txt`; image comparison
