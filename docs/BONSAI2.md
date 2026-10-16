@@ -51,6 +51,30 @@ Validation results and exact source references are recorded in
 [`qa/bonsai2/manifest.json`](../qa/bonsai2/manifest.json). The reproducible native
 probe is `examples/bonsai2_probe.rs`.
 
+Windows x86_64 is the first qualification target. Apple Silicon has a separate
+qualification gate; a Windows result does not certify the Metal backend.
+
+## Draft-model decoding
+
+The portable Bonsai 2 text runtime accepts an independent Qwen3.5 draft model
+through the existing server options:
+
+```sh
+camelid serve --model TARGET.gguf --spec-decode draft --spec-draft-model Ternary-Bonsai-2-2B-PTQ1_0.gguf --spec-draft-tokens 3
+```
+
+The draft and target must have the same token mapping. The target verifies every
+proposal, and rejection restores attention, convolution, and recurrent state.
+The target remains responsible for request sampling. Image requests currently
+use the ordinary multimodal decoder.
+
+Prism's published DSpark assistants target the earlier Bonsai generation.
+[The publisher's speculative-decoding guide](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md)
+does not provide a Bonsai 2 DSpark assistant. The independent 2B draft route above
+is a separate implementation. Use `qa/bonsai2/spec-benchmark.mjs` to compare its
+output and elapsed time against the same target without drafting; acceptance
+rate and net speed depend on the target, prompt, and hardware.
+
 Publisher references: [2B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf),
 [4B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf),
 [9B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf), and

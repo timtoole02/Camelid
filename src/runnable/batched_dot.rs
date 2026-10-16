@@ -28,8 +28,8 @@ impl BatchedInputs {
         for tile in self.tiles.chunks_exact(self.width) {
             let mut sums = [0.0_f32; 8];
             for (&weight, inputs) in row.iter().zip(tile) {
-                for p in 0..8 {
-                    sums[p] += weight * inputs[p];
+                for (sum, input) in sums.iter_mut().zip(inputs) {
+                    *sum += weight * input;
                 }
             }
             output.extend(sums);

@@ -45,13 +45,16 @@ for (const name of cases) {
   const path = resolve(`qa/bonsai2/${name}.chatml`)
   await readFile(path) // fail before spawning if a prompt was omitted
   const baseline = await run(path, false)
+  const row = { name, baseline }
+  report.cases.push(row)
+  await writeFile(output, JSON.stringify(report, null, 2))
+  console.log(JSON.stringify({ name, phase: 'baseline', seconds: baseline.seconds, tokens: baseline.ids.length }))
   const speculative = await run(path, true)
   const parity = JSON.stringify(baseline.ids) === JSON.stringify(speculative.ids)
-  const row = { name, parity, baseline, speculative,
+  Object.assign(row, { parity, speculative,
     decode_speedup: speculative.decode_tokens_per_second / baseline.decode_tokens_per_second,
     total_speedup: baseline.seconds / speculative.seconds,
-  }
-  report.cases.push(row)
+  })
   await writeFile(output, JSON.stringify(report, null, 2))
   console.log(JSON.stringify({ name, parity, decode_speedup: row.decode_speedup, total_speedup: row.total_speedup }))
   assert.ok(parity, `${name}: draft output differs from target`)

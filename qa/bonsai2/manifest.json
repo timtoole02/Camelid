@@ -30,10 +30,10 @@
       "gui": "PASS, image attachment and rendered red answer"
     },
     "27B": {
-      "metadata": "publisher header and transform contract inspected",
+      "metadata": "full publisher model and projector downloaded; both SHA256 pins verified",
       "text": "pending",
-      "vision": "pending",
-      "gui": "pending"
+      "vision": "PASS, Red with GUI default image limits",
+      "gui": "PASS, actual attachment and rendered streamed answer; 27b-gui.json"
     }
   },
   "regression": {

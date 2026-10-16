@@ -4,7 +4,7 @@ import http from 'node:http'
 import { basename, resolve } from 'node:path'
 import { readFile, writeFile } from 'node:fs/promises'
 
-const [model, output, api = 'http://127.0.0.1:28182', selected = 'text,tools,context,sampling'] = process.argv.slice(2)
+const [model, output, api = 'http://127.0.0.1:28182', selected = 'text,tools,context,sampling,vision'] = process.argv.slice(2)
 assert.ok(model && output, 'MODEL_PATH OUTPUT required')
 const cases = new Set(selected.split(','))
 function request(path, body) {
@@ -34,7 +34,8 @@ for (let i = 0; i < 180; i++) {
 }
 assert.equal(health.generation_ready, true)
 assert.equal(health.vision_ready, true)
-const report = { model: basename(model), platform: process.platform, date: new Date().toISOString(), cases: [] }
+const report = { model: basename(model), platform: process.platform, date: new Date().toISOString(),
+  backend_build: health.build, selected_backend: health.execution_plan?.selected_backend, cases: [] }
 async function check(name, body, validate) {
   const start = performance.now()
   const response = await request('/v1/chat/completions', {
@@ -75,3 +76,9 @@ if (cases.has('context')) await check('context_recall', {
 if (cases.has('sampling')) await check('sampled_text', {
   messages: [user('What is 2 plus 2? Answer with one number.')], temperature: 0.7, seed: 42, max_tokens: 16,
 }, r => assert.match(content(r), /4|four/i))
+if (cases.has('vision')) await check('vision_spatial', {
+  messages: [user([
+    { type: 'text', text: 'What color is on the left half of the image? Answer with one color.' },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${(await readFile(new URL('./blue-yellow.png', import.meta.url))).toString('base64')}` } },
+  ])], max_tokens: 16,
+}, r => assert.match(content(r), /blue/i))

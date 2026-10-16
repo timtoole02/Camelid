@@ -25,6 +25,24 @@ The draft benchmark runs plain and speculative decoding in separate processes:
 node qa/bonsai2/spec-benchmark.mjs PROBE TARGET.gguf DRAFT.gguf RESULT.json 48
 ```
 
+Set `CAMELID_BENCH_CASES=count,code,explain` to select cases and
+`CAMELID_SPEC_DRAFT_TOKENS` to select the draft window. The default window is 3.
+Build the probe from the same source tree whose hashes the report records.
+Run timing comparisons with other model servers and compiler jobs stopped.
+
+The API qualification harness checks text, a function call and its result,
+context recall, and sampled generation through the production endpoint:
+
+```sh
+node qa/bonsai2/api-qualification.mjs MODEL.gguf RESULT.json http://127.0.0.1:28182 text,tools,context,sampling,vision
+```
+
+For a GUI run that retains normal image sizing, add `--send --default-image`
+to `gui-smoke.mjs`. Output length is bounded to 16 tokens; the actual attachment,
+request construction, streaming renderer, and image limits remain in use.
+`blue-yellow.png` tests spatial color recognition at default sizing; regenerate
+it with `node qa/bonsai2/make-vision-fixture.mjs`.
+
 It records token IDs, first-token and total latency, streaming decode rate,
 accepted/proposed draft counts, and before/after ratios. Token disagreement fails
 the run. Streaming rate excludes time before the first visible token; total
