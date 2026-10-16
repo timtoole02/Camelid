@@ -82,3 +82,9 @@ if (cases.has('vision')) await check('vision_spatial', {
     { type: 'image_url', image_url: { url: `data:image/png;base64,${(await readFile(new URL('./blue-yellow.png', import.meta.url))).toString('base64')}` } },
   ])], max_tokens: 16,
 }, r => assert.match(content(r), /blue/i))
+// Capture once with ordinary decoding and once with the draft enabled; compare
+// generated_token_ids from the two receipts to check seeded request sampling.
+if (cases.has('sampling_long')) await check('sampled_continuation', {
+  messages: [user('Explain how rainbows form in three sentences.')],
+  temperature: 0.7, seed: 42, max_tokens: 32,
+}, r => assert.equal(r.camelid?.generated_token_ids?.length, 32))

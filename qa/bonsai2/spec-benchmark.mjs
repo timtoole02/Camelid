@@ -3,6 +3,8 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { readFile, writeFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { cpus, totalmem } from 'node:os'
 import { basename, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -37,11 +39,19 @@ async function run(prompt, speculative) {
   }
 }
 const digest = bytes => createHash('sha256').update(bytes).digest('hex')
+async function fileDigest(path) {
+  const hash = createHash('sha256')
+  for await (const bytes of createReadStream(path)) hash.update(bytes)
+  return hash.digest('hex')
+}
 const source = {}
 for (const path of ['src/runnable/model.rs', 'src/runnable/speculative.rs', 'src/runnable/batched_dot.rs']) {
   source[path] = digest(await readFile(path))
 }
 const report = { target: basename(target), draft: basename(draft), date: new Date().toISOString(),
+  platform: process.platform, architecture: process.arch, cpu: cpus()[0]?.model, physical_memory_bytes: totalmem(),
+  build_notes: process.env.CAMELID_BENCH_BUILD || null,
+  target_sha256: await fileDigest(target), draft_sha256: await fileDigest(draft),
   probe_sha256: digest(await readFile(probe)), source_sha256: source,
   threads: 8, draft_tokens: Number(window), max_tokens: Number(tokens), cases: [] }
 for (const name of cases) {
@@ -54,7 +64,7 @@ for (const name of cases) {
     assert.ok(expected, `missing reference case ${name}`)
     const length = Math.min(baseline.ids.length, expected.ids.length)
     row.reference = { compared_tokens: length,
-      prefix_matches: JSON.stringify(baseline.ids.slice(0, length)) === JSON.stringify(expected.ids.slice(0, length)),
+      prefix_matches: length > 0 && JSON.stringify(baseline.ids.slice(0, length)) === JSON.stringify(expected.ids.slice(0, length)),
       expected_ids: expected.ids, expected_text: expected.text }
   }
   report.cases.push(row)
