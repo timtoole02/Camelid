@@ -312,6 +312,21 @@ impl CudaResidentDecode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bonsai_upload_borrows_unchanged_packed_bytes() {
+        for (lane, length) in [
+            (ProjQuant::Ptq1_0(0), 28),
+            (ProjQuant::BF16, 256),
+            (ProjQuant::F32, 512),
+        ] {
+            let bytes: Vec<u8> = (0..length).map(|value| (value * 31) as u8).collect();
+            let repacked = repack_for_lane(&bytes, lane, 1, 128, false).unwrap();
+            assert!(matches!(repacked, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(repacked.as_ptr(), bytes.as_ptr());
+            assert_eq!(repacked.as_ref(), bytes);
+        }
+    }
+
     fn warp_dot(weights: &[f32], input: &[f32]) -> f32 {
         let mut partial = [0.0_f32; 32];
         for (lane, sum) in partial.iter_mut().enumerate() {

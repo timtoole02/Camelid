@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 
 import { extractSseEvents, readChatCompletionJsonPayload, readStreamingChatCompletion } from '../src/lib/chatCompletionStream.js'
-import { authoritativeOutputRate, describeMtp12WidthSchedule, readTargetVerifiedMtp12 } from '../src/lib/nativeGenerationMetrics.js'
+import { authoritativeOutputRate, describeMtp12WidthSchedule, readTargetVerifiedMtp12, requestOutputRate } from '../src/lib/nativeGenerationMetrics.js'
 
 const partial = 'data: {"choices":[{"delta":{"content":"hel"}}]}\r\n\r\ndata: {"choices":[{"delta":{"content":"lo"}}]}'
 const firstPass = extractSseEvents(partial)
@@ -87,6 +87,24 @@ assert.deepEqual(
 )
 assert.equal(authoritativeOutputRate({ camelid: streamed.camelid, tokens_out_per_sec: 2 }), 51.494, 'native target-verified rate should outrank the browser estimate')
 assert.equal(authoritativeOutputRate({ camelid: { mtp12: { lossless_target_verified: false, decode_tokens_per_second: 99 } }, tokens_out_per_sec: 2 }), 2, 'unverified native claims must not replace the browser estimate')
+const burstPayloads = [
+  ...['The', ' capital', ' of', ' France', ' is', ' Paris', '.'].map((content) => `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`),
+  'data: {"choices":[],"usage":{"prompt_tokens":24,"completion_tokens":7,"total_tokens":31}}\n\n',
+  'data: [DONE]\n\n',
+]
+for (const chunks of [[burstPayloads.join('')], burstPayloads]) {
+  const burst = await readStreamingChatCompletion(new Response(streamFromChunks(chunks), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  }), () => {})
+  assert.equal(burst.content, 'The capital of France is Paris.')
+  assert.equal(burst.completionTokens, 7, 'CUDA burst delivery must preserve all backend output tokens')
+  assert.equal(requestOutputRate(burst.usage.completion_tokens, 1500), 7 / 1.5, 'one or many SSE chunks must report 7 tokens / 1.5 seconds, not callback spacing')
+}
+assert.equal(requestOutputRate(1, 1000), 1, 'the request rate includes the first output token')
+for (const [tokens, duration] of [[0, 1500], [7, 0], [7, -1], [7, null], [NaN, 1500], [7, Infinity]]) {
+  assert.equal(requestOutputRate(tokens, duration), null, 'invalid or empty measurements must not invent a request rate')
+}
 assert.ok(streamEvents.includes('bytes'), 'stream parser should expose first-byte progress before content')
 assert.ok(streamEvents.includes('role'), 'stream parser should expose role-only chunks while waiting for first content token')
 assert.ok(streamEvents.includes('usage'), 'stream parser should expose backend usage chunks before finalizing the assistant row')

@@ -18,6 +18,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
     ? `${(Number(message.first_content_ms) / 1000).toFixed(2)}s`
     : null
   const outputRate = formatRate(message.tokens_out_per_sec)
+  const requestRate = message.output_rate_source === 'client_request'
 
   const weightLoadTime = metrics.weight_load ? formatDurationMs(metrics.weight_load) : null
   const totalGenTime = metrics.generate ? formatDurationMs(metrics.generate) : null
@@ -31,7 +32,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
       >
         <span className="trigger-icon" aria-hidden="true"><IconChart size={14} /></span>
         <span>Developer Diagnostics</span>
-        {outputRate && <span className="trigger-badge">{outputRate}</span>}
+        {outputRate && <span className="trigger-badge">{outputRate}{requestRate ? ' request' : ''}</span>}
       </button>
 
       {isOpen && (
@@ -44,8 +45,8 @@ export function DeveloperDiagnosticsBlock({ message }) {
               </div>
             )}
             {outputRate && (
-              <div className="summary-card" data-native-rate={message.tokens_out_per_sec ?? undefined}>
-                <span className="card-label">Decode Rate</span>
+              <div className="summary-card" data-native-rate={requestRate ? undefined : message.tokens_out_per_sec ?? undefined} data-rate-source={message.output_rate_source}>
+                <span className="card-label">{requestRate ? 'Request Output Rate' : 'Decode Rate'}</span>
                 <strong className="card-value">{outputRate}</strong>
               </div>
             )}

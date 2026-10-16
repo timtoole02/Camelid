@@ -159,6 +159,11 @@ jobs:
       - name: Check public evidence claims
         run: node scripts/check-public-evidence-claims.mjs
 
+      - name: Check Bonsai 2 Windows CPU and CUDA qualification receipts
+        run: |
+          node qa/bonsai2/check-evidence.mjs
+          node qa/bonsai2/check-cuda-evidence.mjs
+
       - name: Check ledger schema (camelid.ledger/v1)
         run: node scripts/check-ledger-schema.mjs
 
@@ -824,6 +829,10 @@ jobs:
       - name: Frontend UI regression smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
+
+      - name: Frontend request-rate provenance smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/request-rate-provenance-smoke.mjs
 
       - name: Structured output smoke
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

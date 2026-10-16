@@ -146,7 +146,9 @@ The reference side is complete using the official PrismML-Eng/llama.cpp
 counting, code, and prose prompts, 32 generated tokens, eight CPU threads,
 2048 context slots, f16 KV, greedy sampling, an eight-token warmup, and three
 measured repetitions. Rates use the median complete request duration, including
-uncached prefill and excluding model loading and warmup. These timings use a
+uncached prefill and excluding model loading and warmup. Native timing begins
+after tokenization at the Rust generation call; reference timing also includes
+localhost HTTP, tokenization, and JSON response overhead. These timings use a
 different protocol from the historical CPU table above.
 
 The table contains **reference-port results only**, as the range across the

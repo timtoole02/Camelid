@@ -38,6 +38,8 @@ for (const size of [2, 4, 9, 27]) {
   assert.ok(gui.generation_ready && gui.vision_ready && gui.image_input_present)
   assert.equal(gui.image_limits, 'GUI defaults')
   assert.match(gui.text_answer, /Paris/i)
+  assert.equal(gui.output_rate_source, 'client_request')
+  assert.match(gui.text_answer, /tok\/s request/)
   assert.match(gui.answer, /red/i)
   for (const answer of [gui.text_answer, gui.answer]) {
     assert.match(answer, /\bverified\b/i)

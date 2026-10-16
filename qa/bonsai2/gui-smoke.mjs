@@ -68,13 +68,26 @@ try {
     await page.type('textarea[aria-label="Message Camelid"]', 'What is the capital of France? Answer in one sentence.')
     const responsePromise = page.waitForResponse(r => r.url().endsWith('/v1/chat/completions') && r.request().method() === 'POST', { timeout: 900000 })
     await page.click('button[aria-label="Send message"]')
-    assert.ok((await responsePromise).ok(), 'CUDA text request failed')
+    const textResponse = await responsePromise
+    assert.ok(textResponse.ok(), 'CUDA text request failed')
     await page.waitForFunction(() => {
       const last = [...document.querySelectorAll('.cxturn--assistant')].at(-1)
       return last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
     }, { timeout: 900000 })
     receipt.text_answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
+    if (!/Paris/i.test(receipt.text_answer)) {
+      // Headers can be 200 even when cold CUDA setup fails inside the SSE body.
+      // Keep that diagnostic in the runner log instead of losing it behind the
+      // GUI's short error message. Successful public receipts contain no trace.
+      console.error('CUDA text SSE:', await textResponse.text().catch(error => error.message))
+    }
     assert.match(receipt.text_answer, /Paris/i)
+    // CUDA callbacks can arrive as one burst; the browser must label its
+    // full-request clock rather than presenting callback spacing as decode rate.
+    if (process.argv.includes('--require-request-rate')) {
+      assert.match(receipt.text_answer, /tok\/s request/)
+      receipt.output_rate_source = 'client_request'
+    }
     if (requireSupported) {
       assert.doesNotMatch(receipt.text_answer, /unverified/i)
       assert.match(receipt.text_answer, /\bverified\b/i)

@@ -119,19 +119,19 @@ assert.match(hookSource, /camelid_target_verified_render_draft_token_ids: target
 assert.match(hookSource, /: targetVerifiedDraftTokenIds\.length/, 'monolithic visible render bound must equal the authoritative draft length')
 assert.match(hookSource, /targetVerifiedSegments\.reduce\(\(sum, segment\) => sum \+ segment\.token_ids\.length, 0\)/, 'segmented visible render bound must equal the sum of authoritative section drafts')
 assert.match(hookSource, /\(targetVerifiedSegmentedDiagnostics \|\| targetVerifiedRenderDiagnostics\)\.render_tokens_per_second/, 'two-pass final rate must use the backend target-verification clock')
-assert.match(hookSource, /const liveTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200\s*\n\s*\? tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'two-pass live UI must expose the real browser-observed stream delivery rate after a stable measurement window')
+assert.match(hookSource, /const liveDeliveryTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200\s*\n\s*\? tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'two-pass live UI must retain its stream delivery rate after a stable measurement window')
 assert.match(hookSource, /videoRigOptIn: isGemma4Mtp12TargetVerifiedVideoOptedIn\(\)/, 'the frontend gate must read the narrow video-only localStorage opt-in')
 assert.match(hookSource, /camelid_target_verified_render_segments: targetVerifiedSegments/)
 assert.match(hookSource, /camelid_expected_gguf_sha256: '93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b'/)
 assert.match(hookSource, /prepared_web_research_multi_pass_lossless/)
 
 const diagnosticsSource = await readFile(new URL('../src/components/chat/render/Diagnostics.jsx', import.meta.url), 'utf8')
-assert.match(diagnosticsSource, /<span className="card-label">Decode Rate<\/span>/)
-assert.match(diagnosticsSource, /data-native-rate=\{message\.tokens_out_per_sec/)
+assert.match(diagnosticsSource, /requestRate \? 'Request Output Rate' : 'Decode Rate'/)
+assert.match(diagnosticsSource, /data-native-rate=\{requestRate \? undefined : message\.tokens_out_per_sec/)
 assert.doesNotMatch(diagnosticsSource, /Fresh Gemma planning pass|This researched answer|Qualified short-context peak|Fresh Plan Native Decode Rate|Multi-pass researched answer|aggregate native verifier clock|Target-verified lossless MTP/)
 
 const streamingIndicatorSource = await readFile(new URL('../src/components/chat/render/StreamingIndicator.jsx', import.meta.url), 'utf8')
-assert.match(streamingIndicatorSource, /data-rate-source=\{hasNativeRate \? 'backend-native' : 'browser'\}/, 'the one stock rate chip must remain auditable without a visible source label')
+assert.match(streamingIndicatorSource, /data-rate-source=\{hasNativeRate \? 'backend-native' : rateSource\}/, 'the native rate chip retains priority over the browser rate source')
 assert.match(streamingIndicatorSource, /waitForNativeRate/)
 assert.doesNotMatch(streamingIndicatorSource, /message-live-tps__source|message-live-tps--native-segment|Streaming multi-pass synthesis|native segment/)
 
@@ -172,17 +172,17 @@ try {
   )
   assert.match(
     renderTurn({ streaming: true, tokens_out_per_sec: 17 }),
-    /data-live-rate="17" data-rate-source="browser"/,
+    /data-live-rate="17" data-rate-source="browser_delivery"/,
     'ordinary replies must retain their browser-measured live rate',
   )
   assert.doesNotMatch(
     renderTurn({ streaming: false, target_verified_render: true, tokens_out_per_sec: 42 }),
-    /Decode rate, measured in this browser/,
+    /Delivery rate, measured in this browser/,
     'a completed native measurement must not be labeled as browser-measured',
   )
   assert.match(
     renderTurn({ streaming: false, tokens_out_per_sec: 17 }),
-    /Decode rate, measured in this browser/,
+    /Delivery rate, measured in this browser/,
     'ordinary completed replies must retain their browser rate',
   )
 } finally {

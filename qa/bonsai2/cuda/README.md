@@ -45,6 +45,9 @@ Both engines receive the exact `count.chatml`, `code.chatml`, and
 are retained; the middle request duration supplies the published rate. The
 primary metric is generated tokens divided by complete request wall time,
 including uncached prefill. Target/drafter loading and warmup are excluded.
+The native timer surrounds its Rust generation call after tokenization; the
+reference timer surrounds a localhost HTTP completion request and JSON parsing,
+so the port also includes transport, serialization, and tokenization overhead.
 Callback emission timing can be bursty during speculation and is not the
 cross-engine comparison metric.
 

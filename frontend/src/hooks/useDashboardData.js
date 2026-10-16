@@ -11,7 +11,7 @@ import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
 import { isEmbeddingOnlyModel, isGenerationCapableModel, matchResidentItemsToLocalRecords, modelCapabilityFields } from '../lib/modelCapabilities.js'
 import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation.js'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
-import { readExactTargetVerifiedRender, readTargetVerifiedMtp12 } from '../lib/nativeGenerationMetrics'
+import { readExactTargetVerifiedRender, readTargetVerifiedMtp12, requestOutputRate } from '../lib/nativeGenerationMetrics'
 import { readExactTargetVerifiedSegmentedRender } from '../lib/nativeGenerationMetrics'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
@@ -2090,9 +2090,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
         const now = performance.now()
         const liveElapsedMs = now - requestStartedAt
-        /* Decode rate uses the REAL token count (one SSE content delta = one
-           generated token in Camelid) only after first content. Web research
-           and model TTFT are recorded separately and never dilute tok/s. */
+        // Live counts remain stream estimates until authoritative backend usage
+        // arrives. The request clock includes prefill, and starts after research.
         const realTokens = Number(metrics?.completionTokens) || 0
         const firstVisibleContent = !firstContentEmitted && Boolean(fullContent)
         if (firstVisibleContent) {
@@ -2106,12 +2105,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
         // This live value is a browser-observed delivery rate computed from
         // real SSE token arrivals. The backend's native target-verifier clock
         // replaces it after each verified segment and in terminal diagnostics.
-        const liveTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200
+        const liveDeliveryTps = responseIsStreaming && decodedTokens >= 4 && decodeElapsedMs >= 200
           ? tokensPerSecond(decodedTokens, decodeElapsedMs)
           : null
+        const liveTps = targetVerifiedRender
+          ? liveDeliveryTps
+          : (responseIsStreaming && liveElapsedMs >= 200 ? requestOutputRate(realTokens, liveElapsedMs) : null)
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
-          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
+          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round((targetVerifiedRender ? decodeElapsedMs : liveElapsedMs) * 10) / 10, rate_source: targetVerifiedRender ? 'browser_delivery' : 'client_request', tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
         }
         if (performance.now() - lastProgressAt > 100) {
           lastProgressAt = performance.now()
@@ -2156,6 +2158,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // empty until terminal aggregate diagnostics so two clocks cannot
           // appear simultaneously or disagree on screen.
           tokens_out_per_sec: segmentedTargetVerifiedRender ? null : liveTps,
+          output_rate_source: targetVerifiedRender ? 'browser_delivery' : 'client_request',
           streaming_native_segment_rate: latestNativeSegmentRate,
           usage: {
             prompt_tokens: promptTokenEstimate,
@@ -2242,9 +2245,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const elapsedMs = streamCompletedAt - requestStartedAt
       const modelTtftMs = firstTokenAt === null ? null : firstTokenAt - requestStartedAt
-      const decodeElapsedMs = firstTokenAt === null ? null : Math.max(0, streamCompletedAt - firstTokenAt)
-      const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
-      const decodedTokenCount = Math.max(0, completionTokenCount - decodeStartTokens)
+      const completionTokenCount = streamed.usage?.completion_tokens ?? streamed.completionTokens ?? estimateTokenCount(streamed.content)
       // Native facts replace browser-arrival estimates after the backend has
       // completed and attached the lossless verification record. A two-pass
       // turn is fail-closed above, so it never falls through to client timing.
@@ -2307,7 +2308,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_out_per_sec: targetVerifiedRender
           ? (targetVerifiedSegmentedDiagnostics || targetVerifiedRenderDiagnostics).render_tokens_per_second
           : nativeMtp12?.decode_tokens_per_second
-            ?? (responseIsStreaming ? tokensPerSecond(decodedTokenCount, decodeElapsedMs) : null),
+            ?? requestOutputRate(completionTokenCount, elapsedMs),
+        output_rate_source: targetVerifiedRender || nativeMtp12 ? 'backend_native' : 'client_request',
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
         usage: continuedMessage
@@ -2369,6 +2371,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         promptTokens: assistantMessage.usage?.prompt_tokens,
         completionTokens: assistantMessage.usage?.completion_tokens,
         tokensPerSec: assistantMessage.tokens_out_per_sec,
+        rateSource: assistantMessage.output_rate_source,
         usageSource: assistantMessage.usage_source,
         outcome: streamed.finishReason === 'error' ? 'error' : 'ok',
         promptText: messageContent,

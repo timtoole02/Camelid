@@ -44,6 +44,14 @@ enum RawMatBytes {
     /// Page-aligned packed backing. Metal wraps this allocation with
     /// `newBufferWithBytesNoCopy`, so a Q1/Q2 or Q8_0 projection has one resident copy.
     WirePages(Arc<crate::wire_mmap::WirePages>),
+    /// Immutable file-backed PTQ bytes. The mapping is shared by every tensor
+    /// and tied head, so loading a 27B pack does not commit another 6 GB of
+    /// private RAM before CUDA allocates its streamed-weight buffers.
+    Mapped {
+        mapping: Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        len: usize,
+    },
 }
 
 impl RawMatBytes {
@@ -51,6 +59,13 @@ impl RawMatBytes {
         match self {
             Self::Owned(bytes) => bytes.as_slice(),
             Self::WirePages(pages) => pages.bytes(),
+            Self::Mapped {
+                mapping,
+                offset,
+                len,
+            } => mapping
+                .bytes(*offset, *len)
+                .expect("immutable tensor range was validated at load"),
         }
     }
 
@@ -62,10 +77,23 @@ impl RawMatBytes {
         Self::Owned(Arc::new(bytes))
     }
 
+    fn mapped(
+        mapping: Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        len: usize,
+    ) -> Result<Self> {
+        mapping.bytes(offset, len)?;
+        Ok(Self::Mapped {
+            mapping,
+            offset,
+            len,
+        })
+    }
+
     fn wire_pages(&self) -> Option<&Arc<crate::wire_mmap::WirePages>> {
         match self {
             Self::WirePages(pages) => Some(pages),
-            Self::Owned(_) => None,
+            Self::Owned(_) | Self::Mapped { .. } => None,
         }
     }
 }
@@ -1124,13 +1152,42 @@ impl RunnableModel {
             source: e,
         })?;
 
+        // Only the Bonsai PTQ loader uses this backing. The file remains mapped
+        // read-only for the lifetime of its tensors; CUDA uploads and CPU row
+        // decoding consume the same packed bytes. Existing Metal page-backed
+        // formats retain their allocation and NoCopy contracts.
+        let ptq_mapping = if arch == "qwen35"
+            && gguf
+                .tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == GgufTensorType::Ptq1_0)
+        {
+            Some(crate::wire_mmap::GgufWireMmap::map(std::path::Path::new(
+                path,
+            ))?)
+        } else {
+            None
+        };
+
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
             let bitnet_tied_head = arch == "bitnet-b1.58"
                 && d.tensor_type == GgufTensorType::F16
                 && matches!(name, "token_embd.weight" | "output.weight");
-            let bytes = if wants_page_backing(d.tensor_type) || bitnet_tied_head {
+            let bytes = if d.tensor_type == GgufTensorType::Ptq1_0 && ptq_mapping.is_some() {
+                let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
+                    BackendError::InvalidTensorData(format!(
+                        "tensor {name} packed byte length {} does not fit usize",
+                        d.n_bytes
+                    ))
+                })?;
+                RawMatBytes::mapped(
+                    ptq_mapping.as_ref().unwrap().clone(),
+                    d.absolute_offset,
+                    byte_len,
+                )?
+            } else if wants_page_backing(d.tensor_type) || bitnet_tied_head {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -6277,39 +6334,45 @@ impl RunnableModel {
         // Q5_K previously had no resident GEMV and was upcast to Q8_0 blocks at load
         // (~+40 MiB on stock Q3_K_M's four q5_K tensors); with `q5k_gemv` in-tree it
         // rides its own lane at wire size. Returns (repack-ready bytes, lane).
-        let prep = |engine: &mut CudaResidentDecode,
-                    m: &RawMat|
-         -> std::result::Result<(Vec<u8>, ProjQuant), String> {
+        fn prep<'a>(
+            engine: &mut CudaResidentDecode,
+            m: &'a RawMat,
+        ) -> std::result::Result<(std::borrow::Cow<'a, [u8]>, ProjQuant), String> {
+            use std::borrow::Cow;
             if m.tt == GgufTensorType::Ptq1_0 {
                 let transform = m
                     .forward_transform
                     .clone()
                     .ok_or("PTQ1_0 projection lacks its declared Hadamard transform")?;
                 let lane = engine.register_bonsai_transform(transform, m.in_features)?;
-                return Ok((m.bytes.as_slice().to_vec(), lane));
+                return Ok((Cow::Borrowed(m.bytes.as_slice()), lane));
             }
             if m.forward_transform.is_some() {
                 return Err("folded CUDA projection requires PTQ1_0 weights".into());
             }
             match m.tt {
-                GgufTensorType::F32 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::F32)),
-                GgufTensorType::BF16 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::BF16)),
-                GgufTensorType::Q8_0 => Ok((widen_q8(m.bytes.as_slice()), ProjQuant::Q8_0)),
-                GgufTensorType::Q2K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2K)),
-                GgufTensorType::Q3K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q3K)),
-                GgufTensorType::Q4K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q4K)),
-                GgufTensorType::Q5K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q5K)),
-                GgufTensorType::Q6K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q6K)),
-                GgufTensorType::Q1_0 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q1_0)),
-                GgufTensorType::Q2_0G64 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G64)),
+                GgufTensorType::F32 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::F32)),
+                GgufTensorType::BF16 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::BF16)),
+                GgufTensorType::Q8_0 => {
+                    Ok((Cow::Owned(widen_q8(m.bytes.as_slice())), ProjQuant::Q8_0))
+                }
+                GgufTensorType::Q2K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2K)),
+                GgufTensorType::Q3K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q3K)),
+                GgufTensorType::Q4K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q4K)),
+                GgufTensorType::Q5K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q5K)),
+                GgufTensorType::Q6K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q6K)),
+                GgufTensorType::Q1_0 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q1_0)),
+                GgufTensorType::Q2_0G64 => {
+                    Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2_0G64))
+                }
                 GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
-                    Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G128))
+                    Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2_0G128))
                 }
                 other => Err(format!(
                     "qwen35 CUDA lane: unsupported projection quant {other:?}"
                 )),
             }
-        };
+        }
         let mat_bytes = |m: &RawMat| m.bytes.as_slice().len() as u64;
         // Fit the graph to detected VRAM before the first upload. Full-attention
         // layers can stream all seven projections; recurrent layers keep their
@@ -6514,7 +6577,8 @@ impl RunnableModel {
         // math, so the rope inputs are bit-identical to the host-fed path).
         // Failure (e.g. VRAM headroom) is non-fatal — the driver falls back to
         // the host-fed per-token loop.
-        let embd_upload: Option<(Vec<u8>, ProjQuant)> = match self.token_embd.tt {
+        let embd_upload: Option<(std::borrow::Cow<'_, [u8]>, ProjQuant)> = match self.token_embd.tt
+        {
             GgufTensorType::Ptq1_0 => {
                 let transform = self
                     .token_embd
@@ -6522,30 +6586,39 @@ impl RunnableModel {
                     .clone()
                     .ok_or("PTQ1_0 embedding lacks its inverse Hadamard transform")?;
                 let lane = e.register_bonsai_transform(transform, self.token_embd.in_features)?;
-                Some((self.token_embd.bytes.as_slice().to_vec(), lane))
+                Some((
+                    std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                    lane,
+                ))
             }
-            GgufTensorType::Q8_0 => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q8_0))
-            }
-            GgufTensorType::Q3K => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q3K))
-            }
-            GgufTensorType::Q4K => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q4K))
-            }
+            GgufTensorType::Q8_0 => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q8_0,
+            )),
+            GgufTensorType::Q3K => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q3K,
+            )),
+            GgufTensorType::Q4K => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q4K,
+            )),
             GgufTensorType::Q6K => Some((
-                crate::cuda_resident::pad_q6k_blocks(self.token_embd.bytes.as_slice()),
+                std::borrow::Cow::Owned(crate::cuda_resident::pad_q6k_blocks(
+                    self.token_embd.bytes.as_slice(),
+                )),
                 ProjQuant::Q6K,
             )),
-            GgufTensorType::Q1_0 => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q1_0))
-            }
+            GgufTensorType::Q1_0 => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q1_0,
+            )),
             GgufTensorType::Q2_0G64 => Some((
-                self.token_embd.bytes.as_slice().to_vec(),
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
                 ProjQuant::Q2_0G64,
             )),
             GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => Some((
-                self.token_embd.bytes.as_slice().to_vec(),
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
                 ProjQuant::Q2_0G128,
             )),
             _ => None,
@@ -6577,6 +6650,36 @@ impl RunnableModel {
 mod resident_format_admission_tests {
     use super::*;
     use crate::metal::ResidentWeightFormat;
+
+    #[test]
+    fn bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime() {
+        use std::io::Write;
+        let payload: Vec<u8> = (0..1024).map(|value| (value * 31) as u8).collect();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+        let mapping = crate::wire_mmap::GgufWireMmap::map(file.path()).unwrap();
+        let weak = Arc::downgrade(&mapping);
+        assert!(RawMatBytes::mapped(mapping.clone(), 1000, 25).is_err());
+        assert!(RawMatBytes::mapped(mapping.clone(), u64::MAX, 2).is_err());
+        let tensor = RawMatBytes::mapped(mapping.clone(), 17, 28 * 7).unwrap();
+        assert_eq!(tensor.as_slice(), &payload[17..17 + 28 * 7]);
+        assert_eq!(
+            tensor.as_slice().as_ptr(),
+            mapping.bytes(17, 28 * 7).unwrap().as_ptr()
+        );
+        let tied_head = tensor.clone();
+        drop(mapping);
+        drop(tensor);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(tied_head.as_slice(), &payload[17..17 + 28 * 7]);
+        assert!(tied_head.wire_pages().is_none());
+        drop(tied_head);
+        assert!(
+            weak.upgrade().is_none(),
+            "the last tensor must release its file mapping"
+        );
+    }
 
     #[test]
     fn admitted_types_map_to_a_resident_format_and_page_back() {

@@ -660,8 +660,8 @@ assert.match(dashboardHookSource, /connectedTools\?\.length \? \{ tools: connect
 assert.match(dashboardHookSource, /if \(!toolContract.supported \|\| !toolCapability.capable\)/, 'connected tools require both protocol and model support')
 assert.doesNotMatch(dashboardHookSource, /\bcamelid_tools\s*:/, 'Web Auto must not enter a camelid_tools loop')
 assert.match(dashboardHookSource, /web_research_ms: webResearchMs/, 'public-web latency must be persisted separately from model TTFT and decode rate')
-assert.match(dashboardHookSource, /now - firstTokenAt/, 'decode tok\/s must start at the first generated token instead of including research or TTFT')
-assert.match(dashboardHookSource, /responseIsStreaming \? tokensPerSecond\(decodedTokenCount, decodeElapsedMs\) : null/, 'non-streamed or replay-shaped answers must not report browser-invented decode throughput')
+assert.match(dashboardHookSource, /const researchAtSend[\s\S]*const requestStartedAt = performance\.now\(\)/, 'the model request clock must start after public-web research')
+assert.match(dashboardHookSource, /requestOutputRate\(completionTokenCount, elapsedMs\)/, 'browser fallback must measure full request throughput rather than invent decode timing from SSE arrival gaps')
 assert.match(chatWorkspaceSource, /Web Auto will send linked URLs or a search query to the public web/, 'a triggering draft must disclose public-web egress before send, including on touch devices')
 assert.match(messageTurnSource, /warnings\.map/, 'failed or partial research should retain the backend\'s actionable warnings in the reply')
 

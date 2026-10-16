@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import FlowBench from '../components/observatory/FlowBench'
 import NeuralField from '../components/observatory/NeuralField'
 import DetailsPanel from '../components/observatory/DetailsPanel'
 import { useInferenceTelemetry } from '../hooks/useInferenceTelemetry'
-import { getTelemetrySnapshot, subscribeTelemetry, summarizeTelemetry } from '../lib/telemetryLog'
+import { getTelemetrySnapshot, rateSourceLabel, subscribeTelemetry, summarizeTelemetry } from '../lib/telemetryLog'
 import { getChatGateState } from '../lib/chatGate'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconChevronRight, IconObservatory } from '../components/ui/icons'
@@ -100,7 +100,7 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
           <div className="flowbench-rail__tiles">
             <div className="cxv-stat"><span>Requests</span><strong>{summary.total}</strong><small>{summary.errors} error{summary.errors === 1 ? '' : 's'}</small></div>
             <div className="cxv-stat"><span>TTFT med</span><strong>{fmtMs(summary.medianTtftMs)}</strong><small>client-measured</small></div>
-            <div className="cxv-stat"><span>Decode med</span><strong>{fmtRate(summary.medianTokensPerSec)}</strong><small>client-measured</small></div>
+            <div className="cxv-stat"><span>Output rate medians</span>{summary.outputRates.length ? summary.outputRates.map((rate) => <Fragment key={rate.source}><strong>{fmtRate(rate.median)}</strong><small>{rateSourceLabel(rate.source)}</small></Fragment>) : <strong>—</strong>}</div>
           </div>
           <div className="flowbench-rail__model">
             <span className="flowbench-rail__model-id">{activeModelId || 'no model loaded'}</span>

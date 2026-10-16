@@ -10,6 +10,7 @@ const report = {
   date: new Date().toISOString(), metric: '32 generated tokens / uncached warmed request seconds',
   notes: [
     'Request time includes full prompt prefill and decoding; model loading and warmup are excluded for both engines.',
+    'Entry points differ: native timing surrounds the Rust generation call after tokenization; reference timing includes a localhost HTTP completion request, tokenization, serialization and JSON response parsing. Model-work settings are matched; these are request-level measurements.',
     'Native streaming callback timing can be bursty during speculation; complete request wall time is the comparison metric.',
     'The llama.cpp port records its actual layer offload for each mode; a 27B target may use CPU layers on a 6 GiB GPU.',
     'Automatic fitting may assign fewer target layers to the GPU when draft state and the draft model are resident. Speedups therefore describe complete operating configurations on this hardware.',

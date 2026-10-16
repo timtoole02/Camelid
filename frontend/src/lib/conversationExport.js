@@ -7,7 +7,7 @@
 const MESSAGE_EXPORT_FIELDS = [
   'id', 'role', 'content', 'created_at', 'model_id', 'model_name',
   'finish_reason', 'usage', 'usage_source', 'elapsed_ms',
-  'first_content_ms', 'tokens_out_per_sec', 'support_row',
+  'first_content_ms', 'tokens_out_per_sec', 'output_rate_source', 'support_row',
   'web_research', 'image',
 ]
 
@@ -18,6 +18,7 @@ const SUPPORT_ROW_FIELDS = ['id', 'status', 'supported']
 const IMAGE_EXPORT_FIELDS = ['name', 'type', 'size', 'width', 'height', 'data_url']
 const WEB_RESEARCH_FIELDS = ['reason', 'query', 'sources', 'warnings']
 const WEB_SOURCE_FIELDS = ['title', 'url']
+const TELEMETRY_NOTE = 'Operational telemetry, not compatibility or support evidence. Token counts use usage_source. Output rates use output_rate_source: client_request includes prefill and time to first token; backend_native uses backend decode timing; browser_delivery measures stream arrivals. Unlabeled rates have an unspecified clock. Other timing fields are browser-measured.'
 
 function pick(source, fields) {
   const out = {}
@@ -44,7 +45,7 @@ export function exportableConversation(conversation) {
   return {
     format: 'camelid.conversation/v1',
     exported_at: new Date().toISOString(),
-    telemetry_note: 'Timing/token fields are operational telemetry (client-measured unless usage_source=backend). They are not compatibility or support evidence.',
+    telemetry_note: TELEMETRY_NOTE,
     id: conversation?.id || null,
     title: conversation?.title || 'Conversation',
     created_at: conversation?.created_at || null,
@@ -80,7 +81,7 @@ export function exportableConversations(conversations) {
   return {
     format: 'camelid.conversations/v1',
     exported_at: new Date().toISOString(),
-    telemetry_note: 'Timing/token fields are operational telemetry (client-measured unless usage_source=backend). They are not compatibility or support evidence.',
+    telemetry_note: TELEMETRY_NOTE,
     conversation_count: (conversations || []).length,
     conversations: (conversations || []).map((conversation) => {
       const exported = exportableConversation(conversation)

@@ -9840,24 +9840,25 @@ fn repack_for_lane(
     rows: usize,
     cols: usize,
     q1_tiled: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    use std::borrow::Cow;
     let repacked = match q {
-        ProjQuant::Q8_0 => repack_q8_soa(bytes),
-        ProjQuant::Q6K => pad_q6k_blocks(bytes),
-        ProjQuant::Q4K => swz_q4k_blocks(bytes),
+        ProjQuant::Q8_0 => Cow::Owned(repack_q8_soa(bytes)),
+        ProjQuant::Q6K => Cow::Owned(pad_q6k_blocks(bytes)),
+        ProjQuant::Q4K => Cow::Owned(swz_q4k_blocks(bytes)),
         ProjQuant::Ptq1_0(_)
         | ProjQuant::F32
         | ProjQuant::BF16
         | ProjQuant::Q5K
         | ProjQuant::Q2K
-        | ProjQuant::Q3K => bytes.to_vec(),
+        | ProjQuant::Q3K => Cow::Borrowed(bytes),
         ProjQuant::Q1_0 if q1_tiled => {
-            return repack_q1_t128(bytes, rows, cols);
+            return repack_q1_t128(bytes, rows, cols).map(Cow::Owned);
         }
         // IQ4_XS is read straight from the 136-byte GGUF wire (raw passthrough, like
         // Q5_K/Q2_K/Q3_K): the kernel unpacks nibbles/codebook on the fly.
         ProjQuant::IQ4XS | ProjQuant::Q1_0 | ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 => {
-            bytes.to_vec()
+            Cow::Borrowed(bytes)
         }
     };
     Ok(repacked)
@@ -11674,9 +11675,8 @@ fn dispatch_gemm_batched(
             residual,
         ),
         ProjQuant::Q1_0 => {
-            // Bonsai 2 27B keeps its small alpha/beta gates in Q1_0. Preserve
-            // the strict two-token kernel while the much larger PTQ projections
-            // share all proposal tokens and each streamed layer's transfer.
+            // Preserve the strict Q1 kernel's two-token limit when a mixed
+            // projection stack admits a wider batch for its other quant lanes.
             for first in (0..k_tokens).step_by(2) {
                 let count = (k_tokens - first).min(2);
                 launch_prism_q1_f32_gemm_batched_view(
@@ -16174,7 +16174,8 @@ impl CudaResidentDecode {
                 let (rows, cols) = projection_shapes[i];
                 let repacked =
                     repack_for_lane(projections[i], quants[i], rows, cols, self.k.q1_tiled)?;
-                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
+                s.clone_htod(repacked.as_ref())
+                    .map_err(|e| format!("htod: {e}"))
             };
             self.layers.push(ResidentLayer {
                 q: vram(0)?,
@@ -16200,7 +16201,7 @@ impl CudaResidentDecode {
         // Offloaded: repack all seven projections (each into its lane's layout) and lay
         // them out contiguously in one pinned host buffer so the per-forward transfer is
         // a single memcpy.
-        let repacked: Vec<Vec<u8>> = projections
+        let repacked: Vec<std::borrow::Cow<'_, [u8]>> = projections
             .iter()
             .enumerate()
             .map(|(i, b)| {
@@ -16371,7 +16372,9 @@ impl CudaResidentDecode {
             self.hidden,
             self.k.q1_tiled,
         )?;
-        self.output_weight = s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?;
+        self.output_weight = s
+            .clone_htod(repacked.as_ref())
+            .map_err(|e| format!("htod: {e}"))?;
         self.output_quant = output_quant;
         Ok(())
     }
@@ -16605,7 +16608,8 @@ impl CudaResidentDecode {
         let up_u8 =
             |b: &[u8], q: ProjQuant, rows: usize, cols: usize| -> Result<CudaSlice<u8>, String> {
                 let repacked = repack_for_lane(b, q, rows, cols, self.k.q1_tiled)?;
-                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
+                s.clone_htod(repacked.as_ref())
+                    .map_err(|e| format!("htod: {e}"))
             };
         let up_f = |b: &[f32]| -> Result<CudaSlice<f32>, String> {
             s.clone_htod(b).map_err(|e| format!("htod: {e}"))

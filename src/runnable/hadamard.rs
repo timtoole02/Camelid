@@ -17,6 +17,7 @@ pub(crate) struct Transform {
 
 impl Transform {
     #[cfg(feature = "cuda")]
+    #[allow(clippy::type_complexity)] // Borrowed signs plus the declared three-axis permutation.
     pub(crate) fn cuda_parts(&self) -> (usize, &[f32], Option<(usize, usize, usize)>) {
         (self.block, &self.signs, self.permutation)
     }
