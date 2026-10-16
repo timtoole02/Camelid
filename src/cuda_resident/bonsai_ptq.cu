@@ -136,6 +136,145 @@ extern "C" __global__ void bonsai_ptq_matmul(
     }
 }
 
+// The generic eight-token kernel above spends issue slots on inactive token
+// lanes during scalar decode. Specialize the token tile, and let each warp
+// reuse its activation loads across several output rows. Seven lanes read the
+// complete 28-byte PTQ block as aligned words; shuffles distribute its bytes.
+// The on-disk/device layout, per-lane column order, and final reduction stay
+// unchanged. No activation quantization or additional weight allocation.
+template<int TOKENS, int ROWS>
+__device__ __forceinline__ void bonsai_ptq_project_tile(
+    const float* input, const unsigned char* weights, float* output,
+    int rows, int cols, int residual, int tokens
+) {
+    const int lane = threadIdx.x & 31;
+    const int row = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * ROWS;
+    const int token_base = blockIdx.y * TOKENS;
+    const int token_count = min(TOKENS, tokens - token_base);
+    if (row >= rows) return;
+    const int byte_index[4] = {
+        lane & 15, lane & 15, lane < 24 ? lane : lane - 8,
+        lane < 8 ? lane + 16 : lane < 16 ? lane + 8 : lane < 24 ? lane : 24 + (lane & 1)
+    };
+    const int power[4] = {
+        lane < 16 ? 1 : 3, lane < 16 ? 9 : 27,
+        lane < 16 ? 81 : lane < 24 ? 1 : 3,
+        lane < 8 ? 9 : lane < 16 ? 27 : lane < 24 ? 81 : lane < 26 ? 1 : lane < 28 ? 3 : lane < 30 ? 9 : 27
+    };
+    float partial[ROWS][TOKENS] = {};
+    const int blocks = cols / 128;
+    for (int b = 0; b < blocks; ++b) {
+        unsigned int codes[ROWS][4];
+        float scales[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            unsigned int word = 0;
+            if (row + r < rows && lane < 7) {
+                const unsigned char* block = weights + ((size_t)(row + r) * blocks + b) * 28;
+                word = ((const unsigned int*)block)[lane];
+            }
+            unsigned short bits = __shfl_sync(0xffffffffu, word, 6) >> 16;
+            // Preserve NaN payload handling from the original converter too.
+            if ((bits & 0x7c00u) == 0x7c00u) scales[r] = f16_bits_to_f32(bits);
+            else asm("cvt.f32.f16 %0, %1;" : "=f"(scales[r]) : "h"(bits));
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                unsigned int byte = (__shfl_sync(0xffffffffu, word, byte_index[q] / 4)
+                    >> ((byte_index[q] & 3) * 8)) & 255u;
+                codes[r][q] = (((byte * power[q]) & 255u) * 3u) >> 8;
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float weight[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) weight[r] = scales[r] * (float)((int)codes[r][q] - 1);
+            const int i = b * 128 + lane + q * 32;
+            #pragma unroll
+            for (int t = 0; t < TOKENS; ++t) {
+                if (TOKENS == 1 || t < token_count) {
+                    float x = input[(size_t)(token_base + t) * cols + i];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; ++r) partial[r][t] += weight[r] * x;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        #pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+            if (TOKENS == 1 || t < token_count) {
+                for (int step = 16; step > 0; step /= 2)
+                    partial[r][t] += __shfl_down_sync(0xffffffffu, partial[r][t], step);
+                if (lane == 0 && row + r < rows) {
+                    size_t index = (size_t)(token_base + t) * rows + row + r;
+                    output[index] = residual ? output[index] + partial[r][t] : partial[r][t];
+                }
+            }
+        }
+    }
+}
+
+#define BONSAI_PTQ_TILE(NAME, T, R) \
+extern "C" __global__ void NAME( \
+    const float* input, const unsigned char* weights, float* output, \
+    int rows, int cols, int residual, int dense, int tokens) { \
+    bonsai_ptq_project_tile<T, R>(input, weights, output, rows, cols, residual, tokens); \
+}
+BONSAI_PTQ_TILE(bonsai_ptq_t1_r2, 1, 2)
+BONSAI_PTQ_TILE(bonsai_ptq_t1_r4, 1, 4)
+BONSAI_PTQ_TILE(bonsai_ptq_t2_r4, 2, 4)
+BONSAI_PTQ_TILE(bonsai_ptq_t4_r4, 4, 4)
+BONSAI_PTQ_TILE(bonsai_ptq_t8_r4, 8, 4)
+#undef BONSAI_PTQ_TILE
+
+template<int TOKENS, int DENSE>
+__device__ __forceinline__ void bonsai_dense_project_tile(
+    const float* input, const unsigned char* weights, float* output,
+    int rows, int cols, int residual, int tokens
+) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int token_base = blockIdx.y * TOKENS;
+    int token_count = min(TOKENS, tokens - token_base);
+    if (row >= rows) return;
+    float partial[TOKENS] = {};
+    for (int i = lane; i < cols; i += 32) {
+        size_t index = (size_t)row * cols + i;
+        float weight = DENSE == 2 ? __uint_as_float(((unsigned int)((const unsigned short*)weights)[index]) << 16)
+                                 : ((const float*)weights)[index];
+        #pragma unroll
+        for (int t = 0; t < TOKENS; ++t)
+            if (TOKENS == 1 || t < token_count)
+                partial[t] += weight * input[(size_t)(token_base + t) * cols + i];
+    }
+    #pragma unroll
+    for (int t = 0; t < TOKENS; ++t) {
+        if (TOKENS == 1 || t < token_count) {
+            for (int step = 16; step > 0; step /= 2)
+                partial[t] += __shfl_down_sync(0xffffffffu, partial[t], step);
+            if (lane == 0) {
+                size_t index = (size_t)(token_base + t) * rows + row;
+                output[index] = residual ? output[index] + partial[t] : partial[t];
+            }
+        }
+    }
+}
+#define BONSAI_DENSE_TILE(NAME, T, D) \
+extern "C" __global__ void NAME( \
+    const float* input, const unsigned char* weights, float* output, \
+    int rows, int cols, int residual, int dense, int tokens) { \
+    bonsai_dense_project_tile<T, D>(input, weights, output, rows, cols, residual, tokens); \
+}
+BONSAI_DENSE_TILE(bonsai_f32_t1, 1, 1)
+BONSAI_DENSE_TILE(bonsai_f32_t4, 4, 1)
+BONSAI_DENSE_TILE(bonsai_f32_t8, 8, 1)
+BONSAI_DENSE_TILE(bonsai_bf16_t1, 1, 2)
+BONSAI_DENSE_TILE(bonsai_bf16_t4, 4, 2)
+BONSAI_DENSE_TILE(bonsai_bf16_t8, 8, 2)
+#undef BONSAI_DENSE_TILE
+
 extern "C" __global__ void embed_gather_ptq1_0(
     const unsigned char* table, const unsigned int* token, int dim, float* output
 ) {

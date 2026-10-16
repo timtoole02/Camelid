@@ -13,6 +13,10 @@ struct ResidentTransform {
 pub(super) struct BonsaiKernels {
     transform: CudaFunction,
     matmul: CudaFunction,
+    ptq_tiles: [CudaFunction; 5],
+    f32_tiles: [CudaFunction; 3],
+    bf16_tiles: [CudaFunction; 3],
+    legacy_projection: bool,
     pub(super) embed: CudaFunction,
     // Destroy captured graphs before the transform buffers they reference.
     body_graphs: Vec<(u32, u32, SendCudaGraph)>,
@@ -30,6 +34,27 @@ impl BonsaiKernels {
         Ok(Self {
             transform: load("bonsai_hadamard")?,
             matmul: load("bonsai_ptq_matmul")?,
+            ptq_tiles: [
+                load("bonsai_ptq_t1_r2")?,
+                load("bonsai_ptq_t1_r4")?,
+                load("bonsai_ptq_t2_r4")?,
+                load("bonsai_ptq_t4_r4")?,
+                load("bonsai_ptq_t8_r4")?,
+            ],
+            f32_tiles: [
+                load("bonsai_f32_t1")?,
+                load("bonsai_f32_t4")?,
+                load("bonsai_f32_t8")?,
+            ],
+            bf16_tiles: [
+                load("bonsai_bf16_t1")?,
+                load("bonsai_bf16_t4")?,
+                load("bonsai_bf16_t8")?,
+            ],
+            // Retain a reproducible A/B control without changing model loading,
+            // graph capture, sampling, or placement between measurements.
+            legacy_projection: std::env::var("CAMELID_BONSAI2_CUDA_PROJECTION").as_deref()
+                == Ok("baseline"),
             embed: load("embed_gather_ptq1_0")?,
             body_graphs: Vec::new(),
             transforms: Vec::new(),
@@ -159,7 +184,29 @@ impl BonsaiKernels {
         }
         let activation = scratch.as_deref().unwrap_or(input);
         let args = [rows as i32, cols as i32, residual, dense, tokens as i32];
-        let mut launch = stream.launch_builder(&self.matmul);
+        let (kernel, token_tile, row_tile) = if self.legacy_projection {
+            (&self.matmul, 8, 4)
+        } else if dense == 0 {
+            match tokens {
+                1 if rows >= 32768 => (&self.ptq_tiles[1], 1, 16),
+                1 => (&self.ptq_tiles[0], 1, 8),
+                2 => (&self.ptq_tiles[2], 2, 16),
+                3..=4 => (&self.ptq_tiles[3], 4, 16),
+                _ => (&self.ptq_tiles[4], 8, 16),
+            }
+        } else {
+            let tiles = if dense == 1 {
+                &self.f32_tiles
+            } else {
+                &self.bf16_tiles
+            };
+            match tokens {
+                1 => (&tiles[0], 1, 4),
+                2..=4 => (&tiles[1], 4, 4),
+                _ => (&tiles[2], 8, 4),
+            }
+        };
+        let mut launch = stream.launch_builder(kernel);
         launch
             .arg(activation)
             .arg(weights)
@@ -171,7 +218,11 @@ impl BonsaiKernels {
             .arg(&args[4]);
         unsafe {
             launch.launch(LaunchConfig {
-                grid_dim: ((rows as u32).div_ceil(4), (tokens as u32).div_ceil(8), 1),
+                grid_dim: (
+                    (rows as u32).div_ceil(row_tile),
+                    (tokens as u32).div_ceil(token_tile),
+                    1,
+                ),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             })
@@ -340,6 +391,89 @@ mod tests {
             }
         }
         partial[0]
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn bonsai_cuda_projection_tiles_match_legacy_bits() {
+        let mut kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
+        let stream = kernels.stream.clone();
+        // Include partial row/token tiles, the vocabulary dispatch threshold,
+        // all model widths, residual addition, and finite half-scale extremes.
+        for (rows, width, dense) in [
+            (1, 128, 0),
+            (7, 2048, 0),
+            (33, 4096, 0),
+            (7, 6144, 0),
+            (7, 8192, 0),
+            (32769, 128, 0),
+            (7, 96, 1),
+            (7, 5120, 1),
+            (7, 96, 2),
+            (7, 5120, 2),
+        ] {
+            let (lane, weights) = if dense == 0 {
+                let metadata = Arc::new(Transform::test_rotation_geometry(width, 128, None));
+                let id = kernels.bonsai.register(&stream, metadata, width).unwrap();
+                let scales = [0_u16, 0x8000, 1, 0x03ff, 0x0400, 0x3000, 0xb555, 0x7bff];
+                let mut bytes = Vec::with_capacity(rows * width / 128 * 28);
+                for b in 0..rows * width / 128 {
+                    bytes.extend((0..26).map(|i| (b * 17 + i * 31) as u8));
+                    bytes.extend_from_slice(&scales[b % scales.len()].to_le_bytes());
+                }
+                (ProjQuant::Ptq1_0(id), bytes)
+            } else {
+                let values = (0..rows * width).map(|i| ((i * 29 % 257) as f32 - 128.0) / 37.0);
+                if dense == 1 {
+                    (ProjQuant::F32, values.flat_map(f32::to_le_bytes).collect())
+                } else {
+                    (
+                        ProjQuant::BF16,
+                        values
+                            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                            .collect(),
+                    )
+                }
+            };
+            let device_weights = stream.clone_htod(&weights).unwrap();
+            for tokens in [1, 2, 3, 4, 5, 8, 9] {
+                let input: Vec<_> = (0..width * tokens)
+                    .map(|i| ((i * 13 % 113) as f32 - 56.0) / 31.0)
+                    .collect();
+                let device_input = stream.clone_htod(&input).unwrap();
+                let initial: Vec<_> = (0..rows * tokens).map(|i| (i % 53) as f32 / 19.0).collect();
+                for residual in [0, 1] {
+                    let mut results = Vec::new();
+                    for legacy in [true, false] {
+                        kernels.bonsai.legacy_projection = legacy;
+                        let mut output = stream.clone_htod(&initial).unwrap();
+                        kernels
+                            .bonsai
+                            .project(
+                                &stream,
+                                lane,
+                                &device_input,
+                                &device_weights.as_view(),
+                                rows,
+                                width,
+                                tokens,
+                                &mut output,
+                                residual,
+                            )
+                            .unwrap();
+                        results.push(
+                            stream
+                                .clone_dtoh(&output)
+                                .unwrap()
+                                .into_iter()
+                                .map(f32::to_bits)
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    assert_eq!(results[0], results[1], "rows={rows} width={width} dense={dense} tokens={tokens} residual={residual}");
+                }
+            }
+        }
     }
 
     #[test]
