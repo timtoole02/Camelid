@@ -151,76 +151,91 @@ exclude the first visible token and are affected by verified-token bursts.
 
 ## CUDA measurements and qualification
 
-All four Windows CUDA production GUI/API checks through the native
-library-server harness, seeded draft comparisons, and native benchmarks have
-passed. The final rebuilt suite also passed all twelve CUDA tests and both
-host memory regressions, recorded in the [cache and memory receipt](../qa/bonsai2/cuda/cache-parity.json).
-The [CUDA manifest](../qa/bonsai2/cuda/manifest.json) binds the qualified
-artifacts, and the [reproduction workflow](../qa/bonsai2/cuda/README.md) lists
-the commands and required receipts. These model runs did not execute the
-installed Tauri desktop shell; desktop shell CI is separate. Apple Silicon
-qualification remains separate.
+The CUDA projection optimization is enabled by default. It specializes scalar
+and batched token tiles, shares activation loads across output rows, uses grouped
+packed-weight reads, and specializes dense F32/BF16 projections. It retains the
+28-byte PTQ blocks and the original float contraction/reduction order. The
+same-binary control is available with `CAMELID_BONSAI2_CUDA_PROJECTION=baseline`.
 
-Measurements use an Intel i7-11800H, 16 GB RAM, an RTX 3060 Laptop GPU with
-6 GiB VRAM, and driver 576.83. The reference is the official PrismML-Eng/llama.cpp
-[`prism-b10777-e3de715`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715)
-Windows CUDA 12.4 package, using installed CUDA 12.9 runtime
-DLLs. Both harnesses use the same ChatML counting, code, and prose prompts,
-32 generated tokens, eight CPU threads, 2048 context slots, f16 KV, greedy
-sampling, an eight-token warmup, and three measured repetitions. Rates use the
-median complete request duration, including uncached prefill and excluding
-model loading and warmup. Native timing begins after tokenization at the Rust
-generation call; reference timing also includes localhost HTTP, tokenization,
-and JSON response overhead. These timings use a different protocol from the
-historical CPU table above.
+Nsight Systems profiles of 2B, 4B, and 9B identify projections as the main GPU
+cost. In the final 2B trace, they account for 88.6% of kernel time before the
+change; the vocabulary projection falls from 6.45 to 2.01 ms. The profiles include
+an eight-token warmup plus the 32-token request and both prefills. They are
+diagnostic traces, separate from the unprofiled request measurements below.
+The [profile receipts](../qa/bonsai2/cuda-optimized/profile.json) include before/after
+traces for all three resident sizes and the isolated experiments.
 
-The raw native `decode_tokens_per_second` and `decode_speedup` fields describe
-callback delivery timing, which can be bursty on CUDA. They are diagnostics,
-not GPU decode-clock measurements, and are excluded from this comparison.
-All rates below are **request tokens/second**. Drafting uses the same Bonsai 2
-2B pack and a three-token window. A speedup below 1.00x means drafting is slower.
+The pinned [Prism CUDA kernel](https://github.com/PrismML-Eng/llama.cpp/blob/prism-b10777-e3de715/ggml/src/ggml-cuda/vecdotq.cuh)
+uses Q8 activations and integer dot products with a transposed activation layout.
+Camelid retains its qualified float target. Independent integer-drafter
+prototypes did not beat the selected float kernel on the 2B proposal-model
+shapes, so they are excluded. A faster isolated weight-repacking experiment
+increased packed storage by 29% and was also excluded. The port remains faster
+on all measured 2B/4B/9B cases; this patch reduces the gap without reaching parity.
 
-| Target | Prompt | Camelid ordinary | Camelid draft | Camelid draft speedup | Port ordinary | Port draft |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 2B | Counting | 29.50 | 22.27 | 0.75x | 205.24 | 86.05 |
-| 2B | Code | 29.31 | 22.29 | 0.76x | 220.95 | 80.08 |
-| 2B | Prose | 29.87 | 22.90 | 0.77x | 207.75 | 57.03 |
-| 4B | Counting | 13.35 | 16.05 | 1.20x | 117.87 | 70.35 |
-| 4B | Code | 13.27 | 16.02 | 1.21x | 116.71 | 66.51 |
-| 4B | Prose | 13.62 | 6.17 | 0.45x | 112.59 | 46.55 |
-| 9B | Counting | 7.14 | 11.36 | 1.59x | 76.97 | 61.50 |
-| 9B | Code | 7.17 | 11.41 | 1.59x | 77.58 | 55.38 |
-| 9B | Prose | 7.38 | 5.71 | 0.77x | 79.53 | 37.85 |
-| 27B | Counting | 2.06 | 4.50 | 2.19x | 1.74 | 1.19 |
-| 27B | Code | 2.10 | 4.36 | 2.08x | 1.68 | 1.17 |
-| 27B | Prose | 2.12 | 2.92 | 1.38x | 1.76 | 0.89 |
+Measurements use Windows x86_64, an i7-11800H, 16 GB RAM, RTX 3060 Laptop 6 GiB,
+CUDA 12.9 and driver 576.83. The reference is the official
+[prism-b10777-e3de715 release](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10777-e3de715),
+Windows CUDA 12.4 package with installed CUDA 12.9 runtime DLLs. Both engines use
+the exact checked-in counting, code and prose prompts, greedy sampling, 32 output
+tokens, eight CPU threads, 2048 context slots, f16 KV, an eight-token warmup and
+three measured repetitions. Drafting uses the official Bonsai 2 2B pack with a
+three-token window.
 
-Drafting improves counting/code by about 20% on 4B and 59% on 9B. It improves
-all three 27B requests by 1.38–2.19x. It slows every 2B request by 23–25%, even
-with full proposal acceptance, and slows 4B prose by 55% and 9B prose by 23%.
-Drafting remains opt-in; these three prompts do not establish a universal gain.
-The port is faster for every measured 2B/4B/9B case. On the tested 27B
-configuration, Camelid is 1.18–1.25x faster in ordinary mode and 3.29–3.78x faster
-in draft mode. The entry-point difference is retained in the protocol; these
-measurements do not isolate the causes of the performance gap.
+All rates are **request tokens/second**, based on the median complete uncached
+request duration. Loading and warmup are excluded; prefill and generation are
+included. Native timing starts after tokenization, while the reference also
+includes localhost HTTP, tokenization and JSON parsing. Callback-delivery
+`decode_tokens_per_second` fields are diagnostics, not GPU decode-clock rates.
+Ranges below cover the three prompts, not variation across repetitions.
 
-The first three sizes keep their packed target weights on CUDA in both engines.
-For 27B, Camelid streams weights for 19/64 trailing layers ordinarily and 29/64
-with drafting, while all layer computation stays on CUDA. The port places
-45/65 target layers on CUDA ordinarily and 31/65 with drafting; its remaining
-layers compute on CPU. Its entire 25-layer 2B drafter stays on CUDA. These counts
-use each engine's own layer convention. Automatic placement accounts for the
-drafter and speculative state. The comparison measures those complete
-configurations on this constrained GPU; it does not predict all-resident 27B
-performance on a larger GPU.
+| Model | Before ordinary | Optimized ordinary | Optimized + draft | Port ordinary | Port + draft |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2B | 29.17–29.89 | 65.35–67.50 | 41.22–42.89 | 198.08–208.80 | 58.34–81.18 |
+| 4B | 13.33–13.67 | 29.90–31.47 | 12.32–27.52 | 115.25–121.05 | 45.99–71.09 |
+| 9B | 7.21–7.39 | 16.10–16.72 | 10.03–16.75 | 77.60–78.84 | 39.26–62.35 |
+| 27B | 2.01–2.14 | 3.45–3.82 | 3.93–5.23 | 1.60–1.66 | 0.81–1.09 |
 
-All twelve native ordinary/draft outputs match exactly, and each ordinary
-output matches the pinned port baseline at all 32 generated tokens. Repeated
-outputs are stable within each mode. The port's own ordinary and draft prose
-outputs differ for 2B and 9B; those discrepancies remain in the receipts.
-[Complete rates, placement excerpts, and parity results](../qa/bonsai2/cuda/comparison.json)
-retain every case, including slowdowns. These are bounded test results, not a
-claim of whole-output identity for arbitrary prompts.
+Ordinary 2B/4B/9B throughput improves 2.23–2.30x against the original kernel in
+the same executable. 27B improves 1.61–1.90x. Drafting is optional: it slows all
+2B and 4B cases, adds only 2–4% on 9B counting/code and slows 9B prose by 40%.
+It improves 27B counting/code by 1.37–1.52x; the 3% prose gain is a near tie,
+not evidence of a broad advantage. These short prompts do not establish a
+universal speedup. The [twelve-case table](../qa/bonsai2/cuda-optimized/RESULTS.md)
+and [raw comparison](../qa/bonsai2/cuda-optimized/comparison.json) retain all cases.
+
+The first three targets keep their packed weights on CUDA in both engines.
+Native 27B streams 19/64 trailing layers ordinarily and 29/64 with drafting;
+all language-layer computation remains on CUDA. The port places 45/65 target
+layers on GPU ordinarily and 31/65 with drafting, plus all 25/25 drafter layers.
+Its remaining target layers compute on CPU. This compares complete operating
+configurations on a constrained GPU, not entirely resident 27B implementations.
+Native 27B is 2.15–2.39x faster ordinarily and 4.80–5.15x faster with drafting
+than those corresponding port configurations.
+
+All twelve native ordinary/draft outputs match, match the original kernel,
+and match the port's ordinary output at all 32 generated tokens. Repetitions
+are stable within each mode. The port's own ordinary and drafted prose output
+differs for 2B and 9B; those differences are retained in the receipts.
+
+The optimized build passed thirteen CUDA checks and two host memory regressions,
+including the new bitwise legacy/tiled fixture, independent CPU references,
+all four real-model cache/rollback tests, attention boundaries, and all four
+models' greedy/seeded/stop/cancel draft checks. The test-only build used Rust
+opt-level=1 and one job after an opt-level=3 build exhausted host memory. Probe
+and server benchmarks retain opt-level=3; both builds use identical CUDA source
+and NVRTC settings. The [manifest](../qa/bonsai2/cuda-optimized/manifest.json)
+binds binaries, source identity and receipts.
+
+Fresh production-GUI text/image checks passed for all four models through the
+native library-server harness, using the default image settings and an
+8192-slot allocation. They verify supported Windows CUDA routing, image input,
+answers, and request-rate labels. The original broader API qualification
+(including tools, context recall and seeded API continuations) remains in the
+[initial CUDA bundle](../qa/bonsai2/cuda/README.md). These runs exercise the
+production frontend/API, not an installed Tauri shell. Desktop CI is separate;
+Apple Silicon qualification remains separate. Reproduce this optimization pass
+with the [new workflow](../qa/bonsai2/cuda-optimized/README.md).
 
 Publisher references: [2B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf),
 [4B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf),

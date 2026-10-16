@@ -1,0 +1,374 @@
+{
+  "date": "2026-10-16T14:59:50.079Z",
+  "metric": "32 generated tokens / uncached warmed request seconds",
+  "notes": [
+    "Request time includes full prompt prefill and decoding; model loading and warmup are excluded for both engines.",
+    "Entry points differ: native timing surrounds the Rust generation call after tokenization; reference timing includes a localhost HTTP completion request, tokenization, serialization and JSON response parsing. Model-work settings are matched; these are request-level measurements.",
+    "Native decode_tokens_per_second and decode_speedup are legacy callback-delivery diagnostics, not GPU decode-clock measurements. CUDA and speculation can deliver callbacks in bursts; this comparison uses complete request wall time.",
+    "The llama.cpp port records its actual layer offload for each mode; a 27B target may use CPU layers on a 6 GiB GPU.",
+    "Automatic fitting may assign fewer target layers to the GPU when draft state and the draft model are resident. Speedups therefore describe complete operating configurations on this hardware.",
+    "Greedy speculative parity is checked independently within each engine. Differences from the reference are recorded rather than hidden."
+  ],
+  "models": [
+    {
+      "size": 2,
+      "native": "2b-native-benchmark.json",
+      "reference": "2b-reference-benchmark.json",
+      "native_repetitions": 3,
+      "reference_repetitions": 3,
+      "reference_gpu_layers": {
+        "baseline": [
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          }
+        ],
+        "speculative": [
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          },
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          }
+        ]
+      },
+      "cases": [
+        {
+          "name": "count",
+          "native_plain_tokens_per_second": 65.44916226094949,
+          "native_draft_tokens_per_second": 41.387773430911906,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 201.80234721355114,
+          "reference_draft_tokens_per_second": 81.18021830882837,
+          "native_draft_speedup": 0.6323652129556147,
+          "reference_draft_speedup": 0.402275887420288,
+          "native_plain_over_reference_plain": 0.32432309715253177,
+          "native_draft_over_reference_draft": 0.5098258454228741,
+          "native_draft_over_reference_plain": 0.20509064439728525,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "code",
+          "native_plain_tokens_per_second": 65.34826541197997,
+          "native_draft_tokens_per_second": 41.215034677943784,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 208.79755445864353,
+          "reference_draft_tokens_per_second": 74.40199397343856,
+          "native_draft_speedup": 0.6306982200385696,
+          "reference_draft_speedup": 0.3563355622930696,
+          "native_plain_over_reference_plain": 0.3129742854575602,
+          "native_draft_over_reference_draft": 0.5539506735889028,
+          "native_draft_over_reference_plain": 0.19739232475592636,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "explain",
+          "native_plain_tokens_per_second": 67.50059432163907,
+          "native_draft_tokens_per_second": 42.88653161876554,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 198.07912765952094,
+          "reference_draft_tokens_per_second": 58.34062135314149,
+          "native_draft_speedup": 0.6353504298704692,
+          "reference_draft_speedup": 0.2945318976435692,
+          "native_plain_over_reference_plain": 0.3407759066753673,
+          "native_draft_over_reference_draft": 0.7351058426198303,
+          "native_draft_over_reference_plain": 0.21651211879569351,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": false,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "native": "4b-native-benchmark.json",
+      "reference": "4b-reference-benchmark.json",
+      "native_repetitions": 3,
+      "reference_repetitions": 3,
+      "reference_gpu_layers": {
+        "baseline": [
+          {
+            "gpu_layers": 33,
+            "total_layers": 33
+          }
+        ],
+        "speculative": [
+          {
+            "gpu_layers": 33,
+            "total_layers": 33
+          },
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          }
+        ]
+      },
+      "cases": [
+        {
+          "name": "count",
+          "native_plain_tokens_per_second": 29.895589653136422,
+          "native_draft_tokens_per_second": 27.384505846592,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 116.89002402090001,
+          "reference_draft_tokens_per_second": 71.09043169442486,
+          "native_draft_speedup": 0.9160048744420407,
+          "reference_draft_speedup": 0.608182197667389,
+          "native_plain_over_reference_plain": 0.2557582642620646,
+          "native_draft_over_reference_draft": 0.38520663321192883,
+          "native_draft_over_reference_plain": 0.23427581674288672,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "code",
+          "native_plain_tokens_per_second": 30.104166059095608,
+          "native_draft_tokens_per_second": 27.515567792340008,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 115.24928059238069,
+          "reference_draft_tokens_per_second": 62.640721401868035,
+          "native_draft_speedup": 0.9140119589536516,
+          "reference_draft_speedup": 0.5435237519912928,
+          "native_plain_over_reference_plain": 0.26120914511882726,
+          "native_draft_over_reference_draft": 0.43926007198760414,
+          "native_draft_over_reference_plain": 0.23874828242666798,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "explain",
+          "native_plain_tokens_per_second": 31.473018918530023,
+          "native_draft_tokens_per_second": 12.31790716909511,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 121.05017075639732,
+          "reference_draft_tokens_per_second": 45.98533642584722,
+          "native_draft_speedup": 0.3913799054669913,
+          "reference_draft_speedup": 0.37988658866403924,
+          "native_plain_over_reference_plain": 0.25999978952418556,
+          "native_draft_over_reference_draft": 0.2678659791683402,
+          "native_draft_over_reference_plain": 0.10175869304541338,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "native": "9b-native-benchmark.json",
+      "reference": "9b-reference-benchmark.json",
+      "native_repetitions": 3,
+      "reference_repetitions": 3,
+      "reference_gpu_layers": {
+        "baseline": [
+          {
+            "gpu_layers": 33,
+            "total_layers": 33
+          }
+        ],
+        "speculative": [
+          {
+            "gpu_layers": 33,
+            "total_layers": 33
+          },
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          }
+        ]
+      },
+      "cases": [
+        {
+          "name": "count",
+          "native_plain_tokens_per_second": 16.103678704233598,
+          "native_draft_tokens_per_second": 16.391146854738686,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 77.60288566330317,
+          "reference_draft_tokens_per_second": 62.346520401729904,
+          "native_draft_speedup": 1.0178510858161567,
+          "reference_draft_speedup": 0.8034046655459915,
+          "native_plain_over_reference_plain": 0.20751391609460088,
+          "native_draft_over_reference_draft": 0.26290395597255956,
+          "native_draft_over_reference_plain": 0.2112182648188523,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "code",
+          "native_plain_tokens_per_second": 16.149962087964,
+          "native_draft_tokens_per_second": 16.74535500859063,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 77.65261955045426,
+          "reference_draft_tokens_per_second": 60.89161691789848,
+          "native_draft_speedup": 1.0368665212576786,
+          "reference_draft_speedup": 0.784154060357675,
+          "native_plain_over_reference_plain": 0.20797704161764524,
+          "native_draft_over_reference_draft": 0.27500263346872134,
+          "native_draft_over_reference_plain": 0.2156444316435513,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "explain",
+          "native_plain_tokens_per_second": 16.718749053039605,
+          "native_draft_tokens_per_second": 10.029806076206969,
+          "native_cuda_capacity_plan": {
+            "baseline": [],
+            "speculative": []
+          },
+          "reference_plain_tokens_per_second": 78.83600607924157,
+          "reference_draft_tokens_per_second": 39.256540016890156,
+          "native_draft_speedup": 0.599913668444199,
+          "reference_draft_speedup": 0.49795191270130634,
+          "native_plain_over_reference_plain": 0.21206996503900577,
+          "native_draft_over_reference_draft": 0.2554938889645302,
+          "native_draft_over_reference_plain": 0.12722367069338297,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": false,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        }
+      ]
+    },
+    {
+      "size": 27,
+      "native": "27b-native-benchmark.json",
+      "reference": "27b-reference-benchmark.json",
+      "native_repetitions": 3,
+      "reference_repetitions": 3,
+      "reference_gpu_layers": {
+        "baseline": [
+          {
+            "gpu_layers": 45,
+            "total_layers": 65
+          }
+        ],
+        "speculative": [
+          {
+            "gpu_layers": 31,
+            "total_layers": 65
+          },
+          {
+            "gpu_layers": 25,
+            "total_layers": 25
+          }
+        ]
+      },
+      "cases": [
+        {
+          "name": "count",
+          "native_plain_tokens_per_second": 3.4475600104112,
+          "native_draft_tokens_per_second": 5.224369528799419,
+          "native_cuda_capacity_plan": {
+            "baseline": [
+              "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ],
+            "speculative": [
+              "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ]
+          },
+          "reference_plain_tokens_per_second": 1.606216378628569,
+          "reference_draft_tokens_per_second": 1.0891772668745232,
+          "native_draft_speedup": 1.515381752028239,
+          "reference_draft_speedup": 0.6781012081351656,
+          "native_plain_over_reference_plain": 2.1463857897868155,
+          "native_draft_over_reference_draft": 4.796620061481033,
+          "native_draft_over_reference_plain": 3.2525938586556604,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "code",
+          "native_plain_tokens_per_second": 3.8159059121619,
+          "native_draft_tokens_per_second": 5.234176483378292,
+          "native_cuda_capacity_plan": {
+            "baseline": [
+              "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ],
+            "speculative": [
+              "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ]
+          },
+          "reference_plain_tokens_per_second": 1.5960478344314246,
+          "reference_draft_tokens_per_second": 1.0170058635473058,
+          "native_draft_speedup": 1.3716733598425834,
+          "reference_draft_speedup": 0.6372026211292117,
+          "native_plain_over_reference_plain": 2.3908468341873204,
+          "native_draft_over_reference_draft": 5.146653201311484,
+          "native_draft_over_reference_plain": 3.279460909918726,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        },
+        {
+          "name": "explain",
+          "native_plain_tokens_per_second": 3.8219952986830203,
+          "native_draft_tokens_per_second": 3.928234494779695,
+          "native_cuda_capacity_plan": {
+            "baseline": [
+              "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ],
+            "speculative": [
+              "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+            ]
+          },
+          "reference_plain_tokens_per_second": 1.6600768704820184,
+          "reference_draft_tokens_per_second": 0.8068623725471366,
+          "native_draft_speedup": 1.027796788795968,
+          "reference_draft_speedup": 0.4860391629412057,
+          "native_plain_over_reference_plain": 2.302300192624977,
+          "native_draft_over_reference_draft": 4.868531026399065,
+          "native_draft_over_reference_plain": 2.3662967448242904,
+          "native_speculative_parity": true,
+          "reference_speculative_parity": true,
+          "native_reference_parity": true,
+          "first_native_reference_divergence": null
+        }
+      ]
+    }
+  ]
+}

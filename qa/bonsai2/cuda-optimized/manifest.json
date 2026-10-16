@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "date": "2026-10-16T15:15:19.294Z",
+  "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+  "source_tree": "e75277f0bd22420d9a8dc209f6c890df837e0969",
+  "build_configuration": {
+    "profile": "release",
+    "features": [
+      "cuda"
+    ],
+    "target_cpu": "x86-64-v3",
+    "lto": false,
+    "codegen_units": 16,
+    "benchmark_rust_opt_level": 3,
+    "test_crate_rust_opt_level": 1,
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "notes": "The opt-level=3 test build exhausted host memory. The test-only retry used jobs=1 and profile.release.package.camelid.opt-level=1. Probe/server retained opt-level=3 and jobs=2. Both compile the identical CUDA source through the same NVRTC settings. Runtime source is committed; documentation/evidence edits during compilation may add a dirty build suffix."
+  },
+  "scope": "Windows CUDA projection optimization; original CPU/API qualification is retained in ../cuda and the parent directory. New GUI text/image runs use the production frontend in the native library-server harness, not an installed Tauri shell.",
+  "host": {
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "physical_memory_bytes": 16905969664,
+    "gpu": "RTX 3060 Laptop, 6144 MiB, driver 576.83",
+    "cuda_runtime": "12.9"
+  },
+  "binaries": {
+    "probe": {
+      "path": "output/bonsai2-profile/probe-optimized.exe",
+      "sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7"
+    },
+    "tests": {
+      "path": "output/bonsai2-profile/tests-optimized.exe",
+      "sha256": "741bc095bd0966ac3ee916b4c73dddcf4edaf2ec72d415c73a12c76eb07d7340"
+    },
+    "server": {
+      "path": "output/bonsai2-profile/server-optimized.exe",
+      "sha256": "f68d953ab30c3903a5f7762214597e1e77a3080603c7385f70299fa759638375",
+      "receipt_build_id": "v0.8.0-22-g511f0958-dirty"
+    }
+  },
+  "source_sha256": {
+    "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+    "src/runnable/speculative.rs": "a6b032350134e153245f2a8d2782c65c7b6281e29e5ffb314963d91a3d9ff8e5",
+    "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d",
+    "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+    "src/cuda_resident.rs": "74f55bd972eb2ba3e0c4b24aac5d14654375e09574cae470a962f1038d7ffe0a",
+    "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+    "src/cuda_resident/bonsai_ptq.rs": "0098eb28c62cd99e62eaf26f832d3b413a8502f1d323ff1ad13b36647004f3d1",
+    "src/cuda_resident/bonsai_ptq.cu": "1458bd06197234a13103435523d162ce6e5030e0beec0be245eafbd8fbeaa989",
+    "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+    "examples/bonsai2_probe.rs": "a1cfbed789f715e24b05592dde76df9210ccd985578695e01f94691557da499b",
+    "src/wire_mmap.rs": "463014c1a54dd2fe571d171b48fb257c3b60fbdbfdc0510e209352ceafddaf52",
+    "Cargo.toml": "657fb727ce2cc0b6742a4790ce4d8a93112d4323317145409aa1397fc99f9b70",
+    "Cargo.lock": "ef3bf073a2943131fa3aaa74b3e8eca7ad62242c7ac9b22bc3e76410229a972f",
+    ".cargo/config.toml": "5822b899fcc45ad00fa7e50190021446be790221bfb0ecfa1c192b335247e1bb",
+    "build.rs": "eb0c1233f733539424fe81d03d954c4bad41825383c9a0a008308b200d6ddf76",
+    "src/api/mod.rs": "1c9a2bd04c30a8e2548f013f8f0743221791a05646599663264ba13c92517c1a",
+    "src/bonsai2.rs": "1014e153070400eaf730ca7e6d0030a03cc3853486bcb15eaf4fa76d80f53df1",
+    "src/execution_plan.rs": "1d2cfb7377310832b4508e24ea513f1a07aedb715b8bfc9c31430538a9868ad1",
+    "examples/bonsai2_server.rs": "9d9def68bf58576e5587086516410d96cfd184514b9fe986c8e799240645eed0"
+  },
+  "git_source_sha256": {
+    "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+    "src/runnable/speculative.rs": "a6b032350134e153245f2a8d2782c65c7b6281e29e5ffb314963d91a3d9ff8e5",
+    "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d",
+    "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+    "src/cuda_resident.rs": "74f55bd972eb2ba3e0c4b24aac5d14654375e09574cae470a962f1038d7ffe0a",
+    "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+    "src/cuda_resident/bonsai_ptq.rs": "0098eb28c62cd99e62eaf26f832d3b413a8502f1d323ff1ad13b36647004f3d1",
+    "src/cuda_resident/bonsai_ptq.cu": "1458bd06197234a13103435523d162ce6e5030e0beec0be245eafbd8fbeaa989",
+    "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+    "examples/bonsai2_probe.rs": "a1cfbed789f715e24b05592dde76df9210ccd985578695e01f94691557da499b",
+    "src/wire_mmap.rs": "9a924c8bc8c39db823436be45f024f073e757ea09b91364f68c81775fba65124",
+    "Cargo.toml": "160dccbfbfc5f1329363ea7236e4f1c144d75cd9d46b92f4c70d7b052969d2e3",
+    "Cargo.lock": "f244c6dc9d00b1820232208d9ef9d1f945c4732707410468f1304d9eec59323f",
+    ".cargo/config.toml": "c76777135d7965c1487e5335599e88b7c1f1d842170ab27724b7028179960fe4",
+    "build.rs": "da4e7554284fd6446ed94da534f234cd517ce63007cb138d0d923a1419f8d529",
+    "src/api/mod.rs": "1c9a2bd04c30a8e2548f013f8f0743221791a05646599663264ba13c92517c1a",
+    "src/bonsai2.rs": "96e8369f5d9a61b86ffd60c204d246c473918e663a5f839797b922333c9f9294",
+    "src/execution_plan.rs": "7eca910595c4a29c6671730e323dc9abaa95b89a9e30053affc2d193b81d7c02",
+    "examples/bonsai2_server.rs": "9d9def68bf58576e5587086516410d96cfd184514b9fe986c8e799240645eed0"
+  },
+  "build_logs": {
+    "output/bonsai2-profile/build-final.log": "c833018fa8dcbe45a88443bdea09be6c7b0fda37a092b05795e80c838fe299cb",
+    "output/bonsai2-profile/build-tests-retry.log": "041b497f0a470c3528385618404678c38937d46a96d02236e39c0382f0837e22",
+    "output/bonsai2-profile/build-tests-retry.jsonl": "95dfb8100ebf45ce8ece31e703426ac9144c0f3bdf5f05a6f9042f9eba2c81ad",
+    "output/bonsai2-profile/clippy.log": "d528d45bf877dbf5eb8d7e0846bfa27e5fd173ef56d45f636fccc216ef281e8b"
+  },
+  "artifacts": {
+    "27b-baseline-benchmark.json": "3084efaabe7e14e8c3efe6e638314c4c32025623ef7b5a7efd2a8e9b5215d056",
+    "27b-gui-supported-text.png": "d0f2aef0a52d860ed23f36adacdd42e80cdf6b2a44510d8b035979a9a097e8ab",
+    "27b-gui-supported.json": "985578690caf3e6e76465324b0f3960b05aeb723a7d311e4962119bf32e5b976",
+    "27b-gui-supported.png": "1b7ced50418e84c598a7ad24106398203dd9492bbc28c05635c50534d336677a",
+    "27b-native-benchmark.json": "58df6a3846fdef8be80b7190c876e3620025d356c636a2715169f05ae1526e42",
+    "27b-reference-benchmark.json": "736c59dd3782dc3e89d4bea16d7808e22f76bcca7519df4d74e3d59379e42856",
+    "2b-baseline-benchmark.json": "39cf853c4ddfa6654e690f86a62ab1a1195260ede2b3e747b2175c2a70aa7200",
+    "2b-gui-supported-text.png": "a0aa69385b9ad5e7405937bc09661f513f8849a2d735a5c69754d46bb03c2ce4",
+    "2b-gui-supported.json": "80d3c41986edfe5b6d0db660a015a5c62650dd8ba097b7692990fdb258ff0b4b",
+    "2b-gui-supported.png": "b6330524a09c51fe4c9817844ec8a7ade1862f81a94125ee9ac33923a5bf24b5",
+    "2b-native-benchmark.json": "ae127d22810532c5d60f88b7af981f68d9190bc760e7fcd8f3f87e583a9cb883",
+    "2b-reference-benchmark.json": "8f7bf6657aa3a4792ba75908cadd196425c63cd7dda6e837c7647830f0b0e440",
+    "4b-baseline-benchmark.json": "5916ac03b17664c62c828f33f5462fe540b82773dfae2c5ef94599a59c67eafb",
+    "4b-gui-supported-text.png": "2990c47b06b4da8e20f9334a8dbacda9ac3b9e813799d9839a22d27be5ce3cb0",
+    "4b-gui-supported.json": "3321985f693ed57ddba4556dd90e170b792d2b34e04e59feeb57127ab34b2469",
+    "4b-gui-supported.png": "5ee3ef02f95420658d6c79bcba04cc8fbb7413cd7476228de0ec562535adfd78",
+    "4b-native-benchmark.json": "67db22ed64e2182e6ea04684ea1dc20bec76fd6dc4fb2944ab128e8f9c50144b",
+    "4b-reference-benchmark.json": "65d564b7544dd650ba3c8982cc5cc99f825f9cf6c1118a80294049888a64c1d2",
+    "9b-baseline-benchmark.json": "3a954d08fec71d88e2bdf6534684190b25469d6ee803a80eb1a34ebff32328e7",
+    "9b-gui-supported-text.png": "7db1ef4ed8f157783bdf8a8a9d34df75dfbc42a0d77a9ced411b3c067caae616",
+    "9b-gui-supported.json": "53adad830be11866e5b54e5991c93137a89fda94e020010d9fc80f4ba386acb8",
+    "9b-gui-supported.png": "3a9ecbae14cd440fcf303eba686bb9b8900c38279eed124cccf64eb8efab8196",
+    "9b-native-benchmark.json": "389e98c62ec72339312adde762d571454df7b89e0ea8425458291a25172fb4c1",
+    "9b-reference-benchmark.json": "dd01879212d55d92db0f2937a39ce587a2d967c4dacd593c4b27c40371b9ba9e",
+    "cache-parity.json": "ca2931c787c25806b23d39c0c41a66cd0862e3ff755e95933af4a667e73e9d63",
+    "comparison.json": "e8fccd939a9b16da87e348df4dd86cdda086cfddb77a618839bc8a7b5154ff42",
+    "final-2b-baseline-kernels.csv": "1105b817fc0426ef60d1b416e638a5d651820cfc2ad6c8d84918b8ce6e3ed349",
+    "final-2b-tiled-kernels.csv": "426f29e01a5d41bec560d0cb8cefed9049a7ed2d60db2db9a3ea3a07ba5a99b2",
+    "final-4b-baseline-kernels.csv": "ac12918c64efef9fbf007e9e0337caead5b875093fca8d36c52ab2d0235c73ce",
+    "final-4b-tiled-kernels.csv": "b4cd1935077aa1d7d41f3ab513c569e5730b50f5f837895b74ce41ecff1c65ec",
+    "final-9b-baseline-kernels.csv": "e4b6b9f5e8b7499a94626482c7029bac08266451aff0146c69cd802debc9a483",
+    "final-9b-tiled-kernels.csv": "65afe6983289d4d5b3c722024084515546fc1e07593c7babd076e784658337d2",
+    "optimization.json": "f206be7d367eb613d48f0b6bb34b5923b6623394f33a7423a8a838219a8367fd",
+    "profile-after-kernels.csv": "cbfa2b16418f094beb5c4fb729a232b788a103e33fe249e42672fa56f4301f7f",
+    "profile-before-kernels.csv": "fd3895e47c5977977a5dbff760da0fefb8c7ea66633180092af6837a15244a07",
+    "profile.json": "82c30c89b0d7f224d8310e71c4954926426b334b12f9f311434aae8638ba3eac",
+    "README.md": "2d410b55befddb413d884e22710175f8a18034205cfcab1edd2844494ebb245b",
+    "RESULTS.md": "004544bc4145341a2b95cb80a672be535af47acd9593d9200d307b6ccace2f7f"
+  }
+}

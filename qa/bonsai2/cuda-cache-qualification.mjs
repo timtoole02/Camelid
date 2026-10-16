@@ -54,6 +54,7 @@ await run('bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime', null, '
 await run('bonsai_upload_borrows_unchanged_packed_bytes', null, 'default', {}, true)
 await run('bonsai_cuda_transform_projection_and_embedding')
 await run('bonsai_cuda_bf16_projection_matches_warp_reference')
+await run('bonsai_cuda_projection_tiles_match_legacy_bits')
 for (const size of [2, 4, 9, 27]) await run('bonsai2_cuda_batch_cache_and_rollback_parity', size)
 for (const context of ['group-boundary', 'splitk-boundary']) {
   await run('bonsai2_cuda_batch_cache_and_rollback_parity', 2, context, { CAMELID_CUDA_GRAPHS: '1' })

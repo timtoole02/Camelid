@@ -399,7 +399,7 @@ mod tests {
         let mut kernels = CudaResidentKernels::new().expect("CUDA kernel compilation");
         let stream = kernels.stream.clone();
         // Include partial row/token tiles, the vocabulary dispatch threshold,
-        // all model widths, residual addition, and finite half-scale extremes.
+        // representative widths, residual addition, and finite half-scale extremes.
         for (rows, width, dense) in [
             (1, 128, 0),
             (7, 2048, 0),
