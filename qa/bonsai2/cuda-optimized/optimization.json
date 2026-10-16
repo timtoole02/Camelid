@@ -1,0 +1,182 @@
+{
+  "date": "2026-10-16T15:02:15.550Z",
+  "metric": "median warmed uncached request, 32 output tokens",
+  "models": [
+    {
+      "size": 2,
+      "cases": [
+        {
+          "name": "count",
+          "before_plain": 29.1652778981605,
+          "after_plain": 65.44916226094949,
+          "plain_speedup": 2.2440781291193344,
+          "before_draft": 22.1513778087774,
+          "after_draft": 41.387773430911906,
+          "draft_speedup": 1.8684062810084958,
+          "drafter_over_plain": 0.6323652129556147,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "code",
+          "before_plain": 29.176151195191917,
+          "after_plain": 65.34826541197997,
+          "plain_speedup": 2.2397836155561546,
+          "before_draft": 22.194223592653877,
+          "after_draft": 41.215034677943784,
+          "draft_speedup": 1.8570162865073438,
+          "drafter_over_plain": 0.6306982200385696,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "explain",
+          "before_plain": 29.894031264298924,
+          "after_plain": 67.50059432163907,
+          "plain_speedup": 2.2579957090715945,
+          "before_draft": 22.97571890126953,
+          "after_draft": 42.88653161876554,
+          "draft_speedup": 1.8666023815427089,
+          "drafter_over_plain": 0.6353504298704692,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "cases": [
+        {
+          "name": "count",
+          "before_plain": 13.346818625201772,
+          "after_plain": 29.895589653136422,
+          "plain_speedup": 2.2399037922555474,
+          "before_draft": 16.115254690017537,
+          "after_draft": 27.384505846592,
+          "draft_speedup": 1.6992909124517348,
+          "drafter_over_plain": 0.9160048744420407,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "code",
+          "before_plain": 13.333361666726876,
+          "after_plain": 30.104166059095608,
+          "plain_speedup": 2.2578076565807046,
+          "before_draft": 16.10028545806117,
+          "after_draft": 27.515567792340008,
+          "draft_speedup": 1.7090111764796927,
+          "drafter_over_plain": 0.9140119589536516,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "explain",
+          "before_plain": 13.673170295875014,
+          "after_plain": 31.473018918530023,
+          "plain_speedup": 2.301808449502377,
+          "before_draft": 6.184586402692027,
+          "after_draft": 12.31790716909511,
+          "draft_speedup": 1.991710741357477,
+          "drafter_over_plain": 0.3913799054669913,
+          "proposed": 49,
+          "accepted": 15,
+          "parity": true
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "cases": [
+        {
+          "name": "count",
+          "before_plain": 7.226392628609803,
+          "after_plain": 16.103678704233598,
+          "plain_speedup": 2.2284533282177317,
+          "before_draft": 11.428616326706997,
+          "after_draft": 16.391146854738686,
+          "draft_speedup": 1.4342197153329037,
+          "drafter_over_plain": 1.0178510858161567,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "code",
+          "before_plain": 7.206206128842282,
+          "after_plain": 16.149962087964,
+          "plain_speedup": 2.2411185302242504,
+          "before_draft": 11.443323916550561,
+          "after_draft": 16.74535500859063,
+          "draft_speedup": 1.4633296348774767,
+          "drafter_over_plain": 1.0368665212576786,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "explain",
+          "before_plain": 7.3868770190701,
+          "after_plain": 16.718749053039605,
+          "plain_speedup": 2.2633041012972286,
+          "before_draft": 5.788329194436779,
+          "after_draft": 10.029806076206969,
+          "draft_speedup": 1.7327635901991745,
+          "drafter_over_plain": 0.599913668444199,
+          "proposed": 37,
+          "accepted": 18,
+          "parity": true
+        }
+      ]
+    },
+    {
+      "size": 27,
+      "cases": [
+        {
+          "name": "count",
+          "before_plain": 2.140609507652254,
+          "after_plain": 3.4475600104112,
+          "plain_speedup": 1.6105506390057867,
+          "before_draft": 4.39256188278929,
+          "after_draft": 5.224369528799419,
+          "draft_speedup": 1.189367314156523,
+          "drafter_over_plain": 1.515381752028239,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "code",
+          "before_plain": 2.0835151661510563,
+          "after_plain": 3.8159059121619,
+          "plain_speedup": 1.8314749871541105,
+          "before_draft": 4.527429523732948,
+          "after_draft": 5.234176483378292,
+          "draft_speedup": 1.1561033597410078,
+          "drafter_over_plain": 1.3716733598425834,
+          "proposed": 24,
+          "accepted": 24,
+          "parity": true
+        },
+        {
+          "name": "explain",
+          "before_plain": 2.0121721955342164,
+          "after_plain": 3.8219952986830203,
+          "plain_speedup": 1.8994374870925546,
+          "before_draft": 2.7920761159038263,
+          "after_draft": 3.928234494779695,
+          "draft_speedup": 1.4069224232119768,
+          "drafter_over_plain": 1.027796788795968,
+          "proposed": 30,
+          "accepted": 21,
+          "parity": true
+        }
+      ]
+    }
+  ]
+}

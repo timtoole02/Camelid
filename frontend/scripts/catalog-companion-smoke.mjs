@@ -2,6 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 import { catalogDownloadSettlement } from '../src/lib/catalogActivation.js'
+import { findCompatibilityHint, quantLabelFromGgufFileType } from '../src/lib/capabilities.js'
+import { catalogQualification } from '../src/lib/catalogBrowse.js'
+import { getChatGateState } from '../src/lib/chatGate.js'
 import {
   catalogBundleInstalled,
   catalogDownloadBytes,
@@ -13,6 +16,29 @@ import {
 } from '../src/lib/supportedModels.js'
 
 const q1 = SUPPORTED_MODELS.find((item) => item.catalog_id === 'bonsai_27b_q1_0')
+for (const size of [2, 4, 9, 27]) {
+  const model = SUPPORTED_MODELS.find((item) => item.catalog_id === `ternary_bonsai_2_${size}b_ptq1_0`)
+  assert.ok(model, `Bonsai 2 ${size}B is offered on the download page`)
+  const [projector] = model.companion_artifacts
+  assert.equal(projector.filename, `Ternary-Bonsai-2-${size}B-mmproj-Q8_0.gguf`)
+  assert.equal(projector.repo_id, model.repo_id)
+  assert.equal(catalogDownloadBytes(model), model.size_bytes + projector.size_bytes)
+  assert.equal(catalogBundleInstalled(model, new Set([model.filename])), false)
+  assert.equal(catalogBundleInstalled(model, new Set([model.filename, projector.filename])), true)
+  assert.equal(catalogBundleInstalled(model, new Set([model.filename, BONSAI_27B_VISION_PROJECTOR.filename])), false)
+  const capabilities = { model_compatibility: [{ id: model.catalog_id, quantization: 'PTQ1_0', status: 'experimental_implemented' }] }
+  assert.equal(catalogQualification(model, capabilities).kind, 'runnable')
+  const loaded = { ...model, id: model.catalog_id, runtime_model_name: model.catalog_id, model_path: model.filename, provider_kind: 'local', status: 'ready', loaded_now: true, generation_ready: true, lane_class: 'experimental_implemented' }
+  const runtime = { status: 'online', loaded_now: true, generation_ready: true, active_model_id: loaded.id, backend: 'runnable-runtime', vision_ready: true }
+  assert.equal(getChatGateState(capabilities, loaded, runtime).experimentalUnlocked, true)
+  assert.equal(getChatGateState(capabilities, loaded, { ...runtime, generation_ready: false }).experimentalUnlocked, false)
+  for (const quant of ['PTQ1_0', 'file_type 143', undefined]) {
+    const hint = findCompatibilityHint(capabilities, { model_path: `C:/models/${model.filename}`, quant })
+    assert.equal(hint?.target?.id, model.catalog_id)
+    assert.equal(hint?.exact, true)
+  }
+}
+assert.equal(quantLabelFromGgufFileType(143), 'PTQ1_0')
 const q2 = SUPPORTED_MODELS.find((item) => item.catalog_id === 'ternary_bonsai_27b_q2_0')
 assert.ok(q1 && q2, 'both exact 27B catalog rows must be decorated')
 assert.deepEqual(q1.companion_artifacts, [BONSAI_27B_VISION_PROJECTOR])

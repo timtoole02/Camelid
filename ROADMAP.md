@@ -1,6 +1,18 @@
 # Camelid Roadmap
 
-Last updated: 2026-08-10
+Bonsai 2 Windows CUDA qualification completed (2026-10-16): all four
+2B/4B/9B/27B PTQ1_0 packs pass production GUI/API checks through the native
+server harness, seeded draft parity, and the twelve-case native/reference
+benchmark. The rebuilt suite passed all twelve CUDA state/kernel tests and
+both host memory regressions. The 27B path uses shared mapped weights and CUDA
+weight streaming within the tested 6 GiB VRAM/16 GB RAM host. Drafting gives
+workload-dependent gains; the port remains faster on 2B/4B/9B, while Camelid is
+faster on the tested 27B configuration. Apple Silicon, extended context, and
+further throughput improvements remain separate work. See
+[Bonsai 2](docs/BONSAI2.md), the [CUDA manifest](qa/bonsai2/cuda/manifest.json),
+and the [CUDA workflow](qa/bonsai2/cuda/README.md).
+
+Last updated: 2026-10-16
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 

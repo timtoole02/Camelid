@@ -8509,6 +8509,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             ];
             rows.retain(|row| !phase2_ids.contains(row.id));
             rows.extend(phase2);
+            rows.extend(crate::bonsai2::MODELS.iter().map(crate::bonsai2::compatibility));
             rows
         },
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
@@ -13367,18 +13368,28 @@ impl RunnableServeRuntime {
             .and_then(|filename| filename.to_str())
             .is_some_and(|filename| {
                 prism_supported_artifact_identity_matches(filename, model_sha256)
+                    || crate::bonsai2::identity_matches(filename, model_sha256)
             });
         let vision = if exact_prism_artifact {
             prism_mmproj_path(path)
-                .map(crate::runnable::PrismVisionProjector::load)
+                .map(|projector_path| {
+                    crate::runnable::PrismVisionProjector::load(projector_path).map(|p| {
+                        if gguf.metadata.contains_key("prism.hadamard.version") {
+                            p.with_portable_decode()
+                        } else {
+                            p
+                        }
+                    })
+                })
                 .transpose()?
         } else {
             None
         };
         if let Some(projector) = &vision {
-            if projector.projection_dim() != 5120 {
+            let model_width = gguf.metadata_u32("qwen35.embedding_length").unwrap_or(0) as usize;
+            if projector.projection_dim() != model_width {
                 return Err(BackendError::InvalidModelMetadata(format!(
-                    "Prism projector output width {} does not match Qwen3.5 27B width 5120",
+                    "Prism projector output width {} does not match Qwen3.5 width {model_width}",
                     projector.projection_dim()
                 )));
             }
@@ -31232,6 +31243,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bonsai2_windows_plan_requires_exact_bytes_host_and_backend() {
+        for model in crate::bonsai2::MODELS {
+            for backend in ["bonsai2_portable_runtime", "bonsai2_cuda_runtime"] {
+                let mut base = provisional_lfm2_supported_plan();
+                base.model_family = "qwen35".into();
+                base.operating_system = "windows".into();
+                base.architecture = "x86_64".into();
+                base.selected_backend = backend.into();
+                base.support_level = "supported_windows_runtime".into();
+                base.reasons = vec!["support_level=supported_windows_runtime".into()];
+                let path = std::path::Path::new(model.catalog.filename);
+                let mut valid = base.clone();
+                finalize_execution_plan_support_for_loaded_artifact(&mut valid, path, model.sha256);
+                assert_eq!(valid.support_level, "supported_windows_runtime");
+                assert_eq!(
+                    supported_artifact_expected_sha256(model.catalog.filename),
+                    Some(model.sha256)
+                );
+                for failure in [
+                    "digest",
+                    "filename",
+                    "macos",
+                    "linux",
+                    "architecture",
+                    "backend",
+                ] {
+                    let mut plan = base.clone();
+                    match failure {
+                        "macos" | "linux" => plan.operating_system = failure.into(),
+                        "architecture" => plan.architecture = "aarch64".into(),
+                        "backend" => plan.selected_backend = "cpu_reference".into(),
+                        _ => {}
+                    }
+                    finalize_execution_plan_support_for_loaded_artifact(
+                        &mut plan,
+                        if failure == "filename" {
+                            std::path::Path::new("neighbor.gguf")
+                        } else {
+                            path
+                        },
+                        if failure == "digest" {
+                            "00"
+                        } else {
+                            model.sha256
+                        },
+                    );
+                    assert_eq!(plan.support_level, "unknown_or_unvalidated", "{failure}");
+                    assert!(plan
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+                }
+            }
+        }
+    }
+
     /// Every artifact whose supported-row identity is pinned to exact bytes:
     /// the paired Prism evidence bundles, the non-catalog allowlist, and the
     /// curated rows carrying a recorded digest. `classify_model_lane` only
@@ -31792,6 +31860,12 @@ mod tests {
                 "ternary_bonsai_8b_q2_0",
                 "bonsai_27b_q1_0",
                 "ternary_bonsai_27b_q2_0",
+                // Exact publisher Bonsai 2 rows: Windows x86_64 CPU language,
+                // CUDA/CPU single-image GUI/API chat and function tools.
+                "ternary_bonsai_2_2b_ptq1_0",
+                "ternary_bonsai_2_4b_ptq1_0",
+                "ternary_bonsai_2_9b_ptq1_0",
+                "ternary_bonsai_2_27b_ptq1_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 // Llama-3.2-3B-Instruct K-quant rows (filename-anchored ids): GPU-resident
@@ -37380,14 +37454,28 @@ fn catalog_companion_artifact_by_filename(filename: &str) -> Option<CatalogCompa
     CATALOG_COMPANION_BINDINGS
         .iter()
         .map(|binding| binding.artifact)
+        .chain(crate::bonsai2::MODELS.iter().map(|m| m.projector))
         .find(|artifact| artifact.filename.eq_ignore_ascii_case(filename))
 }
 
 fn catalog_companion_expected_sha256(artifact: &CatalogCompanionArtifact) -> Option<&'static str> {
-    (*artifact == BONSAI_27B_VISION_PROJECTOR).then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+    (*artifact == BONSAI_27B_VISION_PROJECTOR)
+        .then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+        .or_else(|| {
+            crate::bonsai2::MODELS
+                .iter()
+                .find(|m| m.projector == *artifact)
+                .map(|m| m.projector_sha256)
+        })
 }
 
 fn catalog_companion_artifacts(catalog_id: &str) -> Vec<CatalogCompanionArtifact> {
+    if let Some(model) = crate::bonsai2::MODELS
+        .iter()
+        .find(|m| m.catalog.catalog_id == catalog_id)
+    {
+        return vec![model.projector];
+    }
     CATALOG_COMPANION_BINDINGS
         .iter()
         .filter(|binding| binding.catalog_ids.contains(&catalog_id))
@@ -38513,6 +38601,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
     ];
     rows.retain(|item| !phase2_ids.contains(item.catalog_id));
     rows.extend(phase2);
+    rows.extend(crate::bonsai2::MODELS.iter().map(|m| m.catalog.clone()));
     rows
 }
 
@@ -41361,6 +41450,7 @@ fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) 
 /// row", never "any bytes will do knowingly".
 fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
     prism_supported_artifact_expected_sha256(filename)
+        .or_else(|| crate::bonsai2::expected_sha256(filename))
         .or_else(|| {
             NON_CATALOG_SUPPORTED_ARTIFACTS
                 .iter()
@@ -41536,6 +41626,9 @@ fn phi3_supported_on_current_host() -> bool {
 }
 
 fn supported_exact_row_host_eligible(filename: &str) -> bool {
+    if crate::bonsai2::expected_sha256(filename).is_some() {
+        return crate::bonsai2::host_eligible(env::consts::OS, env::consts::ARCH);
+    }
     match filename {
         LFM2_5_2_6B_Q8_0_FILENAME => lfm2_supported_on_current_host(),
         PHI3_MINI_4K_Q8_0_FILENAME => phi3_supported_on_current_host(),
@@ -41553,6 +41646,31 @@ fn finalize_execution_plan_support_for_loaded_artifact(
     model_path: &std::path::Path,
     gguf_sha256: &str,
 ) {
+    if plan.support_level == "supported_windows_runtime" {
+        let filename = model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if matches!(
+            plan.selected_backend.as_str(),
+            "bonsai2_portable_runtime" | "bonsai2_cuda_runtime"
+        ) && crate::bonsai2::host_eligible(&plan.operating_system, &plan.architecture)
+            && crate::bonsai2::identity_matches(filename, gguf_sha256)
+        {
+            return;
+        }
+        plan.support_level = "unknown_or_unvalidated".into();
+        for reason in &mut plan.reasons {
+            if reason.starts_with("support_level=") {
+                *reason = "support_level=unknown_or_unvalidated".into();
+            }
+        }
+        plan.reasons.push(
+            "Bonsai 2 Windows support requires the exact publisher digest and qualified host"
+                .into(),
+        );
+        return;
+    }
     if plan.support_level != "supported_exact_row_smoke" {
         return;
     }
@@ -41593,10 +41711,11 @@ fn catalog_host_lane_class_with_eligibility(
     item: &CatalogItem,
     host_eligible: bool,
 ) -> Option<ModelLaneClass> {
-    if matches!(
+    if (matches!(
         item.filename,
         LFM2_5_2_6B_Q8_0_FILENAME | PHI3_MINI_4K_Q8_0_FILENAME
-    ) && supported_compatibility_row_ids().contains(item.catalog_id)
+    ) || crate::bonsai2::expected_sha256(item.filename).is_some())
+        && supported_compatibility_row_ids().contains(item.catalog_id)
     {
         return Some(if host_eligible {
             ModelLaneClass::Supported
@@ -43315,6 +43434,40 @@ mod catalog_fit_tests {
             ),
             "https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf"
         );
+    }
+
+    #[test]
+    fn bonsai2_downloads_bind_distinct_hash_pinned_vision_projectors() {
+        let catalog = curated_catalog();
+        for model in crate::bonsai2::MODELS {
+            let item = catalog
+                .iter()
+                .find(|c| c.catalog_id == model.catalog.catalog_id)
+                .unwrap();
+            assert_eq!(item.filename, model.catalog.filename);
+            assert_eq!(item.quant, "PTQ1_0");
+            assert_eq!(
+                catalog_companion_artifacts(item.catalog_id),
+                vec![model.projector]
+            );
+            assert_eq!(
+                super::catalog_companion_expected_sha256(&model.projector),
+                Some(model.projector_sha256)
+            );
+            assert_eq!(
+                super::prism_vision_companion_for_model(std::path::Path::new(item.filename)),
+                Some(model.projector)
+            );
+            assert_ne!(model.projector, BONSAI_27B_VISION_PROJECTOR);
+            assert!(crate::bonsai2::identity_matches(
+                item.filename,
+                model.sha256
+            ));
+            assert!(!crate::bonsai2::identity_matches(
+                item.filename,
+                &"0".repeat(64)
+            ));
+        }
     }
 
     #[test]

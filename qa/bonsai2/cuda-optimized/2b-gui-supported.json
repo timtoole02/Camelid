@@ -1,0 +1,17 @@
+{
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "platform": "win32",
+  "backend_build": "v0.8.0-22-g511f0958-dirty",
+  "selected_backend": "bonsai2_cuda_runtime",
+  "date": "2026-10-16T15:05:14.852Z",
+  "support_level": "supported_windows_runtime",
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "generation_ready": true,
+  "vision_ready": true,
+  "image_input_present": true,
+  "image_limits": "GUI defaults",
+  "text_answer": "The capital of France is Paris.\n\nBonsai 2 2B PTQ1_0\nVERIFIED\ntokens in 24 · out 7\nfirst token 914ms\n7.6 tok/s request\n915ms\n08:05 AM\nCLIENT-MEASURED\nDeveloper Diagnostics\n7.6 tok/s request",
+  "output_rate_source": "client_request",
+  "answer": "Red\n\nBonsai 2 2B PTQ1_0\nVERIFIED\ntokens in 63 · out 1\nfirst token 412ms\n2.0 tok/s request\n508ms\n08:05 AM\nCLIENT-MEASURED\nDeveloper Diagnostics\n2.0 tok/s request"
+}

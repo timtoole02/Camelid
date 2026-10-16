@@ -623,6 +623,7 @@ fn tensor_type_to_id(t: GgufTensorType) -> u32 {
         GgufTensorType::Q1_0 => 41,
         GgufTensorType::Q2_0 | GgufTensorType::Q2_0G64 | GgufTensorType::Q2_0G128 => 42,
         GgufTensorType::Pq2_0 => 142,
+        GgufTensorType::Ptq1_0 => 143,
         GgufTensorType::Unknown(value) => value as u32,
     }
 }

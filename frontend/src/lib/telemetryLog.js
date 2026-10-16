@@ -78,7 +78,7 @@ function pushRequest(record) {
 
 /* Chat generation: called from the real sendMessage path on completion,
    interruption, or error. */
-export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs, webResearchMs, promptTokens, completionTokens, tokensPerSec, usageSource, outcome, promptText }) {
+export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs, webResearchMs, promptTokens, completionTokens, tokensPerSec, rateSource, usageSource, outcome, promptText }) {
   pushRequest({
     lifecycleId,
     kind: 'chat',
@@ -91,6 +91,7 @@ export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs,
     promptTokens: Number.isFinite(promptTokens) ? promptTokens : null,
     completionTokens: Number.isFinite(completionTokens) ? completionTokens : null,
     tokensPerSec: Number.isFinite(tokensPerSec) ? tokensPerSec : null,
+    rateSource: normalizeRateSource(rateSource),
     usageSource: usageSource || null,
     promptText: typeof promptText === 'string' ? promptText : null,
   })
@@ -128,7 +129,7 @@ export function getTelemetrySnapshot() {
 /* Export whitelist (I7): time, endpoint, model, outcome, independent web/model
    timings, and token counts. promptText and any path-like field can never
    appear here. */
-const EXPORT_FIELDS = ['at', 'kind', 'endpoint', 'modelId', 'outcome', 'httpStatus', 'durationMs', 'webResearchMs', 'ttftMs', 'promptTokens', 'completionTokens', 'tokensPerSec', 'usageSource']
+const EXPORT_FIELDS = ['at', 'kind', 'endpoint', 'modelId', 'outcome', 'httpStatus', 'durationMs', 'webResearchMs', 'ttftMs', 'promptTokens', 'completionTokens', 'tokensPerSec', 'rateSource', 'usageSource']
 
 export function exportTelemetryJson() {
   const rows = state.requests.map((record) => {
@@ -153,9 +154,35 @@ function median(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
 }
 
+function normalizeRateSource(source) {
+  return ['client_request', 'backend_native', 'browser_delivery'].includes(source) ? source : 'unspecified'
+}
+
+export function rateSourceLabel(source) {
+  return {
+    client_request: 'request incl. prefill',
+    backend_native: 'backend decode',
+    browser_delivery: 'browser delivery',
+  }[normalizeRateSource(source)] || 'unspecified clock'
+}
+
+// Do not combine request throughput, native decode, and historical delivery
+// measurements into one median: their denominators describe different work.
+function summarizeOutputRates(requests) {
+  const groups = new Map()
+  for (const record of requests) {
+    if (!Number.isFinite(record.tokensPerSec)) continue
+    const source = normalizeRateSource(record.rateSource)
+    if (!groups.has(source)) groups.set(source, [])
+    groups.get(source).push(record.tokensPerSec)
+  }
+  return [...groups.entries()].map(([source, values]) => ({ source, values, median: median(values) }))
+}
+
 export function summarizeTelemetry(requests) {
   const total = requests.length
   const errors = requests.filter((r) => r.outcome !== 'ok').length
+  const outputRates = summarizeOutputRates(requests)
   return {
     total,
     errors,
@@ -163,7 +190,8 @@ export function summarizeTelemetry(requests) {
     medianWebResearchMs: median(requests.map((r) => r.webResearchMs)),
     medianTtftMs: median(requests.map((r) => r.ttftMs)),
     medianDurationMs: median(requests.map((r) => r.durationMs)),
-    medianTokensPerSec: median(requests.map((r) => r.tokensPerSec)),
+    medianTokensPerSec: outputRates.length === 1 ? outputRates[0].median : null,
+    outputRates,
   }
 }
 

@@ -301,6 +301,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q2_0G64
             | GgufTensorType::Q2_0G128
             | GgufTensorType::Pq2_0
+            | GgufTensorType::Ptq1_0
     )
 }
 

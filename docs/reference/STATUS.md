@@ -1,8 +1,36 @@
 # Camelid Status
 
-Last updated: 2026-10-03
+Last updated: 2026-10-16
 
 TinyLlama tokenizer-reference update (2026-10-03): flat-score TinyLlama Q8_0 now uses its merge ranks and is checked against the model's own SentencePiece tokenizer instead of the pinned llama.cpp tokenizer. The existing runtime admission label is retained, but full current-gate support is on hold until the [TinyLlama refresh checklist](#tinyllama-11b-chat-q8_0) passes. Earlier llama.cpp parity, context, API/WebUI, and RSS/perf receipts remain historical evidence; they do not certify the changed tokenizer. The corrected-tokenizer evidence is [spm-flat-scores-20261002](../../qa/evidence-bundles/spm-flat-scores-20261002/README.md).
+
+Bonsai 2 Windows CUDA qualification (2026-10-16): the official 2B/4B/9B/27B
+PTQ1_0 catalog rows include their distinct Q8_0 vision companions. All four pass
+CUDA text, tool-call/result round trips, seeded sampling, 1,044-token context
+recall, spatial vision, and production GUI text/image checks through the native
+library-server harness. Installed Tauri execution and Apple Silicon qualification
+remain separate. GUI timing is labelled `tok/s request`.
+
+The default CUDA projection now uses transposed Q8 activations, integer DP4A
+contractions, fused rotation/quantization, and four-token tiles while retaining
+the 28-byte packed weights. Fresh ordinary 2B/4B/9B request throughput improves
+2.07–2.47x over the optimized float control; the pinned Prism port's remaining
+lead is 1.26–1.92x. All four models were rerun with and without the 2B drafter,
+with three uncached repetitions per prompt. Drafting remains opt-in: it slows
+the smaller targets on these cases and changes 27B throughput by
+0.89–1.51x. On 6 GiB, 27B compares different strategies: Camelid streams
+weights while computing every language layer on CUDA; the port computes some
+target layers on CPU. See the [complete results](../../qa/bonsai2/cuda-q8/RESULTS.md).
+
+All sixteen kernel/state/host regressions pass. All twelve native benchmark
+outputs match their ordinary/draft and float controls and the port's ordinary
+output at 32 tokens. Across 384 fixed continuation tokens, Q8 retains every
+float top choice; the maximum mean NLL increase is 0.000734 nats/token. This is
+a bounded numerical check, not general model-quality certification.
+The [Q8 manifest](../../qa/bonsai2/cuda-q8/manifest.json) binds source, binaries,
+profiles, benchmark repetitions, and fresh API/GUI receipts. Earlier CPU/CUDA
+receipts remain historical evidence. Details and reproduction:
+[Bonsai 2](../BONSAI2.md), [Q8 workflow](../../qa/bonsai2/cuda-q8/README.md).
 
 CUDA continuous-batching rollout note (2026-09-11): the explicit-opt-in Phase 7/8 runtime project
 is implemented and observable without changing any model-support row. Generation-safe paged KV,

@@ -172,6 +172,7 @@ pub struct PrismVisionEmbedding {
 /// portable CPU implementation as the final fallback.
 pub struct PrismVisionProjector {
     model: PrismVisionModel,
+    portable_decode: bool,
     #[cfg(target_os = "macos")]
     encoder: Mutex<crate::metal::PrismVisionMetalEncoder>,
     #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
@@ -283,6 +284,7 @@ impl PrismVisionProjector {
             let encoder = model.metal_encoder()?;
             Ok(Self {
                 model,
+                portable_decode: false,
                 encoder: Mutex::new(encoder),
             })
         }
@@ -290,6 +292,7 @@ impl PrismVisionProjector {
         {
             Ok(Self {
                 model,
+                portable_decode: false,
                 #[cfg(feature = "cuda")]
                 cuda: PrismVisionCudaRuntime::new(),
             })
@@ -298,6 +301,13 @@ impl PrismVisionProjector {
 
     pub fn projection_dim(&self) -> usize {
         self.model.projection
+    }
+
+    /// The caller has bound the portable Qwen3.5 image decoder. This allows
+    /// CPU encoding to remain a usable fallback for Bonsai 2 on GPU-less hosts.
+    pub fn with_portable_decode(mut self) -> Self {
+        self.portable_decode = true;
+        self
     }
 
     /// Initialize the execution backend without encoding an image. This lets a
@@ -317,10 +327,9 @@ impl PrismVisionProjector {
         // affordance will be missing instead of leaving the operator guessing.
         #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         {
-            eprintln!(
-                "[qwen3vl] projector loaded, but this build has no Metal or CUDA lane to decode \
-                 with image embeddings; image input stays unavailable and text is unaffected"
-            );
+            if !self.portable_decode {
+                eprintln!("[qwen3vl] projector loaded without a bound image decoder; image input stays unavailable");
+            }
         }
         Ok(())
     }
@@ -333,6 +342,9 @@ impl PrismVisionProjector {
     /// build can encode an image on CPU and still have no lane that can decode
     /// with it, so readiness has to account for [`VISION_DECODE_LANE_EXISTS`].
     pub fn backend_ready(&self) -> bool {
+        if self.portable_decode {
+            return true;
+        }
         // A projector that can only encode is not readiness. CPU encode works
         // everywhere, but generation with the result errors out unconditionally
         // off Metal and CUDA, so a build with no decode lane must report false
@@ -452,11 +464,16 @@ impl PrismVisionProjector {
                             });
                         }
                         Err(error) => {
-                            if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
-                                self.model.projection,
-                                "execution",
-                                &error,
-                            ) {
+                            if let Some(diagnostic) = (!self.portable_decode)
+                                .then(|| {
+                                    prism_27b_cuda_failure_diagnostic(
+                                        self.model.projection,
+                                        "execution",
+                                        &error,
+                                    )
+                                })
+                                .flatten()
+                            {
                                 self.cuda.mark_ready(false);
                                 *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
                                 return Err(BackendError::UnsupportedGguf(diagnostic));
@@ -490,17 +507,27 @@ impl PrismVisionProjector {
                 self.cuda.mark_ready(false);
                 return Ok(());
             }
-            *lane = match super::vision_cuda::CudaVisionEncoder::new() {
+            // Activation requantization / tensor-core approximations can change
+            // spatial answers on Bonsai 2 (blue-left/yellow-right regression).
+            // Keep CUDA encoding, using the f32 graph qualified against CPU.
+            *lane = match super::vision_cuda::CudaVisionEncoder::new_with_strict_math(
+                self.portable_decode,
+            ) {
                 Ok(encoder) => {
                     eprintln!("[qwen3vl] streaming CUDA projector active (bounded VRAM)");
                     PrismVisionCudaLane::Ready(encoder)
                 }
                 Err(error) => {
-                    if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
-                        self.model.projection,
-                        "initialization",
-                        &error,
-                    ) {
+                    if let Some(diagnostic) = (!self.portable_decode)
+                        .then(|| {
+                            prism_27b_cuda_failure_diagnostic(
+                                self.model.projection,
+                                "initialization",
+                                &error,
+                            )
+                        })
+                        .flatten()
+                    {
                         self.cuda.mark_ready(false);
                         *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
                         return Err(BackendError::UnsupportedGguf(diagnostic));
@@ -1229,10 +1256,12 @@ fn interpolate_positions_tile_major(
                 for dx in 0..merge {
                     let y = tile_y + dy;
                     let x = tile_x + dx;
-                    let source_y = ((y as f32 + 0.5) * source_side as f32 / height as f32 - 0.5)
-                        .clamp(0.0, (source_side - 1) as f32);
-                    let source_x = ((x as f32 + 0.5) * source_side as f32 / width as f32 - 0.5)
-                        .clamp(0.0, (source_side - 1) as f32);
+                    // Qwen3-VL resizes its learned position grid with
+                    // align_corners=true (including when downsampling).
+                    let source_y = y as f32 * (source_side - 1) as f32
+                        / height.saturating_sub(1).max(1) as f32;
+                    let source_x =
+                        x as f32 * (source_side - 1) as f32 / width.saturating_sub(1).max(1) as f32;
                     let y0 = source_y.floor() as usize;
                     let x0 = source_x.floor() as usize;
                     let y1 = (y0 + 1).min(source_side - 1);
@@ -1257,6 +1286,19 @@ fn interpolate_positions_tile_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learned_positions_align_corners_in_tile_order() {
+        let grid: Vec<f32> = (0..9).map(|i| i as f32).collect();
+        assert_eq!(
+            interpolate_positions_tile_major(&grid, 1, 3, 2, 2, 2),
+            vec![0.0, 2.0, 6.0, 8.0]
+        );
+        assert_eq!(
+            interpolate_positions_tile_major(&grid, 1, 3, 1, 1, 1),
+            vec![0.0]
+        );
+    }
 
     /// Deliberately cfg-independent so it runs on every CI leg, including the
     /// ones that never compile the CPU-only arm of `backend_ready`. The defect

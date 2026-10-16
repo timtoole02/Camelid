@@ -108,6 +108,9 @@ export function formatModelLabel(value) {
   // Already a display name (or a HF repo path) — leave it alone.
   if (/\s/.test(raw)) return raw
   const tail = raw.split('/').pop().replace(/\.gguf$/i, '')
+  // The generation number is separate from the parameter count (2 4B, not 2.4B).
+  const bonsai2 = tail.match(/^ternary[-_]bonsai[-_]2[-_](2|4|9|27)b[-_]ptq1[-_]0$/i)
+  if (bonsai2) return `Bonsai 2 ${bonsai2[1]}B PTQ1_0`
   const tokens = tail.split(/[_-]+/).filter(Boolean)
   const merged = []
   for (const token of tokens) {

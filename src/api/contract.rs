@@ -92,13 +92,14 @@ pub(super) const API_CONFORMANCE_CASES: &[ApiConformanceCase] = &[
     ApiConformanceCase {
         id: "openai_chat_completions",
         status: SupportStatus::SupportedCurrentGate,
-        notes: "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact 27B Prism/Qwen3.5 rows additionally accept one OpenAI image_url content part containing a local PNG/JPEG data URL when their sibling mmproj is resident on macOS Metal or Windows CUDA; /v1/health advertises vision_ready.",
+        notes: "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact 27B Prism/Qwen3.5 rows additionally accept one OpenAI image_url content part containing a local PNG/JPEG data URL when their sibling mmproj is resident on macOS Metal or Windows CUDA. Bonsai 2 2B/4B/9B/27B PTQ1_0 supports Windows x86_64 CPU text, function calling and single-image decoding with each exact matching projector; /v1/health advertises vision_ready.",
         routes: &[post("/v1/chat/completions")],
         supported_modes: &[
             "nonstreaming",
             "streaming",
             "function_tool_roundtrip",
             "prism_single_image_data_url_metal_or_windows_cuda",
+            "bonsai2_single_image_data_url_windows_supported",
         ],
         unsupported_modes: &[
             "multiple_images",

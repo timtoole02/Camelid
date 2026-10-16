@@ -214,7 +214,8 @@ assert.match(messageTurnSource, /data-streaming-state=\{assistantStreaming \? 'a
 assert.match(messageTurnSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
 assert.doesNotMatch(messageTurnSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
 assert.match(messageTurnSource, /\{message\.role === 'assistant' && <MessageMetaFooter message=\{message\} \/>\}/, 'the assistant meta footer should render during streaming too — it is the live tok/s readout (tokens_out_per_sec is live-patched per frame)')
-assert.match(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must label the post-first-content browser timing as decode rate')
+assert.match(messageTurnSource, /Output tokens divided by full model request time, including prefill and time to first token/, 'the footer must explain the request clock used for browser rates')
+assert.match(messageTurnSource, /requestRate \? ' request' : ''/, 'request rates must be labeled visibly, not only in a tooltip')
 assert.match(diagnosticsSource, /Decode Rate/, 'developer diagnostics must use the same decode-rate label')
 assert.match(messageTurnSource, /tokens est\.[\s\S]*in \{usage\.prompt_tokens\}[\s\S]*out \{usage\.completion_tokens/, 'the streaming footer should label live input and output token counts explicitly')
 assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: continuedCompletionTokens,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and its already-generated output count before the first streamed token')
@@ -247,11 +248,8 @@ assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
 assert.match(chatWorkspaceSource, /isBitNetB158ChatModel\(selectedModel, runtime, selectedModelId\)/, 'BitNet controls must use the exact causal-model detector rather than architecture display metadata alone')
-// The window opens at the first GENERATED token and subtracts the token count
-// already delivered at that instant, so research and TTFT are excluded from the
-// rate. It is expressed with firstTokenAt/decodeStartTokens, which the
-// web-research smoke pins from the other side.
-assert.match(dashboardHookSource, /const decodedTokens = firstTokenAt === null \? 0 : Math\.max\(0, realTokens - decodeStartTokens\)[\s\S]*const decodeElapsedMs = firstTokenAt === null \? 0 : now - firstTokenAt[\s\S]*tokensPerSecond\(decodedTokens, decodeElapsedMs\)/, 'live decode rate must start at the active generated-token window and exclude its baseline count')
+assert.match(dashboardHookSource, /requestOutputRate\(realTokens, liveElapsedMs\)/, 'ordinary live rates must include prefill rather than time a CUDA callback burst')
+assert.match(dashboardHookSource, /nativeMtp12\?\.decode_tokens_per_second\s*\?\? requestOutputRate\(completionTokenCount, elapsedMs\)/, 'native measured rates retain priority over the final request-rate fallback')
 assert.match(dashboardHookSource, /effectiveGenerationTokenLimit\([\s\S]*runtime\?\.max_generation_tokens/, 'the outgoing max_tokens value must obey the same live server ceiling used by research budgeting')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
@@ -722,7 +720,7 @@ assert.match(paletteSource, /camelid:open-ledger/, 'palette ledger jumps must us
 assert.match(frontendReadmeSource, /readiness-gate semantics are \*\*unchanged\*\*/, 'frontend README must state gate semantics are unchanged after the overhaul')
 
 /* ---- Session telemetry (Phase 6) ---- */
-assert.match(telemetryViewSource, /Live session stats — measured in this browser, nothing persisted/, 'every telemetry surface must declare its numbers as session stats, not support evidence')
+assert.match(telemetryViewSource, /Live session stats — request measurements, nothing persisted/, 'every telemetry surface must declare its numbers as session stats, not support evidence')
 assert.match(telemetryViewSource, /useState\(false\)/, 'prompt reveal must default to redacted')
 assert.match(telemetryViewSource, /•••• redacted/, 'redacted prompts must render visibly redacted')
 assert.match(telemetryViewSource, /Nothing is seeded, stored, or shared/, 'the page must promise no synthetic data')

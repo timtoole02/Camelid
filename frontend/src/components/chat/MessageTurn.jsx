@@ -149,14 +149,20 @@ function VariantNav({ index, count, onSelect, onDiscard }) {
   )
 }
 
-/* Per-message metadata footer. Token counts are labeled by source (backend
-   usage vs client estimate); TTFT and tok/s are always client-measured and say
-   so — operational telemetry, never support evidence (I4). The Evidence Chip
+/* Per-message metadata footer. Token counts and output rates identify their
+   source and clock; TTFT is client-measured. These are operational telemetry,
+   never support evidence (I4). The Evidence Chip
    cites the contract row that was active when this reply was generated. */
 function MessageMetaFooter({ message }) {
   const usage = message.usage
   const ttft = formatMs(message.first_content_ms)
   const rate = message.target_verified_render ? null : formatRate(message.tokens_out_per_sec)
+  const requestRate = message.output_rate_source === 'client_request'
+  const rateTitle = requestRate
+    ? 'Output tokens divided by full model request time, including prefill and time to first token, measured in this browser'
+    : message.output_rate_source === 'backend_native'
+      ? 'Decode rate reported by the backend'
+      : 'Delivery rate, measured in this browser'
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   const sentAt = formatTimeOfDay(message.created_at)
@@ -203,7 +209,7 @@ function MessageMetaFooter({ message }) {
       {/* "TTFT" is the term of art; under a reply it just needs to say what it
           measures. The abbreviation stays in the tooltip for anyone comparing. */}
       {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
-      {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
+      {rate && <span className="cxturn__meta-item" title={rateTitle}>{rate}{requestRate ? ' request' : ''}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
       {continuedTimes > 0 && (
         <span
@@ -453,6 +459,7 @@ export const MessageTurn = memo(function MessageTurn({ hideManagedToolCalls = fa
             elapsedSeconds={generationElapsedSeconds}
             label={liveStatusLabel}
             tokensPerSec={message.tokens_out_per_sec}
+            rateSource={message.output_rate_source}
             nativeSegmentRate={message.streaming_native_segment_rate}
             waitForNativeRate={message.synthesis_mode === 'prepared_web_research_multi_pass_lossless'}
           />

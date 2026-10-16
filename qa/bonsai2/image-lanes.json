@@ -1,0 +1,44 @@
+{
+  "cuda": {
+    "requested_device": 0,
+    "strict_math": "automatic portable-decode selection; no strict override environment variable",
+    "model_load_order": [
+      "2B API",
+      "2B GUI",
+      "4B API",
+      "4B GUI",
+      "9B API",
+      "9B GUI",
+      "27B API",
+      "27B GUI"
+    ],
+    "projector_log": [
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)",
+      "[qwen3vl] streaming CUDA projector active (bounded VRAM)"
+    ],
+    "server_sha256": "77c36fb3fefe6664cf9ce1c1e6a34f8f53b0a5af15c5445b4b88cf601ef74103"
+  },
+  "cpu_fallback": {
+    "requested_device": 99,
+    "reason": "nonexistent device forces CPU fallback on this one-GPU host",
+    "model_load_order": [
+      "2B",
+      "4B",
+      "9B",
+      "27B"
+    ],
+    "projector_log": [
+      "[qwen3vl] CUDA projector unavailable (vision CudaContext::new(99): DriverError(CUDA_ERROR_INVALID_DEVICE, \"invalid device ordinal\")); using CPU",
+      "[qwen3vl] CUDA projector unavailable (vision CudaContext::new(99): DriverError(CUDA_ERROR_INVALID_DEVICE, \"invalid device ordinal\")); using CPU",
+      "[qwen3vl] CUDA projector unavailable (vision CudaContext::new(99): DriverError(CUDA_ERROR_INVALID_DEVICE, \"invalid device ordinal\")); using CPU",
+      "[qwen3vl] Windows CUDA projector not selected or unavailable; using CPU"
+    ],
+    "server_sha256": "80a3c5dfe525a1ce11a1387a98d0e5247c0c547083ef146e630bed4cf31c2421"
+  }
+}

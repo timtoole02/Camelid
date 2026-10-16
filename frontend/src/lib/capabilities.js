@@ -62,6 +62,7 @@ const GGUF_FILE_TYPE_QUANT_LABELS = {
   // carry tensor type 41 while their file_type is 40; both Prism Q2 block
   // geometries declare file_type 41 and the backend refines the geometry.
   41: 'Q2_0',
+  143: 'PTQ1_0',
 }
 
 /* Quant values travel through normalizeCapabilityKey, which strips separators so
@@ -105,12 +106,12 @@ function extractQuantKey(model, catalogItem, subject) {
   if (explicit) return explicit
 
   const artifactText = [model?.model_path, model?.path, model?.hf_filename, catalogItem?.filename].filter(Boolean).join(' ')
-  const artifactMatch = artifactText.match(/\b(q\d(?:_k_[ms]|_\d)|bf16|f16|f32)\b/i)
+  const artifactMatch = artifactText.match(/\b(ptq1_0|pq2_0|q\d(?:_k_[ms]|_\d)|bf16|f16|f32)\b/i)
   const artifactQuant = normalizeCapabilityKey(artifactMatch?.[1])
   if (artifactQuant) return artifactQuant
 
   const text = subject || ''
-  const match = text.match(/\b(q\d(?:_k_[ms]|_\d)|bf16|f16|f32)\b/i)
+  const match = text.match(/\b(ptq1_0|pq2_0|q\d(?:_k_[ms]|_\d)|bf16|f16|f32)\b/i)
   return normalizeCapabilityKey(match?.[1])
 }
 
@@ -696,7 +697,7 @@ function getModelCapabilityFields(model, catalogItem) {
   // (e.g. "Q8_0") rather than the capability-normalized key ("Q80", underscore
   // stripped) so the combined string reproduces the row id exactly under
   // normalizeExactRowIdentity. Additive only — never removes an existing candidate.
-  const quantPattern = /\b(q\d(?:_k_[ms]|_\d)?|iq\d[a-z0-9_]*|bf16|f16|f32)\b/i
+  const quantPattern = /\b(ptq1_0|pq2_0|q\d(?:_k_[ms]|_\d)?|iq\d[a-z0-9_]*|bf16|f16|f32)\b/i
   const rawQuant =
     [model?.quant, catalogItem?.quant]
       .map((value) => (typeof value === 'string' ? value.match(quantPattern)?.[1] : null))

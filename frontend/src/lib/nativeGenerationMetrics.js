@@ -127,6 +127,16 @@ export function authoritativeOutputRate(message) {
     ?? null
 }
 
+// Token callbacks may arrive in one CUDA/speculative/network burst. The browser
+// can measure the whole model request, but cannot recover its decode clock from
+// the spacing between callbacks. Include prefill and all output tokens here.
+export function requestOutputRate(completionTokens, elapsedMs) {
+  const tokens = Number(completionTokens)
+  const duration = Number(elapsedMs)
+  if (!Number.isFinite(tokens) || tokens <= 0 || !Number.isFinite(duration) || duration <= 0) return null
+  return tokens * 1000 / duration
+}
+
 function positiveInteger(value) {
   const number = Number(value)
   return Number.isInteger(number) && number > 0 ? number : null

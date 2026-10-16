@@ -41,7 +41,7 @@ const formatLiveRate = (value) => {
 
 /* Per-second values (elapsed time, live tok/s) are aria-hidden so the polite
    live region announces only phase-label changes, never the ticking counters. */
-export function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, tokensPerSec = null, nativeSegmentRate = null, waitForNativeRate = false }) {
+export function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, tokensPerSec = null, rateSource = 'browser_delivery', nativeSegmentRate = null, waitForNativeRate = false }) {
   const hasNativeRate = Number.isFinite(Number(nativeSegmentRate)) && Number(nativeSegmentRate) > 0
   const displayedRate = waitForNativeRate
     ? (hasNativeRate ? nativeSegmentRate : null)
@@ -53,9 +53,9 @@ export function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_L
       <span>{label}</span>
       <span aria-hidden="true">{elapsedSeconds}s</span>
       {liveRate && (
-        <span className="message-live-tps" aria-hidden="true" data-live-rate={Number(displayedRate)} data-rate-source={hasNativeRate ? 'backend-native' : 'browser'}>
+        <span className="message-live-tps" aria-hidden="true" data-live-rate={Number(displayedRate)} data-rate-source={hasNativeRate ? 'backend-native' : rateSource}>
           <span className="message-live-tps__value">{liveRate}</span>
-          <span className="message-live-tps__unit">tok/s</span>
+          <span className="message-live-tps__unit">{!hasNativeRate && rateSource === 'client_request' ? 'tok/s request' : 'tok/s'}</span>
         </span>
       )}
     </div>

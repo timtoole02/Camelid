@@ -1,0 +1,96 @@
+[
+  {
+    "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+    "case": "explain",
+    "first_divergent_index": 18,
+    "native_token": {
+      "id": 513,
+      "token": " are",
+      "bytes": [
+        32,
+        97,
+        114,
+        101
+      ],
+      "logprob": -1.2242177724838257
+    },
+    "reference_token": {
+      "id": 2599,
+      "token": " less",
+      "bytes": [
+        32,
+        108,
+        101,
+        115,
+        115
+      ],
+      "logprob": -1.2194551229476929
+    },
+    "log_probability_margin": 0.0047626495361328125,
+    "reference_capture": "2b-explain-reference-score.json",
+    "native_capture": "2b-native-parity.json",
+    "interpretation": "Near-tied first decision; subsequent prefixes differ. This is not whole-output token identity."
+  },
+  {
+    "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+    "case": "explain",
+    "first_divergent_index": 3,
+    "native_token": {
+      "id": 8964,
+      "token": " Earth",
+      "bytes": [
+        32,
+        69,
+        97,
+        114,
+        116,
+        104
+      ],
+      "logprob": -0.7457661032676697
+    },
+    "reference_token": {
+      "id": 279,
+      "token": " the",
+      "bytes": [
+        32,
+        116,
+        104,
+        101
+      ],
+      "logprob": -0.7433609366416931
+    },
+    "log_probability_margin": 0.0024051666259765625,
+    "reference_capture": "4b-explain-reference-score.json",
+    "native_capture": "4b-native-parity.json",
+    "interpretation": "Near-tied first decision; subsequent prefixes differ. This is not whole-output token identity."
+  },
+  {
+    "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+    "case": "explain",
+    "first_divergent_index": 4,
+    "native_token": {
+      "id": 685,
+      "token": " up",
+      "bytes": [
+        32,
+        117,
+        112
+      ],
+      "logprob": -0.6935551166534424
+    },
+    "reference_token": {
+      "id": 314,
+      "token": " of",
+      "bytes": [
+        32,
+        111,
+        102
+      ],
+      "logprob": -0.6931393146514893
+    },
+    "log_probability_margin": 0.000415802001953125,
+    "reference_capture": "9b-explain-reference-score.json",
+    "native_capture": "9b-draft-benchmark.json",
+    "interpretation": "Near-tied first decision; subsequent prefixes differ. This is not whole-output token identity."
+  }
+]

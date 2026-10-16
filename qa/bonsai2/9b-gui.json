@@ -1,0 +1,6 @@
+{
+  "generation_ready": true,
+  "vision_ready": true,
+  "image_input_present": true,
+  "answer": "Red\n\nTernary Bonsai 2.9B PTQ1 0\nUNVERIFIED MODEL\ntokens in 29 · out 1\nfirst token 112.2s\n116.6s\n05:02 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n—"
+}

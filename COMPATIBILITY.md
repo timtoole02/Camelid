@@ -1,6 +1,23 @@
 # Camelid Compatibility Matrix
 
-Last updated: 2026-08-10
+Bonsai 2 2B/4B/9B/27B PTQ1_0 is supported on Windows x86_64 through completed
+CPU and CUDA qualifications. CUDA production GUI/API checks through the native
+library-server harness pass for all four exact publisher packs: text,
+single-image chat, sampling, function-tool round trips, and 1,044-token context
+recall. All twelve CUDA benchmark outputs match the
+pinned reference baseline and the native draft route exactly at 32 tokens;
+all four seeded API continuations also match with and without drafting.
+
+CUDA language layers compute on the GPU. On the tested RTX 3060 Laptop GPU with
+6 GiB VRAM and 16 GB host RAM, 27B streams selected packed weights from host
+memory. The final rebuilt suite passed all twelve CUDA tests and both host
+memory regressions. The [CUDA manifest](qa/bonsai2/cuda/manifest.json) binds the
+qualified models, projectors, binaries, and receipts. Larger context and Apple
+Silicon require separate qualification. See [Bonsai 2](docs/BONSAI2.md), the
+[historical CPU manifest](qa/bonsai2/manifest.json), and the
+[CUDA evidence workflow](qa/bonsai2/cuda/README.md).
+
+Last updated: 2026-10-16
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 

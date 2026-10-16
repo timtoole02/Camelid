@@ -1,0 +1,601 @@
+{
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "projection_policy": "tiled",
+  "cases": [
+    {
+      "name": "count",
+      "scores": [
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.00005878122227898075,
+          "top1_log_probability": -0.00005878122227898075
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000010587889214264123,
+          "top1_log_probability": -0.0000010587889214264123
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.010688185832862018,
+          "top1_log_probability": -0.010688185832862018
+        },
+        {
+          "token": 17,
+          "argmax": 17,
+          "log_probability": -7.243643551646528e-7,
+          "top1_log_probability": -7.243643551646528e-7
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -3.717338614706023e-8,
+          "top1_log_probability": -3.717338614706023e-8
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.0000010117120829988835,
+          "top1_log_probability": -0.0000010117120829988835
+        },
+        {
+          "token": 18,
+          "argmax": 18,
+          "log_probability": -1.751449438813779e-7,
+          "top1_log_probability": -1.751449438813779e-7
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000013559970248877562,
+          "top1_log_probability": -0.0000013559970248877562
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.000021010000949672758,
+          "top1_log_probability": -0.000021010000949672758
+        },
+        {
+          "token": 19,
+          "argmax": 19,
+          "log_probability": -3.77540768425888e-7,
+          "top1_log_probability": -3.77540768425888e-7
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -2.738050142170323e-8,
+          "top1_log_probability": -2.738050142170323e-8
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -1.593331369065254e-7,
+          "top1_log_probability": -1.593331369065254e-7
+        },
+        {
+          "token": 20,
+          "argmax": 20,
+          "log_probability": -2.3990656927708187e-7,
+          "top1_log_probability": -2.3990656927708187e-7
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -3.152335459333244e-7,
+          "top1_log_probability": -3.152335459333244e-7
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -2.88660604752522e-7,
+          "top1_log_probability": -2.88660604752522e-7
+        },
+        {
+          "token": 21,
+          "argmax": 21,
+          "log_probability": -0.0000028839401515767804,
+          "top1_log_probability": -0.0000028839401515767804
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -1.916219005693165e-7,
+          "top1_log_probability": -1.916219005693165e-7
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -2.2235552066263153e-7,
+          "top1_log_probability": -2.2235552066263153e-7
+        },
+        {
+          "token": 22,
+          "argmax": 22,
+          "log_probability": -0.0000014186469350363495,
+          "top1_log_probability": -0.0000014186469350363495
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -6.521201356690653e-8,
+          "top1_log_probability": -6.521201356690653e-8
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -3.2196691535091304e-8,
+          "top1_log_probability": -3.2196691535091304e-8
+        },
+        {
+          "token": 23,
+          "argmax": 23,
+          "log_probability": -0.0000022101974650468037,
+          "top1_log_probability": -0.0000022101974650468037
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -1.4320677621526556e-7,
+          "top1_log_probability": -1.4320677621526556e-7
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -1.966141986997627e-7,
+          "top1_log_probability": -1.966141986997627e-7
+        },
+        {
+          "token": 24,
+          "argmax": 24,
+          "log_probability": -9.987179332426876e-7,
+          "top1_log_probability": -9.987179332426876e-7
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000001214289287787551,
+          "top1_log_probability": -0.000001214289287787551
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.000003379234950529053,
+          "top1_log_probability": -0.000003379234950529053
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.00004296194365949191,
+          "top1_log_probability": -0.00004296194365949191
+        },
+        {
+          "token": 15,
+          "argmax": 15,
+          "log_probability": -0.0002504109825096634,
+          "top1_log_probability": -0.0002504109825096634
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000009115185076069565,
+          "top1_log_probability": -0.000009115185076069565
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.00000500909288447815,
+          "top1_log_probability": -0.00000500909288447815
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -2.639761653711048e-7,
+          "top1_log_probability": -2.639761653711048e-7
+        }
+      ]
+    },
+    {
+      "name": "code",
+      "scores": [
+        {
+          "token": 71093,
+          "argmax": 71093,
+          "log_probability": -0.0020205659505592166,
+          "top1_log_probability": -0.0020205659505592166
+        },
+        {
+          "token": 12305,
+          "argmax": 12305,
+          "log_probability": -0.000014781428216537051,
+          "top1_log_probability": -0.000014781428216537051
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.00005624199127396423,
+          "top1_log_probability": -0.00005624199127396423
+        },
+        {
+          "token": 727,
+          "argmax": 727,
+          "log_probability": -0.00009276396828994393,
+          "top1_log_probability": -0.00009276396828994393
+        },
+        {
+          "token": 51184,
+          "argmax": 51184,
+          "log_probability": -0.00007408824201249331,
+          "top1_log_probability": -0.00007408824201249331
+        },
+        {
+          "token": 1393,
+          "argmax": 1393,
+          "log_probability": -0.003188173376802439,
+          "top1_log_probability": -0.003188173376802439
+        },
+        {
+          "token": 1590,
+          "argmax": 1590,
+          "log_probability": -0.0000012559322932759187,
+          "top1_log_probability": -0.0000012559322932759187
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -3.9208357094366875e-7,
+          "top1_log_probability": -3.9208357094366875e-7
+        },
+        {
+          "token": 262,
+          "argmax": 262,
+          "log_probability": -4.3280139649937155e-7,
+          "top1_log_probability": -4.3280139649937155e-7
+        },
+        {
+          "token": 1067,
+          "argmax": 1067,
+          "log_probability": -0.46476781285554836,
+          "top1_log_probability": -0.46476781285554836
+        },
+        {
+          "token": 283,
+          "argmax": 283,
+          "log_probability": -5.831874716477614e-8,
+          "top1_log_probability": -5.831874716477614e-8
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -3.3427065204705286e-7,
+          "top1_log_probability": -3.3427065204705286e-7
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -2.091088688871423e-7,
+          "top1_log_probability": -2.091088688871423e-7
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.000020056297397985645,
+          "top1_log_probability": -0.000020056297397985645
+        },
+        {
+          "token": 262,
+          "argmax": 262,
+          "log_probability": -6.832896559672008e-8,
+          "top1_log_probability": -6.832896559672008e-8
+        },
+        {
+          "token": 364,
+          "argmax": 364,
+          "log_probability": -0.00030531766467944976,
+          "top1_log_probability": -0.00030531766467944976
+        },
+        {
+          "token": 585,
+          "argmax": 585,
+          "log_probability": -0.000028844971367902872,
+          "top1_log_probability": -0.000028844971367902872
+        },
+        {
+          "token": 303,
+          "argmax": 303,
+          "log_probability": -0.00000673559977215632,
+          "top1_log_probability": -0.00000673559977215632
+        },
+        {
+          "token": 2020,
+          "argmax": 2020,
+          "log_probability": -0.000010254517476937508,
+          "top1_log_probability": -0.000010254517476937508
+        },
+        {
+          "token": 7,
+          "argmax": 7,
+          "log_probability": -0.000007902064936615716,
+          "top1_log_probability": -0.000007902064936615716
+        },
+        {
+          "token": 17,
+          "argmax": 17,
+          "log_probability": -0.43594395882949044,
+          "top1_log_probability": -0.43594395882949044
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -2.8782594085896562e-9,
+          "top1_log_probability": -2.8782594085896562e-9
+        },
+        {
+          "token": 307,
+          "argmax": 307,
+          "log_probability": -5.59917054943071e-8,
+          "top1_log_probability": -5.59917054943071e-8
+        },
+        {
+          "token": 478,
+          "argmax": 478,
+          "log_probability": -0.00015572035860600408,
+          "top1_log_probability": -0.00015572035860600408
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -8.419931418757187e-10,
+          "top1_log_probability": -8.419931418757187e-10
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -5.047695026405563e-7,
+          "top1_log_probability": -5.047695026405563e-7
+        },
+        {
+          "token": 1590,
+          "argmax": 1590,
+          "log_probability": -4.326680880240019e-8,
+          "top1_log_probability": -4.326680880240019e-8
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.000023849171206791198,
+          "top1_log_probability": -0.000023849171206791198
+        },
+        {
+          "token": 285,
+          "argmax": 285,
+          "log_probability": -0.0000016949852152947642,
+          "top1_log_probability": -0.0000016949852152947642
+        },
+        {
+          "token": 1067,
+          "argmax": 1067,
+          "log_probability": -3.895095446182495e-7,
+          "top1_log_probability": -3.895095446182495e-7
+        },
+        {
+          "token": 11076,
+          "argmax": 11076,
+          "log_probability": -0.0007910116563607517,
+          "top1_log_probability": -0.0007910116563607517
+        },
+        {
+          "token": 585,
+          "argmax": 585,
+          "log_probability": -2.5907798573143737e-7,
+          "top1_log_probability": -2.5907798573143737e-7
+        }
+      ]
+    },
+    {
+      "name": "explain",
+      "scores": [
+        {
+          "token": 29108,
+          "argmax": 29108,
+          "log_probability": -0.629001232347111,
+          "top1_log_probability": -0.629001232347111
+        },
+        {
+          "token": 4009,
+          "argmax": 4009,
+          "log_probability": -0.00018051122974682698,
+          "top1_log_probability": -0.00018051122974682698
+        },
+        {
+          "token": 5435,
+          "argmax": 5435,
+          "log_probability": -0.8917885083389585,
+          "top1_log_probability": -0.8917885083389585
+        },
+        {
+          "token": 660,
+          "argmax": 660,
+          "log_probability": -0.23627047150944946,
+          "top1_log_probability": -0.23627047150944946
+        },
+        {
+          "token": 7736,
+          "argmax": 7736,
+          "log_probability": -0.032624123204367805,
+          "top1_log_probability": -0.032624123204367805
+        },
+        {
+          "token": 314,
+          "argmax": 314,
+          "log_probability": -0.018041594303692676,
+          "top1_log_probability": -0.018041594303692676
+        },
+        {
+          "token": 279,
+          "argmax": 279,
+          "log_probability": -0.019824170353999193,
+          "top1_log_probability": -0.019824170353999193
+        },
+        {
+          "token": 46026,
+          "argmax": 46026,
+          "log_probability": -0.7345569476579819,
+          "top1_log_probability": -0.7345569476579819
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.19432532284453785,
+          "top1_log_probability": -0.19432532284453785
+        },
+        {
+          "token": 694,
+          "argmax": 694,
+          "log_probability": -0.14155411778770244,
+          "top1_log_probability": -0.14155411778770244
+        },
+        {
+          "token": 22602,
+          "argmax": 22602,
+          "log_probability": -1.2901011676077658,
+          "top1_log_probability": -1.2901011676077658
+        },
+        {
+          "token": 89661,
+          "argmax": 89661,
+          "log_probability": -0.5271941915477392,
+          "top1_log_probability": -0.5271941915477392
+        },
+        {
+          "token": 318,
+          "argmax": 318,
+          "log_probability": -0.4278561505022296,
+          "top1_log_probability": -0.4278561505022296
+        },
+        {
+          "token": 11855,
+          "argmax": 11855,
+          "log_probability": -0.3883076161117138,
+          "top1_log_probability": -0.3883076161117138
+        },
+        {
+          "token": 8,
+          "argmax": 8,
+          "log_probability": -0.262376107479529,
+          "top1_log_probability": -0.262376107479529
+        },
+        {
+          "token": 5640,
+          "argmax": 5640,
+          "log_probability": -0.6303910891056681,
+          "top1_log_probability": -0.6303910891056681
+        },
+        {
+          "token": 10281,
+          "argmax": 10281,
+          "log_probability": -0.7409643539036033,
+          "top1_log_probability": -0.7409643539036033
+        },
+        {
+          "token": 321,
+          "argmax": 321,
+          "log_probability": -0.39759259885073917,
+          "top1_log_probability": -0.39759259885073917
+        },
+        {
+          "token": 513,
+          "argmax": 513,
+          "log_probability": -1.2049612415792232,
+          "top1_log_probability": -1.2049612415792232
+        },
+        {
+          "token": 35742,
+          "argmax": 35742,
+          "log_probability": -0.7753578541502222,
+          "top1_log_probability": -0.7753578541502222
+        },
+        {
+          "token": 777,
+          "argmax": 777,
+          "log_probability": -0.13075491625095736,
+          "top1_log_probability": -0.13075491625095736
+        },
+        {
+          "token": 539,
+          "argmax": 539,
+          "log_probability": -0.43056968912925697,
+          "top1_log_probability": -0.43056968912925697
+        },
+        {
+          "token": 3594,
+          "argmax": 3594,
+          "log_probability": -0.9683313729504235,
+          "top1_log_probability": -0.9683313729504235
+        },
+        {
+          "token": 33470,
+          "argmax": 33470,
+          "log_probability": -0.00172264028007163,
+          "top1_log_probability": -0.00172264028007163
+        },
+        {
+          "token": 1056,
+          "argmax": 1056,
+          "log_probability": -0.5230901343575418,
+          "top1_log_probability": -0.5230901343575418
+        },
+        {
+          "token": 4860,
+          "argmax": 4860,
+          "log_probability": -0.014035285591244673,
+          "top1_log_probability": -0.014035285591244673
+        },
+        {
+          "token": 89661,
+          "argmax": 89661,
+          "log_probability": -0.05587295168268369,
+          "top1_log_probability": -0.05587295168268369
+        },
+        {
+          "token": 318,
+          "argmax": 318,
+          "log_probability": -0.23722251662329796,
+          "top1_log_probability": -0.23722251662329796
+        },
+        {
+          "token": 1114,
+          "argmax": 1114,
+          "log_probability": -0.033202476572224526,
+          "top1_log_probability": -0.033202476572224526
+        },
+        {
+          "token": 553,
+          "argmax": 553,
+          "log_probability": -0.0491580744000224,
+          "top1_log_probability": -0.0491580744000224
+        },
+        {
+          "token": 1061,
+          "argmax": 1061,
+          "log_probability": -0.04576044815382829,
+          "top1_log_probability": -0.04576044815382829
+        },
+        {
+          "token": 24057,
+          "argmax": 24057,
+          "log_probability": -0.5451084915782367,
+          "top1_log_probability": -0.5451084915782367
+        }
+      ]
+    }
+  ],
+  "model_sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+  "test_binary_sha256": "97e8608e15c5080035d7f467406b5a8d262e65123dd993aab07ee580734e399d",
+  "cases_sha256": "ae127d22810532c5d60f88b7af981f68d9190bc760e7fcd8f3f87e583a9cb883",
+  "log_sha256": "cd58bf853f7b0e528e6f5b25cc7849b9d43ce29cdbdfc7c7c55e2998d15c8ffa"
+}

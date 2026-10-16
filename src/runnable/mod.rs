@@ -13,6 +13,7 @@
 
 pub mod admit;
 pub mod dequant;
+pub(crate) mod hadamard;
 pub mod model;
 pub mod smoke;
 mod vision;

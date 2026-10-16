@@ -1,0 +1,2388 @@
+{
+  "schema": 1,
+  "scope": "Diagnostic profiling and exploratory isolated kernels; not headline request throughput",
+  "tool": "Nsight Systems 2025.1.3",
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "prompt": "qa/bonsai2/count.chatml",
+  "tokens": 32,
+  "warmup_tokens": 8,
+  "context": 2048,
+  "threads": 8,
+  "command": "nsys profile --trace=cuda,nvtx --sample=none --cuda-graph-trace=node [--cuda-event-trace=false for V1] --force-overwrite=true -o TRACE PROBE MODEL PROMPT 32",
+  "environment": {
+    "CAMELID_QWEN35_CUDA": "1",
+    "CAMELID_QWEN35_METAL": "0",
+    "CAMELID_QWEN35_CUDA_MAXPOS": "2048",
+    "CAMELID_PROBE_REQUIRE_CUDA": "1",
+    "CAMELID_PROBE_WARMUPS": "1",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "profiles": [
+    {
+      "name": "baseline-2b",
+      "binary": "output/bonsai2-reference/bonsai2-probe-cuda-qualified.exe",
+      "binary_sha256": "b11de98eae42fed15d4a9cba3807fca6def4d9686960a07235a48284d24358dd",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "source_notes": "Retained original qualified executable.",
+      "trace_sha256": "882e4a9ae802976f1795f9fe61ece06925fc71132f558012c4a79803d2d714ce",
+      "cuda_event_trace": "default",
+      "kernel_total_ns": 1444980417,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1536,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 166354.351010101,
+          "total_ns": 461134261
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 102421.57972582972,
+          "total_ns": 283912619
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 62080,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 6444985.785714285,
+          "total_ns": 270689403
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1536,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 403466.42424242425,
+          "total_ns": 106515136
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 512,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 234667.67424242425,
+          "total_ns": 61952266
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 4,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 1512,
+          "mean_ns": 28275.059523809523,
+          "total_ns": 42751890
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 252,
+          "mean_ns": 113353.48015873016,
+          "total_ns": 28565077
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 128,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 504,
+          "mean_ns": 19749.61111111111,
+          "total_ns": 9953804
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 24,
+          "mean_ns": 272725.0833333333,
+          "total_ns": 6545402
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 4,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 144,
+          "mean_ns": 38204.145833333336,
+          "total_ns": 5501397
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 128,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 48,
+          "mean_ns": 39670.6875,
+          "total_ns": 1904193
+        }
+      ]
+    },
+    {
+      "name": "v1-2b",
+      "binary": "output/bonsai2-profile/probe-v1.exe",
+      "binary_sha256": "bc7a2c72b66dd2861c00af76473fb9dfcd256ba72f69a93f87181aaee9572e57",
+      "source_commit": null,
+      "source_notes": "Uncommitted V1 production implementation, before adding the new test fixture. The production kernel and dispatch match commit 511f09584e79d7ac16e974604de4ab9c0ed1ae57; this is exploratory profiling, not the final benchmark binary.",
+      "trace_sha256": "dc2f5c5a105dde94be3e87dcbfba2471a499e4e8dc63e9c5236aa905f05c0740",
+      "cuda_event_trace": "false",
+      "kernel_total_ns": 696926141,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 768,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 54662.02561327561,
+          "total_ns": 151523135
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 256,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 35645.003246753244,
+          "total_ns": 98807949
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r4",
+          "gridX": 15520,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 48,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 2035021.0238095238,
+          "total_ns": 85470883
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 384,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 314953.1893939394,
+          "total_ns": 83147642
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 128,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 257145.67045454544,
+          "total_ns": 67886457
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 252,
+          "mean_ns": 37876.28571428572,
+          "total_ns": 9544824
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 64,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 504,
+          "mean_ns": 16771.85119047619,
+          "total_ns": 8453013
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 24,
+          "mean_ns": 232357.08333333334,
+          "total_ns": 5576570
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 32,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 48,
+          "mean_ns": 84530.10416666667,
+          "total_ns": 4057445
+        }
+      ]
+    }
+  ],
+  "experiments": {
+    "micro-original-multirow": [
+      {
+        "mode": 9,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 234.138,
+        "new_us": 61.389,
+        "speedup": 3.814
+      },
+      {
+        "mode": 10,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 234.086,
+        "new_us": 51.302,
+        "speedup": 4.563
+      },
+      {
+        "mode": 11,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 233.984,
+        "new_us": 51.302,
+        "speedup": 4.561
+      },
+      {
+        "mode": 12,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 233.882,
+        "new_us": 64.461,
+        "speedup": 3.628
+      },
+      {
+        "mode": 9,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 244.275,
+        "new_us": 140.288,
+        "speedup": 1.741
+      },
+      {
+        "mode": 10,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 244.07,
+        "new_us": 84.48,
+        "speedup": 2.889
+      },
+      {
+        "mode": 11,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 216.832,
+        "new_us": 73.267,
+        "speedup": 2.959
+      },
+      {
+        "mode": 12,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 216.832,
+        "new_us": 76.339,
+        "speedup": 2.84
+      },
+      {
+        "mode": 9,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 223.181,
+        "new_us": 219.546,
+        "speedup": 1.017
+      },
+      {
+        "mode": 10,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 223.078,
+        "new_us": 139.264,
+        "speedup": 1.602
+      },
+      {
+        "mode": 11,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 223.13,
+        "new_us": 113.818,
+        "speedup": 1.96
+      },
+      {
+        "mode": 12,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 238.387,
+        "new_us": 135.066,
+        "speedup": 1.765
+      },
+      {
+        "mode": 9,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 217.293,
+        "new_us": 56.883,
+        "speedup": 3.82
+      },
+      {
+        "mode": 10,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 217.344,
+        "new_us": 48.538,
+        "speedup": 4.478
+      },
+      {
+        "mode": 11,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 217.293,
+        "new_us": 52.531,
+        "speedup": 4.136
+      },
+      {
+        "mode": 12,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 217.242,
+        "new_us": 82.534,
+        "speedup": 2.632
+      },
+      {
+        "mode": 9,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 222.618,
+        "new_us": 125.44,
+        "speedup": 1.775
+      },
+      {
+        "mode": 10,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 223.795,
+        "new_us": 108.134,
+        "speedup": 2.07
+      },
+      {
+        "mode": 11,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 222.515,
+        "new_us": 84.429,
+        "speedup": 2.636
+      },
+      {
+        "mode": 12,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 222.925,
+        "new_us": 96.102,
+        "speedup": 2.32
+      },
+      {
+        "mode": 9,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 227.021,
+        "new_us": 235.725,
+        "speedup": 0.963
+      },
+      {
+        "mode": 10,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 217.19,
+        "new_us": 136.755,
+        "speedup": 1.588
+      },
+      {
+        "mode": 11,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 244.122,
+        "new_us": 138.65,
+        "speedup": 1.761
+      },
+      {
+        "mode": 12,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 244.275,
+        "new_us": 168.243,
+        "speedup": 1.452
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 6796.083,
+        "new_us": 2030.95,
+        "speedup": 3.346
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 6817.638,
+        "new_us": 1546.342,
+        "speedup": 4.409
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 6872.78,
+        "new_us": 1472.051,
+        "speedup": 4.669
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 6884.25,
+        "new_us": 1684.531,
+        "speedup": 4.087
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 7729.612,
+        "new_us": 4844.595,
+        "speedup": 1.596
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 7697.562,
+        "new_us": 3447.706,
+        "speedup": 2.233
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 7765.76,
+        "new_us": 2854.246,
+        "speedup": 2.721
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 7754.394,
+        "new_us": 2685.594,
+        "speedup": 2.887
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 8844.902,
+        "new_us": 8430.183,
+        "speedup": 1.049
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 8754.943,
+        "new_us": 5628.263,
+        "speedup": 1.556
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 8732.621,
+        "new_us": 4604.876,
+        "speedup": 1.896
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 8786.482,
+        "new_us": 4576.973,
+        "speedup": 1.92
+      },
+      {
+        "mode": 9,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 593.613,
+        "new_us": 171.264,
+        "speedup": 3.466
+      },
+      {
+        "mode": 10,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 647.424,
+        "new_us": 151.859,
+        "speedup": 4.263
+      },
+      {
+        "mode": 11,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 706.97,
+        "new_us": 149.606,
+        "speedup": 4.726
+      },
+      {
+        "mode": 12,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 709.222,
+        "new_us": 204.237,
+        "speedup": 3.473
+      },
+      {
+        "mode": 9,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 720.128,
+        "new_us": 418.509,
+        "speedup": 1.721
+      },
+      {
+        "mode": 10,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 761.293,
+        "new_us": 297.216,
+        "speedup": 2.561
+      },
+      {
+        "mode": 11,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 795.238,
+        "new_us": 260.301,
+        "speedup": 3.055
+      },
+      {
+        "mode": 12,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 783.462,
+        "new_us": 244.736,
+        "speedup": 3.201
+      },
+      {
+        "mode": 9,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 812.851,
+        "new_us": 861.082,
+        "speedup": 0.944
+      },
+      {
+        "mode": 10,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 878.899,
+        "new_us": 535.091,
+        "speedup": 1.643
+      },
+      {
+        "mode": 11,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 904.038,
+        "new_us": 445.645,
+        "speedup": 2.029
+      },
+      {
+        "mode": 12,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 920.576,
+        "new_us": 463.462,
+        "speedup": 1.986
+      },
+      {
+        "mode": 9,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 610.662,
+        "new_us": 177.05,
+        "speedup": 3.449
+      },
+      {
+        "mode": 10,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 652.083,
+        "new_us": 155.904,
+        "speedup": 4.183
+      },
+      {
+        "mode": 11,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 706.765,
+        "new_us": 162.355,
+        "speedup": 4.353
+      },
+      {
+        "mode": 12,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 710.144,
+        "new_us": 213.402,
+        "speedup": 3.328
+      },
+      {
+        "mode": 9,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 733.286,
+        "new_us": 444.57,
+        "speedup": 1.649
+      },
+      {
+        "mode": 10,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 810.394,
+        "new_us": 515.738,
+        "speedup": 1.571
+      },
+      {
+        "mode": 11,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 790.579,
+        "new_us": 267.674,
+        "speedup": 2.954
+      },
+      {
+        "mode": 12,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 797.491,
+        "new_us": 293.478,
+        "speedup": 2.717
+      },
+      {
+        "mode": 9,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 825.6,
+        "new_us": 902.349,
+        "speedup": 0.915
+      },
+      {
+        "mode": 10,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 891.648,
+        "new_us": 568.064,
+        "speedup": 1.57
+      },
+      {
+        "mode": 11,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 912.589,
+        "new_us": 460.032,
+        "speedup": 1.984
+      },
+      {
+        "mode": 12,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 912.179,
+        "new_us": 524.339,
+        "speedup": 1.74
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 14459.648,
+        "new_us": 4295.885,
+        "speedup": 3.366
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 13407.898,
+        "new_us": 3503.053,
+        "speedup": 3.827
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 13540.302,
+        "new_us": 3300.915,
+        "speedup": 4.102
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 13421.209,
+        "new_us": 3598.08,
+        "speedup": 3.73
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 15208.141,
+        "new_us": 9529.345,
+        "speedup": 1.596
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 15012.3,
+        "new_us": 6834.125,
+        "speedup": 2.197
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 14985.268,
+        "new_us": 6146.202,
+        "speedup": 2.438
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 14930.125,
+        "new_us": 5625.139,
+        "speedup": 2.654
+      },
+      {
+        "mode": 9,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 18436.504,
+        "new_us": 16848.895,
+        "speedup": 1.094
+      },
+      {
+        "mode": 10,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 18602.395,
+        "new_us": 11899.084,
+        "speedup": 1.563
+      },
+      {
+        "mode": 11,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 18240.152,
+        "new_us": 9356.697,
+        "speedup": 1.949
+      },
+      {
+        "mode": 12,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 18642.637,
+        "new_us": 8955.033,
+        "speedup": 2.082
+      }
+    ],
+    "micro-repacked-full": [
+      {
+        "mode": 5,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 207.872,
+        "new_us": 39.168,
+        "speedup": 5.307
+      },
+      {
+        "mode": 5,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 217.6,
+        "new_us": 109.056,
+        "speedup": 1.995
+      },
+      {
+        "mode": 5,
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 223.13,
+        "new_us": 200.653,
+        "speedup": 1.112
+      },
+      {
+        "mode": 5,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 217.395,
+        "new_us": 43.418,
+        "speedup": 5.007
+      },
+      {
+        "mode": 5,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 223.386,
+        "new_us": 110.387,
+        "speedup": 2.024
+      },
+      {
+        "mode": 5,
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 227.021,
+        "new_us": 204.39,
+        "speedup": 1.111
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 7864.167,
+        "new_us": 1338.726,
+        "speedup": 5.874
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 7834.266,
+        "new_us": 4243.866,
+        "speedup": 1.846
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 8804.762,
+        "new_us": 7755.776,
+        "speedup": 1.135
+      },
+      {
+        "mode": 5,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 598.477,
+        "new_us": 117.914,
+        "speedup": 5.076
+      },
+      {
+        "mode": 5,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 650.496,
+        "new_us": 355.789,
+        "speedup": 1.828
+      },
+      {
+        "mode": 5,
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 830.976,
+        "new_us": 796.518,
+        "speedup": 1.043
+      },
+      {
+        "mode": 5,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 614.707,
+        "new_us": 120.576,
+        "speedup": 5.098
+      },
+      {
+        "mode": 5,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 719.155,
+        "new_us": 375.501,
+        "speedup": 1.915
+      },
+      {
+        "mode": 5,
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 868.608,
+        "new_us": 820.89,
+        "speedup": 1.058
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 1,
+        "diff": 0,
+        "old_us": 13728.513,
+        "new_us": 2943.795,
+        "speedup": 4.664
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 4,
+        "diff": 0,
+        "old_us": 15183.513,
+        "new_us": 8929.127,
+        "speedup": 1.7
+      },
+      {
+        "mode": 5,
+        "rows": 248320,
+        "cols": 4096,
+        "tokens": 8,
+        "diff": 0,
+        "old_us": 18635.828,
+        "new_us": 16401.152,
+        "speedup": 1.136
+      }
+    ],
+    "micro-draft": [
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 55.842136,
+        "int8_us": 151.551987,
+        "speedup": 0.368468
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 116.838402,
+        "int8_us": 165.444275,
+        "speedup": 0.70621
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 183.500793,
+        "int8_us": 220.808548,
+        "speedup": 0.83104
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "float_us": 63.726933,
+        "int8_us": 158.720001,
+        "speedup": 0.401505
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "float_us": 161.962662,
+        "int8_us": 175.240524,
+        "speedup": 0.924231
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "float_us": 270.131195,
+        "int8_us": 230.126938,
+        "speedup": 1.173836
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 2277.68335,
+        "int8_us": 4832.495117,
+        "speedup": 0.471327
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 3662.404541,
+        "int8_us": 5473.245605,
+        "speedup": 0.669147
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 6389.964355,
+        "int8_us": 7256.541992,
+        "speedup": 0.88058
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "float_us": 191.726944,
+        "int8_us": 425.64267,
+        "speedup": 0.450441
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "float_us": 562.926941,
+        "int8_us": 507.903992,
+        "speedup": 1.108333
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "float_us": 982.903442,
+        "int8_us": 633.44635,
+        "speedup": 1.551676
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "float_us": 227.020798,
+        "int8_us": 456.055481,
+        "speedup": 0.497792
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "float_us": 847.633057,
+        "int8_us": 479.300262,
+        "speedup": 1.76848
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "float_us": 1562.453369,
+        "int8_us": 643.345032,
+        "speedup": 2.42864
+      }
+    ],
+    "micro-draft-vector": [
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 55.978664,
+        "int8_us": 74.410667,
+        "speedup": 0.752294
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 116.360542,
+        "int8_us": 111.206398,
+        "speedup": 1.046347
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 183.46666,
+        "int8_us": 204.185593,
+        "speedup": 0.898529
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "float_us": 63.761066,
+        "int8_us": 77.243736,
+        "speedup": 0.825453
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "float_us": 161.962662,
+        "int8_us": 115.165871,
+        "speedup": 1.406343
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "float_us": 269.892273,
+        "int8_us": 214.016006,
+        "speedup": 1.261085
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 2274.611084,
+        "int8_us": 2459.818848,
+        "speedup": 0.924707
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 3677.935059,
+        "int8_us": 3731.48999,
+        "speedup": 0.985648
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 6417.783691,
+        "int8_us": 6334.054688,
+        "speedup": 1.013219
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "float_us": 192.477859,
+        "int8_us": 213.572266,
+        "speedup": 0.901231
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "float_us": 520.601624,
+        "int8_us": 317.030396,
+        "speedup": 1.642119
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "float_us": 966.587708,
+        "int8_us": 573.132751,
+        "speedup": 1.686499
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "float_us": 226.235748,
+        "int8_us": 207.530685,
+        "speedup": 1.090132
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "float_us": 854.66449,
+        "int8_us": 314.504517,
+        "speedup": 2.717495
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "float_us": 1542.007446,
+        "int8_us": 578.423462,
+        "speedup": 2.66588
+      }
+    ],
+    "micro-draft-fullblock": [
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 55.739735,
+        "int8_us": 99.498665,
+        "speedup": 0.560206
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 116.292267,
+        "int8_us": 356.078949,
+        "speedup": 0.326591
+      },
+      {
+        "rows": 6144,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 184.012787,
+        "int8_us": 705.911438,
+        "speedup": 0.260674
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 1,
+        "float_us": 63.965866,
+        "int8_us": 103.185066,
+        "speedup": 0.619914
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 4,
+        "float_us": 162.065048,
+        "int8_us": 366.830933,
+        "speedup": 0.441798
+      },
+      {
+        "rows": 2048,
+        "cols": 6144,
+        "tokens": 8,
+        "float_us": 270.370148,
+        "int8_us": 750.796814,
+        "speedup": 0.360111
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 1,
+        "float_us": 2203.818848,
+        "int8_us": 2918.058838,
+        "speedup": 0.755235
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 4,
+        "float_us": 3612.637695,
+        "int8_us": 10019.84082,
+        "speedup": 0.360548
+      },
+      {
+        "rows": 248320,
+        "cols": 2048,
+        "tokens": 8,
+        "float_us": 6366.173828,
+        "int8_us": 20048.416016,
+        "speedup": 0.31754
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 1,
+        "float_us": 183.125336,
+        "int8_us": 266.444794,
+        "speedup": 0.687292
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 4,
+        "float_us": 511.317352,
+        "int8_us": 1010.96106,
+        "speedup": 0.505774
+      },
+      {
+        "rows": 12288,
+        "cols": 4096,
+        "tokens": 8,
+        "float_us": 905.557312,
+        "int8_us": 2039.432495,
+        "speedup": 0.444024
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 1,
+        "float_us": 223.197861,
+        "int8_us": 266.649597,
+        "speedup": 0.837046
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 4,
+        "float_us": 829.474182,
+        "int8_us": 1014.408508,
+        "speedup": 0.817692
+      },
+      {
+        "rows": 4096,
+        "cols": 12288,
+        "tokens": 8,
+        "float_us": 1528.763672,
+        "int8_us": 2024.994141,
+        "speedup": 0.754947
+      }
+    ]
+  },
+  "experiment_notes": [
+    "Standalone NVCC -O3 --fmad=false -arch=sm_86; application uses NVRTC compute_80. Synthetic weights/activations, not complete model requests.",
+    "multirow mode 10 is two rows/warp; mode 11 is four. These float variants were selected. All recorded diff fields are zero output-bit differences.",
+    "Repacked weights and the three integer-drafter prototypes were rejected. The integer prototypes include quantization cost; they are not a reproduction of the port's optimized transposed integer kernel.",
+    "Nsight Compute on a synthetic scalar float specialization measured 93.17% L1/TEX throughput, 12.88% DRAM throughput, 95.66% L1 hit rate, 89.68% compute throughput, and no local-memory spill. It identifies L1/issue pressure on that kernel, not a full-application bandwidth claim."
+  ],
+  "qualified_profiles": [
+    {
+      "size": 2,
+      "projection_policy": "baseline",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "0458ac32f0a8fef31a1d5090597b32c6b8ead223914441f41dda5f6777e6aa7a",
+      "kernel_total_ns": 1450828057,
+      "projection_fraction": 0.8855229548404026,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1536,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 167181.38816738816,
+          "total_ns": 463426808
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 102940.96248196249,
+          "total_ns": 285352348
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 62080,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 6447739.452380952,
+          "total_ns": 270805057
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1536,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 406235.70075757575,
+          "total_ns": 107246225
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 512,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 235880.20454545456,
+          "total_ns": 62272374
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 4,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 1512,
+          "mean_ns": 28382.904761904763,
+          "total_ns": 42914952
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 252,
+          "mean_ns": 113938.05158730158,
+          "total_ns": 28712389
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 128,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 504,
+          "mean_ns": 19854.386904761905,
+          "total_ns": 10006611
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 24,
+          "mean_ns": 273370.5833333333,
+          "total_ns": 6560894
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 4,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 144,
+          "mean_ns": 38417.944444444445,
+          "total_ns": 5532184
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 128,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 48,
+          "mean_ns": 39827.208333333336,
+          "total_ns": 1911706
+        }
+      ]
+    },
+    {
+      "size": 2,
+      "projection_policy": "tiled",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "782e18f69df94b54c3878ddcc062d467d95d5d23996f66ed0a2d75b2c6f5c588",
+      "kernel_total_ns": 670027206,
+      "projection_fraction": 0.7516719447956267,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 768,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 53745.17568542568,
+          "total_ns": 148981627
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 256,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2772,
+          "mean_ns": 35001.03896103896,
+          "total_ns": 97022880
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r4",
+          "gridX": 15520,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 48,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 2005828.4285714286,
+          "total_ns": 84244794
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 384,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 285001.07575757575,
+          "total_ns": 75240284
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 128,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 264,
+          "mean_ns": 233238.30681818182,
+          "total_ns": 61574913
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 252,
+          "mean_ns": 37274.519841269845,
+          "total_ns": 9393179
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 64,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 504,
+          "mean_ns": 16480.349206349205,
+          "total_ns": 8306096
+        },
+        {
+          "kernel": "bonsai_f32_t1",
+          "gridX": 4,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 1512,
+          "mean_ns": 4678.352513227514,
+          "total_ns": 7073669
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 24,
+          "mean_ns": 208649.54166666666,
+          "total_ns": 5007589
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 32,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 48,
+          "mean_ns": 75979.22916666667,
+          "total_ns": 3647003
+        },
+        {
+          "kernel": "bonsai_f32_t8",
+          "gridX": 4,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 144,
+          "mean_ns": 21865.409722222223,
+          "total_ns": 3148619
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "projection_policy": "baseline",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "d32c4d41daa33ac0c767a8d8fdc55f31809c3fdf3506e161e96f4468fa8348d0",
+      "kernel_total_ns": 3204102953,
+      "projection_fraction": 0.9058795758364635,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2304,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 311418.0535714286,
+          "total_ns": 837091728
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 640,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 236568.63355654763,
+          "total_ns": 635896487
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2048,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 1344,
+          "mean_ns": 279422.9300595238,
+          "total_ns": 375544418
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 62080,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 8163365.19047619,
+          "total_ns": 342861338
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2304,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 754119.75390625,
+          "total_ns": 193054657
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 1008,
+          "mean_ns": 144122.7251984127,
+          "total_ns": 145275707
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 640,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 542429.33203125,
+          "total_ns": 138861909
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2048,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 128,
+          "mean_ns": 671398.1875,
+          "total_ns": 85938968
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 8,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2016,
+          "mean_ns": 35737.211805555555,
+          "total_ns": 72046219
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 96,
+          "mean_ns": 339649.71875,
+          "total_ns": 32606373
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 256,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 672,
+          "mean_ns": 41035.97321428572,
+          "total_ns": 27576174
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 8,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 192,
+          "mean_ns": 51372.338541666664,
+          "total_ns": 9863489
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 64,
+          "mean_ns": 92405.578125,
+          "total_ns": 5913957
+        }
+      ]
+    },
+    {
+      "size": 4,
+      "projection_policy": "tiled",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "8a3d7f50d425cebd216e6ef302a63f54003b53fe9a12dfaf46cdb5a7b52ae664",
+      "kernel_total_ns": 1494839345,
+      "projection_fraction": 0.794813170374506,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 1152,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 98068.95052083333,
+          "total_ns": 263609339
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 320,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 80054.59821428571,
+          "total_ns": 215186760
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 160,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 609201.93359375,
+          "total_ns": 155955695
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 576,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 560453.875,
+          "total_ns": 143476192
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 1344,
+          "mean_ns": 88323.59226190476,
+          "total_ns": 118706908
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r4",
+          "gridX": 15520,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 48,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 2629827.904761905,
+          "total_ns": 110452772
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 512,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 128,
+          "mean_ns": 526636.2890625,
+          "total_ns": 67409445
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 1008,
+          "mean_ns": 49219.8373015873,
+          "total_ns": 49613596
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 96,
+          "mean_ns": 258478.96875,
+          "total_ns": 24813981
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 128,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 672,
+          "mean_ns": 22160.145833333332,
+          "total_ns": 14891618
+        },
+        {
+          "kernel": "bonsai_f32_t1",
+          "gridX": 8,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2016,
+          "mean_ns": 5927.231150793651,
+          "total_ns": 11949298
+        },
+        {
+          "kernel": "bonsai_f32_t8",
+          "gridX": 8,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 192,
+          "mean_ns": 31386.520833333332,
+          "total_ns": 6026212
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 64,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 64,
+          "mean_ns": 94159.109375,
+          "total_ns": 6026183
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "projection_policy": "baseline",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "281a770aa4a33c40df9e4d3105ec5962762a47e038868aa35447c37012d6be7e",
+      "kernel_total_ns": 5887207756,
+      "projection_fraction": 0.9198888018654798,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 3072,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 653951.2239583334,
+          "total_ns": 1757820890
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 3696,
+          "mean_ns": 389546.78544372297,
+          "total_ns": 1439764919
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2048,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 1344,
+          "mean_ns": 440648.4151785714,
+          "total_ns": 592231470
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 62080,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 12879173.57142857,
+          "total_ns": 540925290
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 3072,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 1651609.921875,
+          "total_ns": 422812140
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 1024,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 352,
+          "mean_ns": 957902.5568181818,
+          "total_ns": 337181700
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 2048,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 128,
+          "mean_ns": 1105957.1328125,
+          "total_ns": 141562513
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 8,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 2016,
+          "mean_ns": 55954.75843253968,
+          "total_ns": 112804793
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 256,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 672,
+          "mean_ns": 63900.212797619046,
+          "total_ns": 42940943
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 8,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 192,
+          "mean_ns": 92992.75,
+          "total_ns": 17854608
+        },
+        {
+          "kernel": "bonsai_ptq_matmul",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 56,
+          "localMemoryPerThread": 0,
+          "launches": 64,
+          "mean_ns": 151206.609375,
+          "total_ns": 9677223
+        }
+      ]
+    },
+    {
+      "size": 9,
+      "projection_policy": "tiled",
+      "source_commit": "511f09584e79d7ac16e974604de4ab9c0ed1ae57",
+      "probe_sha256": "7c5ef76edf2553d9f7b61f632677b04371d95bdfdc2ab86fa1f8162a37eb24c7",
+      "cuda_event_trace": false,
+      "trace_sha256": "8ebddc064e487c94103c0f7168359c03ca33033d11b03be64c0c8e16ecb50bba",
+      "kernel_total_ns": 2871497014,
+      "projection_fraction": 0.8308214657262395,
+      "projections": [
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 1536,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2688,
+          "mean_ns": 199678.26264880953,
+          "total_ns": 536735170
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 512,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 3696,
+          "mean_ns": 135138.15746753247,
+          "total_ns": 499470630
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 768,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 256,
+          "mean_ns": 1628472.32421875,
+          "total_ns": 416888915
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 256,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 352,
+          "mean_ns": 1071427.5397727273,
+          "total_ns": 377142494
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 1024,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 1344,
+          "mean_ns": 139073.31175595237,
+          "total_ns": 186914531
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r4",
+          "gridX": 15520,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 48,
+          "localMemoryPerThread": 0,
+          "launches": 42,
+          "mean_ns": 4178916.238095238,
+          "total_ns": 175514482
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 512,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 128,
+          "mean_ns": 1029516.34375,
+          "total_ns": 131778092
+        },
+        {
+          "kernel": "bonsai_ptq_t1_r2",
+          "gridX": 128,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 672,
+          "mean_ns": 34863.77976190476,
+          "total_ns": 23428460
+        },
+        {
+          "kernel": "bonsai_f32_t1",
+          "gridX": 8,
+          "gridY": 1,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 2016,
+          "mean_ns": 8807.380952380952,
+          "total_ns": 17755680
+        },
+        {
+          "kernel": "bonsai_f32_t8",
+          "gridX": 8,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 40,
+          "localMemoryPerThread": 0,
+          "launches": 192,
+          "mean_ns": 56285.052083333336,
+          "total_ns": 10806730
+        },
+        {
+          "kernel": "bonsai_ptq_t8_r4",
+          "gridX": 64,
+          "gridY": 2,
+          "blockX": 128,
+          "registersPerThread": 72,
+          "localMemoryPerThread": 0,
+          "launches": 64,
+          "mean_ns": 144783.96875,
+          "total_ns": 9266174
+        }
+      ]
+    }
+  ]
+}

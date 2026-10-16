@@ -45,6 +45,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### PrismML llama.cpp PTQ1 CUDA reference
+
+The Bonsai transposed Q8 CUDA projection in `src/cuda_resident/bonsai_q8.cu`
+uses the activation plane layout and exact integer-sum technique from the
+PrismML llama.cpp port's PTQ1 CUDA work. The source above is covered by the
+same MIT notice reproduced for llama.cpp / ggml.
+
+- Reference: <https://github.com/PrismML-Eng/llama.cpp/tree/prism-b10777-e3de715/ggml/src/ggml-cuda>
+- License: MIT, Copyright (c) 2023-2026 The ggml authors
+
 ### NVIDIA CUDA NVRTC runtime (prebuilt Windows GPU release)
 
 Camelid's prebuilt Windows release bundles the NVIDIA CUDA NVRTC runtime-compilation

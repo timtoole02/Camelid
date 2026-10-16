@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-15",
+  "scope": "Supported Windows x86_64 exact-artifact text, single-image GUI/API chat, sampling and function-tool round trips",
+  "host": "Windows x86_64",
+  "language_backend": "portable CPU with activation Hadamard transforms",
+  "image_backend": "CUDA f32 projector; CPU fallback",
+  "reference": {
+    "repository": "https://github.com/PrismML-Eng/llama.cpp",
+    "release": "prism-b10777-e3de715",
+    "backend": "CPU",
+    "sampling": "greedy, thinking disabled; text output up to 32 tokens; original reference image smoke uses four merged image tokens"
+  },
+  "publisher_artifact_identities": "../../src/bonsai2.rs",
+  "models": {
+    "2B": {
+      "api": "2b-api-qualified.json",
+      "gui": "2b-gui-supported.json",
+      "result": "PASS six API cases, CPU/CUDA vision, packaged GUI attachment with Verified badge, and three exact draft comparisons",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "2b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "2b-cpu-vision.json",
+      "speculative_decoding": "2b-draft-benchmark.json",
+      "gui_before_promotion": "2b-gui-qualified.json",
+      "gui_screenshot": "2b-gui-supported.png"
+    },
+    "4B": {
+      "api": "4b-api-qualified.json",
+      "gui": "4b-gui-supported.json",
+      "result": "PASS six API cases, CPU/CUDA vision, packaged GUI attachment with Verified badge, and three exact draft comparisons",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "4b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "4b-cpu-vision.json",
+      "speculative_decoding": "4b-draft-benchmark.json",
+      "gui_before_promotion": "4b-gui-qualified.json",
+      "gui_screenshot": "4b-gui-supported.png"
+    },
+    "9B": {
+      "api": "9b-api-qualified.json",
+      "gui": "9b-gui-supported.json",
+      "result": "PASS six API cases, CPU/CUDA vision, packaged GUI attachment with Verified badge, and three exact draft comparisons",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "9b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "9b-cpu-vision.json",
+      "speculative_decoding": "9b-draft-benchmark.json",
+      "gui_before_promotion": "9b-gui-qualified.json",
+      "gui_screenshot": "9b-gui-supported.png"
+    },
+    "27B": {
+      "api": "27b-api-qualified.json",
+      "gui": "27b-gui-supported.json",
+      "result": "PASS six API cases, CPU/CUDA vision, packaged GUI attachment with Verified badge, and three exact draft comparisons",
+      "context": "1044 prompt tokens; recall ORCHID",
+      "reference": "27b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "27b-cpu-vision.json",
+      "speculative_decoding": "27b-draft-benchmark.json",
+      "gui_before_promotion": "27b-gui-qualified.json",
+      "gui_screenshot": "27b-gui-supported.png"
+    }
+  },
+  "regression": {
+    "problem": "Qwen3-VL learned position grid used pixel-center interpolation instead of align_corners=true",
+    "before": "2B described the solid red fixture as a black and white photograph on both CPU and CUDA encoders",
+    "after": "2B and 4B correctly identify red after correcting the shared position interpolation",
+    "unit_test": "learned_positions_align_corners_in_tile_order",
+    "reference_source": "https://github.com/PrismML-Eng/llama.cpp/blob/prism/tools/mtmd/models/qwen3vl.cpp"
+  },
+  "not_qualified": [
+    "Apple Silicon and other platforms",
+    "resident GPU language decoding",
+    "model-native 262K or extended context",
+    "multiple images, audio and video"
+  ],
+  "reproduction": "README.md",
+  "qualification_binary_sha256": "77c36fb3fefe6664cf9ce1c1e6a34f8f53b0a5af15c5445b4b88cf601ef74103",
+  "reference_divergences": "reference-divergences.json",
+  "cuda_precision_regression": {
+    "before": "Approximate CUDA encoder answered Yellow for left blue/right yellow fixture",
+    "after": "Automatic accurate f32 encoder answers Blue on all four sizes at default image limits",
+    "evidence": "vision case in each api-qualified receipt"
+  },
+  "supported_binary_sha256": "80a3c5dfe525a1ce11a1387a98d0e5247c0c547083ef146e630bed4cf31c2421",
+  "supported_probe_sha256": "9b7e42446c045ddc26496be6e3f6d25f46c162a16035d54f9a6baf33894b30b8",
+  "build": "release opt-level=3, x86-64-v3, lto=false, codegen-units=16, cuda feature; source snapshot committed as 1c3f9040",
+  "historical_gui_note": "gui-qualified receipts capture functional image testing before support promotion; their Unverified badge is historical.",
+  "performance": "performance.json",
+  "draft_cache_parity": "cache-parity.json",
+  "image_encoder_lanes": "image-lanes.json",
+  "reference_summary": {
+    "2B": "text/count/code token-identical; explain first divergence is reference rank 2, 0.00476-nat margin",
+    "4B": "text/count/code token-identical; explain first divergence is reference rank 2, 0.00241-nat margin",
+    "9B": "text/count/code token-identical; explain first divergence is reference rank 2, 0.00042-nat margin",
+    "27B": "text/count/code/explain token-identical"
+  },
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU, 6 GiB; image encoder only",
+  "seeded_sampling_parity": {
+    "baseline": "9b-cpu-vision.json, sampled_continuation",
+    "draft": "9b-sampled-draft.json",
+    "result": "PASS, all 32 generated token IDs identical at temperature 0.7 and seed 42",
+    "draft_activity": "18 accepted of 37 proposed; production server log"
+  },
+  "evidence_check": "node qa/bonsai2/check-evidence.mjs"
+}

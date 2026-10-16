@@ -2,6 +2,7 @@
 pub mod alloc_gate;
 pub mod api;
 pub(crate) mod bitnet_kernels;
+pub(crate) mod bonsai2;
 pub mod capability;
 pub mod catalog;
 pub mod chat;

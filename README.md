@@ -126,6 +126,15 @@ Use a trusted private LAN or private Tailscale HTTPS access with authentication.
 
 ## Supported models
 
+Bonsai 2 **2B, 4B, 9B, and 27B** PTQ1_0 support text, GUI image chat, and
+function calling on Windows x86_64 with CPU or CUDA language decoding. Downloads
+include the matching vision projector. All four passed CUDA production GUI/API
+checks through the native server harness, matched benchmarks, and the final
+state and memory regression suite. The [CUDA manifest](qa/bonsai2/cuda/manifest.json)
+records the qualified artifacts. CUDA drafting improves selected workloads,
+including all three measured 27B cases, but can also slow a request. See
+[Bonsai 2](docs/BONSAI2.md) for the full comparison and tested limits.
+
 Start with one of these five options. Support applies to exact model files, quantizations, and tested execution paths; see the [compatibility ledger](COMPATIBILITY.md) for each model's limits.
 
 | Best for | Model | Pull ID |

@@ -44,6 +44,14 @@ enum RawMatBytes {
     /// Page-aligned packed backing. Metal wraps this allocation with
     /// `newBufferWithBytesNoCopy`, so a Q1/Q2 or Q8_0 projection has one resident copy.
     WirePages(Arc<crate::wire_mmap::WirePages>),
+    /// Immutable file-backed PTQ bytes. The mapping is shared by every tensor
+    /// and tied head, so loading a 27B pack does not commit another 6 GB of
+    /// private RAM before CUDA allocates its streamed-weight buffers.
+    Mapped {
+        mapping: Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        len: usize,
+    },
 }
 
 impl RawMatBytes {
@@ -51,6 +59,13 @@ impl RawMatBytes {
         match self {
             Self::Owned(bytes) => bytes.as_slice(),
             Self::WirePages(pages) => pages.bytes(),
+            Self::Mapped {
+                mapping,
+                offset,
+                len,
+            } => mapping
+                .bytes(*offset, *len)
+                .expect("immutable tensor range was validated at load"),
         }
     }
 
@@ -62,10 +77,23 @@ impl RawMatBytes {
         Self::Owned(Arc::new(bytes))
     }
 
+    fn mapped(
+        mapping: Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        len: usize,
+    ) -> Result<Self> {
+        mapping.bytes(offset, len)?;
+        Ok(Self::Mapped {
+            mapping,
+            offset,
+            len,
+        })
+    }
+
     fn wire_pages(&self) -> Option<&Arc<crate::wire_mmap::WirePages>> {
         match self {
             Self::WirePages(pages) => Some(pages),
-            Self::Owned(_) => None,
+            Self::Owned(_) | Self::Mapped { .. } => None,
         }
     }
 }
@@ -249,6 +277,10 @@ struct RawMat {
     tt: GgufTensorType,
     in_features: usize,
     out_features: usize,
+    forward_transform: Option<std::sync::Arc<super::hadamard::Transform>>,
+    inverse_transform: Option<std::sync::Arc<super::hadamard::Transform>>,
+    /// Proposal-only arithmetic; public target loading always leaves this off.
+    draft_quantized_ptq: bool,
 }
 
 /// A dequantized 2-D weight (f32), produced transiently from a [`RawMat`].
@@ -279,6 +311,11 @@ impl RawMat {
 
     #[cfg(target_os = "macos")]
     fn prism_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
+        if self.forward_transform.is_some() {
+            return Err(BackendError::UnsupportedGguf(
+                "Bonsai 2 Hadamard projections use the portable runtime".into(),
+            ));
+        }
         let pages = self.bytes.wire_pages().ok_or_else(|| {
             BackendError::InvalidTensorData("Prism Metal weight is not page-backed".into())
         })?;
@@ -363,7 +400,11 @@ impl RawMat {
         }
         let rb = self.row_bytes();
         let slice = &self.bytes.as_slice()[r * rb..(r + 1) * rb];
-        super::dequant::dequantize(self.tt, slice, self.in_features, name)
+        let mut row = super::dequant::dequantize(self.tt, slice, self.in_features, name)?;
+        if let Some(transform) = &self.inverse_transform {
+            transform.inverse(&mut row);
+        }
+        Ok(row)
     }
 
     /// Carve out a contiguous block of `len` out-features starting at `start` into a
@@ -379,6 +420,9 @@ impl RawMat {
             tt: self.tt,
             in_features: self.in_features,
             out_features: len,
+            forward_transform: self.forward_transform.clone(),
+            inverse_transform: self.inverse_transform.clone(),
+            draft_quantized_ptq: self.draft_quantized_ptq,
         }
     }
 
@@ -392,6 +436,16 @@ impl RawMat {
     /// corresponding slice of a whole-matrix dequant.
     fn par_matvec(&self, x: &[f32], name: &str) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), self.in_features);
+        let transformed = self.forward_transform.as_ref().map(|t| t.forward(x));
+        let x = transformed.as_deref().unwrap_or(x);
+        if self.draft_quantized_ptq && self.tt == GgufTensorType::Ptq1_0 {
+            let input = crate::inference::quantize_q8_0_blocks(x);
+            let rb = self.row_bytes();
+            return Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| ptq_dot::dot_row(&self.bytes.as_slice()[r * rb..(r + 1) * rb], &input))
+                .collect());
+        }
         if self.tt == GgufTensorType::I2S {
             let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
             let mut output = vec![0.0_f32; self.out_features];
@@ -625,6 +679,11 @@ impl RawMat {
     /// calling `par_matvec` on each input separately (same per-element arithmetic and
     /// accumulation order — the row dot is unchanged; only the batching differs).
     fn par_matmul(&self, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let transformed = self
+            .forward_transform
+            .as_ref()
+            .map(|transform| xs.iter().map(|x| transform.forward(x)).collect::<Vec<_>>());
+        let xs = transformed.as_deref().unwrap_or(xs);
         let m = xs.len();
         let out_f = self.out_features;
         if self.tt == GgufTensorType::I2S {
@@ -685,6 +744,18 @@ impl RawMat {
         let rb = self.row_bytes();
         // flat[r*m + p] = dot(row_r, xs[p]); par over rows so each row is read once.
         let flat: Vec<f32> = match self.tt {
+            GgufTensorType::Ptq1_0 if self.draft_quantized_ptq => {
+                let inputs: Vec<_> = xs
+                    .iter()
+                    .map(|x| crate::inference::quantize_q8_0_blocks(x))
+                    .collect();
+                (0..out_f)
+                    .into_par_iter()
+                    .flat_map_iter(|r| {
+                        ptq_dot::dot_rows(&self.bytes.as_slice()[r * rb..(r + 1) * rb], &inputs)
+                    })
+                    .collect()
+            }
             GgufTensorType::Q8_0 => {
                 // Quantize each batched activation to Q8 ONCE (outside the per-row
                 // parallel loop), then every row reads the resident weight once and
@@ -710,12 +781,20 @@ impl RawMat {
                 })
                 .collect(),
             _ => {
-                // Fallback (never hit for the Q8_0+F32 qwen35 model): per-input matvec.
-                let mut out = Vec::with_capacity(m);
-                for x in xs {
-                    out.push(self.par_matvec(x, "matmul")?);
-                }
-                return Ok(out);
+                // Unpack each row once for the whole verification batch.
+                // SIMD runs across tokens, preserving each token's f32 sum order.
+                let packed = (m > 1).then(|| batched_dot::BatchedInputs::new(xs, self.in_features));
+                let rows: Result<Vec<Vec<f32>>> = (0..out_f)
+                    .into_par_iter()
+                    .map(|r| {
+                        let row = self.dequant_row(r, "matmul")?;
+                        Ok(match &packed {
+                            Some(packed) => packed.dot_row(&row),
+                            None => xs.iter().map(|x| dot(&row, x)).collect(),
+                        })
+                    })
+                    .collect();
+                rows?.into_iter().flatten().collect()
             }
         };
         // Transpose flat[r*m + p] -> out[p][r].
@@ -787,9 +866,17 @@ impl KvCache {
     }
 }
 
+#[path = "batched_dot.rs"]
+mod batched_dot;
+#[path = "ptq_dot.rs"]
+mod ptq_dot;
+#[path = "speculative.rs"]
+mod speculative;
+
 /// A loaded runnable model: parametric config + quantized weights, ready for greedy
 /// decode. Weights are dequantized to f32 on demand during the forward pass.
 pub struct RunnableModel {
+    source_path: String,
     pub architecture: String,
     pub d_model: usize,
     pub n_layers: usize,
@@ -842,6 +929,10 @@ pub struct RunnableModel {
     /// recurrent state reset at the start of every generate. `None` until first use.
     #[cfg(feature = "cuda")]
     cuda: std::sync::Mutex<Option<crate::cuda_resident::CudaResidentDecode>>,
+    /// The CUDA proposal graph is retained with its target so repeated GUI turns
+    /// do not reload the drafter or rebuild the target's VRAM allocation plan.
+    #[cfg(feature = "cuda")]
+    cuda_draft: std::sync::Mutex<Option<speculative::CachedCudaDraft>>,
     /// Fully resident Apple Metal Qwen3.5 hybrid graph. Built lazily so merely
     /// inspecting/loading a model does not allocate recurrent/KV state.
     #[cfg(target_os = "macos")]
@@ -1005,9 +1096,14 @@ fn command_r_parallel_residual(
 impl RunnableModel {
     /// Admit, parse config, and read every weight into resident quantized form.
     pub fn load(path: &str) -> Result<Self> {
+        Self::load_with_draft_activations(path, false)
+    }
+
+    fn load_with_draft_activations(path: &str, draft_quantized_ptq: bool) -> Result<Self> {
         let gguf = read_metadata(path)?;
         admit::admit(&gguf).map_err(BackendError::from)?;
         let cfg = LlamaModelConfig::from_gguf(&gguf)?;
+        let hadamard = super::hadamard::Hadamard::from_gguf(&gguf)?;
         validate_bitnet_b158_2b_4t(&gguf, &cfg)?;
         let arch = gguf
             .architecture()
@@ -1056,13 +1152,40 @@ impl RunnableModel {
             source: e,
         })?;
 
+        // Only the Bonsai PTQ loader uses this backing. The file remains mapped
+        // read-only for the lifetime of its tensors; CUDA uploads and CPU row
+        // decoding consume the same packed bytes. Existing Metal page-backed
+        // formats retain their allocation and NoCopy contracts.
+        let ptq_mapping = if arch == "qwen35"
+            && gguf
+                .tensors
+                .iter()
+                .any(|tensor| tensor.tensor_type == GgufTensorType::Ptq1_0)
+        {
+            Some(crate::wire_mmap::GgufWireMmap::map(std::path::Path::new(
+                path,
+            ))?)
+        } else {
+            None
+        };
+
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
             let bitnet_tied_head = arch == "bitnet-b1.58"
                 && d.tensor_type == GgufTensorType::F16
                 && matches!(name, "token_embd.weight" | "output.weight");
-            let bytes = if wants_page_backing(d.tensor_type) || bitnet_tied_head {
+            let bytes = if let (GgufTensorType::Ptq1_0, Some(mapping)) =
+                (d.tensor_type, ptq_mapping.as_ref())
+            {
+                let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
+                    BackendError::InvalidTensorData(format!(
+                        "tensor {name} packed byte length {} does not fit usize",
+                        d.n_bytes
+                    ))
+                })?;
+                RawMatBytes::mapped(mapping.clone(), d.absolute_offset, byte_len)?
+            } else if wants_page_backing(d.tensor_type) || bitnet_tied_head {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -1082,6 +1205,9 @@ impl RunnableModel {
                 tt: d.tensor_type,
                 in_features: inf,
                 out_features: outf,
+                forward_transform: hadamard.forward.get(name).cloned(),
+                inverse_transform: hadamard.inverse.get(name).cloned(),
+                draft_quantized_ptq,
             })
         };
         let load_vec = |f: &mut File, name: &str| -> Result<Vec<f32>> {
@@ -1108,6 +1234,9 @@ impl RunnableModel {
                 tt: token_embd.tt,
                 in_features: token_embd.in_features,
                 out_features: token_embd.out_features,
+                forward_transform: token_embd.forward_transform.clone(),
+                inverse_transform: None,
+                draft_quantized_ptq,
             }
         };
         // LFM2 spells its final RMSNorm `token_embd_norm` rather than
@@ -1249,6 +1378,7 @@ impl RunnableModel {
             };
 
             return Ok(Self {
+                source_path: path.to_owned(),
                 architecture: arch,
                 d_model,
                 n_heads,
@@ -1288,6 +1418,8 @@ impl RunnableModel {
                 resident_cuda_artifact,
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
+                #[cfg(feature = "cuda")]
+                cuda_draft: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
                 metal_qwen35: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
@@ -1415,6 +1547,7 @@ impl RunnableModel {
             }
 
             return Ok(RunnableModel {
+                source_path: path.to_owned(),
                 architecture: arch,
                 d_model,
                 n_heads,
@@ -1451,6 +1584,8 @@ impl RunnableModel {
                 resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
+                #[cfg(feature = "cuda")]
+                cuda_draft: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
                 metal_qwen35: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
@@ -1557,6 +1692,7 @@ impl RunnableModel {
         let logit_scale = gguf.metadata_f32(&format!("{arch}.logit_scale"));
 
         Ok(Self {
+            source_path: path.to_owned(),
             architecture: arch,
             d_model,
             n_heads,
@@ -1589,6 +1725,8 @@ impl RunnableModel {
             resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
             #[cfg(feature = "cuda")]
             cuda: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            cuda_draft: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
             metal_qwen35: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
@@ -1845,6 +1983,19 @@ impl RunnableModel {
         Ok(out)
     }
 
+    /// Whether a CUDA language graph has actually been initialized for this model.
+    /// Qualification probes use this after generation to reject a CPU fallback.
+    pub fn cuda_language_active(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda.lock().is_ok_and(|engine| engine.is_some())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
     /// Decode a Qwen3.5 prompt containing one Prism image. `prefix` is the text
     /// through `<|vision_start|>` and `suffix` begins with
     /// `<|vision_end|>`. Image embeddings occupy physical KV slots but advance
@@ -1859,6 +2010,22 @@ impl RunnableModel {
         stop: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if (self.output.forward_transform.is_some()
+            && (!crate::execution_plan::qwen35_cuda_lane_selectable()
+                || self.output.tt != GgufTensorType::Ptq1_0))
+            || !cfg!(any(target_os = "macos", feature = "cuda"))
+        {
+            return self.generate_qwen35_vision_cpu(
+                prefix,
+                image,
+                suffix,
+                max_new,
+                stop,
+                None,
+                &|_| false,
+                on_token,
+            );
+        }
         #[cfg(target_os = "macos")]
         {
             self.generate_qwen35_vision_metal(
@@ -1909,6 +2076,23 @@ impl RunnableModel {
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if (self.output.forward_transform.is_some()
+            && (!crate::execution_plan::qwen35_cuda_lane_selectable()
+                || self.output.tt != GgufTensorType::Ptq1_0))
+            || !cfg!(any(target_os = "macos", feature = "cuda"))
+        {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_qwen35_vision_cpu(
+                prefix,
+                image,
+                suffix,
+                max_new,
+                stop,
+                sampling,
+                should_stop,
+                on_token,
+            );
+        }
         #[cfg(target_os = "macos")]
         {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
@@ -2718,7 +2902,9 @@ struct Lfm2Runtime {
 /// Per-layer incremental state for qwen35 decode. Full-attention layers grow a
 /// standard K/V cache; SSM layers keep a causal-conv ring buffer and the recurrent
 /// per-head state matrix (`num_v_heads` × `d_state` × `d_state`).
+#[derive(Clone)]
 struct Qwen35Cache {
+    rope_override: Option<(Vec<f32>, Vec<f32>)>,
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     /// Conv ring buffer per SSM layer: `(d_conv-1) * conv_dim`, layout
@@ -2742,6 +2928,7 @@ impl Qwen35Cache {
         }
         Self {
             k: vec![Vec::new(); n_layers],
+            rope_override: None,
             v: vec![Vec::new(); n_layers],
             conv,
             state,
@@ -2761,8 +2948,8 @@ impl RunnableModel {
         Ok(logits)
     }
 
-    /// Batched prompt prefill: process ALL prompt positions through the stack, reading
-    /// each weight once per layer (`par_matmul`) instead of once per token — the
+    /// Batched prompt prefill: process bounded chunks through the stack, reading
+    /// each weight once per layer and chunk (`par_matmul`) instead of once per token — the
     /// memory-bandwidth amortization that makes the prompt fast. Builds `cache` (KV for
     /// full-attn layers; conv + recurrent state for SSM layers) identically to running
     /// `decode_token_qwen35` over the prompt — causal attention means each position
@@ -2857,9 +3044,27 @@ impl RunnableModel {
         prompt: &[u32],
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<(Qwen35Cache, Vec<f32>)> {
-        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let mut cache = Qwen35Cache::new(self.qwen35.as_ref().unwrap(), self.n_layers);
+        let mut hidden = Vec::new();
+        for (chunk, tokens) in prompt.chunks(128).enumerate() {
+            hidden = self.qwen35_batch_hidden(tokens, chunk * 128, &mut cache, cancelled)?;
+        }
+        let last = hidden
+            .last()
+            .ok_or_else(|| BackendError::InvalidTensorData("empty qwen35 prompt".into()))?;
+        let normed = self.apply_norm(last, &self.output_norm);
+        Ok((cache, self.output.par_matvec(&normed, "output")?))
+    }
+
+    /// Advance an existing hybrid cache in causal order; share weight reads across tokens.
+    fn qwen35_batch_hidden(
+        &self,
+        prompt: &[u32],
+        position: usize,
+        cache: &mut Qwen35Cache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<Vec<f32>>> {
         let m = prompt.len();
-        let mut cache = Qwen35Cache::new(rt, self.n_layers);
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(m);
         for &tok in prompt {
             let t = tok as usize;
@@ -2871,6 +3076,22 @@ impl RunnableModel {
             }
             hidden.push(self.token_embd.dequant_row(t, "token_embd")?);
         }
+
+        self.qwen35_batch_embeddings(hidden, position, None, cache, cancelled)
+    }
+
+    /// Image rows carry their own logical IMRoPE coordinates; physical KV slots
+    /// remain contiguous. Bound prompt batches to keep temporary activations small.
+    fn qwen35_batch_embeddings(
+        &self,
+        mut hidden: Vec<Vec<f32>>,
+        position: usize,
+        rope_positions: Option<&[[usize; 4]]>,
+        cache: &mut Qwen35Cache,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let m = hidden.len();
 
         for (li, layer) in rt.layers.iter().enumerate() {
             if cancelled.is_some_and(|is_cancelled| is_cancelled()) {
@@ -2894,8 +3115,23 @@ impl RunnableModel {
                     let v = wv.par_matmul(&xn)?;
                     let mut attn_outs = Vec::with_capacity(m);
                     for p in 0..m {
+                        if let Some(positions) = rope_positions {
+                            cache.rope_override = Some(qwen35_imrope_tables(
+                                positions[p],
+                                rt.rope_sections,
+                                self.rope_base,
+                                self.rope_dim,
+                            ));
+                        }
                         attn_outs.push(self.qwen35_attn_compute(
-                            q_norm, k_norm, &qg[p], &k[p], &v[p], p, li, &mut cache,
+                            q_norm,
+                            k_norm,
+                            &qg[p],
+                            &k[p],
+                            &v[p],
+                            position + p,
+                            li,
+                            cache,
                         ));
                     }
                     wo.par_matmul(&attn_outs)?
@@ -2928,7 +3164,7 @@ impl RunnableModel {
                             &z[p],
                             &beta_raw[p],
                             &alpha_raw[p],
-                            &mut cache,
+                            cache,
                         ));
                     }
                     ssm_out.par_matmul(&finals)?
@@ -2965,9 +3201,7 @@ impl RunnableModel {
             }
         }
 
-        let normed = self.apply_norm(&hidden[m - 1], &self.output_norm);
-        let logits = self.output.par_matvec(&normed, "output")?;
-        Ok((cache, logits))
+        Ok(hidden)
     }
 
     /// Greedy decode for qwen35: prefill the prompt position-by-position into the
@@ -3049,7 +3283,7 @@ impl RunnableModel {
         let _ = stream_tokens_observable;
 
         #[cfg(target_os = "macos")]
-        if qwen35_metal_enabled() {
+        if qwen35_metal_enabled() && self.output.forward_transform.is_none() {
             match self.generate_qwen35_metal(
                 prompt,
                 max_new,
@@ -3077,8 +3311,34 @@ impl RunnableModel {
             // defect: the plan and the lane consulted different things. `--gpu off` and
             // the UI toggle stay authoritative because the policy requires
             // `gpu_accel_enabled()`; `CAMELID_QWEN35_CUDA=0` still forces the CPU oracle.
-            let cuda_enabled = crate::execution_plan::qwen35_cuda_lane_selectable();
+            let cuda_enabled = crate::execution_plan::qwen35_cuda_lane_selectable()
+                && (self.output.forward_transform.is_none()
+                    || self.output.tt == GgufTensorType::Ptq1_0);
             if cuda_enabled {
+                if self.output.forward_transform.is_some() {
+                    // A disclosed Bonsai CUDA plan must never silently run its
+                    // language graph on the CPU after a device/setup failure.
+                    if std::env::var("CAMELID_SPEC_DECODE").as_deref() == Ok("draft") {
+                        return self.generate_qwen35_cuda_with_draft(
+                            prompt,
+                            max_new,
+                            stop,
+                            sampling,
+                            is_cancelled,
+                            should_stop,
+                            on_token,
+                        );
+                    }
+                    return self.generate_qwen35_cuda(
+                        prompt,
+                        max_new,
+                        stop,
+                        sampling,
+                        is_cancelled,
+                        should_stop,
+                        on_token,
+                    );
+                }
                 return qwen35_cuda_with_cpu_fallback(
                     on_token,
                     stream_tokens_observable,
@@ -3237,6 +3497,124 @@ impl RunnableModel {
             }
         }
         Ok(generated)
+    }
+
+    /// Portable multimodal decode, including Bonsai 2's folded projections.
+    /// Physical cache slots and IMRoPE positions deliberately advance separately.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_qwen35_vision_cpu(
+        &self,
+        prefix: &[u32],
+        image: &super::vision::PrismVisionEmbedding,
+        suffix: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: Option<&SamplingConfig>,
+        should_stop: &dyn Fn(&[u32]) -> bool,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let rt = self
+            .qwen35
+            .as_ref()
+            .ok_or_else(|| BackendError::UnsupportedGguf("vision requires qwen35".into()))?;
+        if image.grid_width == 0
+            || image.grid_height == 0
+            || image.grid_width.checked_mul(image.grid_height) != Some(image.embeddings.len())
+            || image.embeddings.iter().any(|e| e.len() != self.d_model)
+            || rt.rope_sections[1] == 0
+            || rt.rope_sections[2] == 0
+        {
+            return Err(BackendError::InvalidTensorData(
+                "invalid vision embedding/grid or multimodal RoPE geometry".into(),
+            ));
+        }
+        let cursor = qwen35_vision_decode_cursor(
+            prefix.len(),
+            image.grid_width,
+            image.grid_height,
+            suffix.len(),
+        );
+        // Keep the portable lane bounded like the existing resident defaults.
+        let max_new =
+            qwen35_generation_budget(cursor.kv_position, max_new, 8192, "portable vision")?;
+        if max_new == 0 {
+            return Ok(Vec::new());
+        }
+        let mut cache = Qwen35Cache::new(rt, self.n_layers);
+        let mut inputs = Vec::with_capacity(cursor.kv_position);
+        let embed = |token: u32| -> Result<Vec<f32>> {
+            if token as usize >= self.vocab {
+                return Err(BackendError::InvalidTensorData(
+                    "vision prompt token is outside vocabulary".into(),
+                ));
+            }
+            self.token_embd.dequant_row(token as usize, "token_embd")
+        };
+        for (pos, &token) in prefix.iter().enumerate() {
+            inputs.push((embed(token)?, [pos; 4]));
+        }
+        for (i, embedding) in image.embeddings.iter().enumerate() {
+            inputs.push((
+                embedding.clone(),
+                [
+                    prefix.len(),
+                    prefix.len() + i / image.grid_width,
+                    prefix.len() + i % image.grid_width,
+                    0,
+                ],
+            ));
+        }
+        let suffix_start = cursor.rope_position - suffix.len();
+        for (i, &token) in suffix.iter().enumerate() {
+            inputs.push((embed(token)?, [suffix_start + i; 4]));
+        }
+        let mut last_hidden = Vec::new();
+        for (chunk_index, chunk) in inputs.chunks(64).enumerate() {
+            let embeddings = chunk
+                .iter()
+                .map(|(embedding, _)| embedding.clone())
+                .collect();
+            let positions: Vec<_> = chunk.iter().map(|(_, positions)| *positions).collect();
+            last_hidden = self.qwen35_batch_embeddings(
+                embeddings,
+                chunk_index * 64,
+                Some(&positions),
+                &mut cache,
+                None,
+            )?;
+        }
+        let normed = self.apply_norm(
+            last_hidden.last().expect("nonempty image prompt"),
+            &self.output_norm,
+        );
+        let mut logits = self.output.par_matvec(&normed, "output")?;
+        let sampler = sampling.map(|s| LlamaSampler::Sampling(s.clone()));
+        let mut history = [prefix, suffix].concat();
+        let mut out = Vec::with_capacity(max_new);
+        for i in 0..max_new {
+            let token = if let Some(sampler) = &sampler {
+                qwen35_sample_logits(logits, sampler, &history)?
+            } else {
+                argmax(&logits)
+            };
+            if stop.contains(&token) {
+                break;
+            }
+            out.push(token);
+            history.push(token);
+            on_token(token);
+            if should_stop(&out) || qwen35_repetition_loop(&out) || i + 1 == max_new {
+                break;
+            }
+            cache.rope_override = Some(qwen35_imrope_tables(
+                [cursor.rope_position + i; 4],
+                rt.rope_sections,
+                self.rope_base,
+                self.rope_dim,
+            ));
+            logits = self.decode_token_qwen35(token, cursor.kv_position + i, &mut cache, true)?;
+        }
+        Ok(out)
     }
 
     /// Build the resident LFM2 Metal graph. Every guard here is deliberately
@@ -3967,6 +4345,22 @@ impl RunnableModel {
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if self.output.forward_transform.is_some()
+            && std::env::var("CAMELID_SPEC_DECODE").as_deref() == Ok("draft")
+        {
+            let (draft, window) = self.load_qwen35_draft(true)?;
+            return self.generate_qwen35_with_draft(
+                &draft,
+                window,
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                is_cancelled,
+                should_stop,
+                on_token,
+            );
+        }
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
         let (mut cache, last) = self.prefill_qwen35(prompt, Some(is_cancelled))?;
@@ -4029,6 +4423,12 @@ impl RunnableModel {
         should_stop: &dyn Fn(&[u32]) -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if max_new == 0 {
+            return Ok(Vec::new());
+        }
         // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
         // layers don't attend — see build_qwen35_resident::sparsify_kv), so KV is ~4x
         // smaller than dense and 8192 positions fit alongside the 5.24 GB Q4_K_M on a 6 GB
@@ -4037,6 +4437,7 @@ impl RunnableModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192);
+        let max_new = qwen35_generation_budget(prompt.len(), max_new, max_pos, "CUDA text")?;
         let mut guard = self
             .cuda
             .lock()
@@ -4070,7 +4471,41 @@ impl RunnableModel {
             // token-for-token; the only behavior difference is that forwards
             // scheduled after a mid-chunk stop token advance the (reset-per-
             // call) SSM/KV state without affecting the returned sequence.
-            for (i, &tok) in prompt.iter().enumerate() {
+            let prompt_start = if self.output.forward_transform.is_some()
+                && engine.prefers_batched_prefill()
+                && prompt.len() > 1
+            {
+                let prior = &prompt[..prompt.len() - 1];
+                let half = self.rope_dim / 2;
+                let mut embeddings = Vec::with_capacity(prior.len() * self.d_model);
+                let mut cos_all = Vec::with_capacity(prior.len() * half);
+                let mut sin_all = Vec::with_capacity(prior.len() * half);
+                qwen35_cuda_prefill_segments(prior, is_cancelled, &mut |base, tokens| {
+                    for (offset, &token) in tokens.iter().enumerate() {
+                        embeddings
+                            .extend(self.token_embd.dequant_row(token as usize, "token_embd")?);
+                        let (cos, sin) =
+                            qwen35_rope_tables(base + offset, self.rope_base, self.rope_dim);
+                        cos_all.extend(cos);
+                        sin_all.extend(sin);
+                    }
+                    engine
+                        .prefill_batched_from(
+                            &embeddings,
+                            &cos_all,
+                            &sin_all,
+                            base + tokens.len(),
+                            scale,
+                            base,
+                        )
+                        .map_err(BackendError::InvalidTensorData)?;
+                    Ok(())
+                })?;
+                prior.len()
+            } else {
+                0
+            };
+            for (i, &tok) in prompt.iter().enumerate().skip(prompt_start) {
                 // The forwards below are queued asynchronously; wait for each segment
                 // so the cancel check reflects real progress on the GPU.
                 if i > 0 && i % QWEN35_CUDA_PROMPT_CANCEL_SEGMENT == 0 {
@@ -4118,15 +4553,21 @@ impl RunnableModel {
                 let ids = engine
                     .read_out_tokens(t, readable)
                     .map_err(BackendError::InvalidTensorData)?;
+                if is_cancelled() {
+                    return Err(BackendError::Cancelled);
+                }
                 for id in ids {
                     if stop.contains(&id) {
                         break 'outer;
                     }
                     out.push(id);
                     on_token(id);
-                    // Match the host-fed and multimodal Qwen3.5 loops: a
-                    // device chunk must not bypass the short-cycle guard.
-                    if out.len() >= max_new || qwen35_repetition_loop(&out) {
+                    if is_cancelled() {
+                        return Err(BackendError::Cancelled);
+                    }
+                    // A device chunk must honor the same per-token stopping
+                    // conditions as the host-fed and multimodal loops.
+                    if out.len() >= max_new || should_stop(&out) || qwen35_repetition_loop(&out) {
                         break 'outer;
                     }
                 }
@@ -4516,7 +4957,6 @@ impl RunnableModel {
         cache: &mut Qwen35Cache,
         need_logits: bool,
     ) -> Result<Vec<f32>> {
-        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let t = token as usize;
         if t >= self.vocab {
             return Err(BackendError::InvalidTensorData(format!(
@@ -4524,8 +4964,18 @@ impl RunnableModel {
                 self.vocab
             )));
         }
-        let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
+        let hidden = self.token_embd.dequant_row(t, "token_embd")?;
+        self.decode_hidden_qwen35(hidden, pos, cache, need_logits)
+    }
 
+    fn decode_hidden_qwen35(
+        &self,
+        mut hidden: Vec<f32>,
+        pos: usize,
+        cache: &mut Qwen35Cache,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         for (li, layer) in rt.layers.iter().enumerate() {
             let xn = self.apply_norm(&hidden, &layer.attn_norm);
             let mix = match &layer.kind {
@@ -4629,8 +5079,21 @@ impl RunnableModel {
         self.apply_norm_heads(&mut k, n_kv, hd, k_norm);
 
         // Partial NEOX RoPE: rotates the first rope_dim (64) of each 256-wide head.
-        self.apply_rope(&mut q, n_head, pos, self.rope_base);
-        self.apply_rope(&mut k, n_kv, pos, self.rope_base);
+        if let Some((cos, sin)) = &cache.rope_override {
+            let half = self.rope_dim / 2;
+            for values in [&mut q, &mut k] {
+                for head in values.chunks_exact_mut(hd) {
+                    for i in 0..half {
+                        let (a, b) = (head[i], head[i + half]);
+                        head[i] = a * cos[i] - b * sin[i];
+                        head[i + half] = a * sin[i] + b * cos[i];
+                    }
+                }
+            }
+        } else {
+            self.apply_rope(&mut q, n_head, pos, self.rope_base);
+            self.apply_rope(&mut k, n_kv, pos, self.rope_base);
+        }
 
         cache.k[li].extend_from_slice(&k);
         cache.v[li].extend_from_slice(v_in);
@@ -5146,7 +5609,6 @@ fn qwen35_metal_context_capacity() -> usize {
         .unwrap_or(4096)
 }
 
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Qwen35VisionDecodeCursor {
     kv_position: usize,
@@ -5157,7 +5619,6 @@ struct Qwen35VisionDecodeCursor {
 ///
 /// The KV cache advances by every merged image token, while multimodal RoPE
 /// advances only by the larger grid axis. Suffix text advances both clocks.
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn qwen35_vision_decode_cursor(
     prefix_len: usize,
     grid_width: usize,
@@ -5170,7 +5631,6 @@ fn qwen35_vision_decode_cursor(
     }
 }
 
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn qwen35_generation_budget(
     prompt_slots: usize,
     requested_max_new: usize,
@@ -5602,7 +6062,6 @@ fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>,
 /// time/height/width (`t,h,w,t,h,w,...`) subject to the section caps, exactly as
 /// llama.cpp's `GGML_ROPE_TYPE_IMROPE`; the frequency index continues across
 /// sections and therefore must not reset for height or width.
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn qwen35_imrope_tables(
     positions: [usize; 4],
     sections: [usize; 4],
@@ -5669,6 +6128,14 @@ mod qwen35_imrope_tests {
         assert_eq!(
             qwen35_generation_budget(143, 8, 4096, "multimodal").unwrap(),
             8
+        );
+        assert_eq!(
+            qwen35_generation_budget(8191, 4096, 8192, "CUDA text").unwrap(),
+            1
+        );
+        assert_eq!(
+            qwen35_generation_budget(8191, 0, 8192, "CUDA text").unwrap(),
+            0
         );
     }
 
@@ -5865,24 +6332,45 @@ impl RunnableModel {
         // Q5_K previously had no resident GEMV and was upcast to Q8_0 blocks at load
         // (~+40 MiB on stock Q3_K_M's four q5_K tensors); with `q5k_gemv` in-tree it
         // rides its own lane at wire size. Returns (repack-ready bytes, lane).
-        let prep = |m: &RawMat| -> std::result::Result<(Vec<u8>, ProjQuant), String> {
+        fn prep<'a>(
+            engine: &mut CudaResidentDecode,
+            m: &'a RawMat,
+        ) -> std::result::Result<(std::borrow::Cow<'a, [u8]>, ProjQuant), String> {
+            use std::borrow::Cow;
+            if m.tt == GgufTensorType::Ptq1_0 {
+                let transform = m
+                    .forward_transform
+                    .clone()
+                    .ok_or("PTQ1_0 projection lacks its declared Hadamard transform")?;
+                let lane = engine.register_bonsai_transform(transform, m.in_features)?;
+                return Ok((Cow::Borrowed(m.bytes.as_slice()), lane));
+            }
+            if m.forward_transform.is_some() {
+                return Err("folded CUDA projection requires PTQ1_0 weights".into());
+            }
             match m.tt {
-                GgufTensorType::Q8_0 => Ok((widen_q8(m.bytes.as_slice()), ProjQuant::Q8_0)),
-                GgufTensorType::Q2K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2K)),
-                GgufTensorType::Q3K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q3K)),
-                GgufTensorType::Q4K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q4K)),
-                GgufTensorType::Q5K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q5K)),
-                GgufTensorType::Q6K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q6K)),
-                GgufTensorType::Q1_0 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q1_0)),
-                GgufTensorType::Q2_0G64 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G64)),
+                GgufTensorType::F32 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::F32)),
+                GgufTensorType::BF16 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::BF16)),
+                GgufTensorType::Q8_0 => {
+                    Ok((Cow::Owned(widen_q8(m.bytes.as_slice())), ProjQuant::Q8_0))
+                }
+                GgufTensorType::Q2K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2K)),
+                GgufTensorType::Q3K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q3K)),
+                GgufTensorType::Q4K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q4K)),
+                GgufTensorType::Q5K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q5K)),
+                GgufTensorType::Q6K => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q6K)),
+                GgufTensorType::Q1_0 => Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q1_0)),
+                GgufTensorType::Q2_0G64 => {
+                    Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2_0G64))
+                }
                 GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
-                    Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G128))
+                    Ok((Cow::Borrowed(m.bytes.as_slice()), ProjQuant::Q2_0G128))
                 }
                 other => Err(format!(
                     "qwen35 CUDA lane: unsupported projection quant {other:?}"
                 )),
             }
-        };
+        }
         let mat_bytes = |m: &RawMat| m.bytes.as_slice().len() as u64;
         // Fit the graph to detected VRAM before the first upload. Full-attention
         // layers can stream all seven projections; recurrent layers keep their
@@ -6008,13 +6496,13 @@ impl RunnableModel {
                     q_norm,
                     k_norm,
                 } => {
-                    let (bq, qq) = prep(wq)?;
-                    let (bk, qk) = prep(wk)?;
-                    let (bv, qv) = prep(wv)?;
-                    let (bo, qo) = prep(wo)?;
-                    let (bg, qg) = prep(&layer.ffn_gate)?;
-                    let (bu, qu) = prep(&layer.ffn_up)?;
-                    let (bd, qd) = prep(&layer.ffn_down)?;
+                    let (bq, qq) = prep(&mut e, wq)?;
+                    let (bk, qk) = prep(&mut e, wk)?;
+                    let (bv, qv) = prep(&mut e, wv)?;
+                    let (bo, qo) = prep(&mut e, wo)?;
+                    let (bg, qg) = prep(&mut e, &layer.ffn_gate)?;
+                    let (bu, qu) = prep(&mut e, &layer.ffn_up)?;
+                    let (bd, qd) = prep(&mut e, &layer.ffn_down)?;
                     e.set_layer_located(
                         &bq,
                         &bk,
@@ -6043,14 +6531,14 @@ impl RunnableModel {
                     ssm_norm,
                     ssm_out,
                 } => {
-                    let (bg, qg) = prep(&layer.ffn_gate)?;
-                    let (bu, qu) = prep(&layer.ffn_up)?;
-                    let (bd, qd) = prep(&layer.ffn_down)?;
-                    let (bqkv, qqkv) = prep(wqkv)?;
-                    let (bgate, qgate) = prep(wqkv_gate)?;
-                    let (bbeta, qbeta) = prep(beta)?;
-                    let (balpha, qalpha) = prep(alpha)?;
-                    let (bout, qout) = prep(ssm_out)?;
+                    let (bg, qg) = prep(&mut e, &layer.ffn_gate)?;
+                    let (bu, qu) = prep(&mut e, &layer.ffn_up)?;
+                    let (bd, qd) = prep(&mut e, &layer.ffn_down)?;
+                    let (bqkv, qqkv) = prep(&mut e, wqkv)?;
+                    let (bgate, qgate) = prep(&mut e, wqkv_gate)?;
+                    let (bbeta, qbeta) = prep(&mut e, beta)?;
+                    let (balpha, qalpha) = prep(&mut e, alpha)?;
+                    let (bout, qout) = prep(&mut e, ssm_out)?;
                     e.set_layer_ssm_qwen35(
                         &bg,
                         &bu,
@@ -6080,36 +6568,55 @@ impl RunnableModel {
         if offloaded_layers > 0 {
             e.enable_offload_scratch()?;
         }
-        let (bout, qout) = prep(&self.output)?;
+        let (bout, qout) = prep(&mut e, &self.output)?;
         e.set_output(&self.output_norm, &bout, qout)?;
         // Device-side decode loop: resident quantized embedding table + the
         // all-positions rope tables (built with the VERBATIM qwen35_rope_tables
         // math, so the rope inputs are bit-identical to the host-fed path).
         // Failure (e.g. VRAM headroom) is non-fatal — the driver falls back to
         // the host-fed per-token loop.
-        let embd_upload: Option<(Vec<u8>, ProjQuant)> = match self.token_embd.tt {
-            GgufTensorType::Q8_0 => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q8_0))
+        let embd_upload: Option<(std::borrow::Cow<'_, [u8]>, ProjQuant)> = match self.token_embd.tt
+        {
+            GgufTensorType::Ptq1_0 => {
+                let transform = self
+                    .token_embd
+                    .inverse_transform
+                    .clone()
+                    .ok_or("PTQ1_0 embedding lacks its inverse Hadamard transform")?;
+                let lane = e.register_bonsai_transform(transform, self.token_embd.in_features)?;
+                Some((
+                    std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                    lane,
+                ))
             }
-            GgufTensorType::Q3K => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q3K))
-            }
-            GgufTensorType::Q4K => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q4K))
-            }
+            GgufTensorType::Q8_0 => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q8_0,
+            )),
+            GgufTensorType::Q3K => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q3K,
+            )),
+            GgufTensorType::Q4K => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q4K,
+            )),
             GgufTensorType::Q6K => Some((
-                crate::cuda_resident::pad_q6k_blocks(self.token_embd.bytes.as_slice()),
+                std::borrow::Cow::Owned(crate::cuda_resident::pad_q6k_blocks(
+                    self.token_embd.bytes.as_slice(),
+                )),
                 ProjQuant::Q6K,
             )),
-            GgufTensorType::Q1_0 => {
-                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q1_0))
-            }
+            GgufTensorType::Q1_0 => Some((
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
+                ProjQuant::Q1_0,
+            )),
             GgufTensorType::Q2_0G64 => Some((
-                self.token_embd.bytes.as_slice().to_vec(),
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
                 ProjQuant::Q2_0G64,
             )),
             GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => Some((
-                self.token_embd.bytes.as_slice().to_vec(),
+                std::borrow::Cow::Borrowed(self.token_embd.bytes.as_slice()),
                 ProjQuant::Q2_0G128,
             )),
             _ => None,
@@ -6141,6 +6648,36 @@ impl RunnableModel {
 mod resident_format_admission_tests {
     use super::*;
     use crate::metal::ResidentWeightFormat;
+
+    #[test]
+    fn bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime() {
+        use std::io::Write;
+        let payload: Vec<u8> = (0..1024).map(|value| (value * 31) as u8).collect();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+        let mapping = crate::wire_mmap::GgufWireMmap::map(file.path()).unwrap();
+        let weak = Arc::downgrade(&mapping);
+        assert!(RawMatBytes::mapped(mapping.clone(), 1000, 25).is_err());
+        assert!(RawMatBytes::mapped(mapping.clone(), u64::MAX, 2).is_err());
+        let tensor = RawMatBytes::mapped(mapping.clone(), 17, 28 * 7).unwrap();
+        assert_eq!(tensor.as_slice(), &payload[17..17 + 28 * 7]);
+        assert_eq!(
+            tensor.as_slice().as_ptr(),
+            mapping.bytes(17, 28 * 7).unwrap().as_ptr()
+        );
+        let tied_head = tensor.clone();
+        drop(mapping);
+        drop(tensor);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(tied_head.as_slice(), &payload[17..17 + 28 * 7]);
+        assert!(tied_head.wire_pages().is_none());
+        drop(tied_head);
+        assert!(
+            weak.upgrade().is_none(),
+            "the last tensor must release its file mapping"
+        );
+    }
 
     #[test]
     fn admitted_types_map_to_a_resident_format_and_page_back() {
@@ -6226,6 +6763,9 @@ mod resident_metal_q8_admission_tests {
             tt,
             in_features,
             out_features,
+            forward_transform: None,
+            inverse_transform: None,
+            draft_quantized_ptq: false,
         }
     }
 

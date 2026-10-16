@@ -1,0 +1,601 @@
+{
+  "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+  "projection_policy": "q8",
+  "cases": [
+    {
+      "name": "count",
+      "scores": [
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.06055515347360085,
+          "top1_log_probability": -0.06055515347360085
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.00013645074802681734,
+          "top1_log_probability": -0.00013645074802681734
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.23229035312441937,
+          "top1_log_probability": -0.23229035312441937
+        },
+        {
+          "token": 17,
+          "argmax": 17,
+          "log_probability": -0.0009833335371496332,
+          "top1_log_probability": -0.0009833335371496332
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000012511864291298025,
+          "top1_log_probability": -0.000012511864291298025
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.00016391998035558686,
+          "top1_log_probability": -0.00016391998035558686
+        },
+        {
+          "token": 18,
+          "argmax": 18,
+          "log_probability": -0.00000475008740252747,
+          "top1_log_probability": -0.00000475008740252747
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000019527100668881303,
+          "top1_log_probability": -0.000019527100668881303
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.0001369791350995797,
+          "top1_log_probability": -0.0001369791350995797
+        },
+        {
+          "token": 19,
+          "argmax": 19,
+          "log_probability": -0.0000021912766392517824,
+          "top1_log_probability": -0.0000021912766392517824
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000027089306691152615,
+          "top1_log_probability": -0.0000027089306691152615
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.000002706782893824311,
+          "top1_log_probability": -0.000002706782893824311
+        },
+        {
+          "token": 20,
+          "argmax": 20,
+          "log_probability": -0.000006370743047767746,
+          "top1_log_probability": -0.000006370743047767746
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000024261944346903874,
+          "top1_log_probability": -0.0000024261944346903874
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.0000030295245245781643,
+          "top1_log_probability": -0.0000030295245245781643
+        },
+        {
+          "token": 21,
+          "argmax": 21,
+          "log_probability": -0.000013081474261156245,
+          "top1_log_probability": -0.000013081474261156245
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000013092907842349177,
+          "top1_log_probability": -0.0000013092907842349177
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -8.900822692226029e-7,
+          "top1_log_probability": -8.900822692226029e-7
+        },
+        {
+          "token": 22,
+          "argmax": 22,
+          "log_probability": -0.000006095020655294547,
+          "top1_log_probability": -0.000006095020655294547
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000013784008316974905,
+          "top1_log_probability": -0.0000013784008316974905
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.0000011549194098847693,
+          "top1_log_probability": -0.0000011549194098847693
+        },
+        {
+          "token": 23,
+          "argmax": 23,
+          "log_probability": -0.0000018295995651840258,
+          "top1_log_probability": -0.0000018295995651840258
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.0000016717115833841945,
+          "top1_log_probability": -0.0000016717115833841945
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.0000031100037922726642,
+          "top1_log_probability": -0.0000031100037922726642
+        },
+        {
+          "token": 24,
+          "argmax": 24,
+          "log_probability": -0.000011099032700911948,
+          "top1_log_probability": -0.000011099032700911948
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000005424302308654205,
+          "top1_log_probability": -0.000005424302308654205
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.000013304015979542783,
+          "top1_log_probability": -0.000013304015979542783
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.00004082428227647483,
+          "top1_log_probability": -0.00004082428227647483
+        },
+        {
+          "token": 15,
+          "argmax": 15,
+          "log_probability": -0.0002260886232647863,
+          "top1_log_probability": -0.0002260886232647863
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.000007231494382864412,
+          "top1_log_probability": -0.000007231494382864412
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -0.000015426774293558765,
+          "top1_log_probability": -0.000015426774293558765
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.000001428449117213404,
+          "top1_log_probability": -0.000001428449117213404
+        }
+      ]
+    },
+    {
+      "name": "code",
+      "scores": [
+        {
+          "token": 71093,
+          "argmax": 71093,
+          "log_probability": -0.0028228164454873195,
+          "top1_log_probability": -0.0028228164454873195
+        },
+        {
+          "token": 12305,
+          "argmax": 12305,
+          "log_probability": -0.000024037881711791442,
+          "top1_log_probability": -0.000024037881711791442
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.000026806164076020877,
+          "top1_log_probability": -0.000026806164076020877
+        },
+        {
+          "token": 727,
+          "argmax": 727,
+          "log_probability": -0.0015807713135949086,
+          "top1_log_probability": -0.0015807713135949086
+        },
+        {
+          "token": 51184,
+          "argmax": 51184,
+          "log_probability": -0.015316293191009578,
+          "top1_log_probability": -0.015316293191009578
+        },
+        {
+          "token": 1393,
+          "argmax": 1393,
+          "log_probability": -0.0018567332304684214,
+          "top1_log_probability": -0.0018567332304684214
+        },
+        {
+          "token": 1590,
+          "argmax": 1590,
+          "log_probability": -0.00021008737629912844,
+          "top1_log_probability": -0.00021008737629912844
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.0000023698594802112893,
+          "top1_log_probability": -0.0000023698594802112893
+        },
+        {
+          "token": 262,
+          "argmax": 262,
+          "log_probability": -0.0000035284118986567137,
+          "top1_log_probability": -0.0000035284118986567137
+        },
+        {
+          "token": 1067,
+          "argmax": 1067,
+          "log_probability": -0.32878276154734465,
+          "top1_log_probability": -0.32878276154734465
+        },
+        {
+          "token": 283,
+          "argmax": 283,
+          "log_probability": -6.554289448956752e-7,
+          "top1_log_probability": -6.554289448956752e-7
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -4.869666270224116e-7,
+          "top1_log_probability": -4.869666270224116e-7
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -9.151763933346047e-7,
+          "top1_log_probability": -9.151763933346047e-7
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.000011194846791795499,
+          "top1_log_probability": -0.000011194846791795499
+        },
+        {
+          "token": 262,
+          "argmax": 262,
+          "log_probability": -5.29633464196877e-7,
+          "top1_log_probability": -5.29633464196877e-7
+        },
+        {
+          "token": 364,
+          "argmax": 364,
+          "log_probability": -0.00046008117733364884,
+          "top1_log_probability": -0.00046008117733364884
+        },
+        {
+          "token": 585,
+          "argmax": 585,
+          "log_probability": -0.0000058870350656548,
+          "top1_log_probability": -0.0000058870350656548
+        },
+        {
+          "token": 303,
+          "argmax": 303,
+          "log_probability": -1.3068483895040117e-7,
+          "top1_log_probability": -1.3068483895040117e-7
+        },
+        {
+          "token": 2020,
+          "argmax": 2020,
+          "log_probability": -0.000001253562587066881,
+          "top1_log_probability": -0.000001253562587066881
+        },
+        {
+          "token": 7,
+          "argmax": 7,
+          "log_probability": -0.0000027432362230683793,
+          "top1_log_probability": -0.0000027432362230683793
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.6358302789485997,
+          "top1_log_probability": -0.6358302789485997
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -2.80159042631567e-7,
+          "top1_log_probability": -2.80159042631567e-7
+        },
+        {
+          "token": 307,
+          "argmax": 307,
+          "log_probability": -0.00000316382100962187,
+          "top1_log_probability": -0.00000316382100962187
+        },
+        {
+          "token": 478,
+          "argmax": 478,
+          "log_probability": -0.000013033293875253094,
+          "top1_log_probability": -0.000013033293875253094
+        },
+        {
+          "token": 220,
+          "argmax": 220,
+          "log_probability": -5.544200050167092e-7,
+          "top1_log_probability": -5.544200050167092e-7
+        },
+        {
+          "token": 16,
+          "argmax": 16,
+          "log_probability": -0.0000010784883315295701,
+          "top1_log_probability": -0.0000010784883315295701
+        },
+        {
+          "token": 1590,
+          "argmax": 1590,
+          "log_probability": -0.0000024942425902452214,
+          "top1_log_probability": -0.0000024942425902452214
+        },
+        {
+          "token": 198,
+          "argmax": 198,
+          "log_probability": -0.00001520225246309792,
+          "top1_log_probability": -0.00001520225246309792
+        },
+        {
+          "token": 285,
+          "argmax": 285,
+          "log_probability": -4.81069207580731e-7,
+          "top1_log_probability": -4.81069207580731e-7
+        },
+        {
+          "token": 1067,
+          "argmax": 1067,
+          "log_probability": -2.2415503764250388e-7,
+          "top1_log_probability": -2.2415503764250388e-7
+        },
+        {
+          "token": 11076,
+          "argmax": 11076,
+          "log_probability": -0.003112187798958388,
+          "top1_log_probability": -0.003112187798958388
+        },
+        {
+          "token": 585,
+          "argmax": 585,
+          "log_probability": -3.079462267407962e-7,
+          "top1_log_probability": -3.079462267407962e-7
+        }
+      ]
+    },
+    {
+      "name": "explain",
+      "scores": [
+        {
+          "token": 29108,
+          "argmax": 29108,
+          "log_probability": -0.31464206194013755,
+          "top1_log_probability": -0.31464206194013755
+        },
+        {
+          "token": 4009,
+          "argmax": 4009,
+          "log_probability": -0.000026770874733017536,
+          "top1_log_probability": -0.000026770874733017536
+        },
+        {
+          "token": 12611,
+          "argmax": 12611,
+          "log_probability": -1.411131992564144,
+          "top1_log_probability": -1.411131992564144
+        },
+        {
+          "token": 8964,
+          "argmax": 8964,
+          "log_probability": -0.7311299978304646,
+          "top1_log_probability": -0.7311299978304646
+        },
+        {
+          "token": 579,
+          "argmax": 579,
+          "log_probability": -0.000615155184110705,
+          "top1_log_probability": -0.000615155184110705
+        },
+        {
+          "token": 16078,
+          "argmax": 16078,
+          "log_probability": -0.0018097195922273102,
+          "top1_log_probability": -0.0018097195922273102
+        },
+        {
+          "token": 321,
+          "argmax": 321,
+          "log_probability": -0.32661887126581135,
+          "top1_log_probability": -0.32661887126581135
+        },
+        {
+          "token": 369,
+          "argmax": 369,
+          "log_probability": -1.4339604837814761,
+          "top1_log_probability": -1.4339604837814761
+        },
+        {
+          "token": 35742,
+          "argmax": 35742,
+          "log_probability": -0.14526342689371674,
+          "top1_log_probability": -0.14526342689371674
+        },
+        {
+          "token": 539,
+          "argmax": 539,
+          "log_probability": -0.054033549778853995,
+          "top1_log_probability": -0.054033549778853995
+        },
+        {
+          "token": 6605,
+          "argmax": 6605,
+          "log_probability": -0.928693634374504,
+          "top1_log_probability": -0.928693634374504
+        },
+        {
+          "token": 33470,
+          "argmax": 33470,
+          "log_probability": -0.015236557028078579,
+          "top1_log_probability": -0.015236557028078579
+        },
+        {
+          "token": 321,
+          "argmax": 321,
+          "log_probability": -0.40883231523263674,
+          "top1_log_probability": -0.40883231523263674
+        },
+        {
+          "token": 13280,
+          "argmax": 13280,
+          "log_probability": -0.1844798341022056,
+          "top1_log_probability": -0.1844798341022056
+        },
+        {
+          "token": 18167,
+          "argmax": 18167,
+          "log_probability": -0.5061177134724417,
+          "top1_log_probability": -0.5061177134724417
+        },
+        {
+          "token": 13,
+          "argmax": 13,
+          "log_probability": -0.5256544556183549,
+          "top1_log_probability": -0.5256544556183549
+        },
+        {
+          "token": 8432,
+          "argmax": 8432,
+          "log_probability": -1.0670709559948541,
+          "top1_log_probability": -1.0670709559948541
+        },
+        {
+          "token": 3000,
+          "argmax": 3000,
+          "log_probability": -0.007802129645231304,
+          "top1_log_probability": -0.007802129645231304
+        },
+        {
+          "token": 682,
+          "argmax": 682,
+          "log_probability": -0.3732761537643867,
+          "top1_log_probability": -0.3732761537643867
+        },
+        {
+          "token": 264,
+          "argmax": 264,
+          "log_probability": -0.1081591251891183,
+          "top1_log_probability": -0.1081591251891183
+        },
+        {
+          "token": 22602,
+          "argmax": 22602,
+          "log_probability": -0.0033502756986329985,
+          "top1_log_probability": -0.0033502756986329985
+        },
+        {
+          "token": 43796,
+          "argmax": 43796,
+          "log_probability": -0.00006559500287650621,
+          "top1_log_probability": -0.00006559500287650621
+        },
+        {
+          "token": 1056,
+          "argmax": 1056,
+          "log_probability": -0.5258609134578904,
+          "top1_log_probability": -0.5258609134578904
+        },
+        {
+          "token": 975,
+          "argmax": 975,
+          "log_probability": -0.045010680815728676,
+          "top1_log_probability": -0.045010680815728676
+        },
+        {
+          "token": 7736,
+          "argmax": 7736,
+          "log_probability": -0.0008118627947091284,
+          "top1_log_probability": -0.0008118627947091284
+        },
+        {
+          "token": 11,
+          "argmax": 11,
+          "log_probability": -0.010990004254860963,
+          "top1_log_probability": -0.010990004254860963
+        },
+        {
+          "token": 748,
+          "argmax": 748,
+          "log_probability": -0.04970628079145456,
+          "top1_log_probability": -0.04970628079145456
+        },
+        {
+          "token": 424,
+          "argmax": 424,
+          "log_probability": -0.00025672742780002977,
+          "top1_log_probability": -0.00025672742780002977
+        },
+        {
+          "token": 5055,
+          "argmax": 5055,
+          "log_probability": -0.4991053758529169,
+          "top1_log_probability": -0.4991053758529169
+        },
+        {
+          "token": 35742,
+          "argmax": 35742,
+          "log_probability": -0.0007050344413634946,
+          "top1_log_probability": -0.0007050344413634946
+        },
+        {
+          "token": 303,
+          "argmax": 303,
+          "log_probability": -0.818669178934325,
+          "top1_log_probability": -0.818669178934325
+        },
+        {
+          "token": 660,
+          "argmax": 660,
+          "log_probability": -0.2002191669965896,
+          "top1_log_probability": -0.2002191669965896
+        }
+      ]
+    }
+  ],
+  "model_sha256": "56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60",
+  "test_binary_sha256": "97e8608e15c5080035d7f467406b5a8d262e65123dd993aab07ee580734e399d",
+  "cases_sha256": "67db22ed64e2182e6ea04684ea1dc20bec76fd6dc4fb2944ab128e8f9c50144b",
+  "log_sha256": "35fea86c424c3e6f53d8296b03755d946d88069e6fbaee9fa0021b6a7050ae90"
+}

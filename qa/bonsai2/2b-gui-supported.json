@@ -1,0 +1,15 @@
+{
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "platform": "win32",
+  "backend_build": "v0.8.0-12-g48812c3b-dirty",
+  "selected_backend": "bonsai2_portable_runtime",
+  "date": "2026-10-16T03:58:43.054Z",
+  "support_level": "supported_windows_runtime",
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "generation_ready": true,
+  "vision_ready": true,
+  "image_input_present": true,
+  "image_limits": "GUI defaults",
+  "answer": "The image is red.\n\nBonsai 2 2B PTQ1_0\nVERIFIED\ntokens in 34 · out 5\nfirst token 2.6s\n1.0 tok/s\n6.7s\n08:58 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n1.0 tok/s"
+}

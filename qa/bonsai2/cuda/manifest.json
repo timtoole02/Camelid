@@ -1,0 +1,647 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-10-16T07:39:06.874Z",
+  "status": "pass",
+  "scope": "Exact official Bonsai 2 2B/4B/9B/27B artifacts on Windows x86_64 CUDA, including the production GUI and API served by the native library-server harness.",
+  "host": {
+    "platform": "win32",
+    "architecture": "x64",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "physical_memory_bytes": 16905969664,
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU, 576.83, 6144 MiB",
+    "identity_source": "Consistent native/reference benchmark receipts; GPU and driver reported by reference harness."
+  },
+  "native": {
+    "language_backend": "bonsai2_cuda_runtime; packed PTQ1_0 and native BF16 language computations on CUDA",
+    "image_backend": "Accurate f32 CUDA image projector with the matching pinned Q8_0 companion",
+    "constrained_memory": "27B streams packed weights from host memory and executes language layer computations on CUDA. This is distinct from reference hybrid CPU/GPU layer execution.",
+    "draft": "Same official Bonsai 2 2B model, three-token proposal window, batched target verification and recurrent/KV rollback.",
+    "sampled_draft_runtime": {
+      "path": "qa/bonsai2/cuda/sampled-draft-runtime.json",
+      "size_bytes": 5098,
+      "sha256": "c82f07ada21ba1335d3c78f18972422480677fe9a726dbe017963c53447e4c90",
+      "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+      "binary": "server",
+      "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+    },
+    "tested_context": "1044 prompt tokens with context recall; benchmark and device-test allocation is 2048 slots, not a full 2048-token semantic qualification."
+  },
+  "binaries": {
+    "probe": {
+      "path": "output/bonsai2-reference/bonsai2-probe-cuda-qualified.exe",
+      "size_bytes": 8385536,
+      "sha256": "b11de98eae42fed15d4a9cba3807fca6def4d9686960a07235a48284d24358dd",
+      "role": "probe",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "source_tree": "7fcc8deb8e055c9e75135422bd86f58a2023f654",
+      "source_identity": "Git blob bytes at the explicitly recorded build commit; independent of the current checkout.",
+      "selected_source_blobs_sha256": {
+        "Cargo.toml": "160dccbfbfc5f1329363ea7236e4f1c144d75cd9d46b92f4c70d7b052969d2e3",
+        "Cargo.lock": "f244c6dc9d00b1820232208d9ef9d1f945c4732707410468f1304d9eec59323f",
+        ".cargo/config.toml": "c76777135d7965c1487e5335599e88b7c1f1d842170ab27724b7028179960fe4",
+        "build.rs": "da4e7554284fd6446ed94da534f234cd517ce63007cb138d0d923a1419f8d529",
+        "src/bonsai2.rs": "96e8369f5d9a61b86ffd60c204d246c473918e663a5f839797b922333c9f9294",
+        "src/wire_mmap.rs": "9a924c8bc8c39db823436be45f024f073e757ea09b91364f68c81775fba65124",
+        "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+        "src/runnable/speculative.rs": "a6b032350134e153245f2a8d2782c65c7b6281e29e5ffb314963d91a3d9ff8e5",
+        "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+        "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d",
+        "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+        "src/cuda_resident.rs": "74f55bd972eb2ba3e0c4b24aac5d14654375e09574cae470a962f1038d7ffe0a",
+        "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+        "src/cuda_resident/bonsai_ptq.rs": "b4670f73bca2d015115a5a068a1855c609789cddb58e71542bcfb3793486c7b8",
+        "src/cuda_resident/bonsai_ptq.cu": "e18bfb3706170c71aa03f344ca552ea05b83d176598f714b89f066b1232b7b05",
+        "examples/bonsai2_probe.rs": "a1cfbed789f715e24b05592dde76df9210ccd985578695e01f94691557da499b"
+      },
+      "build_configuration": {
+        "profile": "release",
+        "features": [
+          "cuda"
+        ],
+        "target_cpu": "x86-64-v3",
+        "lto": false,
+        "codegen_units": 16,
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+        "cuda_runtime": "Installed CUDA 12.9; NVIDIA driver 576.83"
+      },
+      "build_command": "cargo build --release --features cuda --example bonsai2_probe --example bonsai2_server --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": {
+        "path": "output/bonsai2-reference/build-cuda-mapped-final.log",
+        "size_bytes": 151,
+        "sha256": "b1f750bdb0f2216be14a835c1ceb54a874a40572b49f6a79e7fa931257401997"
+      },
+      "notes": "All runtime source and frontend changes were committed at this revision. Documentation edits during compilation account for the dirty suffix; no runtime inputs changed."
+    },
+    "tests": {
+      "path": "output/bonsai2-reference/bonsai2-tests-cuda-qualified.exe",
+      "size_bytes": 78907392,
+      "sha256": "eb6d7335992afb77409c5b9e44af0a2f8760e31ea041006b82e812995ab575e2",
+      "role": "tests",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "source_tree": "7fcc8deb8e055c9e75135422bd86f58a2023f654",
+      "source_identity": "Git blob bytes at the explicitly recorded build commit; independent of the current checkout.",
+      "selected_source_blobs_sha256": {
+        "Cargo.toml": "160dccbfbfc5f1329363ea7236e4f1c144d75cd9d46b92f4c70d7b052969d2e3",
+        "Cargo.lock": "f244c6dc9d00b1820232208d9ef9d1f945c4732707410468f1304d9eec59323f",
+        ".cargo/config.toml": "c76777135d7965c1487e5335599e88b7c1f1d842170ab27724b7028179960fe4",
+        "build.rs": "da4e7554284fd6446ed94da534f234cd517ce63007cb138d0d923a1419f8d529",
+        "src/bonsai2.rs": "96e8369f5d9a61b86ffd60c204d246c473918e663a5f839797b922333c9f9294",
+        "src/wire_mmap.rs": "9a924c8bc8c39db823436be45f024f073e757ea09b91364f68c81775fba65124",
+        "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+        "src/runnable/speculative.rs": "a6b032350134e153245f2a8d2782c65c7b6281e29e5ffb314963d91a3d9ff8e5",
+        "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+        "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d",
+        "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+        "src/cuda_resident.rs": "74f55bd972eb2ba3e0c4b24aac5d14654375e09574cae470a962f1038d7ffe0a",
+        "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+        "src/cuda_resident/bonsai_ptq.rs": "b4670f73bca2d015115a5a068a1855c609789cddb58e71542bcfb3793486c7b8",
+        "src/cuda_resident/bonsai_ptq.cu": "e18bfb3706170c71aa03f344ca552ea05b83d176598f714b89f066b1232b7b05"
+      },
+      "build_configuration": {
+        "profile": "release",
+        "features": [
+          "cuda"
+        ],
+        "target_cpu": "x86-64-v3",
+        "lto": false,
+        "codegen_units": 16,
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+        "cuda_runtime": "Installed CUDA 12.9; NVIDIA driver 576.83"
+      },
+      "build_command": "cargo test --release --features cuda --lib --no-run --message-format=json --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": {
+        "path": "output/bonsai2-reference/build-cuda-tests-qualified.log",
+        "size_bytes": 151,
+        "sha256": "f2601a065f0e951b85336b4ffa0f881417b6e3855ad7c952f8eda8844c4aaed1"
+      },
+      "build_outputs": [
+        {
+          "path": "output/bonsai2-reference/build-cuda-tests-qualified.jsonl",
+          "size_bytes": 454268,
+          "sha256": "263e74974952baff2493c01f6e76fc98c609ac87245249480dd70004b45ab43a"
+        }
+      ]
+    },
+    "server": {
+      "path": "output/bonsai2-reference/bonsai2-server-cuda-qualified.exe",
+      "size_bytes": 59308544,
+      "sha256": "dd0442508476d3a3f6d9d2021e28507e0d2f6ddb22a53d8e458219637185ed42",
+      "role": "server",
+      "source_commit": "f37d1ccba1886e17c1fdc429a3f0c83f2b3410e8",
+      "source_tree": "7fcc8deb8e055c9e75135422bd86f58a2023f654",
+      "source_identity": "Git blob bytes at the explicitly recorded build commit; independent of the current checkout.",
+      "selected_source_blobs_sha256": {
+        "Cargo.toml": "160dccbfbfc5f1329363ea7236e4f1c144d75cd9d46b92f4c70d7b052969d2e3",
+        "Cargo.lock": "f244c6dc9d00b1820232208d9ef9d1f945c4732707410468f1304d9eec59323f",
+        ".cargo/config.toml": "c76777135d7965c1487e5335599e88b7c1f1d842170ab27724b7028179960fe4",
+        "build.rs": "da4e7554284fd6446ed94da534f234cd517ce63007cb138d0d923a1419f8d529",
+        "src/bonsai2.rs": "96e8369f5d9a61b86ffd60c204d246c473918e663a5f839797b922333c9f9294",
+        "src/wire_mmap.rs": "9a924c8bc8c39db823436be45f024f073e757ea09b91364f68c81775fba65124",
+        "src/runnable/model.rs": "67b2cd07779e462c6dc845c27a7ffe590a102d61b9f40aaf71e1ab9386bc31d9",
+        "src/runnable/speculative.rs": "a6b032350134e153245f2a8d2782c65c7b6281e29e5ffb314963d91a3d9ff8e5",
+        "src/runnable/hadamard.rs": "012ea96e44f0e4202e4bcf8c5cb0b9a0d8fbb515ec42013809a2c8f51f02f2e9",
+        "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d",
+        "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+        "src/cuda_resident.rs": "74f55bd972eb2ba3e0c4b24aac5d14654375e09574cae470a962f1038d7ffe0a",
+        "src/cuda_resident/bonsai_spec.rs": "a5ea79d2b65e01ce091cb945374e08c251cd666ea52a1f6c626af5a222be0588",
+        "src/cuda_resident/bonsai_ptq.rs": "b4670f73bca2d015115a5a068a1855c609789cddb58e71542bcfb3793486c7b8",
+        "src/cuda_resident/bonsai_ptq.cu": "e18bfb3706170c71aa03f344ca552ea05b83d176598f714b89f066b1232b7b05",
+        "examples/bonsai2_server.rs": "9d9def68bf58576e5587086516410d96cfd184514b9fe986c8e799240645eed0",
+        "src/api/mod.rs": "1c9a2bd04c30a8e2548f013f8f0743221791a05646599663264ba13c92517c1a",
+        "src/execution_plan.rs": "7eca910595c4a29c6671730e323dc9abaa95b89a9e30053affc2d193b81d7c02",
+        "frontend/package.json": "8efaeecf8db222fa70abd848979bafe7485131ac11b7cbfd20a41adcd328b7ed",
+        "frontend/package-lock.json": "0f17a7f9537a44f8ae346346ac4e810d9837df4d64685eccdce329031f5ea3c4",
+        "frontend/src/hooks/useDashboardData.js": "883b1ba222fc088c7c31c9f5e99062cd96c6667fff3785e2497cf71a46a385a2",
+        "frontend/src/lib/nativeGenerationMetrics.js": "4645ee55ca2c313ed82f248676f9be5a56ccf715c0437c7503eaef0c69ea2594",
+        "frontend/src/lib/telemetryLog.js": "6e6b0d084e0758ac82a323f1647ab8fffe09b53388da46bde3f01d91e51a5a3d",
+        "frontend/src/lib/conversationExport.js": "8f4c525ad6d63a9795a979e4da23fddcaffec46c7541d09285e6747759674635",
+        "frontend/src/components/chat/MessageTurn.jsx": "43dc9ab0d053ab2beaf0f5d725355b0219c6e168f41e4f9d77f6002b19fa403d",
+        "frontend/src/components/chat/render/Diagnostics.jsx": "1a43d4de77c52cd1afb72b3cca9e84506b44552dfe71b87b1144dc13724dc115",
+        "frontend/src/components/chat/render/StreamingIndicator.jsx": "65d3a73b95edab297c4db3ba78575674e0e2297630cd6de591be34cf83a359f8",
+        "frontend/src/views/TelemetryView.jsx": "e8f6cb0fbaea6337dc7ab33a55f5f0dbef4c5e8cba5c8314260096ae5dda991e",
+        "frontend/src/views/InferenceObservatoryView.jsx": "a71afdb632be339b0411ed02f7d02bd2859d161b411dce7a7d2d660c50d86792"
+      },
+      "build_configuration": {
+        "profile": "release",
+        "features": [
+          "cuda"
+        ],
+        "target_cpu": "x86-64-v3",
+        "lto": false,
+        "codegen_units": 16,
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+        "cuda_runtime": "Installed CUDA 12.9; NVIDIA driver 576.83"
+      },
+      "receipt_build_id": "v0.8.0-20-gf37d1ccb-dirty",
+      "build_command": "npm --prefix frontend run build; cargo build --release --features cuda --example bonsai2_probe --example bonsai2_server --jobs 2 --config profile.release.lto=false --config profile.release.codegen-units=16",
+      "build_log": {
+        "path": "output/bonsai2-reference/build-cuda-mapped-final.log",
+        "size_bytes": 151,
+        "sha256": "b1f750bdb0f2216be14a835c1ceb54a874a40572b49f6a79e7fa931257401997"
+      },
+      "notes": "Production API and embedded frontend through the small library-server harness. Runtime and frontend source match this commit; the dirty suffix records documentation edits made during the build. GUI/API context allocation was 8192 slots; tested context recall used 1044 prompt tokens."
+    }
+  },
+  "provenance": {
+    "build_record": {
+      "path": "qa/bonsai2/cuda/build-record.json",
+      "size_bytes": 3024,
+      "sha256": "2d7eaf8b1485a1eb979bcbf1135249c2fb1c8e6bbefb97ffeef6266d38f71673"
+    },
+    "association_policy": "Source commits/build options are explicit operator records. Probe and test binary digests must match existing receipts. Server records are matched to original receipt build IDs. Existing receipt source_sha256 fields remain unmodified snapshots of source at receipt creation, not proof of binary build inputs.",
+    "selected_source_hash_format": "SHA-256 of exact Git blob bytes at each recorded commit, independent of checkout newline conversion or later edits.",
+    "generator": {
+      "path": "qa/bonsai2/cuda-manifest.mjs",
+      "size_bytes": 18119,
+      "sha256": "ce04b88b561a8ef5c0f4968545c5a238ad0942aa6b2d84463f3433164533018f"
+    },
+    "evidence_checker": {
+      "path": "qa/bonsai2/check-cuda-evidence.mjs",
+      "size_bytes": 13403,
+      "sha256": "03a3b587e8f088d62897f3189992acb1773b571272a3c7a7de0b7e75ddd8950f"
+    }
+  },
+  "models": {
+    "2B": {
+      "language": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+        "size_bytes": 429183456,
+        "sha256": "36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa",
+        "filename": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/blob/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf"
+      },
+      "vision_projector": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf",
+        "size_bytes": 364664352,
+        "sha256": "ac9934e8d7966d0d62442c202ec8fdad99a045dea79366c1a4a246a46f5c0533",
+        "filename": "Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/blob/main/Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf"
+      },
+      "result": "PASS Windows CUDA text, single-image GUI/API, function tools, context recall, seeded sampling and exact native speculative parity.",
+      "qualified_context_prompt_tokens": 1044,
+      "receipts": {
+        "api": {
+          "path": "qa/bonsai2/cuda/2b-api-qualified.json",
+          "size_bytes": 37974,
+          "sha256": "acd6e914b1ae3555025860002e8228ddf9ddb2b023ddf719ccba6755f9d96b23",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui": {
+          "path": "qa/bonsai2/cuda/2b-gui-supported.json",
+          "size_bytes": 880,
+          "sha256": "1bd14e8b0ec5019b55b7bfc9a91d8007646d0bbc72830415e302248593d10f0f",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "sampled_draft": {
+          "path": "qa/bonsai2/cuda/2b-sampled-draft.json",
+          "size_bytes": 2172,
+          "sha256": "d271e877f16c959e1bda37d4cd9abdb59057f19de86d4c85a5547d12df73a5f1",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui_image_screenshot": {
+          "path": "qa/bonsai2/cuda/2b-gui-supported.png",
+          "size_bytes": 117198,
+          "sha256": "887bfc67f3b62088252b8ac041e3ea863e015292ad4c1145a2e47c911d523cc1"
+        },
+        "gui_text_screenshot": {
+          "path": "qa/bonsai2/cuda/2b-gui-supported-text.png",
+          "size_bytes": 123204,
+          "sha256": "ffa4f241dd8488eec07d61577de0a6dedb8054e81c27bbe949c5719d1573176a"
+        },
+        "native_benchmark": {
+          "path": "qa/bonsai2/cuda/2b-native-benchmark.json",
+          "size_bytes": 54512,
+          "sha256": "538b5388c0a395d5eb848b75a0a73100d8e7523bbb8ae9da9dbedc912c5aa8b7",
+          "binary": "probe"
+        },
+        "reference_benchmark": {
+          "path": "qa/bonsai2/cuda/2b-reference-benchmark.json",
+          "size_bytes": 700281,
+          "sha256": "15758a1b035abce75ed399f2135ed01100365301c6a5b29e1345ca59602bc948"
+        }
+      },
+      "native_weight_placement": {
+        "count": {
+          "baseline": [],
+          "speculative": []
+        },
+        "code": {
+          "baseline": [],
+          "speculative": []
+        },
+        "explain": {
+          "baseline": [],
+          "speculative": []
+        }
+      },
+      "reference_layer_placement": {
+        "baseline": [
+          "0.01.306.359 I load_tensors: offloaded 25/25 layers to GPU"
+        ],
+        "speculative": [
+          "0.01.955.756 I load_tensors: offloaded 25/25 layers to GPU",
+          "0.02.741.909 I load_tensors: offloaded 25/25 layers to GPU"
+        ]
+      }
+    },
+    "4B": {
+      "language": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+        "size_bytes": 949549920,
+        "sha256": "56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60",
+        "filename": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/blob/main/Ternary-Bonsai-2-4B-PTQ1_0.gguf"
+      },
+      "vision_projector": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-4B-mmproj-Q8_0.gguf",
+        "size_bytes": 366894624,
+        "sha256": "db939d5f9b7014137810205e91d05e5f54afd72b0b3af9d33bd7d82f7906a55d",
+        "filename": "Ternary-Bonsai-2-4B-mmproj-Q8_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/blob/main/Ternary-Bonsai-2-4B-mmproj-Q8_0.gguf"
+      },
+      "result": "PASS Windows CUDA text, single-image GUI/API, function tools, context recall, seeded sampling and exact native speculative parity.",
+      "qualified_context_prompt_tokens": 1044,
+      "receipts": {
+        "api": {
+          "path": "qa/bonsai2/cuda/4b-api-qualified.json",
+          "size_bytes": 37897,
+          "sha256": "b32ce4eecba79fae56789b0e000c2042aa14db4f6bb82a8deca9cff7bff4b4af",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui": {
+          "path": "qa/bonsai2/cuda/4b-gui-supported.json",
+          "size_bytes": 876,
+          "sha256": "15c88740e3a4f4fe341fbc883a3451663ff275338d19e2bfceb1f9f9072b954f",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "sampled_draft": {
+          "path": "qa/bonsai2/cuda/4b-sampled-draft.json",
+          "size_bytes": 2170,
+          "sha256": "dc72db2de64e266b3b6422433c2567c3aa6416fe0a792b8783cd3ad2bb5f6604",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui_image_screenshot": {
+          "path": "qa/bonsai2/cuda/4b-gui-supported.png",
+          "size_bytes": 117325,
+          "sha256": "7b918a4ab3f1ffae87abc4a14a9c68655d3f9991544f2a77024aa407c9cdb908"
+        },
+        "gui_text_screenshot": {
+          "path": "qa/bonsai2/cuda/4b-gui-supported-text.png",
+          "size_bytes": 123214,
+          "sha256": "a2e10d3be5067bf8e7f10148b96447be93424be6a5e895e788e477657fa187ac"
+        },
+        "native_benchmark": {
+          "path": "qa/bonsai2/cuda/4b-native-benchmark.json",
+          "size_bytes": 55246,
+          "sha256": "d9e57ea1508bea21285636f16daa8a16ddcb504e2b61e8e3102736a13010f2a0",
+          "binary": "probe"
+        },
+        "reference_benchmark": {
+          "path": "qa/bonsai2/cuda/4b-reference-benchmark.json",
+          "size_bytes": 704044,
+          "sha256": "208b6d224088e28bc61173c1eb43ad96e0ad15da8ea6a540fca152f826033ead"
+        }
+      },
+      "native_weight_placement": {
+        "count": {
+          "baseline": [],
+          "speculative": []
+        },
+        "code": {
+          "baseline": [],
+          "speculative": []
+        },
+        "explain": {
+          "baseline": [],
+          "speculative": []
+        }
+      },
+      "reference_layer_placement": {
+        "baseline": [
+          "0.01.435.269 I load_tensors: offloaded 33/33 layers to GPU"
+        ],
+        "speculative": [
+          "0.02.100.155 I load_tensors: offloaded 33/33 layers to GPU",
+          "0.03.344.931 I load_tensors: offloaded 25/25 layers to GPU"
+        ]
+      }
+    },
+    "9B": {
+      "language": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+        "size_bytes": 1997486976,
+        "sha256": "3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b",
+        "filename": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/blob/main/Ternary-Bonsai-2-9B-PTQ1_0.gguf"
+      },
+      "vision_projector": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf",
+        "size_bytes": 624229664,
+        "sha256": "e0cb6f6988cea323ef798cd77d019bbb819af75582f034eaab0e7232314953db",
+        "filename": "Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/blob/main/Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf"
+      },
+      "result": "PASS Windows CUDA text, single-image GUI/API, function tools, context recall, seeded sampling and exact native speculative parity.",
+      "qualified_context_prompt_tokens": 1044,
+      "receipts": {
+        "api": {
+          "path": "qa/bonsai2/cuda/9b-api-qualified.json",
+          "size_bytes": 37866,
+          "sha256": "c4c8cc15362cc588ac8c8943ee0cd6cb8e8c6937e50511287fb392f31af8e94b",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui": {
+          "path": "qa/bonsai2/cuda/9b-gui-supported.json",
+          "size_bytes": 876,
+          "sha256": "80c9418355665a8aa68b1826debcce4c5abe1b49bc900de3c33b3423c2989827",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "sampled_draft": {
+          "path": "qa/bonsai2/cuda/9b-sampled-draft.json",
+          "size_bytes": 2142,
+          "sha256": "24c4910dcc1340bd8ddd45a16ff3e6cba3e19c00ca5bab28912d5e56286c9569",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui_image_screenshot": {
+          "path": "qa/bonsai2/cuda/9b-gui-supported.png",
+          "size_bytes": 117648,
+          "sha256": "8f1712ada8f89a9c14b2f97d3f1b6d2381a1213c9512012032675b2d3003fdff"
+        },
+        "gui_text_screenshot": {
+          "path": "qa/bonsai2/cuda/9b-gui-supported-text.png",
+          "size_bytes": 123601,
+          "sha256": "8762ebaed8d204df91b4b18a41b586613dc8a013d19108cf014f95faea80a69d"
+        },
+        "native_benchmark": {
+          "path": "qa/bonsai2/cuda/9b-native-benchmark.json",
+          "size_bytes": 55145,
+          "sha256": "e8f7fa54d09fed3deb9edef3b9477049e7af5d566795c70f46fcd26813b08254",
+          "binary": "probe"
+        },
+        "reference_benchmark": {
+          "path": "qa/bonsai2/cuda/9b-reference-benchmark.json",
+          "size_bytes": 696893,
+          "sha256": "9263798e4100a276e2c70f283febcdde9300ece420acb3321e0206bdd946351d"
+        }
+      },
+      "native_weight_placement": {
+        "count": {
+          "baseline": [],
+          "speculative": []
+        },
+        "code": {
+          "baseline": [],
+          "speculative": []
+        },
+        "explain": {
+          "baseline": [],
+          "speculative": []
+        }
+      },
+      "reference_layer_placement": {
+        "baseline": [
+          "0.01.385.613 I load_tensors: offloaded 33/33 layers to GPU"
+        ],
+        "speculative": [
+          "0.02.051.742 I load_tensors: offloaded 33/33 layers to GPU",
+          "0.03.474.115 I load_tensors: offloaded 25/25 layers to GPU"
+        ]
+      }
+    },
+    "27B": {
+      "language": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+        "size_bytes": 5946648928,
+        "sha256": "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3",
+        "filename": "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+      },
+      "vision_projector": {
+        "path": "output/bonsai2-models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+        "size_bytes": 629246976,
+        "sha256": "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903",
+        "filename": "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+        "publisher": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/main/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+      },
+      "result": "PASS Windows CUDA text, single-image GUI/API, function tools, context recall, seeded sampling and exact native speculative parity.",
+      "qualified_context_prompt_tokens": 1044,
+      "receipts": {
+        "api": {
+          "path": "qa/bonsai2/cuda/27b-api-qualified.json",
+          "size_bytes": 37924,
+          "sha256": "373e00e4ff4c618c7748ed101d2c6bc1ee277fd3dcadec612a12b0335ecd387a",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui": {
+          "path": "qa/bonsai2/cuda/27b-gui-supported.json",
+          "size_bytes": 881,
+          "sha256": "bccd4498e9a0276ac7ba950ce48e6c4b82d8f1e2c1356db0eecd24e2f05264ee",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "sampled_draft": {
+          "path": "qa/bonsai2/cuda/27b-sampled-draft.json",
+          "size_bytes": 2141,
+          "sha256": "35ed8e5e7b7c5e110e6c3001a0740636203a0d4836a44d51f627ef47d39c86cd",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        },
+        "gui_image_screenshot": {
+          "path": "qa/bonsai2/cuda/27b-gui-supported.png",
+          "size_bytes": 120906,
+          "sha256": "8b98c6c2ef44a57a5fd236f920240ac58c641740073b64e66e25253ed8706178"
+        },
+        "gui_text_screenshot": {
+          "path": "qa/bonsai2/cuda/27b-gui-supported-text.png",
+          "size_bytes": 123606,
+          "sha256": "935fbb6bbfecc79426db7337bb55b7723577f7e5fffa71908f84a16fb48446b0"
+        },
+        "native_benchmark": {
+          "path": "qa/bonsai2/cuda/27b-native-benchmark.json",
+          "size_bytes": 60033,
+          "sha256": "2d15d820e0ed1cc7bf6108d14a9080b289b01fb84dea62dc15f7f3d51841d8cf",
+          "binary": "probe"
+        },
+        "reference_benchmark": {
+          "path": "qa/bonsai2/cuda/27b-reference-benchmark.json",
+          "size_bytes": 390841,
+          "sha256": "202bddb8818dd0c6106a00117b5729ba64d3998fc2fb648ec47a173831acd096"
+        },
+        "fresh_process_gui": {
+          "path": "qa/bonsai2/cuda/27b-gui-fresh.json",
+          "size_bytes": 881,
+          "sha256": "038e86b1d154453f42d2d0d0b736af67e72474311f6eb4733e4498cda85fc5b3",
+          "backend_build": "v0.8.0-20-gf37d1ccb-dirty",
+          "binary": "server",
+          "binary_association": "Receipt build ID and explicit retained-build record; historical receipts do not contain a server SHA-256."
+        }
+      },
+      "native_weight_placement": {
+        "count": {
+          "baseline": [
+            "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ],
+          "speculative": [
+            "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ]
+        },
+        "code": {
+          "baseline": [
+            "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ],
+          "speculative": [
+            "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ]
+        },
+        "explain": {
+          "baseline": [
+            "[qwen35] CUDA capacity plan: 19/64 trailing layers stream from pinned host RAM; required resident weights 4216 MiB, budget 4226 MiB (free 5122 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ],
+          "speculative": [
+            "[qwen35] CUDA capacity plan: 29/64 trailing layers stream from pinned host RAM; required resident weights 3592 MiB, budget 3648 MiB (free 4544 MiB, sparse KV 128 MiB, headroom 768 MiB)"
+          ]
+        }
+      },
+      "reference_layer_placement": {
+        "baseline": [
+          "0.15.060.820 I load_tensors: offloaded 45/65 layers to GPU"
+        ],
+        "speculative": [
+          "0.10.698.252 I load_tensors: offloaded 31/65 layers to GPU",
+          "0.21.394.767 I load_tensors: offloaded 25/25 layers to GPU"
+        ]
+      },
+      "memory_regression": "A fresh server process completed GUI text and image requests after switching PTQ tensors to immutable file mappings. The regular GUI receipt separately covers loading after the smaller models."
+    }
+  },
+  "device_tests": {
+    "path": "qa/bonsai2/cuda/cache-parity.json",
+    "size_bytes": 11648,
+    "sha256": "ffc7aea5eee79dbbd83ac5b28494a1a9bf6020a7e8d6fee3fc2186f37f9dd1d0",
+    "binary": "tests",
+    "passed": 12,
+    "coverage": "PTQ/FWHT/embedding and BF16 fixtures; all four sizes: every logit, KV, convolution/SSM state, rollback, greedy/seeded generation, stop and cancellation; 2B attention-group and split-K boundaries."
+  },
+  "host_memory_tests": {
+    "receipt": {
+      "path": "qa/bonsai2/cuda/cache-parity.json",
+      "size_bytes": 11648,
+      "sha256": "ffc7aea5eee79dbbd83ac5b28494a1a9bf6020a7e8d6fee3fc2186f37f9dd1d0"
+    },
+    "binary": "tests",
+    "passed": 2,
+    "logs": [
+      {
+        "name": "bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime",
+        "path": "output/bonsai2-reference/cuda-cache-qualified/host-bonsai_ptq_mapped_bytes_preserve_bounds_and_shared_lifetime.log",
+        "size_bytes": 237,
+        "sha256": "0307d2b87edc72d72ac28b53473ae7a2de30668a020870ddcd922e3c068c25a0",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2932 filtered out; finished in 0.01s"
+      },
+      {
+        "name": "bonsai_upload_borrows_unchanged_packed_bytes",
+        "path": "output/bonsai2-reference/cuda-cache-qualified/host-bonsai_upload_borrows_unchanged_packed_bytes.log",
+        "size_bytes": 206,
+        "sha256": "d38227728785e7ae56c3d78caad50e56d97ee677f13245a445c8ccbff61b7b77",
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2932 filtered out; finished in 0.00s"
+      }
+    ],
+    "coverage": "File mapping bounds and overflow rejection, shared tensor/tied-head lifetime, final mapping release, and borrowed PTQ/BF16/F32 CUDA upload bytes."
+  },
+  "reference": {
+    "repository": "https://github.com/PrismML-Eng/llama.cpp",
+    "reference": "PrismML-Eng/llama.cpp prism-b10777-e3de715",
+    "version": "version: 0.2.0-dev (build 10777, commit e3de71522)\r\nbuilt with MSVC 19.44.35229.0 for Windows AMD64",
+    "binary_sha256": {
+      "llama-server.exe": "e95c81a7f99b05b4e9c67eba3f6856d777987ff813e6c1f14069c6c599e029d7",
+      "llama-server-impl.dll": "74367a893c9e7682f635b17416d2cfc8b2a9fb3420957ff03d31e7bd16b98c7b",
+      "llama.dll": "0c4f1e9e4df371770938aa3e95c2b0c66b31567aa78d5a47a273aa6c51aee0df",
+      "ggml-cuda.dll": "385ccf238798fb885ceca6d284b0368d244f92a3dd4be21d8300b3f3401a0c27"
+    },
+    "release_package": "llama-prism-b10777-e3de715-bin-win-cuda-12.4-x64.zip",
+    "release_package_sha256": "fa5874a1412e251a6efb13f289e97bacbbb4e7fc6714c1836b4fc6c1dc863462",
+    "runtime_note": "CUDA 12.4 package with installed CUDA 12.9 runtime DLLs",
+    "configuration_note": "2B/4B/9B fit all target layers on CUDA. 27B uses automatic hybrid CPU/GPU placement; actual per-mode placement is retained above. Draft state can change placement."
+  },
+  "performance": {
+    "path": "qa/bonsai2/cuda/comparison.json",
+    "size_bytes": 15912,
+    "sha256": "673bb1871298176fc4fa19ce3543d3af6d9946d6569779cf4981c3a88cad0f5c",
+    "metric": "Median of three warmed requests, 32 generated tokens divided by complete uncached request wall seconds.",
+    "common_work": "Exact prompt bytes, eight threads, f16 KV, 2048 context slots, one eight-token warmup, greedy sampling, same 2B drafter and three-token window.",
+    "timing_boundary": "Native measures the Rust generation call after tokenization. Reference measures a localhost HTTP completion including tokenization, transport, serialization and JSON parsing. Loading and warmup are excluded; prefill and decoding are included.",
+    "parity_note": "Native ordinary/draft token IDs must match exactly. Cross-engine differences and reference ordinary/draft divergences remain in comparison.json and the original receipts."
+  },
+  "not_qualified": [
+    "Apple Silicon and other operating systems or GPU families",
+    "Installed Tauri desktop-package execution; GUI evidence uses the production library-server harness and bundled frontend",
+    "Model-native 262K or extended context",
+    "Multiple images, audio and video",
+    "Previous-generation DSpark assistants as Bonsai 2 drafters"
+  ],
+  "reproduction": "qa/bonsai2/cuda/README.md",
+  "historical_cpu_manifest": "qa/bonsai2/manifest.json",
+  "evidence_check": "node qa/bonsai2/check-cuda-evidence.mjs"
+}

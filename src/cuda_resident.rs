@@ -13,6 +13,10 @@
 
 use std::sync::Arc;
 
+mod bonsai_ptq;
+mod bonsai_spec;
+use bonsai_ptq::BonsaiKernels;
+
 use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, CudaView};
 use cudarc::nvrtc::{CompileOptions, Ptx};
 
@@ -8833,7 +8837,9 @@ extern "C" __global__ void qwen35_ssm_rmsnorm_gate_q8_d128_batched(
         quants[base + qb * 32 + lane] = (signed char)qv;
     }
 }
-"#
+"#,
+    include_str!("cuda_resident/bonsai_ptq.cu"),
+    include_str!("cuda_resident/bonsai_q8.cu")
 );
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -8843,6 +8849,7 @@ extern "C" __global__ void qwen35_ssm_rmsnorm_gate_q8_d128_batched(
 // `forward_token` (next step) drives the whole sequence.
 #[allow(dead_code)]
 pub struct CudaResidentKernels {
+    bonsai: BonsaiKernels,
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     /// POPC decode kernels are promoted only on the benchmarked Ampere SM86 lane.
@@ -9165,6 +9172,7 @@ impl CudaResidentKernels {
             );
         }
         Ok(Self {
+            bonsai: BonsaiKernels::new(&f)?,
             sm86,
             fast_q1,
             fast_q2: std::env::var("CAMELID_PRISM_CUDA_Q2_DP4A").as_deref() == Ok("1"),
@@ -9833,19 +9841,25 @@ fn repack_for_lane(
     rows: usize,
     cols: usize,
     q1_tiled: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    use std::borrow::Cow;
     let repacked = match q {
-        ProjQuant::Q8_0 => repack_q8_soa(bytes),
-        ProjQuant::Q6K => pad_q6k_blocks(bytes),
-        ProjQuant::Q4K => swz_q4k_blocks(bytes),
-        ProjQuant::Q5K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        ProjQuant::Q8_0 => Cow::Owned(repack_q8_soa(bytes)),
+        ProjQuant::Q6K => Cow::Owned(pad_q6k_blocks(bytes)),
+        ProjQuant::Q4K => Cow::Owned(swz_q4k_blocks(bytes)),
+        ProjQuant::Ptq1_0(_)
+        | ProjQuant::F32
+        | ProjQuant::BF16
+        | ProjQuant::Q5K
+        | ProjQuant::Q2K
+        | ProjQuant::Q3K => Cow::Borrowed(bytes),
         ProjQuant::Q1_0 if q1_tiled => {
-            return repack_q1_t128(bytes, rows, cols);
+            return repack_q1_t128(bytes, rows, cols).map(Cow::Owned);
         }
         // IQ4_XS is read straight from the 136-byte GGUF wire (raw passthrough, like
         // Q5_K/Q2_K/Q3_K): the kernel unpacks nibbles/codebook on the fly.
         ProjQuant::IQ4XS | ProjQuant::Q1_0 | ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 => {
-            bytes.to_vec()
+            Cow::Borrowed(bytes)
         }
     };
     Ok(repacked)
@@ -10643,6 +10657,7 @@ pub(crate) fn launch_prism_q1t128_fused_ffn_bonsai27b(
 /// Packed Prism Q1_0 prompt GEMM over `k_tokens` token-major f32 rows. The
 /// kernel supports one or two tokens and writes token-major output.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn launch_prism_q1_f32_gemm_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -10653,6 +10668,31 @@ pub(crate) fn launch_prism_q1_f32_gemm_batched(
     k_tokens: usize,
     q1_tiled: bool,
     out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_prism_q1_f32_gemm_batched_view(
+        s,
+        f,
+        &input.as_view(),
+        weight,
+        rows,
+        cols,
+        k_tokens,
+        q1_tiled,
+        &mut out.slice_mut(..),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_f32_gemm_batched_view(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input: &CudaView<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    q1_tiled: bool,
+    out: &mut CudaViewMut<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
     debug_assert!((1..=2).contains(&k_tokens));
     let block = 256u32;
@@ -11343,6 +11383,9 @@ fn dispatch_gemv(
     residual: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     match lane {
+        ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16 => kern
+            .bonsai
+            .project(s, lane, input_f32, weight, rows, cols, 1, out, residual),
         ProjQuant::Q8_0 => {
             if kern.q8_multirow && kern.sm86 {
                 if let Some(variant) = q8_multirow_variant(rows, cols) {
@@ -11516,7 +11559,7 @@ fn dispatch_gemm_batched(
     bmma_ready: bool,
     q8k_scales: &CudaSlice<f32>,
     q8k_quants: &CudaSlice<i8>,
-    weight: &CudaSlice<u8>,
+    weight: &CudaView<u8>,
     rows: usize,
     cols: usize,
     k_tokens: usize,
@@ -11524,11 +11567,19 @@ fn dispatch_gemm_batched(
     residual: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     debug_assert!(
-        residual == 0 || (lane == ProjQuant::Q1_0 && kern.fast_q1),
+        residual == 0
+            || matches!(
+                lane,
+                ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
+            )
+            || (lane == ProjQuant::Q1_0 && kern.fast_q1),
         "batched residual epilogue is implemented by the fast Q1 kernels"
     );
     match lane {
-        ProjQuant::Q8_0 => launch_gemm_batched(
+        ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16 => kern.bonsai.project(
+            s, lane, input_f32, weight, rows, cols, k_tokens, out, residual,
+        ),
+        ProjQuant::Q8_0 => launch_gemm_batched_view(
             s,
             &kern.gemm_batched,
             q8_0_scales,
@@ -11539,7 +11590,7 @@ fn dispatch_gemm_batched(
             k_tokens,
             out,
         ),
-        ProjQuant::Q4K => launch_kquant_gemm_batched(
+        ProjQuant::Q4K => launch_kquant_gemm_batched_view(
             s,
             &kern.q4k_gemm_batched,
             q8k_scales,
@@ -11551,7 +11602,7 @@ fn dispatch_gemm_batched(
             9,
             out,
         ),
-        ProjQuant::Q6K => launch_kquant_gemm_batched(
+        ProjQuant::Q6K => launch_kquant_gemm_batched_view(
             s,
             &kern.q6k_gemm_batched,
             q8k_scales,
@@ -11624,17 +11675,25 @@ fn dispatch_gemm_batched(
             out,
             residual,
         ),
-        ProjQuant::Q1_0 => launch_prism_q1_f32_gemm_batched(
-            s,
-            &kern.prism_q1_f32_gemm_batched,
-            input_f32,
-            &weight.slice(0..weight.len()),
-            rows,
-            cols,
-            k_tokens,
-            kern.q1_tiled,
-            out,
-        ),
+        ProjQuant::Q1_0 => {
+            // Preserve the strict Q1 kernel's two-token limit when a mixed
+            // projection stack admits a wider batch for its other quant lanes.
+            for first in (0..k_tokens).step_by(2) {
+                let count = (k_tokens - first).min(2);
+                launch_prism_q1_f32_gemm_batched_view(
+                    s,
+                    &kern.prism_q1_f32_gemm_batched,
+                    &input_f32.slice(first * cols..(first + count) * cols),
+                    weight,
+                    rows,
+                    cols,
+                    count,
+                    kern.q1_tiled,
+                    &mut out.slice_mut(first * rows..(first + count) * rows),
+                )?;
+            }
+            Ok(())
+        }
         _ => unreachable!("unsupported batched projection lane: {lane:?}"),
     }
 }
@@ -11833,6 +11892,31 @@ pub(crate) fn launch_gemm_batched(
     in_scales: &CudaSlice<f32>,
     in_quants: &CudaSlice<i8>,
     weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_gemm_batched_view(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        &weight.as_view(),
+        rows,
+        blocks_per_row,
+        k_tokens,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_gemm_batched_view(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
     rows: usize,
     blocks_per_row: usize,
     k_tokens: usize,
@@ -12501,6 +12585,33 @@ pub(crate) fn launch_kquant_gemm_batched(
     in_scales: &CudaSlice<f32>,
     in_quants: &CudaSlice<i8>,
     weight: &CudaSlice<u8>,
+    rows: usize,
+    n_sb: usize,
+    k_tokens: usize,
+    aux_lanes: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    launch_kquant_gemm_batched_view(
+        s,
+        f,
+        in_scales,
+        in_quants,
+        &weight.as_view(),
+        rows,
+        n_sb,
+        k_tokens,
+        aux_lanes,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kquant_gemm_batched_view(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
     rows: usize,
     n_sb: usize,
     k_tokens: usize,
@@ -14733,6 +14844,12 @@ struct StreamOverlap {
 /// Q8_K for `Q4K`/`Q6K`, so `needs_q8k()` lets the per-norm-point quantizer pick.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProjQuant {
+    /// Packed Bonsai 2 PTQ1_0, with a registered activation transform.
+    Ptq1_0(usize),
+    /// Small unquantized recurrent gate projections.
+    F32,
+    /// Native BF16 recurrent gates, retained at their original two-byte width.
+    BF16,
     Q8_0,
     Q1_0,
     Q2_0G64,
@@ -14757,7 +14874,10 @@ impl ProjQuant {
     /// consume the original f32 activation to preserve the Metal oracle's
     /// reduction association.
     fn is_prism_low_bit(self, fast_q1: bool, fast_q2: bool) -> bool {
-        (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && !fast_q2)
+        matches!(
+            self,
+            ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
+        ) || (matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128) && !fast_q2)
             || (self == ProjQuant::Q1_0 && !fast_q1)
     }
 
@@ -14789,7 +14909,13 @@ impl ProjQuant {
     fn supports_batched(self) -> bool {
         matches!(
             self,
-            ProjQuant::Q8_0 | ProjQuant::Q1_0 | ProjQuant::Q4K | ProjQuant::Q6K
+            ProjQuant::Ptq1_0(_)
+                | ProjQuant::F32
+                | ProjQuant::BF16
+                | ProjQuant::Q8_0
+                | ProjQuant::Q1_0
+                | ProjQuant::Q4K
+                | ProjQuant::Q6K
         )
     }
 
@@ -14802,7 +14928,8 @@ impl ProjQuant {
     pub(crate) fn has_device_embed_gather(self) -> bool {
         matches!(
             self,
-            ProjQuant::Q8_0
+            ProjQuant::Ptq1_0(_)
+                | ProjQuant::Q8_0
                 | ProjQuant::Q1_0
                 | ProjQuant::Q2_0G64
                 | ProjQuant::Q2_0G128
@@ -16048,7 +16175,8 @@ impl CudaResidentDecode {
                 let (rows, cols) = projection_shapes[i];
                 let repacked =
                     repack_for_lane(projections[i], quants[i], rows, cols, self.k.q1_tiled)?;
-                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
+                s.clone_htod(repacked.as_ref())
+                    .map_err(|e| format!("htod: {e}"))
             };
             self.layers.push(ResidentLayer {
                 q: vram(0)?,
@@ -16074,7 +16202,7 @@ impl CudaResidentDecode {
         // Offloaded: repack all seven projections (each into its lane's layout) and lay
         // them out contiguously in one pinned host buffer so the per-forward transfer is
         // a single memcpy.
-        let repacked: Vec<Vec<u8>> = projections
+        let repacked: Vec<std::borrow::Cow<'_, [u8]>> = projections
             .iter()
             .enumerate()
             .map(|(i, b)| {
@@ -16245,7 +16373,9 @@ impl CudaResidentDecode {
             self.hidden,
             self.k.q1_tiled,
         )?;
-        self.output_weight = s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?;
+        self.output_weight = s
+            .clone_htod(repacked.as_ref())
+            .map_err(|e| format!("htod: {e}"))?;
         self.output_quant = output_quant;
         Ok(())
     }
@@ -16479,7 +16609,8 @@ impl CudaResidentDecode {
         let up_u8 =
             |b: &[u8], q: ProjQuant, rows: usize, cols: usize| -> Result<CudaSlice<u8>, String> {
                 let repacked = repack_for_lane(b, q, rows, cols, self.k.q1_tiled)?;
-                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
+                s.clone_htod(repacked.as_ref())
+                    .map_err(|e| format!("htod: {e}"))
             };
         let up_f = |b: &[f32]| -> Result<CudaSlice<f32>, String> {
             s.clone_htod(b).map_err(|e| format!("htod: {e}"))
@@ -16614,6 +16745,9 @@ impl CudaResidentDecode {
     }
 
     fn batched_layer_token_cap(&self) -> usize {
+        if matches!(self.output_quant, ProjQuant::Ptq1_0(_)) {
+            return MAX_VERIFY_K;
+        }
         if self.layers.iter().any(|layer| {
             layer.quants.contains(&ProjQuant::Q1_0)
                 || matches!(&layer.kind, LayerKind::Ssm(ssm) if ssm.quants.contains(&ProjQuant::Q1_0))
@@ -16669,6 +16803,9 @@ impl CudaResidentDecode {
     /// failure: `launch_kquant_gemm_batched` asserts, and `launch_gemm_batched` builds a launch
     /// config the driver rejects. This is the ceiling any operator override is clamped to.
     fn prefill_token_cap_limit(&self) -> usize {
+        if matches!(self.output_quant, ProjQuant::Ptq1_0(_)) {
+            return MAX_PRISM_PREFILL_K;
+        }
         const SHARED_BUDGET: usize = 46 * 1024;
         if self.layers.iter().any(|layer| {
             layer.quants.contains(&ProjQuant::Q1_0)
@@ -16716,7 +16853,10 @@ impl CudaResidentDecode {
 
     fn batched_verify_token_cap(&self) -> usize {
         let layer_cap = self.batched_layer_token_cap();
-        if self.output_quant == ProjQuant::Q8_0 {
+        if matches!(
+            self.output_quant,
+            ProjQuant::Q8_0 | ProjQuant::Ptq1_0(_) | ProjQuant::F32 | ProjQuant::BF16
+        ) {
             return layer_cap;
         }
         let aux_lanes = if self.output_quant == ProjQuant::Q4K {
@@ -16738,7 +16878,7 @@ impl CudaResidentDecode {
     pub fn supports_batched_prefill(&self) -> bool {
         self.supports_batched_layer_stack()
             || (!self.is_windowed()
-                && !self.is_offloaded()
+                && (!self.is_offloaded() || matches!(self.output_quant, ProjQuant::Ptq1_0(_)))
                 && self.qwen35.is_some()
                 && self.layers.iter().all(|layer| {
                     layer.quants.iter().all(|q| q.supports_batched())
@@ -16775,10 +16915,16 @@ impl CudaResidentDecode {
             return false;
         }
         let mature_quants_only = self.layers.iter().all(|layer| {
-            layer
-                .quants
-                .iter()
-                .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
+            layer.quants.iter().all(|q| {
+                matches!(
+                    q,
+                    ProjQuant::Ptq1_0(_)
+                        | ProjQuant::F32
+                        | ProjQuant::BF16
+                        | ProjQuant::Q8_0
+                        | ProjQuant::Q1_0
+                )
+            })
         });
         mature_quants_only || kquant_batched_prefill_enabled()
     }
@@ -16919,7 +17065,10 @@ impl CudaResidentDecode {
         if self.paged_kv_pages.is_some() {
             return Err("paged CUDA KV does not use contiguous KV slots".into());
         }
-        if !self.decode_graphs.is_empty() || self.device_forward_graph.is_some() {
+        if !self.decode_graphs.is_empty()
+            || self.device_forward_graph.is_some()
+            || self.k.bonsai.has_graphs()
+        {
             return Err("cannot add a CUDA KV slot after graph capture".into());
         }
         let stream = self.k.stream.clone();
@@ -19434,7 +19583,11 @@ impl CudaResidentDecode {
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
         }
-        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
+        if self.bonsai_graph_eligible(position) {
+            self.forward_bonsai_graphed(Some((embedding, cos, sin)), position, scale)?;
+        } else {
+            self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
+        }
         launch_argmax(
             &s,
             &self.k.argmax,
@@ -19626,6 +19779,10 @@ impl CudaResidentDecode {
                     .slice(0..1),
             };
             let f = match family {
+                ProjQuant::Ptq1_0(_) => &this.k.bonsai.embed,
+                ProjQuant::F32 | ProjQuant::BF16 => {
+                    return Err("dense embedding gather not implemented".into())
+                }
                 ProjQuant::Q1_0 => &this.k.embed_gather_q1_0,
                 ProjQuant::Q2_0G64 => &this.k.embed_gather_q2_0_g64,
                 ProjQuant::Q2_0G128 => &this.k.embed_gather_q2_0_g128,
@@ -19639,8 +19796,16 @@ impl CudaResidentDecode {
             };
             let dim = this.hidden;
             launch_embed_gather(&s, f, table, &tok_view, dim, &mut this.d_hidden).map_err(map)?;
+            if let ProjQuant::Ptq1_0(id) = family {
+                this.k
+                    .bonsai
+                    .inverse_embedding(&s, *id, &mut this.d_hidden, dim)
+                    .map_err(map)?;
+            }
         }
-        if self.device_forward_graph_eligible() && out_step.is_some() {
+        if self.bonsai_graph_eligible(kv_position) && out_step.is_some() {
+            self.forward_bonsai_graphed(None, kv_position, scale)?;
+        } else if self.device_forward_graph_eligible() && out_step.is_some() {
             self.forward_device_pass_graphed(kv_position, scale)?;
         } else {
             self.forward_pass(
@@ -19866,7 +20031,11 @@ impl CudaResidentDecode {
     ) -> Result<Vec<f32>, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
+        if self.bonsai_graph_eligible(position) {
+            self.forward_bonsai_graphed(Some((embedding, cos, sin)), position, scale)?;
+        } else {
+            self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
+        }
         let mut logits = vec![0f32; self.vocab];
         s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
@@ -20255,7 +20424,7 @@ impl CudaResidentDecode {
             output_bmma,
             &sc.visk,
             &sc.viqk,
-            &self.output_weight,
+            &self.output_weight.as_view(),
             vocab,
             hidden,
             k,
@@ -21461,7 +21630,73 @@ impl CudaResidentDecode {
             self.max_pos,
             self.eps,
         );
+        // Stream a packed layer once per proposal chain, using the same bounded
+        // copy buffers and event ordering as ordinary decode. The following
+        // weight views are valid until this layer records its compute_done event.
+        let copy_stream = self
+            .offload
+            .as_ref()
+            .map(|offload| offload.copy_stream.clone());
+        let n_buf = self
+            .offload
+            .as_ref()
+            .map_or(0, |offload| offload.scratch.len());
+        let off_idx: Vec<usize> = (0..self.n_layers)
+            .filter(|&index| self.layers[index].offloaded.is_some())
+            .collect();
+        if !off_idx.is_empty() && n_buf == 0 {
+            return Err("batched offload has no transfer scratch".into());
+        }
+        if let Some(copy_stream) = &copy_stream {
+            for (sequence, &layer) in off_idx.iter().enumerate().take(n_buf) {
+                self.prefetch_offloaded(layer, sequence % n_buf, copy_stream)?;
+            }
+        }
+        let mut off_seq = 0usize;
         for li in 0..self.n_layers {
+            let offloaded = self.layers[li].offloaded.is_some();
+            let cur_buf = if n_buf > 0 { off_seq % n_buf } else { 0 };
+            if offloaded {
+                s.wait(&self.offload.as_ref().expect("offload scratch").copy_done[cur_buf])
+                    .map_err(map)?;
+            }
+            type WeightView<'a> = CudaView<'a, u8>;
+            let (wq, wk, wv, wo, wgate, wup, wdown): (
+                WeightView,
+                WeightView,
+                WeightView,
+                WeightView,
+                WeightView,
+                WeightView,
+                WeightView,
+            ) = if offloaded {
+                let ranges = self.layers[li]
+                    .offloaded
+                    .as_ref()
+                    .expect("offloaded layer")
+                    .off;
+                let buffer = &self.offload.as_ref().expect("offload scratch").scratch[cur_buf];
+                (
+                    buffer.slice(ranges[0]..ranges[1]),
+                    buffer.slice(ranges[1]..ranges[2]),
+                    buffer.slice(ranges[2]..ranges[3]),
+                    buffer.slice(ranges[3]..ranges[4]),
+                    buffer.slice(ranges[4]..ranges[5]),
+                    buffer.slice(ranges[5]..ranges[6]),
+                    buffer.slice(ranges[6]..ranges[7]),
+                )
+            } else {
+                let layer = &self.layers[li];
+                (
+                    layer.q.as_view(),
+                    layer.k.as_view(),
+                    layer.v.as_view(),
+                    layer.o.as_view(),
+                    layer.gate.as_view(),
+                    layer.up.as_view(),
+                    layer.down.as_view(),
+                )
+            };
             let layer = &self.layers[li];
             let lq = layer.quants;
             let mixer_lane_count = if matches!(&layer.kind, LayerKind::Ssm(_)) {
@@ -21530,7 +21765,7 @@ impl CudaResidentDecode {
                             mixer_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &layer.q,
+                            &wq,
                             2 * q_width,
                             hidden,
                             k,
@@ -21562,7 +21797,7 @@ impl CudaResidentDecode {
                             mixer_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &layer.q,
+                            &wq,
                             q_width,
                             hidden,
                             k,
@@ -21583,7 +21818,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &layer.k,
+                        &wk,
                         kv_width,
                         hidden,
                         k,
@@ -21603,7 +21838,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &layer.v,
+                        &wv,
                         kv_width,
                         hidden,
                         k,
@@ -21762,7 +21997,13 @@ impl CudaResidentDecode {
                             scale,
                             q_width,
                             k,
-                            if splitk_verify_active(self.qwen35.is_some()) {
+                            // PTQ graphs always execute the live-position
+                            // attention path, even when the generic graph
+                            // override is enabled. Its >512 split-K reduction
+                            // must therefore remain enabled during verification.
+                            if matches!(self.output_quant, ProjQuant::Ptq1_0(_))
+                                || splitk_verify_active(self.qwen35.is_some())
+                            {
                                 1
                             } else {
                                 0
@@ -21809,7 +22050,7 @@ impl CudaResidentDecode {
                             attention_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &layer.o,
+                            &wo,
                             hidden,
                             q_width,
                             k,
@@ -21830,7 +22071,7 @@ impl CudaResidentDecode {
                             attention_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &layer.o,
+                            &wo,
                             hidden,
                             q_width,
                             k,
@@ -21875,7 +22116,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &ssm.wqkv,
+                        &ssm.wqkv.as_view(),
                         conv_dim,
                         hidden,
                         k,
@@ -21895,7 +22136,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &ssm.wqkv_gate,
+                        &ssm.wqkv_gate.as_view(),
                         value_dim,
                         hidden,
                         k,
@@ -21915,7 +22156,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &ssm.beta,
+                        &ssm.beta.as_view(),
                         nv,
                         hidden,
                         k,
@@ -21935,7 +22176,7 @@ impl CudaResidentDecode {
                         mixer_bmma,
                         &sc.visk,
                         &sc.viqk,
-                        &ssm.alpha,
+                        &ssm.alpha.as_view(),
                         nv,
                         hidden,
                         k,
@@ -22106,7 +22347,7 @@ impl CudaResidentDecode {
                             ssm_out_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &ssm.ssm_out,
+                            &ssm.ssm_out.as_view(),
                             hidden,
                             value_dim,
                             k,
@@ -22127,7 +22368,7 @@ impl CudaResidentDecode {
                             ssm_out_bmma,
                             &sc.visk,
                             &sc.viqk,
-                            &ssm.ssm_out,
+                            &ssm.ssm_out.as_view(),
                             hidden,
                             value_dim,
                             k,
@@ -22195,7 +22436,7 @@ impl CudaResidentDecode {
                 ffn_bmma,
                 &sc.visk,
                 &sc.viqk,
-                &layer.gate,
+                &wgate,
                 ffn_dim,
                 hidden,
                 k,
@@ -22215,7 +22456,7 @@ impl CudaResidentDecode {
                 ffn_bmma,
                 &sc.visk,
                 &sc.viqk,
-                &layer.up,
+                &wup,
                 ffn_dim,
                 hidden,
                 k,
@@ -22275,7 +22516,7 @@ impl CudaResidentDecode {
                     down_bmma,
                     &sc.visk,
                     &sc.viqk,
-                    &layer.down,
+                    &wdown,
                     hidden,
                     ffn_dim,
                     k,
@@ -22296,7 +22537,7 @@ impl CudaResidentDecode {
                     down_bmma,
                     &sc.visk,
                     &sc.viqk,
-                    &layer.down,
+                    &wdown,
                     hidden,
                     ffn_dim,
                     k,
@@ -22306,6 +22547,17 @@ impl CudaResidentDecode {
                 .map_err(map)?;
                 launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
                     .map_err(map)?;
+            }
+            if offloaded {
+                self.offload.as_ref().expect("offload scratch").compute_done[cur_buf]
+                    .record(&s)
+                    .map_err(map)?;
+                if let (Some(copy_stream), Some(&next_layer)) =
+                    (&copy_stream, off_idx.get(off_seq + n_buf))
+                {
+                    self.prefetch_offloaded(next_layer, cur_buf, copy_stream)?;
+                }
+                off_seq += 1;
             }
         }
         Ok(())
@@ -22928,11 +23180,9 @@ impl CudaResidentDecode {
         n: usize,
         scale: f32,
     ) -> Result<(), String> {
-        // The batched layer stack reads each layer's VRAM weight slice directly and has
-        // no offload-streaming path (unlike forward_pass), so for an offloaded model
-        // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
-        // serial prefill, which streams offloaded weights correctly. Batching is a
-        // resident-only fast path.
+        // The PTQ Qwen3.5 stack stages offloaded weight views once per token
+        // batch. Other model families retain their existing residency gate and
+        // fall back to the serial path when batched execution is unavailable.
         if !self.supports_batched_prefill() {
             if base_position == 0 {
                 return self.prefill(embeddings, cos_all, sin_all, n, scale);

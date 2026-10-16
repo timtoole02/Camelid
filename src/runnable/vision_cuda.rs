@@ -610,7 +610,12 @@ pub(crate) struct CudaVisionEncoder {
 }
 
 impl CudaVisionEncoder {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, String> {
+        Self::new_with_strict_math(false)
+    }
+
+    pub(crate) fn new_with_strict_math(force_strict: bool) -> Result<Self, String> {
         let ordinal = crate::cuda::selected_device_ordinal();
         let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal))
             .map_err(|_| "CUDA driver library not available".to_string())?
@@ -625,12 +630,13 @@ impl CudaVisionEncoder {
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .unwrap_or(0);
         let tensor_core_q8 = cc_major > 7 || (cc_major == 7 && cc_minor >= 5);
-        let strict = std::env::var("CAMELID_PRISM_CUDA_STRICT").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+        let strict = force_strict
+            || std::env::var("CAMELID_PRISM_CUDA_STRICT").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
         let cuda_include = ["CUDA_PATH", "CUDA_HOME"]
             .into_iter()
             .filter_map(std::env::var_os)
