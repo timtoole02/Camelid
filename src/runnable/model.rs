@@ -1175,18 +1175,16 @@ impl RunnableModel {
             let bitnet_tied_head = arch == "bitnet-b1.58"
                 && d.tensor_type == GgufTensorType::F16
                 && matches!(name, "token_embd.weight" | "output.weight");
-            let bytes = if d.tensor_type == GgufTensorType::Ptq1_0 && ptq_mapping.is_some() {
+            let bytes = if let (GgufTensorType::Ptq1_0, Some(mapping)) =
+                (d.tensor_type, ptq_mapping.as_ref())
+            {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
                         d.n_bytes
                     ))
                 })?;
-                RawMatBytes::mapped(
-                    ptq_mapping.as_ref().unwrap().clone(),
-                    d.absolute_offset,
-                    byte_len,
-                )?
+                RawMatBytes::mapped(mapping.clone(), d.absolute_offset, byte_len)?
             } else if wants_page_backing(d.tensor_type) || bitnet_tied_head {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
