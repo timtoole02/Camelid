@@ -9,6 +9,7 @@ const [modelPath, outputPrefix, api = 'http://127.0.0.1:28182'] = process.argv.s
 assert.ok(modelPath && outputPrefix, 'MODEL_PATH and OUTPUT_PREFIX are required')
 const send = process.argv.includes('--send')
 const defaultImage = process.argv.includes('--default-image')
+const requireCuda = process.argv.includes('--require-cuda')
 const requireSupported = process.argv.includes('--require-supported')
 const loaded = await fetch(`${api}/api/models/load`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
@@ -24,6 +25,10 @@ for (let i = 0; i < 120; i++) {
 }
 assert.equal(health.generation_ready, true)
 assert.equal(health.vision_ready, true)
+if (requireCuda) {
+  assert.equal(health.execution_plan?.selected_backend, 'bonsai2_cuda_runtime')
+  assert.equal(health.execution_plan?.cuda_resident_active, true)
+}
 if (requireSupported) assert.equal(health.execution_plan?.support_level, 'supported_windows_runtime')
 console.log(`${basename(modelPath)}: generation and vision ready (${health.build})`)
 const browser = await launchBrowser({ purpose: 'Bonsai 2 image attachment smoke', headless: true, protocolTimeout: 900000 })
@@ -42,7 +47,9 @@ try {
           body.camelid_image_min_tokens = 4
           body.camelid_image_max_tokens = 4
         }
-        assert.ok(body.messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')))
+        if (body.messages.some(m => Array.isArray(m.content))) {
+          assert.ok(body.messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')))
+        }
         req.continue({ postData: JSON.stringify(body) })
       } else req.continue()
     })
@@ -57,6 +64,24 @@ try {
     generation_ready: health.generation_ready, vision_ready: health.vision_ready,
     image_input_present: true, image_limits: defaultImage ? 'GUI defaults' : 'four merged tokens',
   }
+  if (send && requireCuda) {
+    await page.type('textarea[aria-label="Message Camelid"]', 'What is the capital of France? Answer in one sentence.')
+    const responsePromise = page.waitForResponse(r => r.url().endsWith('/v1/chat/completions') && r.request().method() === 'POST', { timeout: 900000 })
+    await page.click('button[aria-label="Send message"]')
+    assert.ok((await responsePromise).ok(), 'CUDA text request failed')
+    await page.waitForFunction(() => {
+      const last = [...document.querySelectorAll('.cxturn--assistant')].at(-1)
+      return last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
+    }, { timeout: 900000 })
+    receipt.text_answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
+    assert.match(receipt.text_answer, /Paris/i)
+    if (requireSupported) {
+      assert.doesNotMatch(receipt.text_answer, /unverified/i)
+      assert.match(receipt.text_answer, /\bverified\b/i)
+    }
+    await page.screenshot({ path: `${outputPrefix}-text.png`, fullPage: true })
+    console.log(`${basename(modelPath)}: text answered through CUDA GUI`)
+  }
   if (send) {
     await input.uploadFile(resolve('qa/bonsai2/red.png'))
     await page.type('textarea[aria-label="Message Camelid"]', 'What color is the image? Answer with one color.')
@@ -67,11 +92,11 @@ try {
     assert.ok(response.ok(), `image request returned ${response.status()}`)
     // Read the rendered completion: long SSE responses can be evicted from
     // Chromium's inspector cache even though the GUI received them correctly.
-    await page.waitForFunction(() => {
+    await page.waitForFunction(expected => {
       const turns = [...document.querySelectorAll('.cxturn--assistant')]
       const last = turns.at(-1)
-      return last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
-    }, { timeout: 900000 })
+      return turns.length >= expected && last && !last.classList.contains('is-streaming') && last.querySelector('.cxturn__body')?.innerText.trim()
+    }, { timeout: 900000 }, requireCuda ? 2 : 1)
     receipt.answer = await page.$eval('.cxturn--assistant:last-of-type .cxturn__body', el => el.innerText)
     assert.match(receipt.answer, /red/i)
     if (requireSupported) {

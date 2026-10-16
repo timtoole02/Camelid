@@ -14,10 +14,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata = gguf::read_metadata(&args[1])?;
     let tokenizer = Tokenizer::from_gguf(&metadata)?;
     let prompt = std::fs::read_to_string(&args[2])?;
+    let load_start = std::time::Instant::now();
     let model = RunnableModel::load(&args[1])?;
+    let model_load_seconds = load_start.elapsed().as_secs_f64();
     let max = args[3].parse()?;
     let stop = tokenizer.special.eog.iter().copied().collect::<Vec<_>>();
-    let start = std::time::Instant::now();
+    let mut start = std::time::Instant::now();
+    let mut warmup_seconds = Vec::new();
     let mut token_times = Vec::new();
     let ids = if args.len() == 6 {
         let (prefix, suffix) = prompt
@@ -50,16 +53,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut |_| token_times.push(start.elapsed().as_secs_f64()),
         )?
     } else {
-        model.generate_stopping_streaming(
-            &tokenizer.encode(&prompt, false, true)?,
-            max,
-            &stop,
-            &mut |_| token_times.push(start.elapsed().as_secs_f64()),
-        )?
+        let tokens = tokenizer.encode(&prompt, false, true)?;
+        let warmups = std::env::var("CAMELID_PROBE_WARMUPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        for _ in 0..warmups {
+            let warmup = std::time::Instant::now();
+            model.generate_stopping_streaming(&tokens, 8, &stop, &mut |_| {})?;
+            warmup_seconds.push(warmup.elapsed().as_secs_f64());
+        }
+        start = std::time::Instant::now();
+        model.generate_stopping_streaming(&tokens, max, &stop, &mut |_| {
+            token_times.push(start.elapsed().as_secs_f64())
+        })?
     };
+    let seconds = start.elapsed().as_secs_f64();
+    let cuda_active = model.cuda_language_active();
+    if std::env::var("CAMELID_PROBE_REQUIRE_CUDA").as_deref() == Ok("1") && !cuda_active {
+        return Err(
+            "CUDA language execution was required, but no CUDA graph was initialized".into(),
+        );
+    }
     println!(
         "{}",
-        serde_json::json!({"ids": ids, "text":tokenizer.decode(&ids, true)?, "seconds":start.elapsed().as_secs_f64(), "token_seconds": token_times})
+        serde_json::json!({"ids": ids, "text":tokenizer.decode(&ids, true)?,
+            "seconds":seconds, "token_seconds": token_times,
+            "backend": if cuda_active { "cuda" } else { "cpu" },
+            "model_load_seconds": model_load_seconds, "warmup_seconds": warmup_seconds})
     );
     Ok(())
 }

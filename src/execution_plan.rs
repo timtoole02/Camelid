@@ -544,15 +544,34 @@ pub fn plan_for_model_with_platform_and_env(
         decode_path,
         fallback_path,
     ) = if gguf.metadata.contains_key("prism.hadamard.version") {
-        reasons.push("Bonsai 2 folded weights use packed portable projections with activation Hadamard transforms; resident GPU decode is not implemented for this basis".into());
-        (
-            "bonsai2_portable_runtime",
-            "packed_hadamard_matvec",
-            "portable_qwen35_prefill",
-            "packed_weights_retained",
-            "portable_qwen35_decode",
-            "no_resident_gpu_hadamard_graph",
-        )
+        let cuda = gguf.architecture() == Some("qwen35")
+            && quant_type == "PTQ1_0"
+            && platform.cuda_resident_active
+            && !matches!(profile, ExecutionProfile::Safe)
+            && !planner_env.flag_disabled("CAMELID_QWEN35_CUDA")
+            && (platform.operating_system == "windows"
+                || planner_env.flag_enabled("CAMELID_QWEN35_CUDA"));
+        if cuda {
+            reasons.push("Bonsai 2 packed PTQ1_0 projections and activation Hadamard transforms execute in the CUDA language graph; oversized rows stream a capacity-planned weight suffix from host memory".into());
+            (
+                "bonsai2_cuda_runtime",
+                "packed_ptq_hadamard_cuda",
+                "bonsai2_cuda_prefill",
+                "packed_weights_capacity_planned",
+                "bonsai2_cuda_decode",
+                "cuda_errors_reported_no_cpu_fallback",
+            )
+        } else {
+            reasons.push("Bonsai 2 folded weights use packed portable projections with activation Hadamard transforms when CUDA is disabled or unavailable".into());
+            (
+                "bonsai2_portable_runtime",
+                "packed_hadamard_matvec",
+                "portable_qwen35_prefill",
+                "packed_weights_retained",
+                "portable_qwen35_decode",
+                "cuda_disabled_or_unavailable",
+            )
+        }
     } else if crate::model::is_bitnet_embedding_model(gguf) && has_i2_s_tensors {
         reasons.push(format!(
             "exact Microsoft BitNet embedding GGUF: decoder-only qwen3/gemma3 graph with \
@@ -962,8 +981,10 @@ pub fn plan_for_model_with_platform_and_env(
     }
     // A Windows receipt never promotes another host or a neighboring file.
     // Final artifact hashing in the load pipeline confirms this provisional plan.
-    if selected_backend == "bonsai2_portable_runtime"
-        && crate::bonsai2::host_eligible(&platform.operating_system, &platform.architecture)
+    if matches!(
+        selected_backend,
+        "bonsai2_portable_runtime" | "bonsai2_cuda_runtime"
+    ) && crate::bonsai2::host_eligible(&platform.operating_system, &platform.architecture)
         && model_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -4386,6 +4407,58 @@ mod tests {
                 );
             }
         }
+        clear_profile_env();
+    }
+
+    #[test]
+    fn bonsai2_cuda_plan_tracks_gpu_policy_and_qualified_host() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let mut gguf = quant_fixture("Bonsai 2", None, &[GgufTensorType::Ptq1_0]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("prism.hadamard.version".into(), GgufMetadataValue::U32(2));
+        for model in crate::bonsai2::MODELS {
+            for cuda_on in [true, false] {
+                let mut platform = cuda_platform("windows", "x86_64", &["avx2"]);
+                platform.cuda_resident_active = cuda_on;
+                let outcome = plan_for_model_with_platform(
+                    &PathBuf::from(model.catalog.filename),
+                    &gguf,
+                    Some(8),
+                    platform,
+                );
+                assert_eq!(
+                    outcome.plan.selected_backend,
+                    if cuda_on {
+                        "bonsai2_cuda_runtime"
+                    } else {
+                        "bonsai2_portable_runtime"
+                    }
+                );
+                assert_eq!(outcome.plan.support_level, "supported_windows_runtime");
+            }
+        }
+        env::set_var("CAMELID_QWEN35_CUDA", "0");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from(crate::bonsai2::MODELS[0].catalog.filename),
+            &gguf,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "bonsai2_portable_runtime");
+        clear_profile_env();
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from(crate::bonsai2::MODELS[0].catalog.filename),
+            &gguf,
+            Some(8),
+            cuda_platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "bonsai2_portable_runtime");
+        assert_ne!(outcome.plan.support_level, "supported_windows_runtime");
         clear_profile_env();
     }
 

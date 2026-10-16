@@ -237,6 +237,7 @@ export const UNEVIDENCED_BACKENDS = new Set([
   // Bonsai 2 needs the Windows artifact/host gate below. The backend name
   // alone must not extend its qualification to Apple Silicon or other files.
   'bonsai2_portable_runtime',
+  'bonsai2_cuda_runtime',
   /* The engine itself treats this one as unvalidated: the admission check in
      `src/api/mod.rs` gates on `selected_backend.contains("_runnable_unvalidated")`.
      Claiming evidence for it here would contradict the engine. */
@@ -293,7 +294,7 @@ export function readActiveLane(runtime) {
     return { present: false, risk: LANE_RISK.UNKNOWN, rows: [], supportLevel: null, reasons: [] }
   }
   const backend = plan.selected_backend || null
-  const evidencedBonsaiWindows = backend === 'bonsai2_portable_runtime'
+  const evidencedBonsaiWindows = ['bonsai2_portable_runtime', 'bonsai2_cuda_runtime'].includes(backend)
     && plan.operating_system === 'windows' && plan.architecture === 'x86_64'
     && plan.support_level === 'supported_windows_runtime'
   const risk = backend === null

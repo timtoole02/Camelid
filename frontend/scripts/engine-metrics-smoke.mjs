@@ -230,13 +230,15 @@ try {
   })
 
   check('Bonsai 2 requires the verified Windows support plan', () => {
-    const plan = { selected_backend: 'bonsai2_portable_runtime', operating_system: 'windows',
+    for (const backend of ['bonsai2_portable_runtime', 'bonsai2_cuda_runtime']) {
+    const plan = { selected_backend: backend, operating_system: 'windows',
       architecture: 'x86_64', support_level: 'supported_windows_runtime' }
     assert.equal(readActiveLane({ execution_plan: plan }).risk, LANE_RISK.EVIDENCED)
     for (const change of [
       { operating_system: 'macos' }, { operating_system: 'linux' },
       { architecture: 'aarch64' }, { support_level: 'unknown_or_unvalidated' },
     ]) assert.equal(readActiveLane({ execution_plan: { ...plan, ...change } }).risk, LANE_RISK.UNEVIDENCED)
+    }
   })
 
   check('the macOS lanes that are default-on read as evidenced', () => {

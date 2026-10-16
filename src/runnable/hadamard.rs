@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::gguf::GgufFile;
 use crate::{BackendError, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Transform {
     block: usize,
     signs: Arc<[f32]>,
@@ -16,14 +16,28 @@ pub(crate) struct Transform {
 }
 
 impl Transform {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_parts(&self) -> (usize, &[f32], Option<(usize, usize, usize)>) {
+        (self.block, &self.signs, self.permutation)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_rotation(width: usize) -> Self {
+        Self::test_rotation_geometry(width, 128, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rotation_geometry(
+        width: usize,
+        block: usize,
+        permutation: Option<(usize, usize, usize)>,
+    ) -> Self {
         Self {
-            block: 128,
+            block,
             signs: (0..width)
                 .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
                 .collect(),
-            permutation: None,
+            permutation,
         }
     }
 

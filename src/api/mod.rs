@@ -31246,54 +31246,56 @@ mod tests {
     #[test]
     fn bonsai2_windows_plan_requires_exact_bytes_host_and_backend() {
         for model in crate::bonsai2::MODELS {
-            let mut base = provisional_lfm2_supported_plan();
-            base.model_family = "qwen35".into();
-            base.operating_system = "windows".into();
-            base.architecture = "x86_64".into();
-            base.selected_backend = "bonsai2_portable_runtime".into();
-            base.support_level = "supported_windows_runtime".into();
-            base.reasons = vec!["support_level=supported_windows_runtime".into()];
-            let path = std::path::Path::new(model.catalog.filename);
-            let mut valid = base.clone();
-            finalize_execution_plan_support_for_loaded_artifact(&mut valid, path, model.sha256);
-            assert_eq!(valid.support_level, "supported_windows_runtime");
-            assert_eq!(
-                supported_artifact_expected_sha256(model.catalog.filename),
-                Some(model.sha256)
-            );
-            for failure in [
-                "digest",
-                "filename",
-                "macos",
-                "linux",
-                "architecture",
-                "backend",
-            ] {
-                let mut plan = base.clone();
-                match failure {
-                    "macos" | "linux" => plan.operating_system = failure.into(),
-                    "architecture" => plan.architecture = "aarch64".into(),
-                    "backend" => plan.selected_backend = "cpu_reference".into(),
-                    _ => {}
-                }
-                finalize_execution_plan_support_for_loaded_artifact(
-                    &mut plan,
-                    if failure == "filename" {
-                        std::path::Path::new("neighbor.gguf")
-                    } else {
-                        path
-                    },
-                    if failure == "digest" {
-                        "00"
-                    } else {
-                        model.sha256
-                    },
+            for backend in ["bonsai2_portable_runtime", "bonsai2_cuda_runtime"] {
+                let mut base = provisional_lfm2_supported_plan();
+                base.model_family = "qwen35".into();
+                base.operating_system = "windows".into();
+                base.architecture = "x86_64".into();
+                base.selected_backend = backend.into();
+                base.support_level = "supported_windows_runtime".into();
+                base.reasons = vec!["support_level=supported_windows_runtime".into()];
+                let path = std::path::Path::new(model.catalog.filename);
+                let mut valid = base.clone();
+                finalize_execution_plan_support_for_loaded_artifact(&mut valid, path, model.sha256);
+                assert_eq!(valid.support_level, "supported_windows_runtime");
+                assert_eq!(
+                    supported_artifact_expected_sha256(model.catalog.filename),
+                    Some(model.sha256)
                 );
-                assert_eq!(plan.support_level, "unknown_or_unvalidated", "{failure}");
-                assert!(plan
-                    .reasons
-                    .iter()
-                    .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+                for failure in [
+                    "digest",
+                    "filename",
+                    "macos",
+                    "linux",
+                    "architecture",
+                    "backend",
+                ] {
+                    let mut plan = base.clone();
+                    match failure {
+                        "macos" | "linux" => plan.operating_system = failure.into(),
+                        "architecture" => plan.architecture = "aarch64".into(),
+                        "backend" => plan.selected_backend = "cpu_reference".into(),
+                        _ => {}
+                    }
+                    finalize_execution_plan_support_for_loaded_artifact(
+                        &mut plan,
+                        if failure == "filename" {
+                            std::path::Path::new("neighbor.gguf")
+                        } else {
+                            path
+                        },
+                        if failure == "digest" {
+                            "00"
+                        } else {
+                            model.sha256
+                        },
+                    );
+                    assert_eq!(plan.support_level, "unknown_or_unvalidated", "{failure}");
+                    assert!(plan
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "support_level=unknown_or_unvalidated"));
+                }
             }
         }
     }
@@ -41649,8 +41651,10 @@ fn finalize_execution_plan_support_for_loaded_artifact(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        if plan.selected_backend == "bonsai2_portable_runtime"
-            && crate::bonsai2::host_eligible(&plan.operating_system, &plan.architecture)
+        if matches!(
+            plan.selected_backend.as_str(),
+            "bonsai2_portable_runtime" | "bonsai2_cuda_runtime"
+        ) && crate::bonsai2::host_eligible(&plan.operating_system, &plan.architecture)
             && crate::bonsai2::identity_matches(filename, gguf_sha256)
         {
             return;

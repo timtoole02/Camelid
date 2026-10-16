@@ -22,7 +22,7 @@ export const SUPPORTED_MODELS = [
     filename: `Ternary-Bonsai-2-${size}B-PTQ1_0.gguf`,
     size_bytes,
     quant: 'PTQ1_0',
-    blurb: 'Compact ternary text and image model. Uses the portable decoder; includes its matching vision projector.',
+    blurb: 'Compact ternary text and image model. Supports Windows CUDA and CPU decoding; includes its matching vision projector.',
     companion_artifacts: [{
       role: 'vision_projector',
       repo_id: `prism-ml/Ternary-Bonsai-2-${size}B-gguf`,

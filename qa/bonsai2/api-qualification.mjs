@@ -34,6 +34,10 @@ for (let i = 0; i < 180; i++) {
 }
 assert.equal(health.generation_ready, true)
 assert.equal(health.vision_ready, true)
+if (process.env.CAMELID_QUALIFY_REQUIRE_CUDA === '1') {
+  assert.equal(health.execution_plan?.selected_backend, 'bonsai2_cuda_runtime')
+  assert.equal(health.execution_plan?.cuda_resident_active, true)
+}
 const report = { model: basename(model), platform: process.platform, date: new Date().toISOString(),
   backend_build: health.build, selected_backend: health.execution_plan?.selected_backend, cases: [] }
 async function check(name, body, validate) {
