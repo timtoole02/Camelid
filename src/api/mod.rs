@@ -31858,6 +31858,12 @@ mod tests {
                 "ternary_bonsai_8b_q2_0",
                 "bonsai_27b_q1_0",
                 "ternary_bonsai_27b_q2_0",
+                // Exact publisher Bonsai 2 rows: Windows x86_64 CPU language,
+                // CUDA/CPU single-image GUI/API chat and function tools.
+                "ternary_bonsai_2_2b_ptq1_0",
+                "ternary_bonsai_2_4b_ptq1_0",
+                "ternary_bonsai_2_9b_ptq1_0",
+                "ternary_bonsai_2_27b_ptq1_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 // Llama-3.2-3B-Instruct K-quant rows (filename-anchored ids): GPU-resident

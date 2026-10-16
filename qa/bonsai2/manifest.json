@@ -18,28 +18,36 @@
       "gui": "2b-gui-qualified.json",
       "result": "PASS six API cases and actual GUI image attachment",
       "context": "1044 prompt tokens; recall ORCHID",
-      "reference": "2b-reference-text.json"
+      "reference": "2b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "2b-cpu-vision.json"
     },
     "4B": {
       "api": "4b-api-qualified.json",
       "gui": "4b-gui-qualified.json",
       "result": "PASS six API cases and actual GUI image attachment",
       "context": "1044 prompt tokens; recall ORCHID",
-      "reference": "4b-reference-text.json"
+      "reference": "4b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "4b-cpu-vision.json"
     },
     "9B": {
       "api": "9b-api-qualified.json",
       "gui": "9b-gui-qualified.json",
       "result": "PASS six API cases and actual GUI image attachment",
       "context": "1044 prompt tokens; recall ORCHID",
-      "reference": "9b-reference-text.json"
+      "reference": "9b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "9b-cpu-vision.json"
     },
     "27B": {
       "api": "27b-api-qualified.json",
       "gui": "27b-gui-qualified.json",
       "result": "PASS six API cases and actual GUI image attachment",
       "context": "1044 prompt tokens; recall ORCHID",
-      "reference": "27b-reference-text.json"
+      "reference": "27b-reference-text.json",
+      "short_text_reference": "PASS, all seven non-EOS token IDs identical",
+      "cpu_image_fallback": "27b-cpu-vision.json"
     }
   },
   "regression": {
@@ -62,5 +70,9 @@
     "before": "Approximate CUDA encoder answered Yellow for left blue/right yellow fixture",
     "after": "Automatic accurate f32 encoder answers Blue on all four sizes at default image limits",
     "evidence": "vision case in each api-qualified receipt"
-  }
+  },
+  "supported_binary_sha256": "80a3c5dfe525a1ce11a1387a98d0e5247c0c547083ef146e630bed4cf31c2421",
+  "supported_probe_sha256": "9b7e42446c045ddc26496be6e3f6d25f46c162a16035d54f9a6baf33894b30b8",
+  "build": "release opt-level=3, x86-64-v3, lto=false, codegen-units=16, cuda feature; source snapshot committed as 1c3f9040",
+  "historical_gui_note": "gui-qualified receipts capture functional image testing before support promotion; their Unverified badge is historical."
 }

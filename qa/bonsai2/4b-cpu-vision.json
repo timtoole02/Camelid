@@ -1,0 +1,42 @@
+{
+  "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+  "platform": "win32",
+  "date": "2026-10-16T02:47:29.791Z",
+  "backend_build": "v0.8.0-12-g48812c3b-dirty",
+  "selected_backend": "bonsai2_portable_runtime",
+  "cases": [
+    {
+      "name": "vision_spatial",
+      "seconds": 10.1930531,
+      "response": {
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion",
+        "created": 1792118859,
+        "model": "bonsai2-qualification",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "blue"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 1,
+          "total_tokens": 43
+        },
+        "camelid": {
+          "generated_token_ids": [
+            11855
+          ],
+          "lane": "runnable",
+          "architecture": "qwen35"
+        }
+      },
+      "pass": true
+    }
+  ]
+}
