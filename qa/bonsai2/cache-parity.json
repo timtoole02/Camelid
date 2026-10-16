@@ -1,0 +1,28 @@
+{
+  "target": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "draft": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "platform": "Windows x86_64",
+  "threads": 8,
+  "test": "runnable::model::speculative::tests::bonsai2_batch_cache_and_draft_parity",
+  "pass": true,
+  "assertions": [
+    "Full target logits: batched versus serial equality",
+    "Attention K and V cache equality",
+    "Convolution cache equality",
+    "Recurrent state equality",
+    "24-token target versus integer-draft generation equality"
+  ],
+  "unit_suite": {
+    "passed": 87,
+    "failed": 0,
+    "ignored": 16
+  },
+  "test_binary_sha256": "9393b7d45777e539d44f5e8a283cd68309c77057b63cdcbd59c12098205bdfcf",
+  "source_sha256": {
+    "src/runnable/model.rs": "30ae61da834ed0c67c95efe9b861d8873e149798601e9cc4b8dea8a1e1844138",
+    "src/runnable/speculative.rs": "17a2005f1301e06fc424c242a84440fa382c6d9121c41f62782d023d719525ef",
+    "src/runnable/ptq_dot.rs": "34a7c237b89e69612b3124ed58652f47439fc661b989289cc22c006d9652a8d3",
+    "src/runnable/batched_dot.rs": "92d1aaf5698e0293a871a0d3359e38b1935b3b39a2a72147cd594dc937300d9d"
+  },
+  "output": "running 1 test\n[bonsai2-spec] accepted 18/18 drafts; 24 tokens in 9.903s decode\ntest runnable::model::speculative::tests::bonsai2_batch_cache_and_draft_parity ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2925 filtered out; finished in 51.08s"
+}

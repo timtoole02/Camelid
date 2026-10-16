@@ -2,7 +2,7 @@
 
 The artifact identities are pinned in `src/bonsai2.rs`. Download the language
 file and matching projector from the corresponding publisher repository. These
-fixtures exercise short, greedy text and image requests with thinking disabled.
+fixtures exercise text, single-image requests, tools and sampling with thinking disabled.
 `red.png` is a generated 64x64 solid-red RGB image, not an external photograph.
 
 ```sh
@@ -41,8 +41,16 @@ Run timing comparisons with other model servers and compiler jobs stopped.
 `CAMELID_BENCH_REFERENCE` can name a reference-text capture for the same target;
 the report separately records agreement with its available token prefix.
 
+The benchmark records token IDs, first-token and total latency, streaming decode
+rate, accepted/proposed drafts, and before/after ratios. Token disagreement fails
+the run. Generation latency includes draft loading and both prefills; target
+model loading happens before the timer in both runs. Streaming rate excludes
+time before the first visible token and can be inflated by verified token bursts.
+Use total generation throughput for the net comparison. These are individual
+32-token measurements on one host, not a throughput guarantee.
+
 The API qualification harness checks text, a function call and its result,
-context recall, and sampled generation through the production endpoint:
+context recall, sampled generation and spatial vision through the production endpoint:
 
 ```sh
 node qa/bonsai2/api-qualification.mjs MODEL.gguf RESULT.json http://127.0.0.1:28182 text,tools,context,sampling,vision
@@ -54,13 +62,6 @@ request construction, streaming renderer, and image limits remain in use.
 `blue-yellow.png` tests spatial color recognition at default sizing; regenerate
 it with `node qa/bonsai2/make-vision-fixture.mjs`.
 
-It records token IDs, first-token and total latency, streaming decode rate,
-accepted/proposed draft counts, and before/after ratios. Token disagreement fails
-the run. Streaming rate excludes time before the first visible token; total
-latency includes draft loading and both prefills. Neither metric is an SLA.
-Prism's official DSpark drafters target the earlier Bonsai generation; this
-benchmark uses an independent Qwen3.5 model with an identical token mapping.
-
 Reference: PrismML-Eng/llama.cpp release `prism-b10777-e3de715`, CPU execution,
 greedy sampling, thinking disabled, image minimum/maximum tokens both four.
 Text comparison uses the exact raw prompt in `text-prompt.txt`; image comparison
@@ -71,3 +72,25 @@ The API pack also qualifies function-tool round trips, sampled generation and
 context recall at 1,044 prompt tokens. Add `--require-supported` to the GUI
 harness to assert the Windows support badge. See `manifest.json` for per-model
 results; larger context and other platforms remain separate qualification work.
+
+The final GUI pass uses the built backend's frontend on port 28182:
+
+```sh
+node qa/bonsai2/gui-smoke.mjs MODEL.gguf RESULT_PREFIX http://127.0.0.1:28182 --send --default-image --require-supported
+```
+
+`image-lanes.json` retains the encoder-selection logs. CPU fallback was forced
+with `CAMELID_CUDA_DEVICE=99` on the one-GPU qualification host. Normal CUDA runs
+used device 0 with no strict-math override; Bonsai 2 selects accurate arithmetic
+automatically. `cache-parity.json` records the real-file batched/serial logits,
+attention cache, convolution state and recurrent state comparison.
+
+Validate the committed receipts without downloading models:
+
+```sh
+node qa/bonsai2/check-evidence.mjs
+```
+
+This checks all API cases, supported GUI receipts, three draft comparisons per
+size, model identities, and the ordinary-versus-draft seeded API continuation.
+It validates the evidence bundle; use the commands above to rerun inference.

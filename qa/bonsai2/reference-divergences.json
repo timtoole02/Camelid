@@ -63,5 +63,34 @@
     "reference_capture": "4b-explain-reference-score.json",
     "native_capture": "4b-native-parity.json",
     "interpretation": "Near-tied first decision; subsequent prefixes differ. This is not whole-output token identity."
+  },
+  {
+    "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+    "case": "explain",
+    "first_divergent_index": 4,
+    "native_token": {
+      "id": 685,
+      "token": " up",
+      "bytes": [
+        32,
+        117,
+        112
+      ],
+      "logprob": -0.6935551166534424
+    },
+    "reference_token": {
+      "id": 314,
+      "token": " of",
+      "bytes": [
+        32,
+        111,
+        102
+      ],
+      "logprob": -0.6931393146514893
+    },
+    "log_probability_margin": 0.000415802001953125,
+    "reference_capture": "9b-explain-reference-score.json",
+    "native_capture": "9b-draft-benchmark.json",
+    "interpretation": "Near-tied first decision; subsequent prefixes differ. This is not whole-output token identity."
   }
 ]

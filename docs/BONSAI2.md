@@ -54,6 +54,12 @@ Validation results and exact source references are recorded in
 [`qa/bonsai2/manifest.json`](../qa/bonsai2/manifest.json). The reproducible native
 probe is `examples/bonsai2_probe.rs`.
 
+The pinned Prism reference matches text, counting and code on all four models,
+and prose on 27B. The 2B/4B/9B prose runs first differ at measured near-ties
+(the native choice is the reference runner-up, with log-probability margins
+0.00476, 0.00241 and 0.00042). These differences are retained in the evidence;
+they are not claims of whole-output reference identity.
+
 Windows x86_64 is the first qualification target. Apple Silicon has a separate
 qualification gate; a Windows result does not certify the Metal backend.
 
@@ -78,6 +84,26 @@ does not provide a Bonsai 2 DSpark assistant. The independent 2B draft route abo
 is a separate implementation. Use `qa/bonsai2/spec-benchmark.mjs` to compare its
 output and elapsed time against the same target without drafting; acceptance
 rate and net speed depend on the target, prompt, and hardware.
+
+Measured on Windows with an Intel i7-11800H, 16 GB RAM and eight CPU threads,
+using a three-token draft window and 32 generated tokens per case. All twelve
+draft runs produced exactly the same token IDs as their ordinary target runs.
+The table gives **ordinary -> draft generation tokens/second**, including draft
+loading and both prefills. Target loading is excluded from both measurements.
+
+| Target | Counting | Code | Prose |
+| --- | ---: | ---: | ---: |
+| 2B | 1.08 -> 1.35 | 1.14 -> 1.34 | 1.1 -> 1.38 |
+| 4B | 0.507 -> 0.878 | 0.541 -> 0.998 | 0.547 -> 0.392 |
+| 9B | 0.297 -> 0.633 | 0.293 -> 0.641 | 0.3 -> 0.32 |
+| 27B | 0.0869 -> 0.221 | 0.0808 -> 0.218 | 0.0844 -> 0.145 |
+
+Counting and code improved 1.18-2.70x end to end. Prose ranged from 0.72x for
+4B to 1.72x for 27B: low draft acceptance can make a request slower. Drafting is
+therefore opt-in. These are individual measurements, not a universal speedup
+or a GPU language-throughput claim. The [full timings and acceptance counts](../qa/bonsai2/performance.json)
+include every case, including the slowdown. Streaming rates in the raw receipts
+exclude the first visible token and are affected by verified-token bursts.
 
 Publisher references: [2B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf),
 [4B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf),
