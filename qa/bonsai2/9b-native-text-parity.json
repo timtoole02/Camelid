@@ -1,0 +1,48 @@
+{
+  "model": "Ternary-Bonsai-2-9B-PTQ1_0.gguf",
+  "date": "2026-10-16T01:36:26.596Z",
+  "platform": "win32",
+  "reference": "PrismML-Eng/llama.cpp prism-b10777-e3de715",
+  "probe_sha256": "262af8560b0937d9ce5b0a020effa69d3104ffdb59e6521c08b275296ceedb01",
+  "cases": [
+    {
+      "name": "text",
+      "pass": true,
+      "actual": {
+        "ids": [
+          760,
+          6511,
+          314,
+          9338,
+          369,
+          11751,
+          13
+        ],
+        "text": "The capital of France is Paris.",
+        "seconds": 38.3364899,
+        "token_seconds": [
+          8.4227357,
+          12.8452091,
+          17.522775,
+          21.7510616,
+          25.7933486,
+          29.7381185,
+          34.0063056
+        ]
+      },
+      "expected": {
+        "ids": [
+          760,
+          6511,
+          314,
+          9338,
+          369,
+          11751,
+          13
+        ],
+        "text": "The capital of France is Paris."
+      }
+    }
+  ],
+  "pass": true
+}

@@ -38,6 +38,8 @@ Set `CAMELID_BENCH_CASES=count,code,explain` to select cases and
 `CAMELID_SPEC_DRAFT_TOKENS` to select the draft window. The default window is 3.
 Build the probe from the same source tree whose hashes the report records.
 Run timing comparisons with other model servers and compiler jobs stopped.
+`CAMELID_BENCH_REFERENCE` can name a reference-text capture for the same target;
+the report separately records agreement with its available token prefix.
 
 The API qualification harness checks text, a function call and its result,
 context recall, and sampled generation through the production endpoint:

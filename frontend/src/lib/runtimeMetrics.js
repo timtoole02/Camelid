@@ -234,8 +234,8 @@ const EVIDENCED_BACKENDS = new Set([
 /* Lanes deliberately left OUT of the set above, so that "not listed" cannot mean
    "nobody looked". The smoke asserts this partition covers the planner. */
 export const UNEVIDENCED_BACKENDS = new Set([
-  // Bonsai 2's packed CPU lane is still completing the model qualification
-  // matrix; track it explicitly until its support receipts are promoted.
+  // Bonsai 2 needs the Windows artifact/host gate below. The backend name
+  // alone must not extend its qualification to Apple Silicon or other files.
   'bonsai2_portable_runtime',
   /* The engine itself treats this one as unvalidated: the admission check in
      `src/api/mod.rs` gates on `selected_backend.contains("_runnable_unvalidated")`.
@@ -293,9 +293,12 @@ export function readActiveLane(runtime) {
     return { present: false, risk: LANE_RISK.UNKNOWN, rows: [], supportLevel: null, reasons: [] }
   }
   const backend = plan.selected_backend || null
+  const evidencedBonsaiWindows = backend === 'bonsai2_portable_runtime'
+    && plan.operating_system === 'windows' && plan.architecture === 'x86_64'
+    && plan.support_level === 'supported_windows_runtime'
   const risk = backend === null
     ? LANE_RISK.UNKNOWN
-    : EVIDENCED_BACKENDS.has(backend)
+    : EVIDENCED_BACKENDS.has(backend) || evidencedBonsaiWindows
       ? LANE_RISK.EVIDENCED
       : LANE_RISK.UNEVIDENCED
 

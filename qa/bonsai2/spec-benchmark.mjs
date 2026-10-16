@@ -10,6 +10,9 @@ const [probe, target, draft, output, tokens = '48'] = process.argv.slice(2)
 assert.ok(probe && target && draft && output, 'PROBE TARGET DRAFT OUTPUT required')
 const cases = (process.env.CAMELID_BENCH_CASES || 'count,code,explain').split(',')
 const window = process.env.CAMELID_SPEC_DRAFT_TOKENS || '3'
+const referencePath = process.env.CAMELID_BENCH_REFERENCE
+const reference = referencePath ? JSON.parse(await readFile(referencePath, 'utf8')) : null
+if (reference) assert.equal(reference.model, basename(target))
 async function run(prompt, speculative) {
   const env = { ...process.env, RAYON_NUM_THREADS: '8', CAMELID_QWEN35_CUDA: '0', CAMELID_QWEN35_METAL: '0' }
   delete env.CAMELID_SPEC_DECODE
@@ -46,6 +49,14 @@ for (const name of cases) {
   await readFile(path) // fail before spawning if a prompt was omitted
   const baseline = await run(path, false)
   const row = { name, baseline }
+  if (reference) {
+    const expected = reference.cases.find(row => row.name === name)
+    assert.ok(expected, `missing reference case ${name}`)
+    const length = Math.min(baseline.ids.length, expected.ids.length)
+    row.reference = { compared_tokens: length,
+      prefix_matches: JSON.stringify(baseline.ids.slice(0, length)) === JSON.stringify(expected.ids.slice(0, length)),
+      expected_ids: expected.ids, expected_text: expected.text }
+  }
   report.cases.push(row)
   await writeFile(output, JSON.stringify(report, null, 2))
   console.log(JSON.stringify({ name, phase: 'baseline', seconds: baseline.seconds, tokens: baseline.ids.length }))

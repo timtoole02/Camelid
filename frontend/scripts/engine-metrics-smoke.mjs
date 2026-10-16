@@ -229,6 +229,16 @@ try {
       'a lane the planner can pick is unclassified — add it to EVIDENCED_BACKENDS or UNEVIDENCED_BACKENDS')
   })
 
+  check('Bonsai 2 requires the verified Windows support plan', () => {
+    const plan = { selected_backend: 'bonsai2_portable_runtime', operating_system: 'windows',
+      architecture: 'x86_64', support_level: 'supported_windows_runtime' }
+    assert.equal(readActiveLane({ execution_plan: plan }).risk, LANE_RISK.EVIDENCED)
+    for (const change of [
+      { operating_system: 'macos' }, { operating_system: 'linux' },
+      { architecture: 'aarch64' }, { support_level: 'unknown_or_unvalidated' },
+    ]) assert.equal(readActiveLane({ execution_plan: { ...plan, ...change } }).risk, LANE_RISK.UNEVIDENCED)
+  })
+
   check('the macOS lanes that are default-on read as evidenced', () => {
     /* Each of these is an opt-OUT in the planner, so a stock macOS serve lands on
        one of them. The first version of this panel called all three unevidenced

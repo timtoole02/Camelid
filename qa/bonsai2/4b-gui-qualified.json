@@ -1,0 +1,12 @@
+{
+  "model": "Ternary-Bonsai-2-4B-PTQ1_0.gguf",
+  "platform": "win32",
+  "backend_build": "v0.8.0-8-ge3f87264-dirty",
+  "selected_backend": "bonsai2_portable_runtime",
+  "date": "2026-10-16T01:43:20.441Z",
+  "generation_ready": true,
+  "vision_ready": true,
+  "image_input_present": true,
+  "image_limits": "GUI defaults",
+  "answer": "Red\n\nTernary Bonsai 2.4B PTQ1 0\nUNVERIFIED MODEL\ntokens in 34 · out 1\nfirst token 6.7s\n8.9s\n06:43 PM\nCLIENT-MEASURED\nDeveloper Diagnostics\n—"
+}
