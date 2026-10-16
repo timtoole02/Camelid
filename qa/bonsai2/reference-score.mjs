@@ -1,7 +1,7 @@
 // ORACLE_SERVER MODEL CASE OUTPUT.json; scores a full greedy reference continuation.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 import { readFile, writeFile } from 'node:fs/promises'
 const [server, model, name, output] = process.argv.slice(2)
 assert.ok(server && model && name && output)
@@ -25,6 +25,8 @@ try {
   })
   const result = await response.json()
   assert.ok(response.ok, JSON.stringify(result))
+  // The server echoes its absolute model path; public evidence uses the artifact name.
+  result.model = basename(model)
   await writeFile(output, JSON.stringify(result, null, 2))
   console.log(JSON.stringify({ content: result.content, probabilities: result.completion_probabilities?.length }))
 } finally {

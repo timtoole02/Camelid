@@ -37,7 +37,7 @@
   ],
   "id_slot": 0,
   "stop": true,
-  "model": "C:\\Users\\timto\\.codex\\worktrees\\bonsai-2-models\\Camelid\\output\\bonsai2-models\\Ternary-Bonsai-2-2B-PTQ1_0.gguf",
+  "model": "Ternary-Bonsai-2-2B-PTQ1_0.gguf",
   "tokens_predicted": 32,
   "tokens_evaluated": 24,
   "generation_settings": {
@@ -6121,7 +6121,7 @@
         103,
         104
       ],
-      "logprob": -0.000018000764612224884,
+      "logprob": -1.8000764612224884E-05,
       "top_logprobs": [
         {
           "id": 1472,
@@ -6136,7 +6136,7 @@
             103,
             104
           ],
-          "logprob": -0.000018000764612224884
+          "logprob": -1.8000764612224884E-05
         },
         {
           "id": 7435,
