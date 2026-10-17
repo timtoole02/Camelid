@@ -1,0 +1,1 @@
+{"model": "local", "messages": [{"role": "user", "content": "List the first eight prime numbers, separated by commas, then explain in one sentence why one is not among them."}], "temperature": 0, "top_p": 1, "seed": 0, "max_tokens": 48}

@@ -1,0 +1,2 @@
+[hw] GPU: Apple M4 | Metal compute | unified-memory yes | GPU-resident inference available
+[hw] CPU: 10 logical cores | SIMD NEON (avx2=false avx512f=false fma=false neon=true) | RAM 6.2 GiB free / 16.0 GiB total

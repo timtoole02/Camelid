@@ -1,0 +1,2 @@
+[hw] GPU: none detected — CPU backend is the inference path
+[hw] CPU: 8 logical cores | SIMD AVX-512 (avx2=true avx512f=true fma=true neon=false) | RAM 12.3 GiB free / 15.3 GiB total

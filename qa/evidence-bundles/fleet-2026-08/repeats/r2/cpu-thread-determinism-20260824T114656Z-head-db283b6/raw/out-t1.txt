@@ -1,0 +1,1 @@
+The first eight prime numbers are 2, 3, 5, 7, 11, 13, 17, and 19. One is not among them because it is not a prime number.

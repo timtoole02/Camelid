@@ -1,0 +1,22 @@
+{
+  "schema": "camelid.cpu-thread-determinism.v1",
+  "generated_utc": "2026-08-22T23:23:40Z",
+  "question": "Does greedy CPU decode produce byte-identical output as the Rayon worker count changes?",
+  "camelid_version": "camelid v0.6.1-191-gdb283b69",
+  "camelid_git_head_short": "db283b69",
+  "host": {
+    "os": "Darwin 25.4.0",
+    "arch": "arm64",
+    "logical_cores": 10
+  },
+  "model": { "file": "Qwen3-0.6B-Q8_0.gguf", "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031" },
+  "request": { "temperature": 0, "top_p": 1, "seed": 0, "max_tokens": 48 },
+  "env": { "CAMELID_LAZY_Q8_0_LINEAR": "1" },
+  "baseline_threads": "1",
+  "diverged_count": 0,
+  "completed_runs": 3,
+  "verdict": "no_divergence",
+  "verdict_note": "A diverged_count of 0 is only meaningful when completed_runs is at least 2. An all-failed sweep is inconclusive, never a determinism pass.",
+  "runs": [{"threads":1,"status":"ok","sha256":"15593cfb9ae89db73c6f3311166f470f7b15ea5158460554581f176a57733208","verdict":"baseline"},{"threads":4,"status":"ok","sha256":"15593cfb9ae89db73c6f3311166f470f7b15ea5158460554581f176a57733208","verdict":"identical_to_baseline"},{"threads":10,"status":"ok","sha256":"15593cfb9ae89db73c6f3311166f470f7b15ea5158460554581f176a57733208","verdict":"identical_to_baseline"}],
+  "scope": "One model, one prompt, one build, one host. Greedy decode only. Tests determinism across Rayon worker counts. This is NOT a parity test against llama.cpp and makes no parity claim. A divergence here would mean CPU parity claims need a thread count recorded alongside them; no divergence is a useful negative result."
+}
