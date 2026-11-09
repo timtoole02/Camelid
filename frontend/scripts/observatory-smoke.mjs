@@ -137,7 +137,7 @@ try {
     assert.ok(!/spawn/i.test(drawBody), 'draw() must not spawn particles; only onEvent may')
   })
   check('renderers: no module fabricates telemetry', () => {
-    for (const file of ['tokenParticles.js', 'layerVisualizer.js', 'kvCacheTrail.js', 'samplerBloom.js', 'clusterConstellation.js']) {
+    for (const file of ['tokenParticles.js', 'layerVisualizer.js', 'kvCacheTrail.js', 'samplerBloom.js', 'clusterConstellation.js', 'starNursery/renderer.js']) {
       const source = readFileSync(resolve(frontendRoot, `src/lib/observatory/${file}`), 'utf8')
       assert.ok(!/(mock|simulate|fake|demoEvent)/i.test(source), `${file} contains a simulation marker`)
     }

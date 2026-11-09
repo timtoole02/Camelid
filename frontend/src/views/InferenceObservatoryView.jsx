@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import FlowBench from '../components/observatory/FlowBench'
 import NeuralField from '../components/observatory/NeuralField'
+import StarNursery from '../components/observatory/StarNursery'
 import DetailsPanel from '../components/observatory/DetailsPanel'
 import { useInferenceTelemetry } from '../hooks/useInferenceTelemetry'
 import { getTelemetrySnapshot, rateSourceLabel, subscribeTelemetry, summarizeTelemetry } from '../lib/telemetryLog'
@@ -16,18 +17,18 @@ import { appStorage } from '../lib/appStorage.js'
    backend-reported run panel (camelid.telemetry/v1 SSE) remains below as a
    separate, explicitly backend-side instrument. */
 
-/* Renderer mode. Neural Field is the default: its Phase 5 gate passed
-   2026-07-02 (frames + PERF p95 2.3ms@DPR1 + truthfulness audit + build —
-   see design-evidence/neural-field/). A stored choice always wins. */
+/* Renderer mode. Star Nursery is the default; Neural Field (Phase 5 gate
+   passed 2026-07-02, see design-evidence/neural-field/) and Flow Bench stay
+   available behind the toggle. A stored choice always wins. */
 const RENDERER_KEY = 'camelid.observatory.renderer'
-const RENDERERS = ['flowbench', 'neuralfield']
+const RENDERERS = ['flowbench', 'neuralfield', 'starnursery']
 
 function initialRenderer() {
   try {
     const stored = appStorage.getItem(RENDERER_KEY)
-    return RENDERERS.includes(stored) ? stored : 'neuralfield'
+    return RENDERERS.includes(stored) ? stored : 'starnursery'
   } catch {
-    return 'neuralfield'
+    return 'starnursery'
   }
 }
 
@@ -62,7 +63,11 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconObservatory size={14} /> Observatory</p>
           <h1>Observatory</h1>
-          <p className="cxv-sub">A live picture of inference on this machine, drawn from the real requests made in this session. When nothing is running, the view stays still.</p>
+          <p className="cxv-sub">
+            {renderer === 'starnursery'
+              ? 'Every star is one decoded token from a real request in this session, so a finished reply becomes a constellation. The nebula only drifts while idle; nothing ignites until a request runs.'
+              : 'A live picture of inference on this machine, drawn from the real requests made in this session. When nothing is running, the view stays still.'}
+          </p>
         </div>
         <div className="cxv-head__actions">
           <div className="observatory-renderer-toggle" role="group" aria-label="Centerpiece renderer">
@@ -82,6 +87,14 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
             >
               Neural Field
             </button>
+            <button
+              type="button"
+              className={renderer === 'starnursery' ? 'is-active' : ''}
+              aria-pressed={renderer === 'starnursery'}
+              onClick={() => pickRenderer('starnursery')}
+            >
+              Star Nursery
+            </button>
           </div>
           <EvidenceChip
             state="neutral"
@@ -93,9 +106,11 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
       </header>
 
       <div className="flowbench-stage">
-        {renderer === 'neuralfield'
-          ? <NeuralField apiBase={apiBase} reducedMotion={reducedMotion} />
-          : <FlowBench reducedMotion={reducedMotion} highlightId={highlightId} />}
+        {renderer === 'starnursery'
+          ? <StarNursery apiBase={apiBase} reducedMotion={reducedMotion} />
+          : renderer === 'neuralfield'
+            ? <NeuralField apiBase={apiBase} reducedMotion={reducedMotion} />
+            : <FlowBench reducedMotion={reducedMotion} highlightId={highlightId} />}
         <aside className="flowbench-rail" aria-label="Live instruments">
           <div className="flowbench-rail__tiles">
             <div className="cxv-stat"><span>Requests</span><strong>{summary.total}</strong><small>{summary.errors} error{summary.errors === 1 ? '' : 's'}</small></div>

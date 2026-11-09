@@ -234,3 +234,81 @@
   color: var(--color-text);
   background: var(--color-accent-soft);
 }
+
+/* ==========================================================================
+   Star Nursery — nebula renderer with floating readouts.
+   The canvas is a deliberately colourful, always-dark sky in both themes
+   (like Fusion Core), so the readouts over it use literal inks that are
+   legible on that sky rather than theme tokens.
+   ========================================================================== */
+.starnursery {
+  background: #05060d;
+  border-color: rgba(150, 170, 255, 0.17);
+}
+.starnursery__hud {
+  position: absolute;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.08em;
+  color: #e9ecff;
+  background: rgba(13, 17, 36, 0.66);
+  border: 1px solid rgba(150, 170, 255, 0.17);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  pointer-events: none;
+}
+.starnursery__hud--phase {
+  top: var(--space-3);
+  left: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  text-transform: uppercase;
+}
+.starnursery__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6f779e;
+  color: #6f779e;
+  box-shadow: 0 0 10px currentColor;
+}
+.starnursery[data-phase='running'] .starnursery__dot,
+.starnursery[data-phase='prefill'] .starnursery__dot { background: #5fe0ff; color: #5fe0ff; }
+.starnursery[data-phase='decode'] .starnursery__dot { background: #ffb454; color: #ffb454; }
+.starnursery[data-phase='finished'] .starnursery__dot { background: #35e6c0; color: #35e6c0; }
+.starnursery[data-phase='error'] .starnursery__dot { background: #ff6a6a; color: #ff6a6a; }
+.starnursery__sealed {
+  padding-left: var(--space-2);
+  border-left: 1px solid rgba(150, 170, 255, 0.3);
+  color: #ffe2a8;
+}
+.starnursery__hud--readout {
+  left: var(--space-3);
+  bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+}
+.starnursery__rate strong {
+  font-size: var(--text-2xl);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.starnursery__sub {
+  margin-top: 2px;
+  color: #a3abd0;
+  font-variant-numeric: tabular-nums;
+}
+.starnursery__hud--legend {
+  right: var(--space-3);
+  bottom: var(--space-3);
+  padding: var(--space-1) var(--space-3);
+  color: #a3abd0;
+}
+@media (max-width: 640px) {
+  .starnursery__hud--legend { display: none; }
+}
