@@ -36,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14        # Apple Silicon
+          - os: macos-latest    # Apple Silicon (macos-14 image is retired)
             label: macos-arm64
           - os: ubuntu-latest
             label: linux-x86_64
@@ -730,7 +730,7 @@ jobs:
   # the documented quarantine-free install path. See camelid-desktop/README.md.
   desktop-macos:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
-    runs-on: macos-14 # Apple Silicon; build-macos-desktop.sh refuses non-arm64 hosts
+    runs-on: macos-latest # Apple Silicon; build-macos-desktop.sh refuses non-arm64 hosts
     permissions:
       contents: write # attach the DMG to the release (no signing secrets involved)
     steps:
