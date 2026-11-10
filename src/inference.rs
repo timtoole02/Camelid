@@ -4544,8 +4544,15 @@ impl LlamaInferenceSession {
             .embedding_lookup(&[token_id], "token_embedding")?;
         let inv_temp = 1.0 / config.temperature;
         let base = config.seed.unwrap_or(0);
+        // The API offsets a request seed by the generated-token index, so a
+        // seeded request's base advances by one per token; unseeded stays 0.
+        // Metal's encode-ahead needs that step to pre-build the next graph
+        // with the seed the next call will pass.
+        let seed_step = u64::from(config.seed.is_some());
         let forward = if metal_sampling {
-            self.try_resident_decode_forward_metal_sample(&embedding, token_id, inv_temp, base)?
+            self.try_resident_decode_forward_metal_sample(
+                &embedding, token_id, inv_temp, base, seed_step,
+            )?
         } else {
             let seed =
                 base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);

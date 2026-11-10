@@ -24458,19 +24458,14 @@ fn encode_resident_matmul_f32(
             e.set_buffer(3, Some(scalar), 0);
             e.set_buffer(4, Some(scalar), 4);
             e.set_buffer(5, Some(scalar), 8);
-            let (groups, threads) = if weight.format == ResidentWeightFormat::Q1_0 {
-                (rows.div_ceil(8), 32)
-            } else {
-                (rows, 32)
-            };
             e.dispatch_thread_groups(
                 metal::MTLSize {
-                    width: groups as u64,
+                    width: rows as u64,
                     height: n_tokens as u64,
                     depth: 1,
                 },
                 metal::MTLSize {
-                    width: threads,
+                    width: 32,
                     height: 1,
                     depth: 1,
                 },
@@ -24537,9 +24532,18 @@ fn encode_resident_matmul_f32(
             e.set_buffer(4, Some(scalar), 0);
             e.set_buffer(5, Some(scalar), 4);
             e.set_buffer(6, Some(scalar), 8);
+            // `q1_0_linear_f32` evaluates eight output rows per threadgroup; the
+            // Q2 kernels own one row each. Dispatching `rows` groups for Q1 is
+            // still correct (the surplus groups return at once) but launches 8x
+            // the threadgroups the kernel uses.
+            let groups = if weight.format == ResidentWeightFormat::Q1_0 {
+                rows.div_ceil(8)
+            } else {
+                rows
+            };
             e.dispatch_thread_groups(
                 metal::MTLSize {
-                    width: rows as u64,
+                    width: groups as u64,
                     height: n_tokens as u64,
                     depth: 1,
                 },
@@ -37387,6 +37391,13 @@ pub enum SampleMode {
     Temperature {
         inv_temperature: f32,
         base_seed: u64,
+        /// How far the caller advances `base_seed` between consecutive tokens
+        /// (the API offsets a request seed by the generated-token index; an
+        /// unseeded request keeps base 0, step 0). Encode-ahead applies it so
+        /// the pre-committed next-token graph carries the seed the next call
+        /// will actually ask for. A wrong step is safe, only slow: the
+        /// signature check rejects the graph and the position is re-run.
+        seed_step: u64,
     },
 }
 
@@ -37408,9 +37419,27 @@ impl SampleMode {
             Self::Temperature {
                 inv_temperature,
                 base_seed,
+                ..
             } => SampleSignature::Temperature {
                 inv_temperature_bits: inv_temperature.to_bits(),
                 token_seed: base_seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(position as u64 + 1),
+            },
+        }
+    }
+
+    /// The mode the caller is expected to request for the following token.
+    #[cfg(target_os = "macos")]
+    fn for_next_token(self) -> Self {
+        match self {
+            Self::Greedy => Self::Greedy,
+            Self::Temperature {
+                inv_temperature,
+                base_seed,
+                seed_step,
+            } => Self::Temperature {
+                inv_temperature,
+                base_seed: base_seed.wrapping_add(seed_step),
+                seed_step,
             },
         }
     }
@@ -39834,6 +39863,12 @@ impl ResidentDecodeState {
                 || next_alt_rope
                     .is_some_and(|(ac, as_)| ac.len() == half_rope && as_.len() == half_rope);
             if position + 2 <= self.max_positions && next_alt_ok {
+                // The next call's sampling seed may differ from this one's.
+                let next_sample_stage = sample_stage.as_ref().map(|stage| SampleStage {
+                    embedding_blocks: stage.embedding_blocks,
+                    mode: stage.mode.for_next_token(),
+                    embed_scale: stage.embed_scale,
+                });
                 if let Some(next) = self.prepare_token(
                     k,
                     layers,
@@ -39843,7 +39878,7 @@ impl ResidentDecodeState {
                     position + 1,
                     scale,
                     logits_stage.as_ref(),
-                    sample_stage.as_ref(),
+                    next_sample_stage.as_ref(),
                 ) {
                     next_encode_us = next.encode_us;
                     // Greedy fast path: the next graph's input is produced by THIS graph's
@@ -39905,19 +39940,34 @@ impl ResidentDecodeState {
             return Some(ResidentTokenOut::Sampled(id));
         }
         self.last_sampled = None;
-        if let Some(logits_buf) = prepared.logits_buf {
+        // CPU-sampled lane (top-k/top-p/penalties, or no device tail): this graph's GPU
+        // work was observed complete above, so its scratch goes back to the pool exactly
+        // as the fast lane's does. Dropping it instead frees several hundred MTLBuffers
+        // through IOGPU on the decode thread every token (~3 ms on Bonsai 4B, M3) and
+        // makes the next encode allocate them all again.
+        let PreparedToken {
+            logits_buf,
+            sampled_buf,
+            final_from_a,
+            _keep: scratch,
+            ..
+        } = prepared;
+        let out = if let Some(logits_buf) = &logits_buf {
             let vocab = logits_stage.as_ref().map(|s| s.vocab_size).unwrap_or(0);
             let mut out = vec![0.0f32; vocab];
-            read_buffer_f32(&logits_buf, &mut out);
-            return Some(ResidentTokenOut::Data(out));
-        }
-        let final_buf = if prepared.final_from_a {
-            &self.buf_a
+            read_buffer_f32(logits_buf, &mut out);
+            out
         } else {
-            &self.buf_b
+            let final_buf = if final_from_a {
+                &self.buf_a
+            } else {
+                &self.buf_b
+            };
+            let mut out = vec![0.0f32; self.hidden];
+            read_buffer_f32(final_buf, &mut out);
+            out
         };
-        let mut out = vec![0.0f32; self.hidden];
-        read_buffer_f32(final_buf, &mut out);
+        pool_recycle(k, scratch.into_iter().chain(sampled_buf).chain(logits_buf));
         Some(ResidentTokenOut::Data(out))
     }
 
@@ -40240,6 +40290,7 @@ impl ResidentDecodeState {
                     SampleMode::Temperature {
                         inv_temperature,
                         base_seed,
+                        ..
                     } => {
                         let temperature_scalar = nb(4);
                         let seed_scalar = nb(8);
