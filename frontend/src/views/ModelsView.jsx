@@ -569,7 +569,7 @@ export default function ModelsView({
       {deleteBlockedReason ? (
         <p className="lane-delete-guard" id="model-delete-guard">{deleteBlockedReason}</p>
       ) : null}
-      {spine.localError && !spine.local ? (
+      {spine.localError && !spine.local && runtime?.status !== 'offline' ? (
         <Notice notice={`Could not list local models: ${spine.localError}`} tone="error" />
       ) : null}
 
@@ -693,6 +693,7 @@ export default function ModelsView({
 
       {/* Zone 5 — get models: curated picks + live Hugging Face search */}
       <CatalogLaneBrowse
+        engineOffline={runtime?.status === 'offline'}
         externalQuery={modelQuery}
         onCuratedMatchCount={setCatalogMatchCount}
         apiBase={catalogApiBase || apiBase}

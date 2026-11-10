@@ -289,13 +289,11 @@ export default function ArenaView({ models = [], runtime, apiBase = '', loadDash
 
   return (
     <div className="arena-view">
-      <header className="arena-header">
-        <div className="arena-title">
-          <span className="arena-title__icon"><IconScale size={20} /></span>
-          <div>
-            <h1>Model Arena</h1>
-            <p>Compare two local models with the same prompt and live performance details.</p>
-          </div>
+      <header className="arena-header cxv-head">
+        <div className="cxv-head__copy">
+          <p className="cxv-kicker"><IconScale size={14} /> Models</p>
+          <h1>Model Arena</h1>
+          <p className="cxv-sub">Compare two local models with the same prompt and live performance details.</p>
         </div>
         {vote && <div className="arena-vote-receipt"><IconCheck size={14} /> Voted: {vote}</div>}
       </header>

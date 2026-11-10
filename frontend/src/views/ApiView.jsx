@@ -77,7 +77,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
         <div className="cxv-stat"><span>Runtime</span><strong>{runtimeStatus.label}</strong><small>{generationReady ? 'generation_ready=true' : loadedNow ? 'loaded_now=true' : runtime?.status === 'offline' ? 'backend unreachable' : 'no model loaded'}</small></div>
         <div className="cxv-stat"><span>Loaded model</span><strong>{loadedNow ? 'Active' : 'None'}</strong><small title={runtime?.active_model_id || 'nothing loaded'}>{runtime?.active_model_id || 'nothing loaded'}</small></div>
         <div className="cxv-stat"><span>Selected model</span><strong>{selectedRowStat}</strong><small>{selectedRowSub}</small></div>
-        <div className="cxv-stat"><span>Local API</span><strong>{apiBase ? 'Online' : 'Offline'}</strong><small>{apiBase || 'unavailable'}</small></div>
+        <div className="cxv-stat"><span>Local API</span><strong>{runtime?.status === 'offline' ? 'Unreachable' : apiBase ? 'Online' : 'Offline'}</strong><small>{apiBase || 'unavailable'}</small></div>
       </div>
 
       <section className="cxv-card cxv-panel">

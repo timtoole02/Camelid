@@ -773,6 +773,7 @@ function CatalogFamilyGroups({ items, renderItem, openFamilies = false }) {
 }
 
 export function CatalogLaneBrowse({
+  engineOffline = false,
   apiBase = '',
   capabilities,
   localFilenames = new Set(),
@@ -1048,7 +1049,9 @@ export function CatalogLaneBrowse({
         />
       )}
       <UndeterminedFitNotice items={visibleItems} />
-      {error ? (
+      {/* While the engine is offline the app banner already says so; a failed
+          first catalog load is that same fact, not a second error. */}
+      {error && !(engineOffline && items === null) ? (
         <Notice
           notice={items === null ? `Catalog unavailable: ${error}` : error}
           tone="error"
@@ -1056,6 +1059,7 @@ export function CatalogLaneBrowse({
         />
       ) : null}
       {items === null && !error ? <p className="lane-empty">Loading catalog…</p> : null}
+      {items === null && error && engineOffline ? <p className="lane-empty">The catalog loads when the engine is running.</p> : null}
 
       {items === null && !error ? null : searching ? (
         <CatalogGroup

@@ -9,7 +9,9 @@ function memoryValue(value, loading) {
   return formatBytes(value)
 }
 
-export function RuntimeMemoryPanel({ apiBase }) {
+/* `offline`: the app-level banner already explains an unreachable engine, so
+   the panel does not repeat it as a raw request error. */
+export function RuntimeMemoryPanel({ apiBase, offline = false }) {
   const { memory, loading, purging, error, notice, refresh, purge, clearNotice } = useRuntimeMemory(apiBase)
   const modelCount = memory?.models?.length || 0
   const cacheEntries = Number(memory?.kv_cache_entries || 0)
@@ -48,7 +50,7 @@ export function RuntimeMemoryPanel({ apiBase }) {
         </div>
       </div>
 
-      {error ? <Notice notice={error} tone="error" /> : null}
+      {error && !offline ? <Notice notice={error} tone="error" /> : null}
       {notice ? <Notice notice={notice} tone="success" onDismiss={clearNotice} /> : null}
 
       <div className="cxv-stat-grid a-memory__stats">

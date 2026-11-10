@@ -580,6 +580,11 @@
     min-width: 104px;
     background: var(--color-composer-surface);
   }
+  /* The row scrolls sideways, so its buttons must keep their width: letting
+     them shrink squeezed "Add a model" under its neighbours on phones. */
+  /* (Not when the sticky model picker is in the row: there the buttons must
+     still shrink so the scrolled-to control fits beside the pinned picker.) */
+  .cxcomposer__tools:not(:has(.cxcomposer__model, .cxcomposer__model-select)) .cxcomposer__tool { flex-shrink: 0; white-space: nowrap; }
   .cxcomposer__tool--collapsible .cxcomposer__tool-label { display: none; }
   .cxcomposer__tool--collapsible { width: 32px; padding: 0; flex: none; justify-content: center; }
   .cxcomposer__model-select { width: 100%; min-width: 0; max-width: 150px; }
