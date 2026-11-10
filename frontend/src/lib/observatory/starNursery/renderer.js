@@ -269,6 +269,9 @@ export function createStarNurseryRenderer({ reducedMotion = false } = {}) {
 
   function draw(ctx, frame) {
     const { w, h, t, dt, run, connection } = frame
+    // Width the constellation may use: an overlaid instrument rail (if any)
+    // is kept clear. The sky and gas still fill the whole canvas.
+    const sw = Math.max(w - (frame.insetRight || 0), w * 0.5)
     const unavailable = connection === 'unavailable'
 
     // A run whose events stopped without inference_finished settles via the
@@ -330,7 +333,7 @@ export function createStarNurseryRenderer({ reducedMotion = false } = {}) {
 
     // ---- prompt dust falling into the protostar where the reply begins ----
     const origin = starPosition(0, state.phase)
-    const ox = origin.x * w
+    const ox = origin.x * sw
     const oy = origin.y * h
     if (state.prefill.glow > 0.01) {
       const fill = state.prefill.fill
@@ -350,8 +353,8 @@ export function createStarNurseryRenderer({ reducedMotion = false } = {}) {
     }
 
     // ---- constellations: the fading previous run, then the current one ----
-    drawConstellation(ctx, state.ghosts, w, h, k, state.ghostFade * 0.6 * dim, true)
-    drawConstellation(ctx, state.stars, w, h, k, dim, reduced)
+    drawConstellation(ctx, state.ghosts, sw, h, k, state.ghostFade * 0.6 * dim, true)
+    drawConstellation(ctx, state.stars, sw, h, k, dim, reduced)
 
     // Next star condensing as layers complete (only where layer events exist).
     if (state.forming != null && state.awake && !reduced) {
@@ -360,7 +363,7 @@ export function createStarNurseryRenderer({ reducedMotion = false } = {}) {
       ctx.strokeStyle = `rgb(${INK.cream})`
       ctx.lineWidth = 1
       ctx.beginPath()
-      ctx.arc(p.x * w, p.y * h, ((1 - state.forming) * 22 + 4) * k, 0, TAU)
+      ctx.arc(p.x * sw, p.y * h, ((1 - state.forming) * 22 + 4) * k, 0, TAU)
       ctx.stroke()
     }
 
@@ -370,8 +373,8 @@ export function createStarNurseryRenderer({ reducedMotion = false } = {}) {
         b.age += dt
         const f = 1 - b.age / 1200
         if (f <= 0) return false
-        glow(ctx, b.x * w, b.y * h, (40 + 140 * (1 - f)) * k, INK.gold, f * 0.7)
-        glow(ctx, b.x * w, b.y * h, 24 * k, INK.white, f)
+        glow(ctx, b.x * sw, b.y * h, (40 + 140 * (1 - f)) * k, INK.gold, f * 0.7)
+        glow(ctx, b.x * sw, b.y * h, 24 * k, INK.white, f)
         return true
       })
     }

@@ -105,9 +105,12 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
         </div>
       </header>
 
-      <div className="flowbench-stage">
+      {/* Star Nursery runs edge to edge: the canvas fills the stage and the
+          instrument rail floats over it as a glass panel (stacked below on
+          narrow screens). */}
+      <div className={`flowbench-stage ${renderer === 'starnursery' ? 'flowbench-stage--bleed' : ''}`}>
         {renderer === 'starnursery'
-          ? <StarNursery apiBase={apiBase} reducedMotion={reducedMotion} />
+          ? <StarNursery apiBase={apiBase} reducedMotion={reducedMotion} bleed />
           : renderer === 'neuralfield'
             ? <NeuralField apiBase={apiBase} reducedMotion={reducedMotion} />
             : <FlowBench reducedMotion={reducedMotion} highlightId={highlightId} />}

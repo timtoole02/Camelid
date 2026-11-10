@@ -96,7 +96,7 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconAnalytics size={14} /> Analytics</p>
           <h1>Analytics</h1>
-          <p className="cxv-sub">Prompts, replies, and model usage from this browser. Usage shows activity — not support; family, quant, and API readiness still come from /api/capabilities.</p>
+          <p className="cxv-sub">Prompts, replies, and model usage from this browser. Usage shows activity, not support: which models are verified is on the Compatibility page.</p>
         </div>
         <div className="cxv-head__actions">
           <StatusDot tone={runtime?.generation_ready ? 'ready' : 'warn'} pulse={runtime?.generation_ready} label={runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not ready' : 'No ready model'} />
@@ -111,7 +111,7 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
         <div className="cxv-stat"><span>Chat-ready</span><strong>{chatReadyModels}</strong><small>{runtime?.generation_ready ? 'runtime ready' : 'load a local GGUF'}</small></div>
       </div>
 
-      <RuntimeMemoryPanel apiBase={apiBase} />
+      <RuntimeMemoryPanel apiBase={apiBase} offline={runtime?.status === 'offline'} />
 
       <div className="cxv-grid cxv-grid--two">
         <section className="cxv-card cxv-panel">

@@ -287,7 +287,7 @@ export default function DownloadedModelsView({
 
       <Notice notice={error} tone="error" onDismiss={() => setError('')} />
       <Notice notice={notice} tone="success" onDismiss={() => setNotice('')} />
-      {spine.localError && !spine.local ? (
+      {spine.localError && !spine.local && runtime?.status !== 'offline' ? (
         <Notice notice={`Could not list downloaded models: ${spine.localError}`} tone="error" />
       ) : null}
 

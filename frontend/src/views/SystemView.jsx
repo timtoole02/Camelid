@@ -97,7 +97,7 @@ export default function SystemView({ runtime, selectedModel, capabilities, metri
           className="cx-empty--inline"
           icon={<IconSystem size={22} />}
           title="Backend unreachable"
-          description={`Nothing answered at ${runtime?.api_base || 'the configured API base'}. Start the local runtime (cargo run -- serve) or fix the API base in Settings; runtime health and the support gate below stay unknown until /v1/health responds.`}
+          description={`Nothing answered at ${runtime?.api_base || 'the configured API base'}. Start the engine from Settings (or fix the API address there). Runtime health and chat readiness below stay unknown until the engine responds.`}
         />
       )}
 
@@ -106,7 +106,7 @@ export default function SystemView({ runtime, selectedModel, capabilities, metri
         <div className="cxv-stat"><span>Ready to generate</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong><small>{runtimePill}</small></div>
         <div className="cxv-stat"><span>Loaded model</span><strong>{runtime?.loaded_now ? 'Active' : 'None'}</strong><small title={runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</small></div>
         <div className="cxv-stat"><span>Chat readiness</span><strong>{gateStat}</strong><small>{gateStatSub}</small></div>
-        <div className="cxv-stat"><span>Local API</span><strong>{runtime?.api_base ? 'Online' : 'Offline'}</strong><small>{apiBase}</small></div>
+        <div className="cxv-stat"><span>Local API</span><strong>{runtime?.status === 'offline' ? 'Unreachable' : runtime?.api_base ? 'Online' : 'Offline'}</strong><small>{apiBase}</small></div>
       </div>
 
       <div className="cxv-grid cxv-grid--two">

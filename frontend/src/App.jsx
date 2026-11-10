@@ -25,6 +25,20 @@ import { RETRO_TRANSITION_KEY, useRetroTransition } from './hooks/useRetroTransi
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
+/* Suspense fallback for lazily loaded views: the shape of a page (kicker,
+   title, lede, stat tiles) so the frame does not jump when the view arrives. */
+function ViewSkeleton() {
+  return (
+    <div className="view-loading view-skeleton" role="status" aria-label="Loading view">
+      <span className="view-skeleton__bar view-skeleton__bar--kicker" />
+      <span className="view-skeleton__bar view-skeleton__bar--title" />
+      <span className="view-skeleton__bar view-skeleton__bar--lede" />
+      <div className="view-skeleton__tiles"><span /><span /><span /></div>
+      <span className="sr-only">Loading view…</span>
+    </div>
+  )
+}
+
 const ProjectsView = lazy(() => import('./views/ProjectsView'))
 const ChangesView = lazy(() => import('./views/ChangesView'))
 const ConnectionsView = lazy(() => import('./views/ConnectionsView'))
@@ -177,11 +191,23 @@ function App() {
   }, [sidebarCollapsed])
 
   // Deep-link the active tab via the URL hash (e.g. #library) — shareable and
-  // handy for direct navigation. Runs once on mount if a valid tab hash is present.
+  // handy for direct navigation. Read on mount, and again whenever the hash
+  // changes without a reload: in-app `href="#telemetry"` links and the
+  // browser's Back/Forward buttons both land here.
   useEffect(() => {
-    if (typeof window === 'undefined') return
-    const hash = window.location.hash.replace('#', '')
-    if (HASH_TABS.has(hash)) setTab(hash)
+    if (typeof window === 'undefined') return undefined
+    const syncTabFromHash = (initial) => {
+      const hash = window.location.hash.replace('#', '')
+      if (HASH_TABS.has(hash)) setTab(hash) // the api-surface guard effect redirects disallowed tabs
+      else if (!hash && initial !== true) setTab('chat')
+    }
+    syncTabFromHash(true)
+    window.addEventListener('hashchange', syncTabFromHash)
+    window.addEventListener('popstate', syncTabFromHash)
+    return () => {
+      window.removeEventListener('hashchange', syncTabFromHash)
+      window.removeEventListener('popstate', syncTabFromHash)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -274,11 +300,22 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [mobileNavOpen, paletteOpen, shortcutsOpen])
 
+  /* While the engine-offline banner is on screen it already says the engine
+     is unreachable and offers the fix; the generic "Could not reach Camelid"
+     error notice above it would only repeat that with a raw transport error. */
+  const offlineNoticeIsRedundant = !DEMO_UI && runtime?.status === 'offline' && tab !== 'settings'
+    && noticeTone === 'error' && typeof notice === 'string' && notice.startsWith('Could not reach Camelid')
+
   const navigateTab = (next) => {
     const allowedTab = apiSurfaceAllowsTab(apiSurface, next) ? next : 'chat'
     setTab(allowedTab)
     if (typeof window !== 'undefined' && HASH_TABS.has(allowedTab)) {
-      window.history.replaceState(null, '', allowedTab === 'chat' ? window.location.pathname : `#${allowedTab}`)
+      // Push (not replace) so Back returns to the previous view; re-selecting
+      // the current view must not stack duplicate history entries.
+      const nextHash = allowedTab === 'chat' ? '' : `#${allowedTab}`
+      if (window.location.hash !== nextHash) {
+        window.history.pushState(null, '', nextHash || window.location.pathname)
+      }
     }
     closeMobileNav()
   }
@@ -444,7 +481,7 @@ function App() {
 
         {(tab !== 'chat' || chatMode === 'code' || (mcpActivity.conversationId && mcpActivity.conversationId !== selectedConversation?.id)) && mcpActivity.phase !== 'idle' && <div className="camelid-notice-slot"><McpRunPanel activity={mcpActivity} approval={mcpApproval} onDecision={decideMcpApproval} onStop={stopGeneration} /></div>}
 
-        {notice && (
+        {notice && !offlineNoticeIsRedundant && (
           <div className="camelid-notice-slot">
             <Notice notice={notice} tone={noticeTone} onDismiss={clearNotice} />
           </div>
@@ -471,7 +508,7 @@ function App() {
            page and needs the padded page frame. */}
         <div ref={stageRef} className="retro-transition-stage">
         <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
-          <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
+          <Suspense fallback={<ViewSkeleton />}>
           {codingVisited && !isLanChatOnly(apiSurface) && <div className="coding-mount" hidden={tab !== 'chat' || chatMode !== 'code'}>
             <CodingWorkspace apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} projects={projects} chatContext={chatContext} contextSources={contextSources} updateChatContext={updateChatContext} globalPrompt={globalPrompt} setTab={navigateTab} onActivity={setCodingActivity} active={tab === 'chat' && chatMode === 'code'} />
           </div>}

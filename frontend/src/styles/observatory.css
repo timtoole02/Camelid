@@ -312,3 +312,48 @@
 @media (max-width: 640px) {
   .starnursery__hud--legend { display: none; }
 }
+
+/* ==========================================================================
+   Edge-to-edge stage (Star Nursery): the canvas fills the whole stage and the
+   instrument rail floats over its right side as a glass panel. Inside the
+   panel the theme tokens are re-pointed at inks that read on the always-dark
+   sky, so the rail's existing tiles restyle themselves in both themes.
+   Breakpoint and panel width must match RAIL_OVERLAY_* in StarNursery.jsx.
+   ========================================================================== */
+@media (min-width: 1101px) {
+  .flowbench-stage--bleed {
+    display: block;
+    min-height: clamp(560px, 70vh, 780px);
+  }
+  .flowbench-stage--bleed > .flowbench {
+    position: absolute;
+    inset: 0;
+    min-height: 0;
+  }
+  .flowbench-stage--bleed > .flowbench-rail {
+    --color-text: #e9ecff;
+    --color-text-muted: #a3abd0;
+    --color-text-faint: #7c84ab;
+    --color-surface: transparent;
+    --color-bg-elevated: transparent;
+    --color-border-soft: rgba(150, 170, 255, 0.17);
+    --color-accent-text: #a3c4e4;
+    --color-accent-soft: rgba(143, 182, 220, 0.16);
+    --color-error: #e9928a;
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    bottom: var(--space-3);
+    z-index: 2;
+    width: 308px;
+    padding: var(--space-3);
+    overflow-y: auto;
+    color: var(--color-text);
+    background: rgba(13, 17, 36, 0.62);
+    border: 1px solid rgba(150, 170, 255, 0.17);
+    border-radius: var(--radius-lg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .flowbench-stage--bleed .starnursery__hud--legend { right: calc(308px + var(--space-3) * 2); }
+}

@@ -534,6 +534,9 @@
   background: var(--color-surface-subtle);
   margin: 0 0 var(--space-4);
 }
+/* A full-width inline card has room for a readable line; the centered
+   variant's 42ch cap left its text squeezed into a narrow column. */
+.cx-empty.cx-empty--inline .cx-empty__desc { max-width: 72ch; }
 
 /* ==========================================================================
    Shared micro-typography utilities

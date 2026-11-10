@@ -18,6 +18,11 @@ import { fmtRate } from './format'
 
 const DPR_CAP = 2
 const CONSUMER_ID = 'starnursery'
+/* In the edge-to-edge layout the instrument rail floats over the right of the
+   canvas on wide screens; the constellation keeps clear of it. Must match the
+   .flowbench-stage--bleed rules in observatory.css. */
+const RAIL_OVERLAY_QUERY = '(min-width: 1101px)'
+const RAIL_OVERLAY_INSET = 332
 
 const PHASE_LABEL = {
   idle: 'Idle',
@@ -28,7 +33,7 @@ const PHASE_LABEL = {
   error: 'Error',
 }
 
-export default function StarNursery({ apiBase, reducedMotion = false }) {
+export default function StarNursery({ apiBase, reducedMotion = false, bleed = false }) {
   const canvasRef = useRef(null)
   const store = useInferenceTelemetry(apiBase)
   const storeRef = useRef(store)
@@ -40,6 +45,7 @@ export default function StarNursery({ apiBase, reducedMotion = false }) {
     const ctx = canvas.getContext('2d')
     const renderer = createStarNurseryRenderer({ reducedMotion })
 
+    const railOverlay = bleed ? window.matchMedia?.(RAIL_OVERLAY_QUERY) : null
     let raf = 0
     let lastT = performance.now()
     let dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
@@ -64,6 +70,7 @@ export default function StarNursery({ apiBase, reducedMotion = false }) {
         run: s.getRun(),
         connection: s.getConnection(),
         runStale: s.isRunStale(),
+        insetRight: railOverlay?.matches ? RAIL_OVERLAY_INSET : 0,
       }
     }
 
@@ -104,7 +111,7 @@ export default function StarNursery({ apiBase, reducedMotion = false }) {
       document.removeEventListener('visibilitychange', onVisibility)
       observer.disconnect()
     }
-  }, [reducedMotion])
+  }, [reducedMotion, bleed])
 
   const run = store.getRun()
   const unavailable = store.getConnection() === 'unavailable'
