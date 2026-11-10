@@ -178,6 +178,7 @@ enum MetalSampleRequest {
         input_token: u32,
         inv_temperature: f32,
         base_seed: u64,
+        seed_step: u64,
     },
 }
 
@@ -194,10 +195,12 @@ impl MetalSampleRequest {
             Self::Temperature {
                 inv_temperature,
                 base_seed,
+                seed_step,
                 ..
             } => metal::SampleMode::Temperature {
                 inv_temperature,
                 base_seed,
+                seed_step,
             },
         }
     }
@@ -1281,6 +1284,7 @@ impl super::LlamaInferenceSession {
         input_token: u32,
         inv_temperature: f32,
         base_seed: u64,
+        seed_step: u64,
     ) -> Result<Option<ResidentForward>> {
         self.try_resident_decode_forward_metal_inner(
             embedding,
@@ -1289,6 +1293,7 @@ impl super::LlamaInferenceSession {
                 input_token,
                 inv_temperature,
                 base_seed,
+                seed_step,
             }),
         )
     }
@@ -1478,17 +1483,32 @@ impl super::LlamaInferenceSession {
             None
         };
 
-        // GPU-side greedy sampling stage: only when the caller asked for it, logits run on
-        // the GPU, and the token embedding table is plain Q8_0 (the gather reads its rows).
+        // GPU-side sampling stage: only when the caller asked for it, logits run on the
+        // GPU, and the token embedding table is one the device gather can read: plain
+        // Q8_0, or a Prism packed table (Bonsai's Q1_0/Q2_0 token table, read in place
+        // by `embed_row_gather_q1_0` / `_q2_0_g64` / `_q2_0_g128`). Without it every
+        // token pays a logits readback and a CPU sample.
+        // `table` (not `embedding`): `embedding` is this function's input activation row.
+        let table = &weights.token_embedding;
+        let (embedding_gatherable, embedding_blocks_expected) = match table.source_type {
+            Some(GgufTensorType::Q8_0) => (
+                table.q8_0_blocks.is_some() || table.q8_0_wire_pages.is_some(),
+                vocab * (hidden / 32),
+            ),
+            Some(GgufTensorType::Q2_0G64) => (
+                table.kquant_wire_pages.is_some() || table.low_bit_wire().is_some(),
+                vocab * (hidden / 64),
+            ),
+            Some(GgufTensorType::Q1_0 | GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0) => (
+                table.kquant_wire_pages.is_some() || table.low_bit_wire().is_some(),
+                vocab * (hidden / 128),
+            ),
+            _ => (false, 0),
+        };
         let sample_stage = match gpu_sample {
-            Some(_)
-                if compute_logits
-                    && weights.token_embedding.source_type == Some(GgufTensorType::Q8_0)
-                    && (weights.token_embedding.q8_0_blocks.is_some()
-                        || weights.token_embedding.q8_0_wire_pages.is_some()) =>
-            {
+            Some(_) if compute_logits && embedding_gatherable => {
                 let embedding_blocks = resident_weight_bytes(&weights.token_embedding);
-                (embedding_blocks.block_count() == vocab * (hidden / 32)).then_some(
+                (embedding_blocks.block_count() == embedding_blocks_expected).then_some(
                     metal::SampleStage {
                         embedding_blocks,
                         mode: gpu_sample.expect("sample request matched above").mode(),
