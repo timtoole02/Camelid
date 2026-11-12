@@ -410,6 +410,52 @@ mod tests {
         );
     }
 
+    /// Every id in a "Pull ID" table column of the README or the model guide
+    /// must resolve. A new catalog row can make a short id ambiguous (as
+    /// happened to `mistral`), and only a scan of the docs notices.
+    #[test]
+    fn every_pull_id_in_the_docs_tables_resolves() {
+        let entries = curated_catalog();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0usize;
+        let mut broken = Vec::new();
+
+        for doc in ["README.md", "docs/MODELS.md"] {
+            let text = std::fs::read_to_string(root.join(doc)).expect("readable doc");
+            let mut column: Option<usize> = None;
+            for (lineno, line) in text.lines().enumerate() {
+                let line = line.trim();
+                if !line.starts_with('|') {
+                    column = None;
+                    continue;
+                }
+                let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+                if let Some(at) = cells.iter().position(|cell| *cell == "Pull ID") {
+                    column = Some(at);
+                    continue;
+                }
+                let Some(cell) = column.and_then(|at| cells.get(at)) else {
+                    continue;
+                };
+                let id = cell.trim_matches('`');
+                if id.is_empty() || id.starts_with('-') || id.contains(' ') {
+                    continue;
+                }
+                checked += 1;
+                if resolve(&entries, id).is_err() {
+                    broken.push(format!("{doc}:{} -> `{id}`", lineno + 1));
+                }
+            }
+        }
+
+        assert!(checked > 0, "found no Pull ID tables in the docs");
+        assert!(
+            broken.is_empty(),
+            "these documented pull ids do not resolve to exactly one row:\n  {}",
+            broken.join("\n  ")
+        );
+    }
+
     #[test]
     fn a_family_fragment_spanning_several_quants_refuses_to_guess() {
         // BEHAVIOR CHANGE: `llama32_3b` was the README quickstart id and resolved
@@ -439,8 +485,9 @@ mod tests {
 
     #[test]
     fn the_documented_quant_qualified_ids_all_resolve() {
-        // Every pull id printed in the README table must resolve to exactly the
-        // row it names -- that table is the only place most users look.
+        // Every pull id printed in the README and docs/MODELS.md tables must
+        // resolve to exactly the row it names -- those tables are where most
+        // users look.
         let entries = curated_catalog();
         for (id, expected) in [
             ("1b_instruct_q8", "llama32_1b_instruct_q8_0"),
@@ -449,6 +496,20 @@ mod tests {
             ("3b_instruct_q4", "llama_3_2_3b_instruct_q4_k_m"),
             ("3b_instruct_q5", "llama_3_2_3b_instruct_q5_k_m"),
             ("ornith", "Ornith 1.0 9B"),
+            ("tinyllama", "tinyllama_1_1b_chat_q8_0"),
+            ("nomic", "nomic_embed_text_v1_5_q8_0"),
+            ("lfm2_5_2_6b", "lfm2_5_2_6b_q8_0"),
+            ("mistral_7b_instruct_v0_3", "mistral_7b_instruct_v0_3_q8_0"),
+            ("qwen3_4b_q4", "qwen3_4b_q4_k_m"),
+            ("llama31_8b_instruct_q8_0", "llama31_8b_instruct_q8_0"),
+            ("gemma4_12b_it_q8_0", "gemma4_12b_it_q8_0"),
+            ("qwen3_8b_instruct", "qwen3_8b_instruct_q8_0"),
+            ("distill_qwen_7b", "deepseek_r1_distill_qwen_7b_q8_0"),
+            ("qwen25_coder_7b", "qwen25_coder_7b_q8_0"),
+            ("bonsai_2_2b", "ternary_bonsai_2_2b_ptq1_0"),
+            ("bonsai_2_4b", "ternary_bonsai_2_4b_ptq1_0"),
+            ("bonsai_2_9b", "ternary_bonsai_2_9b_ptq1_0"),
+            ("bonsai_2_27b", "ternary_bonsai_2_27b_ptq1_0"),
         ] {
             let item =
                 resolve(&entries, id).unwrap_or_else(|err| panic!("id {id} must resolve: {err}"));

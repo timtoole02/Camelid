@@ -9,8 +9,8 @@ weight streaming within the tested 6 GiB VRAM/16 GB RAM host. Drafting gives
 workload-dependent gains; the port remains faster on 2B/4B/9B, while Camelid is
 faster on the tested 27B configuration. Apple Silicon, extended context, and
 further throughput improvements remain separate work. See
-[Bonsai 2](docs/BONSAI2.md), the [CUDA manifest](qa/bonsai2/cuda/manifest.json),
-and the [CUDA workflow](qa/bonsai2/cuda/README.md).
+[Bonsai 2](docs/BONSAI2.md), the [CUDA manifest](qa/bonsai2/cuda-q8/manifest.json),
+and the [CUDA workflow](qa/bonsai2/cuda-q8/README.md).
 
 Last updated: 2026-10-16
 
@@ -104,7 +104,7 @@ Promote only what can be defended row by row.
 - Extend Windows coverage to the gaps its bundles name: WebUI/frontend smoke, longer/model-native context, thinking mode, and Windows parity bundles for the Llama 3.2 1B/3B rows.
 - Take agent mode past macOS: Windows and Linux live-lane transcripts, so the host claim matches the CI-validated builds.
 - Broaden quantization support only with per-quant tests, docs, and at least one row-specific real-model parity artifact. Metadata parsing alone never promotes a quant.
-- Bring the next candidate families in as single exact rows — Qwen2.5-7B-Instruct Q8_0 and gemma-2-9b-it Q8_0 — with tokenizer/template fixtures and prompt-token parity before any runtime-support wording.
+- Bring the next candidate families in as single exact rows — Qwen2.5-7B-Instruct Q8_0 (gemma-2-9b-it Q8_0 is now verified runnable; see `COMPATIBILITY.md`) — with tokenizer/template fixtures and prompt-token parity before any runtime-support wording.
 - Require separate evidence rows for any encoder, quant, GPU path, or classifier-head reranker beyond the exact Nomic embedding lane.
 
 ### Later

@@ -18,8 +18,9 @@ Read these first:
 
 - [`README.md`](README.md) — product overview, quick start, and starter models
 - [`docs/MODELS.md`](docs/MODELS.md) — full download catalog, model setup, and validation details
+- [`docs/BONSAI2.md`](docs/BONSAI2.md) — Bonsai 2 PTQ1_0 runtime, Windows CPU/CUDA qualification, drafting, and benchmarks
 - [`docs/MCP.md`](docs/MCP.md) — connected tool servers, approvals, and automatic chat continuation (preview)
-- [Project and conversation context](docs/PROJECT_CONTEXT.md) — shared instructions, reference files, and per-chat inheritance.
+- [Project and conversation context](docs/PROJECT_CONTEXT.md) — shared instructions, reference files, per-chat inheritance, and the Knowledge Library (collections, watched folders, citations).
 - [Memory](docs/MEMORY.md) — facts about you the model suggests and you choose to keep, where each came from, and what reaches the model.
 - [Output previews and file review](docs/OUTPUTS_AND_CHANGES.md) — downloads, approved local file changes, and undo.
 - [`docs/REMOTE_CHAT.md`](docs/REMOTE_CHAT.md) — browser chat over a private LAN or Tailscale
@@ -39,6 +40,7 @@ Read these first:
 - [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) — shortest safe local contributor path
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — current toolchain, env-var, and path guidance
 - [`docs/CUDA_CONTINUOUS_BATCHING.md`](docs/CUDA_CONTINUOUS_BATCHING.md) — explicit-opt-in CUDA sequence batching, two-model residency, observability, and rollback
+- [`docs/CUDA_MIN_P_SAMPLING.md`](docs/CUDA_MIN_P_SAMPLING.md) — opt-in GPU-resident min-p sampling on CUDA and its qualification
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change class
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices
