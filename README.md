@@ -35,6 +35,8 @@ Chat, work with files, and code with supported GGUF models on your own hardware.
 | **Projects and context** | Group chats with shared instructions and reference files. Choose what each conversation inherits and inspect the sources included in the next request. [Guide](docs/PROJECT_CONTEXT.md) · [Screenshot](docs/assets/readme/desktop-projects.png) |
 | **Files and previews** | Browse generated files beside the conversation, switch between Preview and Source, and download outputs. On the local engine, review a proposed file change before applying it, with conflict checks and Undo. [Guide](docs/OUTPUTS_AND_CHANGES.md) |
 | **Code in Chat** | Work in a local project with a live plan, read-only helper agents, file reviews, individually approved commands, checks, and project previews, including a managed local preview server for Chrome. Pause, steer, queue a follow-up, or return to a saved session. [Guide](docs/AGENTIC_CODING.md) |
+| **Knowledge Library** | Add PDFs, Word files, HTML pages, text, and source code (up to 64 MB each), group them into collections, or watch a folder. Chats and projects search the library by keyword and meaning and answer with citations you can open and check. [Guide](docs/PROJECT_CONTEXT.md#knowledge-collections) |
+| **Memory** | Optionally let the model suggest facts about you to keep for later chats. Nothing is saved until you choose **Remember**, and you can edit or forget any memory on the Memory page. Off by default. [Guide](docs/MEMORY.md) |
 | **Web and connected tools** | Use **Web Auto** for web research with reply sources. Connect local or remote MCP servers, choose tools per conversation, and approve each tool call. MCP is a preview feature. [MCP guide](docs/MCP.md) |
 | **Mobile browser chat** | Chat from your phone with a compact model selector, project context, and file previews. Inference stays on your computer; browser history and context stay separate on each device. [Remote setup](docs/REMOTE_CHAT.md) |
 | **Models and developer tools** | Browse the model catalog, inspect local GGUF metadata, check compatibility evidence, explore API examples, and inspect request telemetry. Model and tool availability follow the active engine's capabilities. |
@@ -126,15 +128,6 @@ Use a trusted private LAN or private Tailscale HTTPS access with authentication.
 
 ## Supported models
 
-Bonsai 2 **2B, 4B, 9B, and 27B** PTQ1_0 support text, GUI image chat, and
-function calling on Windows x86_64 with CPU or CUDA language decoding. Downloads
-include the matching vision projector. All four passed CUDA production GUI/API
-checks through the native server harness, matched benchmarks, and the final
-state and memory regression suite. The [CUDA manifest](qa/bonsai2/cuda/manifest.json)
-records the qualified artifacts. CUDA drafting improves selected workloads,
-including all three measured 27B cases, but can also slow a request. See
-[Bonsai 2](docs/BONSAI2.md) for the full comparison and tested limits.
-
 Start with one of these five options. Support applies to exact model files, quantizations, and tested execution paths; see the [compatibility ledger](COMPATIBILITY.md) for each model's limits.
 
 | Best for | Model | Pull ID |
@@ -143,9 +136,11 @@ Start with one of these five options. Support applies to exact model files, quan
 | Small end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
 | Compact Windows CPU or tested M4 Metal chat (~2.9 GB) | LFM2.5 2.6B Q8_0 | `lfm2_5_2_6b` |
 | Local embeddings (CPU) | Nomic Embed Text v1.5 Q8_0 | `nomic` |
-| Chat on a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
+| Chat on a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral_7b_instruct_v0_3` |
 
 Llama 3.2 3B and LFM2.5 have support limited to the documented exact-file smoke tests; broader context, hardware, and behavior do not inherit that support.
+
+**Bonsai 2** 2B, 4B, 9B, and 27B PTQ1_0 support text, image chat, and function calling on Windows x86_64 with CPU or CUDA (for example, `camelid pull bonsai_2_4b`). The app's **Models** page also downloads the matching vision projector; `camelid pull` fetches only the language model. Apple Silicon and longer context are not yet qualified, and optional speculative drafting speeds up some requests but slows others. See [Bonsai 2](docs/BONSAI2.md) for tested limits and benchmarks, and the [CUDA manifest](qa/bonsai2/cuda-q8/manifest.json) for the qualified files.
 
 [Browse the full catalog and validation details](docs/MODELS.md), including coding, vision, and experimental models. Gemma 4 12B-It QAT Q4_0 is available for a tested 16 GB M4 Mac, with **validation pending**. Download availability does not imply verified support.
 
@@ -217,13 +212,16 @@ See the [contributor quick start](docs/CONTRIBUTOR_QUICKSTART.md) for prerequisi
 
 - [Documentation index](DOCS.md)
 - [Model catalog and validation](docs/MODELS.md)
+- [Bonsai 2](docs/BONSAI2.md)
 - [Remote browser chat](docs/REMOTE_CHAT.md)
-- [Projects and conversation context](docs/PROJECT_CONTEXT.md)
+- [Projects, conversation context, and the Knowledge Library](docs/PROJECT_CONTEXT.md)
+- [Memory](docs/MEMORY.md)
 - [Output previews and file review](docs/OUTPUTS_AND_CHANGES.md)
 - [Code in Chat](docs/AGENTIC_CODING.md)
 - [Connected tools (MCP preview)](docs/MCP.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [CUDA continuous batching and model residency](docs/CUDA_CONTINUOUS_BATCHING.md)
+- [CUDA min-p sampling](docs/CUDA_MIN_P_SAMPLING.md)
 - [Architecture](docs/architecture/ARCHITECTURE.md)
 - [Validation matrix](docs/VALIDATION_MATRIX.md)
 - [Roadmap](ROADMAP.md)
