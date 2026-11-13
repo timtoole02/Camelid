@@ -1,0 +1,89 @@
+{
+  "schema": "camelid.parity-receipt/v1",
+  "receipt_id": "c0cfdeea2ac889b18d7ac773c391bb52e01a2fddfa7f26adb3ed5ae27ee5ab46",
+  "created_utc": "2026-08-22T14:04:41Z",
+  "lane": {
+    "model_id": "Qwen3-0.6B-Q8_0",
+    "gguf_sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+    "gguf_filename": "Qwen3-0.6B-Q8_0.gguf",
+    "quantization": "Q8_0",
+    "architecture": "qwen3",
+    "tokenizer_kind": "gpt2_bpe",
+    "tokenizer_sha256": "59afe9d266b6304529b469e538d5dc65f4bdf152ef392f76a87168d2420c73e7",
+    "camelid_version": "v0.6.1-191-gdb283b69",
+    "camelid_commit": "db283b6958f5619f053f4568374885a0f9919331"
+  },
+  "reference": {
+    "tool": "none",
+    "binary": "runnable-smoke-admission",
+    "version": null,
+    "commit": null
+  },
+  "request": {
+    "endpoint": "runnable/smoke-admission",
+    "messages_or_prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+    "max_tokens": 24,
+    "temperature": 0.0,
+    "top_p": null,
+    "top_k": null,
+    "seed": null,
+    "stop": []
+  },
+  "reproducible": true,
+  "result": {
+    "prompt_token_ids": [
+      151644,
+      872,
+      198,
+      3838,
+      374,
+      279,
+      6722,
+      315,
+      9625,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198
+    ],
+    "generated_token_ids": [
+      151667,
+      198,
+      32313,
+      11,
+      279,
+      1196,
+      374,
+      10161,
+      369,
+      279,
+      6722,
+      315,
+      9625,
+      13,
+      358,
+      1414,
+      429,
+      9625,
+      594,
+      6722,
+      374,
+      12095,
+      13,
+      1988
+    ],
+    "generated_text": "<think>\nOkay, the user is asking for the capital of France. I know that France's capital is Paris. But",
+    "completion_tokens": 24,
+    "finish_reason": "length"
+  },
+  "parity": {
+    "compared_against_reference": false,
+    "prompt_tokens_match": null,
+    "generated_tokens_match": null,
+    "generated_text_match": null,
+    "first_divergent_token_index": null
+  },
+  "execution_lane": "runnable"
+}

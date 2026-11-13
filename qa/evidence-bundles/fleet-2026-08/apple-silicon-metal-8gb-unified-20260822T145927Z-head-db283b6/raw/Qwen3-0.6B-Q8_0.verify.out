@@ -1,0 +1,2 @@
+NO PROFILE model=Qwen3-0.6B-Q8_0.gguf report_id=56988b9c3712121862a713016fec058cbfda17510daeb595b9c1ec1ff9b81b88 output=./evidence-clean/apple-silicon-metal-8gb-unified-20260822T145927Z-head-db283b6/raw/Qwen3-0.6B-Q8_0.verify.json
+No built-in verification profile matches this exact GGUF. Camelid abstained.
